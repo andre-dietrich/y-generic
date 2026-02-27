@@ -3,23 +3,35 @@
   "version": "1.0.0",
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
-  "author": "",
-  "type": "commonjs",
+  "author": "André Dietrich",
+  "main": "./dist/lib.js",
+  "types": "./dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "default": "./dist/lib.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "npx parcel serve test/index.html --open",
     "test": "parcel test.html --open",
-    "build": "npx parcel build test.html --dist-dir dist-test"
+    "build": "rm -rf dist && tsc"
   },
   "dependencies": {
     "lib0": "^0.2.98",
-    "parcel": "^2.16.4",
-    "quill": "^2.0.3",
     "y-protocols": "^1.0.6",
-    "y-quill": "^1.0.0",
     "yjs": "^13.6.29"
   },
   "devDependencies": {
+    "@types/node": "^20.0.0",
     "buffer": "^6.0.3",
-    "process": "^0.11.10"
+    "parcel": "^2.16.4",
+    "process": "^0.11.10",
+    "quill": "^2.0.3",
+    "typescript": "^5.0.0",
+    "y-quill": "^1.0.0"
   }
 }

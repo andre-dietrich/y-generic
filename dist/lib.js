@@ -29,19 +29,9 @@
  * provider.pubsub.subscribe('chat', (msg) => console.log(msg))
  * ```
  */
-
-export { GenericProvider, PubSubChannel } from './index'
-export type { Transport, ConnectionConfig, ConnectionStatus } from './transport'
-
+export { GenericProvider, PubSubChannel } from './index';
 // Optional monitoring utilities (for advanced diagnostics)
 // Note: Built-in hash verification (verifyUpdates: true) is recommended for most use cases
 // SyncHealthMonitor is useful for monitoring across ALL peers simultaneously via pub/sub
-export { SyncHealthMonitor, computeDocumentHash } from './sync-monitor'
-export type { DesyncDetails } from './sync-monitor'
-
-// Example implementations (optional - for reference)
-export {
-  WebSocketTransport,
-  PubNubTransport,
-  IndexedDBTransport,
-} from './examples'
+export { SyncHealthMonitor, computeDocumentHash } from './sync-monitor';
+//# sourceMappingURL=lib.js.map

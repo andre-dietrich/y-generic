@@ -1,5 +1,5 @@
 import * as Y from 'yjs'
-import { GenericProvider } from '../src/exports'
+import { GenericProvider } from '../src/lib'
 import type { Transport, ConnectionConfig } from '../src/transport'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'

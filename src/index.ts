@@ -257,13 +257,13 @@ export class GenericProvider extends Observable<string> {
   disconnect(): void {
     // Stop periodic sync
     if (this._syncIntervalId !== undefined) {
-      clearInterval(this._syncIntervalId as number)
+      clearInterval(this._syncIntervalId)
       this._syncIntervalId = undefined
     }
 
     // Clear any pending batched updates
     if (this._batchTimeoutId !== undefined) {
-      clearTimeout(this._batchTimeoutId as number)
+      clearTimeout(this._batchTimeoutId)
       this._batchTimeoutId = undefined
       this._pendingUpdate = null
     }
@@ -294,13 +294,13 @@ export class GenericProvider extends Observable<string> {
 
     // Stop periodic sync (disconnect() will also do this, but be explicit)
     if (this._syncIntervalId !== undefined) {
-      clearInterval(this._syncIntervalId as number)
+      clearInterval(this._syncIntervalId)
       this._syncIntervalId = undefined
     }
 
     // Clear any pending batched updates
     if (this._batchTimeoutId !== undefined) {
-      clearTimeout(this._batchTimeoutId as number)
+      clearTimeout(this._batchTimeoutId)
       this._batchTimeoutId = undefined
       this._pendingUpdate = null
     }
@@ -406,7 +406,7 @@ export class GenericProvider extends Observable<string> {
 
     // Clear existing timeout
     if (this._batchTimeoutId !== undefined) {
-      clearTimeout(this._batchTimeoutId as number)
+      clearTimeout(this._batchTimeoutId)
     }
 
     // Set new timeout to send after delay

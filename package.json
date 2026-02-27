@@ -1,0 +1,25 @@
+{
+  "name": "genericprovider",
+  "version": "1.0.0",
+  "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "npx parcel serve test/index.html --open",
+    "test": "parcel test.html --open",
+    "build": "npx parcel build test.html --dist-dir dist-test"
+  },
+  "dependencies": {
+    "lib0": "^0.2.98",
+    "parcel": "^2.16.4",
+    "quill": "^2.0.3",
+    "y-protocols": "^1.0.6",
+    "y-quill": "^1.0.0",
+    "yjs": "^13.6.29"
+  },
+  "devDependencies": {
+    "buffer": "^6.0.3",
+    "process": "^0.11.10"
+  }
+}

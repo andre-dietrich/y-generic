@@ -1,0 +1,418 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Generic Provider Test - Yjs Sync</title>
+
+    <!-- Quill CSS -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css"
+      rel="stylesheet"
+    />
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+        margin: 0;
+        padding: 20px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        min-height: 100vh;
+      }
+
+      .container {
+        max-width: 1400px;
+        margin: 0 auto;
+      }
+
+      header {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      h1 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 28px;
+      }
+
+      .subtitle {
+        color: #666;
+        font-size: 14px;
+        margin: 0 0 15px 0;
+      }
+
+      .controls {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: 500;
+        transition: all 0.2s;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+      }
+
+      button:active {
+        transform: translateY(0);
+      }
+
+      #add-client-btn {
+        background: #4caf50;
+        color: white;
+      }
+
+      #add-client-btn:hover {
+        background: #45a049;
+      }
+
+      #clear-all-btn {
+        background: #f44336;
+        color: white;
+      }
+
+      #clear-all-btn:hover {
+        background: #da190b;
+      }
+
+      #network-toggle-btn:hover {
+        opacity: 0.9;
+      }
+
+      #network-status {
+        display: inline-flex;
+        align-items: center;
+        transition: color 0.3s;
+      }
+
+      .info-box {
+        background: #e3f2fd;
+        border-left: 4px solid #2196f3;
+        padding: 15px;
+        margin-bottom: 20px;
+        border-radius: 5px;
+      }
+
+      .info-box h3 {
+        margin: 0 0 10px 0;
+        color: #1976d2;
+        font-size: 16px;
+      }
+
+      .info-box ul {
+        margin: 5px 0;
+        padding-left: 20px;
+      }
+
+      .info-box li {
+        color: #555;
+        font-size: 13px;
+        margin: 5px 0;
+      }
+
+      #clients-container {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+        gap: 15px;
+        margin-bottom: 20px;
+      }
+
+      .client {
+        animation: slideIn 0.3s ease-out;
+      }
+
+      @keyframes slideIn {
+        from {
+          opacity: 0;
+          transform: translateY(-20px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      #log-container {
+        background: white;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        max-height: 300px;
+        overflow-y: auto;
+      }
+
+      #log-container h3 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 18px;
+      }
+
+      #log {
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        color: #333;
+      }
+
+      .loading {
+        text-align: center;
+        padding: 40px;
+        color: white;
+        font-size: 18px;
+      }
+
+      .badge {
+        display: inline-block;
+        padding: 3px 8px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: bold;
+        margin-left: 5px;
+      }
+
+      .badge-success {
+        background: #4caf50;
+        color: white;
+      }
+
+      .badge-info {
+        background: #2196f3;
+        color: white;
+      }
+
+      /* Responsive design */
+      @media (max-width: 768px) {
+        #clients-container {
+          grid-template-columns: 1fr;
+        }
+
+        body {
+          padding: 10px;
+        }
+
+        h1 {
+          font-size: 22px;
+        }
+      }
+
+      /* Quill editor custom styles */
+      .editor-container {
+        background: white;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        margin-bottom: 10px;
+      }
+
+      .ql-toolbar {
+        border: none;
+        border-bottom: 1px solid #e0e0e0;
+        background: #f9f9f9;
+        border-radius: 4px 4px 0 0;
+      }
+
+      .ql-container {
+        border: none;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 14px;
+      }
+
+      .ql-editor {
+        min-height: 150px;
+        max-height: 150px;
+        overflow-y: auto;
+      }
+
+      .ql-editor.ql-blank::before {
+        color: #999;
+        font-style: normal;
+      }
+
+      /* Quill images */
+      .ql-editor img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+        margin: 10px 0;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+
+      /* Quill cursor colors for awareness */
+      .ql-cursor-caret {
+        border-left: 2px solid;
+      }
+
+      .ql-cursor-selection {
+        opacity: 0.3;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>
+          🚀 Generic Provider Test
+          <span class="badge badge-success">Live</span>
+          <span class="badge badge-info">Yjs</span>
+        </h1>
+        <p class="subtitle">
+          Test the GenericProvider with in-memory Dummy transport. Multiple
+          clients sync in real-time!
+        </p>
+
+        <div class="controls">
+          <button id="add-client-btn">➕ Add Client</button>
+          <button id="clear-all-btn">🗑️ Clear All</button>
+          <button
+            id="network-toggle-btn"
+            style="background: #ff9800; color: white"
+          >
+            📡 Go Offline
+          </button>
+          <span
+            id="network-status"
+            style="
+              padding: 10px 15px;
+              font-weight: bold;
+              font-size: 14px;
+              color: #4caf50;
+            "
+            >🟢 Online</span
+          >
+        </div>
+
+        <div
+          style="
+            margin-top: 15px;
+            padding: 15px;
+            background: #f5f5f5;
+            border-radius: 8px;
+          "
+        >
+          <h3 style="margin: 0 0 10px 0; font-size: 14px; color: #666">
+            🌐 Network Simulation
+          </h3>
+          <div style="margin-bottom: 10px; font-size: 12px; color: #2196f3">
+            ℹ️ Fast desync detection enabled (hash verification on each
+            update)<br />
+            ℹ️ Sequence numbers for ordering & duplicate detection<br />
+            ℹ️ Auto-sync retries every 2 seconds as backup<br />
+            ℹ️ Exponential backoff on repeated failures (10ms → 10s)<br />
+            ℹ️ Rate limiting: max 20 sync requests per 10 seconds<br />
+            ℹ️ Update batching available (batchUpdates option) for efficiency
+          </div>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px">
+            <div>
+              <label
+                style="
+                  display: block;
+                  font-size: 12px;
+                  margin-bottom: 5px;
+                  color: #666;
+                "
+              >
+                Delay:
+                <span id="delay-value" style="font-weight: bold">10ms</span>
+              </label>
+              <input
+                type="range"
+                id="delay-slider"
+                min="0"
+                max="5000"
+                value="10"
+                style="width: 100%"
+              />
+            </div>
+            <div>
+              <label
+                style="
+                  display: block;
+                  font-size: 12px;
+                  margin-bottom: 5px;
+                  color: #666;
+                "
+              >
+                Packet Loss:
+                <span id="loss-value" style="font-weight: bold">0%</span>
+              </label>
+              <input
+                type="range"
+                id="loss-slider"
+                min="0"
+                max="99"
+                value="0"
+                style="width: 100%"
+              />
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <div class="info-box">
+        <h3>📝 How to Test</h3>
+        <ul>
+          <li>
+            <strong>Use the rich text editor</strong> - Format text, add images,
+            see live cursors & selections sync instantly
+          </li>
+          <li>
+            <strong>Change names/colors</strong> - See awareness updates in the
+            "Users Online" section
+          </li>
+          <li>
+            <strong>Add more clients</strong> - Test with 3, 4, or more
+            simultaneous connections
+          </li>
+          <li>
+            <strong>Disconnect a client</strong> - See how others react and
+            remove the user from awareness
+          </li>
+          <li>
+            <strong>Toggle offline/online</strong> - Simulate network problems
+            and watch synchronization behavior
+          </li>
+          <li>
+            <strong>Adjust delay/packet loss</strong> - Test sync resilience
+            under adverse network conditions
+          </li>
+          <li>
+            <strong>Watch for desync warnings</strong> - Hash-based monitoring
+            checks sync health every 5s (orange flash = detected & fixed)
+          </li>
+          <li>
+            <strong>Refresh the page</strong> - Data is only in memory, so it
+            resets (no persistence)
+          </li>
+        </ul>
+      </div>
+
+      <div id="clients-container"></div>
+
+      <div id="log-container">
+        <h3>📊 Activity Log</h3>
+        <div id="log"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./index.ts"></script>
+  </body>
+</html>

@@ -267,7 +267,6 @@ async function exampleRoomCollaboration() {
   // Connect to specific room
   await provider.connect({
     room: 'course-123-classroom-a',
-    course: 'https://example.com/course.md',
     url: 'ws://localhost:1234',
   })
 

@@ -50,9 +50,6 @@ export interface ConnectionConfig {
   /** Room/channel identifier for grouping clients */
   room: string
 
-  /** Optional course URL for multi-course scenarios */
-  course?: string
-
   /** Optional password for encrypted communication */
   password?: string
 

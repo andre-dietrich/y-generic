@@ -10,25 +10,57 @@
     ".": {
       "types": "./dist/lib.d.ts",
       "default": "./dist/lib.js"
+    },
+    "./providers/dummy": {
+      "types": "./dist/providers/dummy.d.ts",
+      "default": "./dist/providers/dummy.js"
+    },
+    "./providers/simple-peer": {
+      "types": "./dist/providers/simple-peer.d.ts",
+      "default": "./dist/providers/simple-peer.js"
+    },
+    "./providers/peerjs": {
+      "types": "./dist/providers/peerjs.d.ts",
+      "default": "./dist/providers/peerjs.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "dev": "npx parcel serve test/index.html --open",
+    "dev:dummy": "npx parcel serve test/dummy/index.html --open --port 3001",
+    "dev:simple-peer": "npx parcel serve test/simple-peer/index.html --open --port 3002",
+    "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },
   "dependencies": {
     "lib0": "^0.2.98",
+    "y-indexeddb": "^9.0.12",
+    "y-leveldb": "^0.2.0",
     "y-protocols": "^1.0.6",
+    "y-provider": "^0.10.3-canary.2",
+    "y-webrtc": "^10.3.0",
+    "y-websocket": "^3.0.0",
     "yjs": "^13.6.29"
+  },
+  "peerDependencies": {
+    "peerjs": "^1.5.0",
+    "simple-peer": "^9.11.0"
+  },
+  "peerDependenciesMeta": {
+    "simple-peer": {
+      "optional": true
+    },
+    "peerjs": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "buffer": "^6.0.3",
     "parcel": "^2.16.4",
+    "peerjs": "^1.5.5",
     "process": "^0.11.10",
     "quill": "^2.0.3",
     "typescript": "^5.0.0",

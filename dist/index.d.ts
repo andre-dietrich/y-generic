@@ -83,6 +83,10 @@ export declare class GenericProvider extends Observable<string> {
     private _syncInterval;
     private _syncIntervalId?;
     private _verifyUpdates;
+    private _disableBc;
+    private _bcChannel;
+    private _bcConnected;
+    private _bcSubscriber?;
     private _hashMismatchCount;
     private _lastHashMismatchTime;
     private _syncRequestTimes;
@@ -96,6 +100,7 @@ export declare class GenericProvider extends Observable<string> {
     private _updateHandler?;
     private _awarenessUpdateHandler?;
     private _unsubscribeTransport?;
+    private _beforeUnloadHandler?;
     /**
      * Create a new generic provider.
      *
@@ -125,6 +130,14 @@ export declare class GenericProvider extends Observable<string> {
          * @default 0 (disabled - immediate transmission)
          */
         batchUpdates?: number;
+        /**
+         * Disable BroadcastChannel for cross-tab communication.
+         * When enabled (default), updates are shared instantly between tabs
+         * in the same browser without going through the network transport.
+         * Automatically disabled in non-browser environments (e.g., Node.js).
+         * @default false (BroadcastChannel enabled)
+         */
+        disableBc?: boolean;
     });
     /**
      * Connect to the backend and start syncing.
@@ -150,6 +163,10 @@ export declare class GenericProvider extends Observable<string> {
      * Whether the provider is connected to the backend
      */
     get connected(): boolean;
+    /**
+     * Whether BroadcastChannel is connected for cross-tab sync
+     */
+    get bcConnected(): boolean;
     /**
      * Whether the document is synced with remote peers
      */
@@ -212,7 +229,17 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _broadcastAwareness;
     /**
-     * Send data through the transport.
+     * Setup BroadcastChannel for cross-tab communication.
+     * Automatically disabled in non-browser environments.
+     */
+    private _setupBroadcastChannel;
+    /**
+     * Disconnect from BroadcastChannel and mark local client as offline.
+     */
+    private _disconnectBroadcastChannel;
+    /**
+     * Send data through both BroadcastChannel (if connected) and transport.
+     * This ensures updates reach both local tabs and remote peers.
      */
     private _send;
     /**

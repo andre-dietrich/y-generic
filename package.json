@@ -46,10 +46,6 @@
     "./providers/matrix": {
       "types": "./dist/providers/matrix/index.d.ts",
       "default": "./dist/providers/matrix/index.js"
-    },
-    "./providers/webbluetooth": {
-      "types": "./dist/providers/webbluetooth/index.d.ts",
-      "default": "./dist/providers/webbluetooth/index.js"
     }
   },
   "files": [
@@ -65,18 +61,13 @@
     "dev:pubnub": "npx parcel serve test/pubnub/index.html --open --port 3007",
     "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
     "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
-    "dev:webbluetooth": "npx parcel serve test/webbluetooth/index.html --open --port 3010 --https",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },
   "dependencies": {
     "lib0": "^0.2.98",
-    "y-indexeddb": "^9.0.12",
-    "y-leveldb": "^0.2.0",
     "y-protocols": "^1.0.6",
     "y-provider": "^0.10.3-canary.2",
-    "y-webrtc": "^10.3.0",
-    "y-websocket": "^3.0.0",
     "yjs": "^13.6.29"
   },
   "peerDependencies": {

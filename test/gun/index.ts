@@ -9,7 +9,6 @@ import * as Y from 'yjs'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
-import Gun from 'gun'
 import { GenericProvider } from '../../src/index'
 import { GunTransport } from '../../src/providers/gun/index'
 import {
@@ -18,6 +17,9 @@ import {
   videoHandler as sharedVideoHandler,
 } from '../shared/quill-media'
 import { log, updateStatus, updateSyncStatus } from '../shared/ui-helpers'
+
+// Gun is loaded from CDN as a global variable
+declare const Gun: any
 
 // Register custom Quill blots
 registerMediaBlots()
@@ -77,7 +79,10 @@ async function initWithConfig(config: {
   localStorage: boolean
 }) {
   log('🚀 Initializing GunDB test...', 'info')
-  log(`📋 Configuration: Room="${config.room}", Peers=${config.peers.length}, Debug=${config.debug}`, 'info')
+  log(
+    `📋 Configuration: Room="${config.room}", Peers=${config.peers.length}, Debug=${config.debug}`,
+    'info',
+  )
 
   // Update room badge
   const roomBadge = document.getElementById('room-badge')!
@@ -335,10 +340,18 @@ function setupConnectionForm() {
   const mainContent = document.getElementById('main-content')!
 
   const configRoom = document.getElementById('config-room') as HTMLInputElement
-  const configPeers = document.getElementById('config-peers') as HTMLTextAreaElement
-  const configBatchInterval = document.getElementById('config-batch-interval') as HTMLInputElement
-  const configDebug = document.getElementById('config-debug') as HTMLInputElement
-  const configLocalStorage = document.getElementById('config-localstorage') as HTMLInputElement
+  const configPeers = document.getElementById(
+    'config-peers',
+  ) as HTMLTextAreaElement
+  const configBatchInterval = document.getElementById(
+    'config-batch-interval',
+  ) as HTMLInputElement
+  const configDebug = document.getElementById(
+    'config-debug',
+  ) as HTMLInputElement
+  const configLocalStorage = document.getElementById(
+    'config-localstorage',
+  ) as HTMLInputElement
 
   connectBtn.addEventListener('click', async () => {
     // Validate room name
@@ -381,7 +394,7 @@ function setupConnectionForm() {
     } catch (error) {
       console.error('Connection failed:', error)
       alert(`Failed to connect: ${error}`)
-      
+
       // Show config panel again
       configPanel.classList.remove('hidden')
       mainContent.classList.add('hidden')

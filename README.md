@@ -6,7 +6,7 @@ A clean, minimal, backend-agnostic provider for Yjs that lets you implement any 
 
 Try out all the different transport providers in action:
 
-**[👉 View Live Demos](https://yourusername.github.io/y-generic/)**
+**[👉 View Live Demos](https://andre-dietrich.github.io/y-generic/)**
 
 Explore 9 different transport implementations:
 - **Dummy** - In-memory testing with network simulation

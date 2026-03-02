@@ -12,6 +12,40 @@ import Peer from 'simple-peer'
 import { GenericProvider } from '../../src/index'
 import { SimplePeerTransport } from '../../src/providers/simple-peer/index'
 
+const BlockEmbed = Quill.import('blots/block/embed') as any
+
+// Custom Video Blot for HTML5 video support
+class VideoBlot extends BlockEmbed {
+  static blotName = 'video'
+  static tagName = 'video'
+
+  static create(value: string) {
+    const node = super.create(value) as HTMLVideoElement
+    node.setAttribute('src', value)
+    node.setAttribute('controls', 'true')
+    node.setAttribute('preload', 'metadata')
+    node.setAttribute('style', 'max-width: 100%; height: auto;')
+
+    // Add error handler
+    node.onerror = function () {
+      console.error('Video load error:', node.error)
+      if (node.error) {
+        console.error(
+          `Error code: ${node.error.code}, message: ${node.error.message}`,
+        )
+      }
+    }
+
+    return node
+  }
+
+  static value(node: HTMLVideoElement) {
+    return node.getAttribute('src')
+  }
+}
+
+Quill.register(VideoBlot, true)
+
 // Configuration
 const ROOM_NAME = 'simple-peer-test'
 const SIGNALING_SERVERS = [
@@ -158,15 +192,21 @@ async function init() {
     theme: 'snow',
     placeholder: 'Start typing... Your changes will sync with other peers!',
     modules: {
-      toolbar: [
-        [{ header: [1, 2, 3, false] }],
-        ['bold', 'italic', 'underline', 'strike'],
-        ['blockquote', 'code-block'],
-        [{ list: 'ordered' }, { list: 'bullet' }],
-        [{ color: [] }, { background: [] }],
-        ['link'],
-        ['clean'],
-      ],
+      toolbar: {
+        container: [
+          [{ header: [1, 2, 3, false] }],
+          ['bold', 'italic', 'underline', 'strike'],
+          ['blockquote', 'code-block'],
+          [{ list: 'ordered' }, { list: 'bullet' }],
+          [{ color: [] }, { background: [] }],
+          ['link', 'image', 'video'],
+          ['clean'],
+        ],
+        handlers: {
+          image: imageHandler,
+          video: videoHandler,
+        },
+      },
     },
   })
 
@@ -289,6 +329,68 @@ async function init() {
   })
 
   log('✅ Setup complete! Ready to collaborate.', 'success')
+}
+
+// Image upload handler
+function imageHandler(this: any) {
+  const input = document.createElement('input')
+  input.setAttribute('type', 'file')
+  input.setAttribute('accept', 'image/*')
+  input.click()
+
+  input.onchange = () => {
+    const file = input.files?.[0]
+    if (file) {
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        const range = this.quill.getSelection(true)
+        this.quill.insertEmbed(range.index, 'image', e.target?.result)
+        this.quill.setSelection(range.index + 1)
+        log('📸 Image uploaded', 'success')
+      }
+      reader.readAsDataURL(file)
+    }
+  }
+}
+
+// Video upload handler
+function videoHandler(this: any) {
+  const input = document.createElement('input')
+  input.setAttribute('type', 'file')
+  input.setAttribute('accept', 'video/mp4,video/webm,video/ogg')
+  input.click()
+
+  input.onchange = () => {
+    const file = input.files?.[0]
+    if (file) {
+      // Check if format is supported
+      const supportedFormats = ['video/mp4', 'video/webm', 'video/ogg']
+      if (!supportedFormats.includes(file.type)) {
+        log(
+          `❌ Unsupported video format: ${file.type}. Please use MP4, WebM, or OGG.`,
+          'error',
+        )
+        return
+      }
+
+      log(
+        `📹 Uploading ${file.type} video (${(file.size / 1024 / 1024).toFixed(2)} MB)...`,
+        'info',
+      )
+
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        const range = this.quill.getSelection(true)
+        this.quill.insertEmbed(range.index, 'video', e.target?.result)
+        this.quill.setSelection(range.index + 1)
+        log('🎬 Video uploaded', 'success')
+      }
+      reader.onerror = () => {
+        log('❌ Failed to read video file', 'error')
+      }
+      reader.readAsDataURL(file)
+    }
+  }
 }
 
 // Setup pub/sub chat functionality

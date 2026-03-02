@@ -4,6 +4,40 @@ import type { Transport, ConnectionConfig } from '../../src/transport'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
 
+const BlockEmbed = Quill.import('blots/block/embed') as any
+
+// Custom Video Blot for HTML5 video support
+class VideoBlot extends BlockEmbed {
+  static blotName = 'video'
+  static tagName = 'video'
+
+  static create(value: string) {
+    const node = super.create(value) as HTMLVideoElement
+    node.setAttribute('src', value)
+    node.setAttribute('controls', 'true')
+    node.setAttribute('preload', 'metadata')
+    node.setAttribute('style', 'max-width: 100%; height: auto;')
+
+    // Add error handler
+    node.onerror = function () {
+      console.error('Video load error:', node.error)
+      if (node.error) {
+        console.error(
+          `Error code: ${node.error.code}, message: ${node.error.message}`,
+        )
+      }
+    }
+
+    return node
+  }
+
+  static value(node: HTMLVideoElement) {
+    return node.getAttribute('src')
+  }
+}
+
+Quill.register(VideoBlot, true)
+
 // ============================================================================
 // Dummy Transport - Simulates network communication in-memory
 // ============================================================================
@@ -150,13 +184,19 @@ class TestClient {
       theme: 'snow',
       placeholder: 'Type here... changes sync automatically!',
       modules: {
-        toolbar: [
-          [{ header: [1, 2, 3, false] }],
-          ['bold', 'italic', 'underline', 'strike'],
-          [{ list: 'ordered' }, { list: 'bullet' }],
-          ['link', 'image', 'code-block'],
-          ['clean'],
-        ],
+        toolbar: {
+          container: [
+            [{ header: [1, 2, 3, false] }],
+            ['bold', 'italic', 'underline', 'strike'],
+            [{ list: 'ordered' }, { list: 'bullet' }],
+            ['link', 'image', 'video', 'code-block'],
+            ['clean'],
+          ],
+          handlers: {
+            image: () => this.imageHandler(),
+            video: () => this.videoHandler(),
+          },
+        },
       },
     })
 
@@ -169,6 +209,58 @@ class TestClient {
 
     // Setup event listeners
     this.setupListeners()
+  }
+
+  private imageHandler(): void {
+    const input = document.createElement('input')
+    input.setAttribute('type', 'file')
+    input.setAttribute('accept', 'image/*')
+    input.click()
+
+    input.onchange = () => {
+      const file = input.files?.[0]
+      if (file) {
+        const reader = new FileReader()
+        reader.onload = (e) => {
+          const range = this.quill.getSelection(true)
+          this.quill.insertEmbed(range.index, 'image', e.target?.result)
+          this.quill.setSelection(range.index + 1)
+        }
+        reader.readAsDataURL(file)
+      }
+    }
+  }
+
+  private videoHandler(): void {
+    const input = document.createElement('input')
+    input.setAttribute('type', 'file')
+    input.setAttribute('accept', 'video/mp4,video/webm,video/ogg')
+    input.click()
+
+    input.onchange = () => {
+      const file = input.files?.[0]
+      if (file) {
+        // Check if format is supported
+        const supportedFormats = ['video/mp4', 'video/webm', 'video/ogg']
+        if (!supportedFormats.includes(file.type)) {
+          console.error(
+            `Unsupported video format: ${file.type}. Please use MP4, WebM, or OGG.`,
+          )
+          return
+        }
+
+        const reader = new FileReader()
+        reader.onload = (e) => {
+          const range = this.quill.getSelection(true)
+          this.quill.insertEmbed(range.index, 'video', e.target?.result)
+          this.quill.setSelection(range.index + 1)
+        }
+        reader.onerror = () => {
+          console.error('Failed to read video file')
+        }
+        reader.readAsDataURL(file)
+      }
+    }
   }
 
   private createUI(container: HTMLElement): ClientUI {

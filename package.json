@@ -22,6 +22,10 @@
     "./providers/peerjs": {
       "types": "./dist/providers/peerjs.d.ts",
       "default": "./dist/providers/peerjs.js"
+    },
+    "./providers/indexeddb": {
+      "types": "./dist/providers/indexeddb.d.ts",
+      "default": "./dist/providers/indexeddb.js"
     }
   },
   "files": [
@@ -31,6 +35,7 @@
     "dev:dummy": "npx parcel serve test/dummy/index.html --open --port 3001",
     "dev:simple-peer": "npx parcel serve test/simple-peer/index.html --open --port 3002",
     "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
+    "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },

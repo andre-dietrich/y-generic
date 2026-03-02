@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IndexedDB Provider Test - Yjs Local Persistence</title>
+
+    <!-- Quill CSS -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css"
+      rel="stylesheet"
+    />
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+        margin: 0;
+        padding: 20px;
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        min-height: 100vh;
+      }
+
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+      }
+
+      header {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      h1 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 28px;
+      }
+
+      .subtitle {
+        color: #666;
+        font-size: 14px;
+        margin: 0 0 15px 0;
+      }
+
+      .badge {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 4px;
+        font-size: 12px;
+        font-weight: bold;
+        margin-left: 10px;
+      }
+
+      .badge-indexeddb {
+        background: #38ef7d;
+        color: white;
+      }
+
+      .badge-info {
+        background: #3498db;
+        color: white;
+      }
+
+      .status-bar {
+        display: flex;
+        gap: 15px;
+        flex-wrap: wrap;
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 8px;
+        margin-top: 15px;
+      }
+
+      .status-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        color: #333;
+      }
+
+      .status-indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        transition: all 0.3s;
+      }
+
+      .status-indicator.connected {
+        background: #4caf50;
+        box-shadow: 0 0 8px #4caf50;
+      }
+
+      .status-indicator.disconnected {
+        background: #f44336;
+      }
+
+      .status-indicator.connecting {
+        background: #ff9800;
+        animation: pulse 1.5s infinite;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.5;
+        }
+      }
+
+      .info-box {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      .info-box h3 {
+        margin: 0 0 15px 0;
+        color: #333;
+        font-size: 18px;
+      }
+
+      .info-box ul {
+        margin: 0;
+        padding-left: 20px;
+      }
+
+      .info-box li {
+        margin-bottom: 8px;
+        line-height: 1.5;
+        color: #555;
+      }
+
+      .editor-section {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .editor-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 15px;
+        padding-bottom: 15px;
+        border-bottom: 2px solid #eee;
+      }
+
+      .editor-controls {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+
+      button {
+        padding: 8px 16px;
+        border: none;
+        border-radius: 5px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+      }
+
+      button:active {
+        transform: translateY(0);
+      }
+
+      .btn-primary {
+        background: #38ef7d;
+        color: white;
+      }
+
+      .btn-danger {
+        background: #f44336;
+        color: white;
+      }
+
+      .btn-secondary {
+        background: #95a5a6;
+        color: white;
+      }
+
+      .editor-container {
+        background: white;
+        border: 1px solid #ccc;
+        border-radius: 4px;
+        margin-bottom: 15px;
+      }
+
+      .ql-toolbar {
+        border: none;
+        border-bottom: 1px solid #e0e0e0;
+        background: #f9f9f9;
+        border-radius: 4px 4px 0 0;
+      }
+
+      .ql-container {
+        border: none;
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 14px;
+      }
+
+      .ql-editor {
+        min-height: 250px;
+      }
+
+      .ql-editor.ql-blank::before {
+        color: #999;
+        font-style: normal;
+      }
+
+      .stats-section {
+        padding: 15px;
+        background: #f9f9f9;
+        border-radius: 5px;
+      }
+
+      .stats-section h4 {
+        margin: 0 0 10px 0;
+        font-size: 14px;
+        color: #666;
+      }
+
+      .stat-item {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 0;
+        border-bottom: 1px solid #e0e0e0;
+      }
+
+      .stat-item:last-child {
+        border-bottom: none;
+      }
+
+      .stat-label {
+        color: #666;
+        font-size: 13px;
+      }
+
+      .stat-value {
+        color: #333;
+        font-weight: 600;
+        font-size: 13px;
+      }
+
+      #log-container {
+        background: white;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        max-height: 300px;
+        overflow-y: auto;
+      }
+
+      #log-container h3 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 18px;
+      }
+
+      #log {
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        color: #333;
+      }
+
+      .log-entry {
+        padding: 4px 0;
+        border-bottom: 1px solid #f0f0f0;
+      }
+
+      .log-entry:last-child {
+        border-bottom: none;
+      }
+
+      .log-time {
+        color: #999;
+        margin-right: 8px;
+      }
+
+      @media (max-width: 768px) {
+        body {
+          padding: 10px;
+        }
+
+        h1 {
+          font-size: 22px;
+        }
+
+        .status-bar {
+          flex-direction: column;
+          gap: 10px;
+        }
+
+        .editor-controls {
+          flex-wrap: wrap;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>
+          💾 IndexedDB Provider Test
+          <span class="badge badge-indexeddb">IndexedDB</span>
+          <span class="badge badge-info">Yjs</span>
+        </h1>
+        <p class="subtitle">
+          Test local persistence using browser's IndexedDB. All changes are
+          automatically saved and restored on page reload!
+        </p>
+
+        <div class="status-bar">
+          <div class="status-item">
+            <div
+              id="connection-indicator"
+              class="status-indicator connecting"
+            ></div>
+            <span id="connection-status">Connecting...</span>
+          </div>
+          <div class="status-item">
+            <strong>Database:</strong>
+            <span id="db-name">-</span>
+          </div>
+          <div class="status-item">
+            <strong>Updates:</strong>
+            <span id="update-count">0</span>
+          </div>
+          <div class="status-item">
+            <strong>Storage:</strong>
+            <span id="sync-status">⏳ Loading...</span>
+          </div>
+        </div>
+      </header>
+
+      <div class="info-box">
+        <h3>📝 How to Test</h3>
+        <ul>
+          <li>
+            <strong>Type something</strong> - All changes are automatically
+            saved to IndexedDB
+          </li>
+          <li>
+            <strong>Reload the page</strong> - Your content will be restored
+            from local storage
+          </li>
+          <li>
+            <strong>Close and reopen your browser</strong> - Data persists
+            across sessions
+          </li>
+          <li>
+            <strong>Clear database</strong> - Use the "Clear All" button to
+            reset storage
+          </li>
+          <li>
+            <strong>Check stats</strong> - Monitor how many updates are stored
+          </li>
+          <li>
+            <strong>Works offline</strong> - No network required, everything is
+            local!
+          </li>
+        </ul>
+      </div>
+
+      <div class="editor-section">
+        <div class="editor-header">
+          <h2 style="margin: 0; color: #333; font-size: 20px">
+            📄 Persistent Document
+          </h2>
+          <div class="editor-controls">
+            <button id="btn-refresh" class="btn-secondary">
+              🔄 Refresh Stats
+            </button>
+            <button id="btn-compact" class="btn-primary">🗜️ Compact</button>
+            <button id="btn-clear" class="btn-danger">🗑️ Clear All</button>
+          </div>
+        </div>
+
+        <div id="editor"></div>
+
+        <div class="stats-section">
+          <h4>📊 Storage Statistics</h4>
+          <div class="stat-item">
+            <span class="stat-label">Total Updates Stored</span>
+            <span class="stat-value" id="stat-updates">-</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Database Name</span>
+            <span class="stat-value" id="stat-db">-</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Object Store</span>
+            <span class="stat-value" id="stat-store">-</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Auto-Compact</span>
+            <span class="stat-value" id="stat-autocompact">-</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="log-container">
+        <h3>📊 Activity Log</h3>
+        <div id="log"></div>
+      </div>
+    </div>
+
+    <script type="module" src="./index.ts"></script>
+  </body>
+</html>

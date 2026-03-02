@@ -95,6 +95,7 @@ export declare class PeerJSTransport implements Transport {
     private coordinatorPeerId;
     private coordinatorConn?;
     private roomPeers;
+    private reElectionInProgress;
     /**
      * Create a new PeerJS transport.
      *
@@ -156,6 +157,15 @@ export declare class PeerJSTransport implements Transport {
      * Handle coordinator disconnect - start re-election.
      */
     private handleCoordinatorDisconnect;
+    /**
+     * Attempt to connect to the coordinator.
+     * If coordinator doesn't exist yet, retry a few times.
+     */
+    private attemptCoordinatorConnection;
+    /**
+     * Transition from regular peer to coordinator by reconnecting with coordinator ID.
+     */
+    private transitionToCoordinator;
     /**
      * Connect to a peer by ID.
      * To avoid race conditions, only the peer with the lower ID initiates the connection.

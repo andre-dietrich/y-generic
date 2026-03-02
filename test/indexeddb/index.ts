@@ -10,91 +10,18 @@ import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
 import { GenericProvider } from '../../src/index'
 import { IndexedDBTransport } from '../../src/providers/indexeddb/index'
+import {
+  registerMediaBlots,
+  imageHandler as sharedImageHandler,
+  videoHandler as sharedVideoHandler,
+} from '../shared/quill-media'
+import { log, updateStatus, updateStorageStatus } from '../shared/ui-helpers'
 
-const BlockEmbed = Quill.import('blots/block/embed') as any
-
-// Custom Video Blot for HTML5 video support
-class VideoBlot extends BlockEmbed {
-  static blotName = 'video'
-  static tagName = 'video'
-
-  static create(value: string) {
-    const node = super.create(value) as HTMLVideoElement
-    node.setAttribute('src', value)
-    node.setAttribute('controls', 'true')
-    node.setAttribute('preload', 'metadata')
-    node.setAttribute('style', 'max-width: 100%; height: auto;')
-
-    // Add error handler
-    node.onerror = function () {
-      console.error('Video load error:', node.error)
-      if (node.error) {
-        console.error(
-          `Error code: ${node.error.code}, message: ${node.error.message}`,
-        )
-      }
-    }
-
-    return node
-  }
-
-  static value(node: HTMLVideoElement) {
-    return node.getAttribute('src')
-  }
-}
-
-Quill.register(VideoBlot, true)
+// Register custom Quill blots
+registerMediaBlots()
 
 // Configuration
 const ROOM_NAME = 'indexeddb-test'
-
-// Log function
-function log(message: string, type: 'info' | 'success' | 'error' = 'info') {
-  const logEl = document.getElementById('log')!
-  const time = new Date().toLocaleTimeString()
-  const colors = {
-    info: '#2196f3',
-    success: '#4caf50',
-    error: '#f44336',
-  }
-
-  const entry = document.createElement('div')
-  entry.className = 'log-entry'
-  entry.innerHTML = `<span class="log-time">[${time}]</span><span style="color: ${colors[type]}">${message}</span>`
-  logEl.appendChild(entry)
-
-  // Auto-scroll to bottom
-  const logContainer = document.getElementById('log-container')!
-  logContainer.scrollTop = logContainer.scrollHeight
-
-  // Keep only last 50 entries
-  if (logEl.children.length > 50) {
-    logEl.removeChild(logEl.children[0])
-  }
-}
-
-// Update status indicators
-function updateStatus(
-  status: 'connected' | 'disconnected' | 'connecting',
-  message: string,
-) {
-  const indicator = document.getElementById('connection-indicator')!
-  const statusEl = document.getElementById('connection-status')!
-
-  indicator.className = `status-indicator ${status}`
-  statusEl.textContent = message
-}
-
-function updateStorageStatus(synced: boolean) {
-  const syncStatusEl = document.getElementById('sync-status')!
-  if (synced) {
-    syncStatusEl.innerHTML = '✅ Saved'
-    syncStatusEl.style.color = '#4caf50'
-  } else {
-    syncStatusEl.innerHTML = '💾 Saving...'
-    syncStatusEl.style.color = '#ff9800'
-  }
-}
 
 // Update stats display
 async function updateStats(transport: IndexedDBTransport) {
@@ -274,66 +201,13 @@ async function init() {
   log('✅ Setup complete! Your work is automatically saved.', 'success')
 }
 
-// Image upload handler
+// Wrap shared handlers to pass log function
 function imageHandler(this: any) {
-  const input = document.createElement('input')
-  input.setAttribute('type', 'file')
-  input.setAttribute('accept', 'image/*')
-  input.click()
-
-  input.onchange = () => {
-    const file = input.files?.[0]
-    if (file) {
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        const range = this.quill.getSelection(true)
-        this.quill.insertEmbed(range.index, 'image', e.target?.result)
-        this.quill.setSelection(range.index + 1)
-        log('📸 Image uploaded and saved', 'success')
-      }
-      reader.readAsDataURL(file)
-    }
-  }
+  sharedImageHandler.call(this, log)
 }
 
-// Video upload handler
 function videoHandler(this: any) {
-  const input = document.createElement('input')
-  input.setAttribute('type', 'file')
-  input.setAttribute('accept', 'video/mp4,video/webm,video/ogg')
-  input.click()
-
-  input.onchange = () => {
-    const file = input.files?.[0]
-    if (file) {
-      // Check if format is supported
-      const supportedFormats = ['video/mp4', 'video/webm', 'video/ogg']
-      if (!supportedFormats.includes(file.type)) {
-        log(
-          `❌ Unsupported video format: ${file.type}. Please use MP4, WebM, or OGG.`,
-          'error',
-        )
-        return
-      }
-
-      log(
-        `📹 Uploading ${file.type} video (${(file.size / 1024 / 1024).toFixed(2)} MB)...`,
-        'info',
-      )
-
-      const reader = new FileReader()
-      reader.onload = (e) => {
-        const range = this.quill.getSelection(true)
-        this.quill.insertEmbed(range.index, 'video', e.target?.result)
-        this.quill.setSelection(range.index + 1)
-        log('🎬 Video uploaded and saved', 'success')
-      }
-      reader.onerror = () => {
-        log('❌ Failed to read video file', 'error')
-      }
-      reader.readAsDataURL(file)
-    }
-  }
+  sharedVideoHandler.call(this, log)
 }
 
 // Start when DOM is ready

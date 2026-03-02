@@ -48,6 +48,7 @@ export class PeerJSTransport {
         this.isCoordinator = false;
         this.coordinatorPeerId = '';
         this.roomPeers = new Set(); // All peers in room (coordinator tracks this)
+        this.reElectionInProgress = false; // Prevent duplicate re-elections
         if (!options.peer) {
             throw new Error('PeerJSTransport requires the "peer" option. ' +
                 'Please provide the PeerJS constructor: ' +
@@ -242,6 +243,7 @@ export class PeerJSTransport {
         }
         this.peers.clear();
         this.knownPeers.clear();
+        this.reElectionInProgress = false;
         // Destroy peer
         if (this.peer) {
             this.peer.destroy();
@@ -511,48 +513,136 @@ export class PeerJSTransport {
      * Handle coordinator disconnect - start re-election.
      */
     handleCoordinatorDisconnect() {
+        // Prevent duplicate re-elections
+        if (this.reElectionInProgress) {
+            this.log('⏭️ Re-election already in progress, skipping');
+            return;
+        }
+        this.log('🗳️ Coordinator disconnected, starting re-election');
+        this.reElectionInProgress = true;
         this.coordinatorConn = undefined;
         // Gather all known peer IDs
         const knownPeerIds = [
             this.peerId,
             ...Array.from(this.knownPeers),
             ...Array.from(this.peers.keys()),
-        ];
+        ].filter((id) => id !== this.coordinatorPeerId); // Exclude the old coordinator
         // Sort and pick lowest ID
         knownPeerIds.sort();
         const lowestId = knownPeerIds[0];
-        // Re-election starting
+        this.log('🗳️ Coordinator election: Lowest peer ID is', lowestId);
         if (lowestId === this.peerId) {
-            this.log('Becoming coordinator (re-elected)');
-            this.becomeCoordinator();
-            // Notify all known peers that I'm the new coordinator
-            for (const peerId of this.roomPeers) {
-                if (peerId !== this.peerId) {
-                    const peerConn = this.peers.get(peerId);
-                    if (peerConn && peerConn.connected) {
-                        // Send coordinator announcement via existing connection
-                        try {
-                            this.sendCoordinationMessage(peerConn.conn, {
-                                type: 'coordinator-change',
-                                coordinatorId: this.peerId,
-                            });
-                        }
-                        catch (err) {
-                            this.log('⚠️ Failed to notify peer of coordinator change:', peerId);
-                        }
-                    }
-                }
-            }
+            this.log('👑 I have the lowest ID, attempting to claim coordinator role');
+            this.transitionToCoordinator();
         }
         else {
             // Waiting for new coordinator
-            // Try to connect to the new coordinator
-            // Waiting for new coordinator
+            this.log('⏳ Waiting for new coordinator:', lowestId);
+            // Wait a bit for the new coordinator to claim the ID, then try to connect
             setTimeout(() => {
-                this.setupCrossBrowserDiscovery().catch((err) => {
-                    this.log('⚠️ Failed to connect to new coordinator:', err);
+                this.attemptCoordinatorConnection();
+            }, 2000);
+        }
+    }
+    /**
+     * Attempt to connect to the coordinator.
+     * If coordinator doesn't exist yet, retry a few times.
+     */
+    attemptCoordinatorConnection(retryCount = 0) {
+        const maxRetries = 5;
+        if (retryCount >= maxRetries) {
+            this.log('❌ Failed to connect to coordinator after', maxRetries, 'attempts');
+            // Try to become coordinator ourselves as fallback
+            this.log('🔄 Attempting to become coordinator as fallback');
+            this.transitionToCoordinator();
+            return;
+        }
+        this.log(`🔌 Attempting to connect to coordinator (attempt ${retryCount + 1}/${maxRetries})`);
+        this.setupCrossBrowserDiscovery()
+            .then(() => {
+            this.log('✅ Successfully connected to new coordinator');
+            this.reElectionInProgress = false; // Re-election complete
+        })
+            .catch((err) => {
+            this.log(`⚠️ Failed to connect to coordinator (attempt ${retryCount + 1}):`, err);
+            // Retry with exponential backoff
+            const delay = 1000 * Math.pow(1.5, retryCount);
+            setTimeout(() => {
+                this.attemptCoordinatorConnection(retryCount + 1);
+            }, delay);
+        });
+    }
+    /**
+     * Transition from regular peer to coordinator by reconnecting with coordinator ID.
+     */
+    async transitionToCoordinator() {
+        this.log('🔄 Transitioning to coordinator role...');
+        // Save current state
+        const currentConnections = Array.from(this.peers.entries());
+        const callback = this._callback;
+        const room = this._room;
+        // Close current peer connection
+        if (this.peer) {
+            this.peer.destroy();
+        }
+        // Clear state but keep connections info
+        this.peers.clear();
+        this._connected = false;
+        try {
+            // Attempt to claim coordinator ID
+            await new Promise((resolve, reject) => {
+                const coordinatorPeer = new this.options.peer(this.coordinatorPeerId, {
+                    debug: this.options.debug ? 3 : 0,
+                    ...this.options.peerOptions,
                 });
-            }, 1000);
+                const timeout = setTimeout(() => {
+                    this.log('❌ Timeout claiming coordinator ID');
+                    coordinatorPeer.destroy();
+                    reject(new Error('Timeout claiming coordinator ID'));
+                }, 5000);
+                coordinatorPeer.on('open', (id) => {
+                    clearTimeout(timeout);
+                    if (id === this.coordinatorPeerId) {
+                        this.log('✅ Successfully claimed coordinator ID:', id);
+                        this.peer = coordinatorPeer;
+                        this.peerId = id;
+                        this.isCoordinator = true;
+                        this.roomPeers.clear();
+                        this.roomPeers.add(this.peerId);
+                        this._connected = true;
+                        this._callback = callback;
+                        this.reElectionInProgress = false; // Re-election complete
+                        // Setup peer discovery as coordinator
+                        this.setupPeerDiscovery();
+                        // Listen for incoming connections
+                        this.peer.on('connection', (conn) => {
+                            this.handleIncomingConnection(conn);
+                        });
+                        // Re-establish connections with known peers
+                        this.log('🔗 Re-establishing connections with', currentConnections.length, 'known peers');
+                        for (const [peerId, _] of currentConnections) {
+                            if (peerId !== this.coordinatorPeerId) {
+                                this.knownPeers.add(peerId);
+                                this.roomPeers.add(peerId);
+                            }
+                        }
+                        resolve();
+                    }
+                });
+                coordinatorPeer.on('error', (error) => {
+                    clearTimeout(timeout);
+                    this.log('❌ Error claiming coordinator ID:', error);
+                    coordinatorPeer.destroy();
+                    reject(error);
+                });
+            });
+        }
+        catch (error) {
+            this.log('❌ Failed to transition to coordinator:', error);
+            this.reElectionInProgress = false; // Re-election failed
+            // Fallback: recreate as regular peer
+            this.log('🔄 Falling back to regular peer');
+            // Just stay disconnected for now - the other peers might succeed
         }
     }
     /**

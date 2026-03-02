@@ -38,6 +38,10 @@
     "./providers/pubnub": {
       "types": "./dist/providers/pubnub/index.d.ts",
       "default": "./dist/providers/pubnub/index.js"
+    },
+    "./providers/websocket": {
+      "types": "./dist/providers/websocket/index.d.ts",
+      "default": "./dist/providers/websocket/index.js"
     }
   },
   "files": [
@@ -51,6 +55,7 @@
     "dev:gun": "npx parcel serve test/gun/index.html --open --port 3005",
     "dev:trystero": "npx parcel serve test/trystero/index.html --open --port 3006",
     "dev:pubnub": "npx parcel serve test/pubnub/index.html --open --port 3007",
+    "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },

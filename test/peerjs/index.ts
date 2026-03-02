@@ -9,9 +9,11 @@ import * as Y from 'yjs'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
-import Peer from 'peerjs'
 import { GenericProvider } from '../../src/index'
 import { PeerJSTransport } from '../../src/providers/peerjs/index'
+
+// Peer is loaded from CDN as a global variable
+declare const Peer: any
 
 const BlockEmbed = Quill.import('blots/block/embed') as any
 

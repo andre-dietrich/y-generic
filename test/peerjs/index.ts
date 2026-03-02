@@ -50,9 +50,6 @@ class VideoBlot extends BlockEmbed {
 
 Quill.register(VideoBlot, true)
 
-// Configuration
-const ROOM_NAME = 'peerjs-test'
-
 // Generate random user ID
 const userId = Math.random().toString(36).substring(7)
 
@@ -203,9 +200,21 @@ function videoHandler(this: any) {
   }
 }
 
-// Initialize
-async function init() {
+// Initialize with user configuration
+async function initWithConfig(config: {
+  room: string
+  peerHost?: string
+  peerPort?: number
+  peerSecure: boolean
+  iceServers: string[]
+  debug: boolean
+}) {
   log('🚀 Initializing PeerJS test...', 'info')
+  log(`📋 Configuration: Room="${config.room}", Debug=${config.debug}`, 'info')
+
+  // Update room name display
+  const roomNameEl = document.getElementById('room-name')!
+  roomNameEl.textContent = config.room
 
   // Create Yjs document
   const doc = new Y.Doc()
@@ -213,9 +222,32 @@ async function init() {
 
   // Create PeerJS transport
   log('📡 Creating PeerJS transport...', 'info')
+
+  // Build peer options
+  const peerOptions: any = {
+    secure: config.peerSecure,
+    debug: config.debug ? 3 : 0,
+  }
+
+  // Add custom host/port if provided
+  if (config.peerHost) {
+    peerOptions.host = config.peerHost
+  }
+  if (config.peerPort) {
+    peerOptions.port = config.peerPort
+  }
+
+  // Add ICE servers for WebRTC
+  if (config.iceServers.length > 0) {
+    peerOptions.config = {
+      iceServers: config.iceServers.map((url) => ({ urls: url })),
+    }
+  }
+
   const transport = new PeerJSTransport({
-    peer: Peer, // Pass the PeerJS constructor
-    debug: true, // Enable debug logging in console
+    peer: Peer,
+    peerOptions,
+    debug: config.debug,
   })
 
   // Create provider
@@ -349,9 +381,9 @@ async function init() {
   }, 1000)
 
   // Connect to room
-  log(`🌐 Connecting to room: ${ROOM_NAME}...`, 'info')
+  log(`🌐 Connecting to room: ${config.room}...`, 'info')
   try {
-    await provider.connect({ room: ROOM_NAME })
+    await provider.connect({ room: config.room })
     log('✅ Successfully joined room!', 'success')
 
     // Check peer discovery status
@@ -463,9 +495,89 @@ function setupPubSubChat(provider: GenericProvider) {
   log('💬 Pub/Sub chat ready!', 'success')
 }
 
+// Setup connect button handler
+function setupConnectionForm() {
+  const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement
+  const configPanel = document.getElementById('config-panel')!
+  const mainContent = document.getElementById('main-content')!
+
+  const configRoom = document.getElementById('config-room') as HTMLInputElement
+  const configPeerHost = document.getElementById(
+    'config-peerjs-host',
+  ) as HTMLInputElement
+  const configPeerPort = document.getElementById(
+    'config-peerjs-port',
+  ) as HTMLInputElement
+  const configIceServers = document.getElementById(
+    'config-ice-servers',
+  ) as HTMLTextAreaElement
+  const configSecure = document.getElementById(
+    'config-secure',
+  ) as HTMLInputElement
+  const configDebug = document.getElementById(
+    'config-debug',
+  ) as HTMLInputElement
+
+  connectBtn.addEventListener('click', async () => {
+    // Validate room name
+    const room = configRoom.value.trim()
+    if (!room) {
+      alert('Please enter a room name')
+      configRoom.focus()
+      return
+    }
+
+    // Parse PeerJS host and port
+    const peerHost = configPeerHost.value.trim() || undefined
+    const peerPort = configPeerPort.value
+      ? parseInt(configPeerPort.value)
+      : undefined
+
+    // Parse ICE servers (one per line, filter empty lines)
+    const iceServersText = configIceServers.value
+    const iceServers = iceServersText
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+
+    // Get other config
+    const peerSecure = configSecure.checked
+    const debug = configDebug.checked
+
+    // Disable button
+    connectBtn.disabled = true
+    connectBtn.textContent = '⏳ Connecting...'
+
+    try {
+      // Hide config panel, show main content
+      configPanel.classList.add('hidden')
+      mainContent.classList.remove('hidden')
+
+      // Initialize with config
+      await initWithConfig({
+        room,
+        peerHost,
+        peerPort,
+        peerSecure,
+        iceServers,
+        debug,
+      })
+    } catch (error) {
+      console.error('Connection failed:', error)
+      alert(`Failed to connect: ${error}`)
+
+      // Show config panel again
+      configPanel.classList.remove('hidden')
+      mainContent.classList.add('hidden')
+      connectBtn.disabled = false
+      connectBtn.textContent = '🚀 Connect'
+    }
+  })
+}
+
 // Start when DOM is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init)
+  document.addEventListener('DOMContentLoaded', setupConnectionForm)
 } else {
-  init()
+  setupConnectionForm()
 }

@@ -287,6 +287,116 @@
         margin-right: 8px;
       }
 
+      /* Configuration panel styles */
+      .config-panel {
+        background: white;
+        padding: 30px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .config-panel h2 {
+        margin: 0 0 20px 0;
+        color: #333;
+        font-size: 24px;
+      }
+
+      .form-group {
+        margin-bottom: 20px;
+      }
+
+      .form-group label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 600;
+        color: #555;
+        font-size: 14px;
+      }
+
+      .form-group input[type='text'],
+      .form-group input[type='number'],
+      .form-group textarea {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-size: 14px;
+        font-family: inherit;
+        transition: border-color 0.3s;
+      }
+
+      .form-group input:focus,
+      .form-group textarea:focus {
+        outline: none;
+        border-color: #667eea;
+      }
+
+      .form-group textarea {
+        min-height: 80px;
+        resize: vertical;
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+      }
+
+      .checkbox-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .checkbox-group input[type='checkbox'] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+      }
+
+      .checkbox-group label {
+        margin: 0;
+        font-weight: normal;
+        cursor: pointer;
+      }
+
+      .help-text {
+        font-size: 12px;
+        color: #999;
+        margin-top: 5px;
+      }
+
+      .btn {
+        padding: 12px 30px;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        border: none;
+        border-radius: 5px;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        transition:
+          transform 0.2s,
+          box-shadow 0.2s;
+      }
+
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 12px rgba(102, 126, 234, 0.4);
+      }
+
+      .btn:active {
+        transform: translateY(0);
+      }
+
+      .btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
       /* Responsive design */
       @media (max-width: 768px) {
         body {
@@ -342,7 +452,7 @@
           </div>
           <div class="status-item">
             <strong>Room:</strong>
-            <span id="room-name">peerjs-test</span>
+            <span id="room-name">(not connected)</span>
           </div>
           <div class="status-item">
             <strong>Sync:</strong>
@@ -351,131 +461,220 @@
         </div>
       </header>
 
-      <div class="info-box">
-        <h3>📝 How to Test</h3>
-        <ul>
-          <li>
-            <strong>Open 2-3 tabs in the SAME browser</strong> - Tabs will
-            discover each other via BroadcastChannel
-          </li>
-          <li>
-            <strong>Wait ~1 second</strong> - You should see "🔍 Discovered
-            peer" and "✅ Connection opened" in console
-          </li>
-          <li>
-            <strong>Edit the document</strong> - Type in any tab and see changes
-            sync instantly across all tabs
-          </li>
-          <li>
-            <strong>Customize your user</strong> - Change your name and color to
-            identify yourself in the user list
-          </li>
-          <li>
-            <strong>Watch peer count</strong> - Shows number of connected peers
-            (should be N-1 where N is tabs)
-          </li>
-          <li>
-            <strong>Check the log & console</strong> - See detailed connection
-            events and debug information
-          </li>
-        </ul>
-      </div>
+      <!-- Configuration Panel -->
+      <div id="config-panel" class="config-panel">
+        <h2>⚙️ Connection Settings</h2>
+        <p class="subtitle" style="margin-bottom: 20px">
+          Configure your PeerJS connection settings before joining a room.
+        </p>
 
-      <div class="editor-section">
-        <div class="editor-header">
-          <h2 style="margin: 0; color: #333; font-size: 20px">
-            📄 Shared Document
-          </h2>
-          <div class="user-controls">
-            <input
-              type="text"
-              id="user-name"
-              placeholder="Your name"
-              maxlength="20"
-            />
-            <input type="color" id="user-color" value="#3498db" />
+        <div class="form-group">
+          <label for="config-room">Room Name *</label>
+          <input
+            type="text"
+            id="config-room"
+            placeholder="Enter room name (e.g., my-collab-room)"
+            value="peerjs-test"
+            required
+          />
+          <div class="help-text">
+            Users in the same room can collaborate together.
           </div>
         </div>
 
-        <div id="editor"></div>
+        <div class="form-group">
+          <label for="config-peerjs-host">PeerJS Server Host</label>
+          <input
+            type="text"
+            id="config-peerjs-host"
+            placeholder="0.peerjs.com (default)"
+            value=""
+          />
+          <div class="help-text">
+            Leave empty to use default PeerJS cloud server (0.peerjs.com).
+          </div>
+        </div>
 
-        <div class="awareness-section">
-          <h4>👥 Users Online</h4>
-          <div id="user-list" class="user-list">
-            <div class="user-badge">
-              <div class="color-dot" style="background: #999"></div>
-              <span style="color: #999">No users yet</span>
+        <div class="form-group">
+          <label for="config-peerjs-port">PeerJS Server Port</label>
+          <input
+            type="number"
+            id="config-peerjs-port"
+            placeholder="443 (default)"
+            value=""
+            min="1"
+            max="65535"
+          />
+          <div class="help-text">Default is 443 for HTTPS.</div>
+        </div>
+
+        <div class="form-group">
+          <label for="config-ice-servers">ICE Servers (STUN/TURN)</label>
+          <textarea
+            id="config-ice-servers"
+            placeholder="stun:stun.l.google.com:19302&#10;stun:stun1.l.google.com:19302"
+          >
+stun:stun.l.google.com:19302
+stun:stun1.l.google.com:19302
+stun:stun2.l.google.com:19302</textarea
+          >
+          <div class="help-text">
+            STUN servers help with NAT traversal. One server URL per line.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="checkbox-group">
+            <input type="checkbox" id="config-secure" checked />
+            <label for="config-secure">Use Secure Connection (HTTPS/WSS)</label>
+          </div>
+          <div class="help-text">
+            Recommended for production. Disable only for local development.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="checkbox-group">
+            <input type="checkbox" id="config-debug" />
+            <label for="config-debug">Enable Debug Logging</label>
+          </div>
+          <div class="help-text">
+            Shows detailed connection events in the browser console.
+          </div>
+        </div>
+
+        <button id="connect-btn" class="btn">🚀 Connect</button>
+      </div>
+
+      <!-- Main Content (Hidden until connected) -->
+      <div id="main-content" class="hidden">
+        <div class="info-box">
+          <h3>📝 How to Test</h3>
+          <ul>
+            <li>
+              <strong>Open 2-3 tabs in the SAME browser</strong> - Tabs will
+              discover each other via BroadcastChannel
+            </li>
+            <li>
+              <strong>Wait ~1 second</strong> - You should see "🔍 Discovered
+              peer" and "✅ Connection opened" in console
+            </li>
+            <li>
+              <strong>Edit the document</strong> - Type in any tab and see
+              changes sync instantly across all tabs
+            </li>
+            <li>
+              <strong>Customize your user</strong> - Change your name and color
+              to identify yourself in the user list
+            </li>
+            <li>
+              <strong>Watch peer count</strong> - Shows number of connected
+              peers (should be N-1 where N is tabs)
+            </li>
+            <li>
+              <strong>Check the log & console</strong> - See detailed connection
+              events and debug information
+            </li>
+          </ul>
+        </div>
+
+        <div class="editor-section">
+          <div class="editor-header">
+            <h2 style="margin: 0; color: #333; font-size: 20px">
+              📄 Shared Document
+            </h2>
+            <div class="user-controls">
+              <input
+                type="text"
+                id="user-name"
+                placeholder="Your name"
+                maxlength="20"
+              />
+              <input type="color" id="user-color" value="#3498db" />
+            </div>
+          </div>
+
+          <div id="editor"></div>
+
+          <div class="awareness-section">
+            <h4>👥 Users Online</h4>
+            <div id="user-list" class="user-list">
+              <div class="user-badge">
+                <div class="color-dot" style="background: #999"></div>
+                <span style="color: #999">No users yet</span>
+              </div>
             </div>
           </div>
         </div>
-      </div>
 
-      <div class="editor-section">
-        <div class="editor-header">
-          <h2 style="margin: 0; color: #333; font-size: 20px">
-            💬 Pub/Sub Chat
-          </h2>
-        </div>
-        <div
-          style="
-            background: #f9f9f9;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 10px;
-          "
-        >
+        <div class="editor-section">
+          <div class="editor-header">
+            <h2 style="margin: 0; color: #333; font-size: 20px">
+              💬 Pub/Sub Chat
+            </h2>
+          </div>
           <div
-            id="chat-messages"
             style="
-              max-height: 200px;
-              overflow-y: auto;
+              background: #f9f9f9;
+              padding: 15px;
+              border-radius: 5px;
               margin-bottom: 10px;
-              padding: 10px;
-              background: white;
-              border-radius: 4px;
-              font-size: 13px;
             "
           >
-            <div style="color: #999; text-align: center; padding: 20px">
-              💬 Start chatting with other peers...
-            </div>
-          </div>
-          <div style="display: flex; gap: 10px">
-            <input
-              type="text"
-              id="chat-input"
-              placeholder="Type a message..."
+            <div
+              id="chat-messages"
               style="
-                flex: 1;
-                padding: 10px 15px;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-                font-size: 14px;
-              "
-            />
-            <button
-              id="chat-send"
-              style="
-                padding: 10px 20px;
-                background: #667eea;
-                color: white;
-                border: none;
-                border-radius: 5px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: bold;
+                max-height: 200px;
+                overflow-y: auto;
+                margin-bottom: 10px;
+                padding: 10px;
+                background: white;
+                border-radius: 4px;
+                font-size: 13px;
               "
             >
-              Send
-            </button>
+              <div style="color: #999; text-align: center; padding: 20px">
+                💬 Start chatting with other peers...
+              </div>
+            </div>
+            <div style="display: flex; gap: 10px">
+              <input
+                type="text"
+                id="chat-input"
+                placeholder="Type a message..."
+                style="
+                  flex: 1;
+                  padding: 10px 15px;
+                  border: 1px solid #ddd;
+                  border-radius: 5px;
+                  font-size: 14px;
+                "
+              />
+              <button
+                id="chat-send"
+                style="
+                  padding: 10px 20px;
+                  background: #667eea;
+                  color: white;
+                  border: none;
+                  border-radius: 5px;
+                  cursor: pointer;
+                  font-size: 14px;
+                  font-weight: bold;
+                "
+              >
+                Send
+              </button>
+            </div>
           </div>
         </div>
-      </div>
 
-      <div id="log-container">
-        <h3>📊 Connection Log</h3>
-        <div id="log"></div>
+        <div id="log-container">
+          <h3>📊 Connection Log</h3>
+          <div id="log"></div>
+        </div>
       </div>
+      <!-- End Main Content -->
     </div>
 
     <script type="module" src="./index.ts"></script>

@@ -4,6 +4,7 @@ import * as syncProtocol from 'y-protocols/sync'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
 import { Observable } from 'lib0/observable'
+import * as bc from 'lib0/broadcastchannel'
 
 import type { Transport, ConnectionConfig, ConnectionStatus } from './transport'
 
@@ -132,6 +133,12 @@ export class GenericProvider extends Observable<string> {
   private _syncInterval: number // ms between periodic syncs
   private _syncIntervalId?: ReturnType<typeof setTimeout>
   private _verifyUpdates: boolean // whether to send/verify hashes
+  private _disableBc: boolean // whether to disable BroadcastChannel
+
+  // BroadcastChannel state for cross-tab sync
+  private _bcChannel: string = ''
+  private _bcConnected: boolean = false
+  private _bcSubscriber?: (data: ArrayBuffer, origin: any) => void
 
   // Hash verification tracking for exponential backoff
   private _hashMismatchCount: number = 0
@@ -154,6 +161,7 @@ export class GenericProvider extends Observable<string> {
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
   private _unsubscribeTransport?: () => void
+  private _beforeUnloadHandler?: () => void
 
   /**
    * Create a new generic provider.
@@ -187,6 +195,14 @@ export class GenericProvider extends Observable<string> {
        * @default 0 (disabled - immediate transmission)
        */
       batchUpdates?: number
+      /**
+       * Disable BroadcastChannel for cross-tab communication.
+       * When enabled (default), updates are shared instantly between tabs
+       * in the same browser without going through the network transport.
+       * Automatically disabled in non-browser environments (e.g., Node.js).
+       * @default false (BroadcastChannel enabled)
+       */
+      disableBc?: boolean
     } = {},
   ) {
     super()
@@ -198,6 +214,7 @@ export class GenericProvider extends Observable<string> {
     this._syncInterval = options.syncInterval ?? 5000
     this._verifyUpdates = options.verifyUpdates ?? true
     this._batchUpdates = options.batchUpdates ?? 0
+    this._disableBc = options.disableBc ?? false
 
     this._setupDocumentSync()
     this._setupAwarenessSync()
@@ -216,6 +233,9 @@ export class GenericProvider extends Observable<string> {
     this._setStatus({ state: 'connecting' })
 
     try {
+      // Setup BroadcastChannel for cross-tab sync (if enabled and available)
+      this._setupBroadcastChannel(config)
+
       // Connect the transport
       await this.transport.connect(config)
 
@@ -268,6 +288,9 @@ export class GenericProvider extends Observable<string> {
       this._pendingUpdate = null
     }
 
+    // Disconnect BroadcastChannel
+    this._disconnectBroadcastChannel()
+
     if (this._unsubscribeTransport) {
       this._unsubscribeTransport()
       this._unsubscribeTransport = undefined
@@ -319,6 +342,12 @@ export class GenericProvider extends Observable<string> {
       this._awarenessUpdateHandler = undefined
     }
 
+    // Remove beforeunload handler
+    if (this._beforeUnloadHandler && typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this._beforeUnloadHandler)
+      this._beforeUnloadHandler = undefined
+    }
+
     this.awareness.destroy()
     super.destroy()
   }
@@ -335,6 +364,13 @@ export class GenericProvider extends Observable<string> {
    */
   get connected(): boolean {
     return this.transport.isConnected
+  }
+
+  /**
+   * Whether BroadcastChannel is connected for cross-tab sync
+   */
+  get bcConnected(): boolean {
+    return this._bcConnected
   }
 
   /**
@@ -443,16 +479,18 @@ export class GenericProvider extends Observable<string> {
 
     this.awareness.on('update', this._awarenessUpdateHandler)
 
-    // Cleanup: mark as offline when page unloads
+    // Cleanup: mark as offline and disconnect BC when page unloads
     if (typeof window !== 'undefined') {
-      const beforeUnload = () => {
+      this._beforeUnloadHandler = () => {
         awarenessProtocol.removeAwarenessStates(
           this.awareness,
           [this.doc.clientID],
           'window unload',
         )
+        // Disconnect BroadcastChannel to notify other tabs
+        this._disconnectBroadcastChannel()
       }
-      window.addEventListener('beforeunload', beforeUnload)
+      window.addEventListener('beforeunload', this._beforeUnloadHandler)
     }
   }
 
@@ -750,9 +788,144 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Send data through the transport.
+   * Setup BroadcastChannel for cross-tab communication.
+   * Automatically disabled in non-browser environments.
+   */
+  private _setupBroadcastChannel(config: ConnectionConfig): void {
+    // Check if BroadcastChannel is available and not disabled
+    if (
+      this._disableBc ||
+      typeof BroadcastChannel === 'undefined' ||
+      typeof window === 'undefined'
+    ) {
+      return
+    }
+
+    // Create channel name based on room
+    this._bcChannel = `yjs-${config.room}`
+
+    // Setup subscriber for incoming messages from other tabs
+    this._bcSubscriber = (data: ArrayBuffer, origin: any) => {
+      // Ignore messages from this provider instance
+      if (origin === this) {
+        return
+      }
+
+      // Process the message (will be from another tab)
+      const uint8Data = new Uint8Array(data)
+      const decoder = decoding.createDecoder(uint8Data)
+      const encoder = encoding.createEncoder()
+      const messageType = decoding.readVarUint(decoder)
+
+      // Handle sync messages received via BC
+      if (
+        messageType === MESSAGE_SYNC ||
+        messageType === MESSAGE_SYNC_VERIFIED
+      ) {
+        encoding.writeVarUint(encoder, MESSAGE_SYNC)
+
+        // Skip sequence number and clientID if it's a verified message
+        if (messageType === MESSAGE_SYNC_VERIFIED) {
+          decoding.readVarUint(decoder) // seqNum
+          decoding.readVarUint(decoder) // clientID
+        }
+
+        const syncMessageType = syncProtocol.readSyncMessage(
+          decoder,
+          encoder,
+          this.doc,
+          this, // transaction origin
+        )
+
+        // Mark as synced if we received SyncStep2
+        if (
+          syncMessageType === syncProtocol.messageYjsSyncStep2 &&
+          !this._synced
+        ) {
+          this._synced = true
+          this.emit('synced', [true])
+        }
+
+        // Send reply via BC if needed
+        if (encoding.length(encoder) > 1) {
+          bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this)
+        }
+      } else {
+        // For other messages, just apply them directly
+        // (Move decoder position back to include message type)
+        this._handleIncomingMessage(uint8Data)
+      }
+    }
+
+    // Subscribe to the channel
+    bc.subscribe(this._bcChannel, this._bcSubscriber)
+    this._bcConnected = true
+
+    // Send initial sync via BroadcastChannel
+    // This allows syncing with other tabs immediately
+    const encoderSync = encoding.createEncoder()
+    encoding.writeVarUint(encoderSync, MESSAGE_SYNC)
+    syncProtocol.writeSyncStep1(encoderSync, this.doc)
+    bc.publish(this._bcChannel, encoding.toUint8Array(encoderSync), this)
+
+    // Broadcast local state via BroadcastChannel
+    const encoderState = encoding.createEncoder()
+    encoding.writeVarUint(encoderState, MESSAGE_SYNC)
+    syncProtocol.writeSyncStep2(encoderState, this.doc)
+    bc.publish(this._bcChannel, encoding.toUint8Array(encoderState), this)
+
+    // Broadcast local awareness state via BroadcastChannel
+    if (this.awareness.getLocalState() !== null) {
+      const encoderAwareness = encoding.createEncoder()
+      encoding.writeVarUint(encoderAwareness, MESSAGE_AWARENESS)
+      encoding.writeVarUint8Array(
+        encoderAwareness,
+        awarenessProtocol.encodeAwarenessUpdate(this.awareness, [
+          this.doc.clientID,
+        ]),
+      )
+      bc.publish(this._bcChannel, encoding.toUint8Array(encoderAwareness), this)
+    }
+  }
+
+  /**
+   * Disconnect from BroadcastChannel and mark local client as offline.
+   */
+  private _disconnectBroadcastChannel(): void {
+    if (!this._bcConnected || !this._bcSubscriber) {
+      return
+    }
+
+    // Broadcast awareness state with null (indicating disconnect)
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(
+        this.awareness,
+        [this.doc.clientID],
+        new Map(),
+      ),
+    )
+    bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this)
+
+    // Unsubscribe from channel
+    bc.unsubscribe(this._bcChannel, this._bcSubscriber)
+    this._bcConnected = false
+    this._bcSubscriber = undefined
+  }
+
+  /**
+   * Send data through both BroadcastChannel (if connected) and transport.
+   * This ensures updates reach both local tabs and remote peers.
    */
   private _send(data: Uint8Array): void {
+    // Send via BroadcastChannel to other tabs first
+    if (this._bcConnected) {
+      bc.publish(this._bcChannel, data, this)
+    }
+
+    // Send via network transport
     if (!this.transport.isConnected) {
       return
     }

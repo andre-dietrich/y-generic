@@ -2,6 +2,23 @@
 
 A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.
 
+## 🚀 Live Demos
+
+Try out all the different transport providers in action:
+
+**[👉 View Live Demos](https://yourusername.github.io/y-generic/)**
+
+Explore 9 different transport implementations:
+- **Dummy** - In-memory testing with network simulation
+- **SimplePeer** - WebRTC peer-to-peer
+- **PeerJS** - Simplified WebRTC with cloud signaling
+- **IndexedDB** - Local browser persistence
+- **Gun** - Decentralized graph database
+- **Trystero** - Serverless WebRTC (Nostr, BitTorrent, MQTT, IPFS)
+- **PubNub** - Cloud pub/sub with global CDN
+- **WebSocket** - Standard client-server (y-websocket compatible)
+- **Matrix** - Federated communication protocol
+
 ## Design Philosophy
 
 **You implement**: How data is transmitted (WebSocket, WebRTC, PubNub, IndexedDB, etc.)  

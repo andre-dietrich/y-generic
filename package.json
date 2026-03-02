@@ -6,6 +6,10 @@
   "author": "André Dietrich",
   "main": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
+  "targets": {
+    "main": false,
+    "types": false
+  },
   "exports": {
     ".": {
       "types": "./dist/lib.d.ts",
@@ -62,12 +66,26 @@
     "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
     "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
     "test": "parcel test.html --open",
-    "build": "rm -rf dist && tsc"
+    "build": "rm -rf dist && tsc",
+    "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",
+    "build:demo:dummy": "npx parcel build test/dummy/index.html --dist-dir demos/dummy --public-url ../ --no-source-maps",
+    "build:demo:simple-peer": "npx parcel build test/simple-peer/index.html --dist-dir demos/simple-peer --public-url ../ --no-source-maps",
+    "build:demo:peerjs": "npx parcel build test/peerjs/index.html --dist-dir demos/peerjs --public-url ../ --no-source-maps",
+    "build:demo:indexeddb": "npx parcel build test/indexeddb/index.html --dist-dir demos/indexeddb --public-url ../ --no-source-maps",
+    "build:demo:gun": "npx parcel build test/gun/index.html --dist-dir demos/gun --public-url ../ --no-source-maps",
+    "build:demo:trystero": "npx parcel build test/trystero/index.html --dist-dir demos/trystero --public-url ../ --no-source-maps",
+    "build:demo:pubnub": "npx parcel build test/pubnub/index.html --dist-dir demos/pubnub --public-url ../ --no-source-maps",
+    "build:demo:websocket": "npx parcel build test/websocket/index.html --dist-dir demos/websocket --public-url ../ --no-source-maps",
+    "build:demo:matrix": "npx parcel build test/matrix/index.html --dist-dir demos/matrix --public-url ../ --no-source-maps",
+    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix"
   },
   "dependencies": {
     "lib0": "^0.2.98",
+    "quill": "^2.0.3",
+    "quill-cursors": "^4.0.4",
     "y-protocols": "^1.0.6",
     "y-provider": "^0.10.3-canary.2",
+    "y-quill": "^1.0.0",
     "yjs": "^13.6.29"
   },
   "peerDependencies": {
@@ -87,15 +105,15 @@
     }
   },
   "devDependencies": {
+    "@parcel/transformer-typescript-types": "^2.16.4",
     "@types/node": "^20.0.0",
     "buffer": "^6.0.3",
+    "events": "^3.3.0",
     "gun": "^0.2020.1241",
     "parcel": "^2.16.4",
     "peerjs": "^1.5.5",
     "process": "^0.11.10",
-    "quill": "^2.0.3",
-    "quill-cursors": "^4.0.4",
-    "typescript": "^5.0.0",
-    "y-quill": "^1.0.0"
+    "simple-peer": "^9.11.0",
+    "typescript": "^5.0.0"
   }
 }

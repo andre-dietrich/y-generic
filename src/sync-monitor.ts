@@ -47,7 +47,7 @@ export function computeDocumentHash(doc: Y.Doc): string {
  */
 export class SyncHealthMonitor {
   private provider: GenericProvider
-  private intervalId?: NodeJS.Timeout | number
+  private intervalId?: any // NodeJS.Timeout in Node.js, number in browsers
   private localHash: string = ''
   private peerHashes: Map<number, string> = new Map()
 

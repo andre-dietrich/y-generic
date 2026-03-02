@@ -26,7 +26,7 @@ registerMediaBlots()
 Quill.register('modules/cursors', QuillCursors)
 
 // Configuration
-const ROOM_NAME = 'gun-test3'
+const ROOM_NAME = 'gun-test333'
 
 // Update awareness user list
 function updateUserList(awareness: any) {
@@ -217,7 +217,7 @@ async function init() {
   // Connect to room
   log(`🌐 Connecting to GunDB room: ${ROOM_NAME}...`, 'info')
   try {
-    await provider.connect({ room: ROOM_NAME })
+    await provider.connect({ room: ROOM_NAME, batchInterval: 2000 })
     log('✅ Successfully connected to GunDB!', 'success')
     log('💡 Tip: Open another tab to see real-time sync!', 'info')
   } catch (error) {

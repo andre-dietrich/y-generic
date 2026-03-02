@@ -70,8 +70,9 @@ export interface GunTransportOptions {
     debug?: boolean;
     /**
      * Update batch interval in milliseconds.
-     * Gun will batch multiple updates within this window.
-     * @default 50
+     * Uses debouncing - timer resets on each update.
+     * Only sends after this period of inactivity.
+     * @default 100
      */
     batchInterval?: number;
 }
@@ -120,10 +121,12 @@ export declare class GunTransport implements Transport {
     disconnect(): void;
     /**
      * Send data to all peers via Gun.
+     * Uses debouncing - each new update resets the timer.
      */
     send(data: Uint8Array): void;
     /**
      * Flush batched updates to Gun.
+     * Called after debounce period (no new updates for batchInterval ms).
      */
     private flushBatch;
     /**

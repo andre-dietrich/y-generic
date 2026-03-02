@@ -77,8 +77,9 @@ export interface GunTransportOptions {
 
   /**
    * Update batch interval in milliseconds.
-   * Gun will batch multiple updates within this window.
-   * @default 50
+   * Uses debouncing - timer resets on each update.
+   * Only sends after this period of inactivity.
+   * @default 100
    */
   batchInterval?: number
 }
@@ -103,7 +104,7 @@ export class GunTransport implements Transport {
   private throttleTimeout?: ReturnType<typeof setTimeout>
   private pendingUpdates: Map<string, any> = new Map()
   private updateSlot: number = 0
-  private readonly BUFFER_SIZE = 10 // Circular buffer size
+  private readonly BUFFER_SIZE = 50 // Circular buffer size
 
   /**
    * Create a new Gun transport.
@@ -124,7 +125,7 @@ export class GunTransport implements Transport {
       peers: options.peers ?? [],
       gunOptions: options.gunOptions ?? {},
       debug: options.debug ?? false,
-      batchInterval: options.batchInterval ?? 50,
+      batchInterval: options.batchInterval ?? 100, // Debounce: wait 100ms after last update
     }
   }
 
@@ -310,6 +311,7 @@ export class GunTransport implements Transport {
 
   /**
    * Send data to all peers via Gun.
+   * Uses debouncing - each new update resets the timer.
    */
   send(data: Uint8Array): void {
     if (!this._connected || !this.roomNode) {
@@ -320,12 +322,12 @@ export class GunTransport implements Transport {
     // Add to batch
     this.updateBatch.push(data)
 
-    // Clear existing timeout
+    // Clear existing timeout (debouncing - resets timer on each update)
     if (this.batchTimeout) {
       clearTimeout(this.batchTimeout)
     }
 
-    // Set new timeout to flush batch
+    // Set new timeout to flush batch after period of inactivity
     this.batchTimeout = setTimeout(() => {
       this.flushBatch()
     }, this.options.batchInterval)
@@ -333,6 +335,7 @@ export class GunTransport implements Transport {
 
   /**
    * Flush batched updates to Gun.
+   * Called after debounce period (no new updates for batchInterval ms).
    */
   private flushBatch(): void {
     if (this.updateBatch.length === 0) return

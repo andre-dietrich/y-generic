@@ -49,7 +49,7 @@ export class GunTransport {
         this.connectionTime = 0;
         this.pendingUpdates = new Map();
         this.updateSlot = 0;
-        this.BUFFER_SIZE = 10; // Circular buffer size
+        this.BUFFER_SIZE = 50; // Circular buffer size
         if (!options.gun) {
             throw new Error('GunTransport requires the "gun" option. ' +
                 'Please provide the Gun constructor: ' +
@@ -60,7 +60,7 @@ export class GunTransport {
             peers: options.peers ?? [],
             gunOptions: options.gunOptions ?? {},
             debug: options.debug ?? false,
-            batchInterval: options.batchInterval ?? 50,
+            batchInterval: options.batchInterval ?? 100, // Debounce: wait 100ms after last update
         };
     }
     /**
@@ -213,6 +213,7 @@ export class GunTransport {
     }
     /**
      * Send data to all peers via Gun.
+     * Uses debouncing - each new update resets the timer.
      */
     send(data) {
         if (!this._connected || !this.roomNode) {
@@ -221,17 +222,18 @@ export class GunTransport {
         }
         // Add to batch
         this.updateBatch.push(data);
-        // Clear existing timeout
+        // Clear existing timeout (debouncing - resets timer on each update)
         if (this.batchTimeout) {
             clearTimeout(this.batchTimeout);
         }
-        // Set new timeout to flush batch
+        // Set new timeout to flush batch after period of inactivity
         this.batchTimeout = setTimeout(() => {
             this.flushBatch();
         }, this.options.batchInterval);
     }
     /**
      * Flush batched updates to Gun.
+     * Called after debounce period (no new updates for batchInterval ms).
      */
     flushBatch() {
         if (this.updateBatch.length === 0)

@@ -68,6 +68,7 @@
     "peerjs": "^1.5.5",
     "process": "^0.11.10",
     "quill": "^2.0.3",
+    "quill-cursors": "^4.0.4",
     "typescript": "^5.0.0",
     "y-quill": "^1.0.0"
   }

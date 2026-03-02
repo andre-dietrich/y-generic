@@ -8,11 +8,15 @@
 import * as Y from 'yjs'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
+import QuillCursors from 'quill-cursors'
 import Peer from 'peerjs'
 import { GenericProvider } from '../../src/index'
 import { PeerJSTransport } from '../../src/providers/peerjs/index'
 
 const BlockEmbed = Quill.import('blots/block/embed') as any
+
+// Register QuillCursors module for collaborative cursors
+Quill.register('modules/cursors', QuillCursors)
 
 // Custom Video Blot for HTML5 video support
 class VideoBlot extends BlockEmbed {
@@ -247,6 +251,7 @@ async function init() {
     theme: 'snow',
     placeholder: 'Start typing... Your changes will sync with other peers!',
     modules: {
+      cursors: true,
       toolbar: {
         container: [
           [{ header: [1, 2, 3, false] }],

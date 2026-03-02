@@ -3,8 +3,12 @@ import { GenericProvider } from '../../src/lib'
 import type { Transport, ConnectionConfig } from '../../src/transport'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
+import QuillCursors from 'quill-cursors'
 
 const BlockEmbed = Quill.import('blots/block/embed') as any
+
+// Register QuillCursors module for collaborative cursors
+Quill.register('modules/cursors', QuillCursors)
 
 // Custom Video Blot for HTML5 video support
 class VideoBlot extends BlockEmbed {
@@ -184,6 +188,7 @@ class TestClient {
       theme: 'snow',
       placeholder: 'Type here... changes sync automatically!',
       modules: {
+        cursors: true,
         toolbar: {
           container: [
             [{ header: [1, 2, 3, false] }],

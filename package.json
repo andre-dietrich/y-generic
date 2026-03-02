@@ -26,6 +26,10 @@
     "./providers/indexeddb": {
       "types": "./dist/providers/indexeddb.d.ts",
       "default": "./dist/providers/indexeddb.js"
+    },
+    "./providers/gun": {
+      "types": "./dist/providers/gun.d.ts",
+      "default": "./dist/providers/gun.js"
     }
   },
   "files": [
@@ -36,6 +40,7 @@
     "dev:simple-peer": "npx parcel serve test/simple-peer/index.html --open --port 3002",
     "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
     "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
+    "dev:gun": "npx parcel serve test/gun/index.html --open --port 3005",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },
@@ -50,10 +55,14 @@
     "yjs": "^13.6.29"
   },
   "peerDependencies": {
+    "gun": "^0.2020.1240",
     "peerjs": "^1.5.0",
     "simple-peer": "^9.11.0"
   },
   "peerDependenciesMeta": {
+    "gun": {
+      "optional": true
+    },
     "simple-peer": {
       "optional": true
     },
@@ -64,6 +73,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "buffer": "^6.0.3",
+    "gun": "^0.2020.1241",
     "parcel": "^2.16.4",
     "peerjs": "^1.5.5",
     "process": "^0.11.10",

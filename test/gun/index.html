@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>GunDB Provider Test - Yjs Decentralized Sync</title>
+
+    <!-- Quill CSS -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css"
+      rel="stylesheet"
+    />
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+        margin: 0;
+        padding: 20px;
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        min-height: 100vh;
+      }
+
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+      }
+
+      header {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      h1 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 28px;
+      }
+
+      .subtitle {
+        color: #666;
+        font-size: 14px;
+        margin: 0 0 15px 0;
+      }
+
+      .status-bar {
+        display: flex;
+        gap: 15px;
+        flex-wrap: wrap;
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 8px;
+        margin-top: 15px;
+      }
+
+      .status-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        color: #333;
+      }
+
+      .status-indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        transition: all 0.3s;
+      }
+
+      .status-indicator.connected {
+        background: #4caf50;
+        box-shadow: 0 0 8px #4caf50;
+      }
+
+      .status-indicator.disconnected {
+        background: #f44336;
+      }
+
+      .status-indicator.connecting {
+        background: #ff9800;
+        animation: pulse 1.5s infinite;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.5;
+        }
+      }
+
+      .badge {
+        background: #e3f2fd;
+        color: #1976d2;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .editor-container {
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        overflow: hidden;
+        margin-bottom: 20px;
+      }
+
+      #editor {
+        min-height: 300px;
+        font-size: 16px;
+      }
+
+      .controls {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .control-group {
+        margin-bottom: 15px;
+      }
+
+      .control-group:last-child {
+        margin-bottom: 0;
+      }
+
+      .control-label {
+        display: block;
+        font-weight: 600;
+        color: #333;
+        margin-bottom: 8px;
+        font-size: 14px;
+      }
+
+      input[type='text'],
+      input[type='color'] {
+        padding: 8px 12px;
+        border: 2px solid #e0e0e0;
+        border-radius: 6px;
+        font-size: 14px;
+        transition: border-color 0.2s;
+        width: 100%;
+      }
+
+      input[type='text']:focus,
+      input[type='color']:focus {
+        outline: none;
+        border-color: #11998e;
+      }
+
+      input[type='color'] {
+        height: 40px;
+        cursor: pointer;
+      }
+
+      .user-list {
+        margin-top: 10px;
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .user-badge {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 6px 12px;
+        background: #f5f5f5;
+        border-radius: 16px;
+        font-size: 13px;
+        color: #333;
+      }
+
+      .color-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid white;
+        box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.1);
+      }
+
+      .log-container {
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        overflow: hidden;
+      }
+
+      .log-header {
+        padding: 15px 20px;
+        background: #f5f5f5;
+        border-bottom: 1px solid #e0e0e0;
+        font-weight: 600;
+        color: #333;
+        font-size: 14px;
+      }
+
+      #log-container {
+        max-height: 200px;
+        overflow-y: auto;
+        padding: 15px 20px;
+      }
+
+      #log {
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .log-entry {
+        margin-bottom: 8px;
+        word-wrap: break-word;
+      }
+
+      .log-time {
+        color: #999;
+        margin-right: 8px;
+      }
+
+      .info-box {
+        background: #e8f5e9;
+        border-left: 4px solid #4caf50;
+        padding: 15px;
+        border-radius: 6px;
+        margin-top: 15px;
+        font-size: 14px;
+        line-height: 1.6;
+      }
+
+      .info-box strong {
+        display: block;
+        margin-bottom: 8px;
+        color: #2e7d32;
+      }
+
+      .info-box ul {
+        margin: 8px 0 0 0;
+        padding-left: 20px;
+      }
+
+      .info-box li {
+        margin-bottom: 4px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>🧬 GunDB Provider Test</h1>
+        <p class="subtitle">
+          Decentralized peer-to-peer collaboration with Yjs + GunDB
+        </p>
+
+        <div class="status-bar">
+          <div class="status-item">
+            <div
+              id="connection-indicator"
+              class="status-indicator connecting"
+            ></div>
+            <span id="connection-status">Connecting...</span>
+          </div>
+          <div class="status-item">
+            <span>Sync:</span>
+            <span id="sync-status">⏳ Syncing...</span>
+          </div>
+          <div class="status-item">
+            <span class="badge">Room: gun-test</span>
+          </div>
+        </div>
+
+        <div class="info-box">
+          <strong>💡 About GunDB</strong>
+          GunDB is a decentralized graph database with automatic conflict
+          resolution. Your changes sync directly with other peers without a
+          central server!
+          <ul>
+            <li><strong>Decentralized:</strong> No single point of failure</li>
+            <li>
+              <strong>Offline-first:</strong> Works without internet, syncs when
+              connected
+            </li>
+            <li>
+              <strong>Real-time:</strong> Changes appear instantly across all
+              peers
+            </li>
+          </ul>
+        </div>
+      </header>
+
+      <div class="controls">
+        <div class="control-group">
+          <label class="control-label">Your Name</label>
+          <input type="text" id="user-name" placeholder="Enter your name..." />
+        </div>
+
+        <div class="control-group">
+          <label class="control-label">Cursor Color</label>
+          <input type="color" id="user-color" />
+        </div>
+
+        <div class="control-group">
+          <label class="control-label">Connected Users</label>
+          <div id="user-list" class="user-list">
+            <div class="user-badge">
+              <div class="color-dot" style="background: #999"></div>
+              <span style="color: #999">No users yet</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="editor-container">
+        <div id="editor"></div>
+      </div>
+
+      <div class="controls">
+        <div class="control-label">💬 Pub/Sub Chat</div>
+        <div
+          id="chat-messages"
+          style="
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 10px;
+            padding: 10px;
+            background: #f9f9f9;
+            border-radius: 6px;
+            font-size: 13px;
+          "
+        >
+          <div style="color: #999; text-align: center; padding: 20px">
+            💬 Start chatting with other peers...
+          </div>
+        </div>
+        <div style="display: flex; gap: 10px">
+          <input
+            type="text"
+            id="chat-input"
+            placeholder="Type a message..."
+            style="
+              flex: 1;
+              padding: 10px 15px;
+              border: 2px solid #e0e0e0;
+              border-radius: 6px;
+              font-size: 14px;
+            "
+          />
+          <button
+            id="chat-send"
+            style="
+              padding: 10px 20px;
+              background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+              color: white;
+              border: none;
+              border-radius: 6px;
+              cursor: pointer;
+              font-size: 14px;
+              font-weight: bold;
+              transition: transform 0.2s;
+            "
+            onmouseover="this.style.transform = 'scale(1.05)'"
+            onmouseout="this.style.transform = 'scale(1)'"
+          >
+            Send
+          </button>
+        </div>
+      </div>
+
+      <div class="log-container">
+        <div class="log-header">📋 Activity Log</div>
+        <div id="log-container">
+          <div id="log"></div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./index.ts"></script>
+  </body>
+</html>

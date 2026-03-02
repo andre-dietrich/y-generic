@@ -30,6 +30,10 @@
     "./providers/gun": {
       "types": "./dist/providers/gun.d.ts",
       "default": "./dist/providers/gun.js"
+    },
+    "./providers/trystero": {
+      "types": "./dist/providers/trystero/index.d.ts",
+      "default": "./dist/providers/trystero/index.js"
     }
   },
   "files": [
@@ -41,6 +45,7 @@
     "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
     "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
     "dev:gun": "npx parcel serve test/gun/index.html --open --port 3005",
+    "dev:trystero": "npx parcel serve test/trystero/index.html --open --port 3006",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },

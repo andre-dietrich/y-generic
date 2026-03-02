@@ -1,0 +1,599 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Trystero Provider Test - Yjs P2P Sync</title>
+
+    <!-- Quill CSS -->
+    <link
+      href="https://cdn.jsdelivr.net/npm/quill@2.0.3/dist/quill.snow.css"
+      rel="stylesheet"
+    />
+
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu,
+          Cantarell, sans-serif;
+        margin: 0;
+        padding: 20px;
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+        min-height: 100vh;
+      }
+
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+      }
+
+      header {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        margin-bottom: 20px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+      }
+
+      h1 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 28px;
+      }
+
+      .subtitle {
+        color: #666;
+        font-size: 14px;
+        margin: 0 0 15px 0;
+      }
+
+      .status-bar {
+        display: flex;
+        gap: 15px;
+        flex-wrap: wrap;
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 8px;
+        margin-top: 15px;
+      }
+
+      .status-item {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        color: #333;
+      }
+
+      .status-indicator {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        transition: all 0.3s;
+      }
+
+      .status-indicator.connected {
+        background: #4caf50;
+        box-shadow: 0 0 8px #4caf50;
+      }
+
+      .status-indicator.disconnected {
+        background: #f44336;
+      }
+
+      .status-indicator.connecting {
+        background: #ff9800;
+        animation: pulse 1.5s infinite;
+      }
+
+      @keyframes pulse {
+        0%,
+        100% {
+          opacity: 1;
+        }
+        50% {
+          opacity: 0.5;
+        }
+      }
+
+      .badge {
+        background: #e0e7ff;
+        color: #4338ca;
+        padding: 4px 12px;
+        border-radius: 12px;
+        font-size: 12px;
+        font-weight: 600;
+        margin-left: 10px;
+      }
+
+      /* Configuration panel styles */
+      .config-panel {
+        background: white;
+        padding: 30px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .config-panel h2 {
+        margin: 0 0 20px 0;
+        color: #333;
+        font-size: 24px;
+      }
+
+      .form-group {
+        margin-bottom: 20px;
+      }
+
+      .form-group label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 600;
+        color: #555;
+        font-size: 14px;
+      }
+
+      .form-group input[type='text'],
+      .form-group input[type='password'],
+      .form-group textarea {
+        width: 100%;
+        padding: 10px 12px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-size: 14px;
+        font-family: inherit;
+        transition: border-color 0.3s;
+      }
+
+      .form-group input:focus,
+      .form-group textarea:focus {
+        outline: none;
+        border-color: #6366f1;
+      }
+
+      .form-group textarea {
+        min-height: 100px;
+        resize: vertical;
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+      }
+
+      .checkbox-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .checkbox-group input[type='checkbox'] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+      }
+
+      .checkbox-group label {
+        margin: 0;
+        font-weight: normal;
+        cursor: pointer;
+      }
+
+      .help-text {
+        font-size: 12px;
+        color: #999;
+        margin-top: 5px;
+      }
+
+      .btn {
+        padding: 12px 30px;
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+        color: white;
+        border: none;
+        border-radius: 5px;
+        font-size: 16px;
+        font-weight: bold;
+        cursor: pointer;
+        transition:
+          transform 0.2s,
+          box-shadow 0.2s;
+      }
+
+      .btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 12px rgba(99, 102, 241, 0.4);
+      }
+
+      .btn:active {
+        transform: translateY(0);
+      }
+
+      .btn:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+        transform: none;
+      }
+
+      .hidden {
+        display: none !important;
+      }
+
+      /* Main content styles */
+      .editor-container {
+        background: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        overflow: hidden;
+        margin-bottom: 20px;
+      }
+
+      #editor {
+        min-height: 300px;
+        font-size: 16px;
+      }
+
+      .controls {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .control-group {
+        margin-bottom: 15px;
+      }
+
+      .control-group:last-child {
+        margin-bottom: 0;
+      }
+
+      .control-label {
+        display: block;
+        font-weight: 600;
+        color: #333;
+        margin-bottom: 8px;
+        font-size: 14px;
+      }
+
+      input[type='text'],
+      input[type='color'] {
+        padding: 8px 12px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-size: 14px;
+      }
+
+      input[type='color'] {
+        width: 60px;
+        height: 40px;
+        cursor: pointer;
+      }
+
+      .user-list {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        padding: 15px;
+        background: #f5f5f5;
+        border-radius: 5px;
+      }
+
+      .user-badge {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        background: white;
+        border-radius: 20px;
+        font-size: 13px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+      }
+
+      .user-badge .color-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        border: 2px solid white;
+        box-shadow: 0 0 4px rgba(0, 0, 0, 0.2);
+      }
+
+      .chat-section {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .chat-messages {
+        max-height: 200px;
+        overflow-y: auto;
+        margin-bottom: 15px;
+        padding: 15px;
+        background: #f9f9f9;
+        border-radius: 5px;
+        font-size: 13px;
+      }
+
+      .chat-input-container {
+        display: flex;
+        gap: 10px;
+      }
+
+      #chat-input {
+        flex: 1;
+        padding: 10px 15px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-size: 14px;
+      }
+
+      #chat-send {
+        padding: 10px 20px;
+        background: #6366f1;
+        color: white;
+        border: none;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 14px;
+        font-weight: bold;
+      }
+
+      #chat-send:hover {
+        background: #4f46e5;
+      }
+
+      #log-container {
+        background: white;
+        padding: 15px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        max-height: 300px;
+        overflow-y: auto;
+      }
+
+      #log-container h3 {
+        margin: 0 0 10px 0;
+        color: #333;
+        font-size: 18px;
+      }
+
+      #log {
+        font-family: 'Courier New', monospace;
+        font-size: 12px;
+        color: #333;
+      }
+
+      .log-entry {
+        padding: 4px 0;
+        border-bottom: 1px solid #f0f0f0;
+      }
+
+      .log-entry:last-child {
+        border-bottom: none;
+      }
+
+      .log-time {
+        color: #999;
+        margin-right: 8px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>
+          ✨ Trystero Provider Test
+          <span class="badge">Trystero</span>
+          <span class="badge" id="strategy-badge">Nostr</span>
+          <span class="badge">Yjs</span>
+        </h1>
+        <p class="subtitle">
+          Test serverless peer-to-peer synchronization using Trystero. Choose a
+          strategy and configure settings to start collaboration!
+        </p>
+
+        <div class="status-bar">
+          <div class="status-item">
+            <div
+              id="connection-indicator"
+              class="status-indicator connecting"
+            ></div>
+            <span id="connection-status">Not connected</span>
+          </div>
+          <div class="status-item">
+            <strong>Room:</strong>
+            <span id="room-badge">(not connected)</span>
+          </div>
+          <div class="status-item">
+            <strong>Peers:</strong>
+            <span id="peer-count">0</span>
+          </div>
+          <div class="status-item">
+            <strong>Sync:</strong>
+            <span id="sync-status">⏳ Waiting...</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- Configuration Panel -->
+      <div id="config-panel" class="config-panel">
+        <h2>⚙️ Connection Settings</h2>
+        <p class="subtitle" style="margin-bottom: 20px">
+          Configure your Trystero connection settings before joining a room.
+        </p>
+
+        <div class="form-group">
+          <label for="config-strategy">Strategy *</label>
+          <select
+            id="config-strategy"
+            style="
+              width: 100%;
+              padding: 10px 12px;
+              border: 1px solid #ddd;
+              border-radius: 5px;
+              font-size: 14px;
+              background: white;
+              cursor: pointer;
+            "
+          >
+            <option value="nostr" selected>🐦 Nostr (8KB - Fast relays)</option>
+            <option value="torrent">🌊 BitTorrent (5KB - Smallest)</option>
+            <option value="mqtt">📡 MQTT (75KB - IoT brokers)</option>
+            <option value="ipfs">🪐 IPFS (119KB - Content-addressed)</option>
+          </select>
+          <div class="help-text">
+            Choose the decentralized strategy for peer discovery. All strategies
+            work identically.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="config-app-id">App ID *</label>
+          <input
+            type="text"
+            id="config-app-id"
+            placeholder="Enter unique app identifier"
+            value="yjs-trystero-demo"
+            required
+          />
+          <div class="help-text">
+            A unique identifier for your application. Must be the same for all
+            collaborators.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="config-room">Room Name *</label>
+          <input
+            type="text"
+            id="config-room"
+            placeholder="Enter room name (e.g., my-collab-room)"
+            value="trystero-test"
+            required
+          />
+          <div class="help-text">
+            Users in the same room can collaborate together.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="config-password">Password (Optional)</label>
+          <input
+            type="password"
+            id="config-password"
+            placeholder="Leave empty for no password"
+          />
+          <div class="help-text">
+            Optional password for encrypting session descriptions. All peers
+            must use the same password to connect.
+          </div>
+        </div>
+
+        <div class="form-group" id="relay-config">
+          <label for="config-relays" id="relay-label">Relay URLs</label>
+          <textarea
+            id="config-relays"
+            placeholder="wss://relay1.example.com&#10;wss://relay2.example.com"
+          >
+wss://relay.damus.io
+wss://relay.nostr.band
+wss://nos.lol
+wss://relay.snort.social
+wss://nostr.wine</textarea
+          >
+          <div class="help-text" id="relay-help">
+            Relay URLs for peer discovery. One URL per line. Leave empty to use
+            Trystero defaults.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="config-turn-servers">TURN Servers (Optional)</label>
+          <textarea
+            id="config-turn-servers"
+            placeholder='{"urls": "turn:my-turn.server:3478", "username": "user", "credential": "pass"}&#10;{"urls": "turn:another.server:3478"}'
+          ></textarea>
+          <div class="help-text">
+            Optional TURN servers for NAT traversal (JSON format, one per line).
+            Leave empty to use defaults.
+          </div>
+        </div>
+
+        <div class="form-group">
+          <div class="checkbox-group">
+            <input type="checkbox" id="config-debug" />
+            <label for="config-debug">Enable Debug Logging</label>
+          </div>
+          <div class="help-text">
+            Shows detailed connection events in the browser console.
+          </div>
+        </div>
+
+        <button id="connect-btn" class="btn">🚀 Connect</button>
+      </div>
+
+      <!-- Main Content (Hidden until connected) -->
+      <div id="main-content" class="hidden">
+        <div class="controls">
+          <div class="control-group">
+            <label class="control-label">Your Name</label>
+            <input
+              type="text"
+              id="user-name"
+              placeholder="Enter your name"
+              value="Anonymous"
+            />
+          </div>
+          <div class="control-group">
+            <label class="control-label">Your Color</label>
+            <input type="color" id="user-color" value="#6366f1" />
+          </div>
+          <div class="control-group">
+            <label class="control-label">👥 Users Online</label>
+            <div id="user-list" class="user-list">
+              <div class="user-badge">
+                <div class="color-dot" style="background: #999"></div>
+                <span style="color: #999">No users yet</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="editor-container">
+          <div id="editor"></div>
+        </div>
+
+        <div class="chat-section">
+          <h3 style="margin: 0 0 15px 0; color: #333; font-size: 18px">
+            💬 Pub/Sub Chat
+          </h3>
+          <div id="chat-messages" class="chat-messages">
+            <div style="color: #999; text-align: center; padding: 20px">
+              💬 Start chatting with other peers...
+            </div>
+          </div>
+          <div class="chat-input-container">
+            <input
+              type="text"
+              id="chat-input"
+              placeholder="Type a message..."
+            />
+            <button id="chat-send">Send</button>
+          </div>
+        </div>
+
+        <div id="log-container">
+          <h3>📊 Connection Log</h3>
+          <div id="log"></div>
+        </div>
+      </div>
+      <!-- End Main Content -->
+    </div>
+
+    <script type="module" src="./index.ts"></script>
+  </body>
+</html>

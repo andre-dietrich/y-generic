@@ -65,6 +65,7 @@ export declare class DummyHub {
     broadcast(room: string, data: Uint8Array, sender: DummyTransport, options?: {
         latency?: number;
         dropRate?: number;
+        jitter?: number;
     }): void;
     /**
      * Get the number of clients connected to a room.
@@ -103,6 +104,21 @@ export interface DummyTransportOptions {
      */
     dropRate?: number;
     /**
+     * Latency jitter as a fraction of latency (0-1).
+     * Randomizes delivery time to simulate out-of-order arrival.
+     *
+     * Examples:
+     * - jitter = 0: All messages arrive at exactly `latency` ms (in order)
+     * - jitter = 0.5: Messages arrive between latency*0.5 and latency*1.5
+     * - jitter = 1.0: Messages arrive between 0 and latency*2 (maximum variance)
+     *
+     * This causes messages to potentially arrive out of order, which is
+     * useful for testing CRDT conflict resolution.
+     *
+     * @default 0
+     */
+    jitter?: number;
+    /**
      * Automatically connect on first send.
      * Useful for testing auto-reconnect behavior.
      * @default false
@@ -132,6 +148,10 @@ export declare class DummyTransport implements Transport {
      *
      * // With network simulation
      * const transport = new DummyTransport({ latency: 100, dropRate: 0.1 })
+     *
+     * // With out-of-order delivery (useful for testing CRDT)
+     * const transport = new DummyTransport({ latency: 100, jitter: 0.5 })
+     * // Messages arrive between 50ms and 150ms (may arrive out of order)
      *
      * // Advanced - explicit shared hub
      * const hub = new DummyHub()

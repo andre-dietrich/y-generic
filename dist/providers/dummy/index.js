@@ -87,6 +87,7 @@ export class DummyHub {
             return;
         const latency = options?.latency ?? 0;
         const dropRate = options?.dropRate ?? 0;
+        const jitter = options?.jitter ?? 0;
         for (const client of clients) {
             // Don't send back to sender
             if (client.transport === sender)
@@ -95,8 +96,16 @@ export class DummyHub {
             if (dropRate > 0 && Math.random() < dropRate) {
                 continue;
             }
+            // Calculate actual delay with jitter
+            let actualDelay = latency;
+            if (latency > 0 && jitter > 0) {
+                // Random delay between latency*(1-jitter) and latency*(1+jitter)
+                const minDelay = latency * (1 - jitter);
+                const maxDelay = latency * (1 + jitter);
+                actualDelay = minDelay + Math.random() * (maxDelay - minDelay);
+            }
             // Simulate network latency
-            if (latency > 0) {
+            if (actualDelay > 0) {
                 setTimeout(() => {
                     try {
                         client.callback(data);
@@ -104,7 +113,7 @@ export class DummyHub {
                     catch (error) {
                         console.error('Error delivering message:', error);
                     }
-                }, latency);
+                }, actualDelay);
             }
             else {
                 try {
@@ -167,6 +176,10 @@ export class DummyTransport {
      * // With network simulation
      * const transport = new DummyTransport({ latency: 100, dropRate: 0.1 })
      *
+     * // With out-of-order delivery (useful for testing CRDT)
+     * const transport = new DummyTransport({ latency: 100, jitter: 0.5 })
+     * // Messages arrive between 50ms and 150ms (may arrive out of order)
+     *
      * // Advanced - explicit shared hub
      * const hub = new DummyHub()
      * const transport1 = new DummyTransport({ hub })
@@ -181,6 +194,7 @@ export class DummyTransport {
         this.options = {
             latency: options.latency ?? 0,
             dropRate: options.dropRate ?? 0,
+            jitter: options.jitter ?? 0,
             autoConnect: options.autoConnect ?? false,
         };
     }
@@ -231,6 +245,7 @@ export class DummyTransport {
         this.hub.broadcast(this._room, data, this, {
             latency: this.options.latency,
             dropRate: this.options.dropRate,
+            jitter: this.options.jitter,
         });
     }
     /**

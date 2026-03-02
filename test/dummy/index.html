@@ -318,9 +318,16 @@
             ℹ️ Auto-sync retries every 2 seconds as backup<br />
             ℹ️ Exponential backoff on repeated failures (10ms → 10s)<br />
             ℹ️ Rate limiting: max 20 sync requests per 10 seconds<br />
-            ℹ️ Update batching available (batchUpdates option) for efficiency
+            ℹ️ Update batching available (batchUpdates option) for efficiency<br />
+            ℹ️ Jitter causes variable delays & out-of-order message delivery<br />
+            <strong style="color: #ff6b6b"
+              >⚠️ BroadcastChannel disabled to test network simulation
+              accurately</strong
+            >
           </div>
-          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px">
+          <div
+            style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px"
+          >
             <div>
               <label
                 style="
@@ -363,6 +370,27 @@
                 style="width: 100%"
               />
             </div>
+            <div>
+              <label
+                style="
+                  display: block;
+                  font-size: 12px;
+                  margin-bottom: 5px;
+                  color: #666;
+                "
+              >
+                Jitter:
+                <span id="jitter-value" style="font-weight: bold">0</span>
+              </label>
+              <input
+                type="range"
+                id="jitter-slider"
+                min="0"
+                max="100"
+                value="0"
+                style="width: 100%"
+              />
+            </div>
           </div>
         </div>
       </header>
@@ -391,8 +419,16 @@
             and watch synchronization behavior
           </li>
           <li>
-            <strong>Adjust delay/packet loss</strong> - Test sync resilience
-            under adverse network conditions
+            <strong>Adjust delay/packet loss/jitter</strong> - Test sync
+            resilience under adverse network conditions. Jitter causes
+            out-of-order delivery!
+          </li>
+          <li>
+            <strong>Important:</strong> BroadcastChannel is disabled to ensure
+            network simulation works properly. By default, tabs in the same
+            browser sync instantly via BroadcastChannel, bypassing the simulated
+            network. This is disabled here so you can see the real effects of
+            packet loss, delay, and jitter.
           </li>
           <li>
             <strong>Watch for desync warnings</strong> - Hash-based monitoring

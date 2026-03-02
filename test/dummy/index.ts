@@ -55,6 +55,7 @@ let globalNetworkOnline: boolean = true
 // Network simulation parameters
 let networkDelay: number = 10 // milliseconds
 let networkPacketLoss: number = 0 // percentage (0-100)
+let networkJitter: number = 0 // jitter factor (0-1)
 
 /**
  * Dummy transport that simulates network communication.
@@ -104,10 +105,14 @@ export class Dummy implements Transport {
           return
         }
 
-        // Simulate variable network delay (±50% variance)
-        const variance = networkDelay * 0.5
-        const actualDelay =
-          networkDelay + (Math.random() * variance * 2 - variance)
+        // Calculate actual delay with jitter
+        let actualDelay = networkDelay
+        if (networkDelay > 0 && networkJitter > 0) {
+          // Random delay between delay*(1-jitter) and delay*(1+jitter)
+          const minDelay = networkDelay * (1 - networkJitter)
+          const maxDelay = networkDelay * (1 + networkJitter)
+          actualDelay = minDelay + Math.random() * (maxDelay - minDelay)
+        }
 
         setTimeout(() => {
           // Check network status again after delay (both global and target client)
@@ -172,12 +177,13 @@ class TestClient {
     // Use 2 second sync interval for testing (helps with packet loss)
     // Enable verifyUpdates for immediate desync detection (faster than waiting 2s)
     // batchUpdates can be used to reduce network traffic (e.g., batchUpdates: 100)
+    // IMPORTANT: disableBc prevents cross-tab sync, forcing all sync through simulated network
     this.transport = new Dummy()
     this.provider = new GenericProvider(this.doc, this.transport, {
       batchUpdates: 100, // Optional: batch updates for 100ms to reduce traffic
       syncInterval: 2000, // Retry sync every 2 seconds to handle packet loss
       verifyUpdates: true, // Send hash with each update for immediate desync detection
-      // batchUpdates: 100, // Optional: batch updates for 100ms to reduce traffic
+      disableBc: true, // CRITICAL: Disable BroadcastChannel to test network simulation properly
     })
 
     // Create UI
@@ -624,6 +630,10 @@ async function init() {
   const delayValue = document.getElementById('delay-value')!
   const lossSlider = document.getElementById('loss-slider')! as HTMLInputElement
   const lossValue = document.getElementById('loss-value')!
+  const jitterSlider = document.getElementById(
+    'jitter-slider',
+  )! as HTMLInputElement
+  const jitterValue = document.getElementById('jitter-value')!
   const logDiv = document.getElementById('log')!
 
   // Add initial clients
@@ -705,13 +715,25 @@ async function init() {
     log(`📉 Packet loss set to ${networkPacketLoss}%`)
   })
 
+  // Jitter slider
+  jitterSlider.addEventListener('input', () => {
+    networkJitter = parseInt(jitterSlider.value) / 100 // Convert 0-100 to 0-1
+    jitterValue.textContent = networkJitter.toFixed(2)
+    log(
+      `🔀 Network jitter set to ${networkJitter.toFixed(2)} (${parseInt(jitterSlider.value)}%)`,
+    )
+  })
+
   log('✅ Test environment ready!')
   log(
     'TIP: Use the rich text editor - format text, add images, see live cursors!',
   )
   log('TIP: Change names/colors and see awareness updates!')
   log('TIP: Toggle offline/online to simulate connection problems!')
-  log('TIP: Adjust delay and packet loss to test network conditions!')
+  log('TIP: Adjust delay, packet loss, and jitter to test network conditions!')
+  log(
+    'TIP: Jitter causes out-of-order message delivery (realistic network behavior)',
+  )
   log('INFO: Fast desync detection with exponential backoff (10ms → 10s max)')
   log('INFO: Rate limiting active - max 20 sync requests per 10 seconds')
   log('INFO: Sequence numbers enabled for ordering & duplicate detection')

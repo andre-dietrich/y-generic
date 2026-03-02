@@ -34,6 +34,10 @@
     "./providers/trystero": {
       "types": "./dist/providers/trystero/index.d.ts",
       "default": "./dist/providers/trystero/index.js"
+    },
+    "./providers/pubnub": {
+      "types": "./dist/providers/pubnub/index.d.ts",
+      "default": "./dist/providers/pubnub/index.js"
     }
   },
   "files": [
@@ -46,6 +50,7 @@
     "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
     "dev:gun": "npx parcel serve test/gun/index.html --open --port 3005",
     "dev:trystero": "npx parcel serve test/trystero/index.html --open --port 3006",
+    "dev:pubnub": "npx parcel serve test/pubnub/index.html --open --port 3007",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc"
   },

@@ -2,7 +2,7 @@
  * GunDB Provider Test
  *
  * This demo shows decentralized peer-to-peer synchronization using GunDB.
- * Open this page in multiple browser tabs/windows to test collaboration.
+ * Configure connection settings and connect to start collaboration.
  */
 
 import * as Y from 'yjs'
@@ -24,9 +24,6 @@ registerMediaBlots()
 
 // Register QuillCursors module for collaborative cursors
 Quill.register('modules/cursors', QuillCursors)
-
-// Configuration
-const ROOM_NAME = 'gun-test333'
 
 // Update awareness user list
 function updateUserList(awareness: any) {
@@ -71,9 +68,20 @@ function videoHandler(this: any) {
   sharedVideoHandler.call(this, log)
 }
 
-// Initialize
-async function init() {
+// Initialize with user configuration
+async function initWithConfig(config: {
+  room: string
+  peers: string[]
+  debug: boolean
+  batchInterval: number
+  localStorage: boolean
+}) {
   log('🚀 Initializing GunDB test...', 'info')
+  log(`📋 Configuration: Room="${config.room}", Peers=${config.peers.length}, Debug=${config.debug}`, 'info')
+
+  // Update room badge
+  const roomBadge = document.getElementById('room-badge')!
+  roomBadge.textContent = `Room: ${config.room}`
 
   // Create Yjs document
   const doc = new Y.Doc()
@@ -82,17 +90,15 @@ async function init() {
   // Create Gun transport
   log('🔗 Creating Gun transport...', 'info')
 
-  // Note: You can add relay peers here for cross-device sync
-  // For now, we'll use local P2P only (same-device tabs)
   const transport = new GunTransport({
     gun: Gun,
-    peers: [
-      'https://gun.o8.is/gun',
-      'https://gun.defucc.me/gun',
-      'https://shogun-relay.scobrudot.dev/gun',
-      'https://relay.peer.ooo/gun',
-    ], // Add relay servers here: ['https://gun-relay.herokuapp.com/gun']
-    debug: true,
+    peers: config.peers,
+    debug: config.debug,
+    batchInterval: config.batchInterval,
+    gunOptions: {
+      localStorage: config.localStorage,
+      radisk: config.localStorage,
+    },
   })
 
   // Create provider
@@ -215,9 +221,9 @@ async function init() {
   updateUserList(provider.awareness)
 
   // Connect to room
-  log(`🌐 Connecting to GunDB room: ${ROOM_NAME}...`, 'info')
+  log(`🌐 Connecting to GunDB room: ${config.room}...`, 'info')
   try {
-    await provider.connect({ room: ROOM_NAME, batchInterval: 2000 })
+    await provider.connect({ room: config.room })
     log('✅ Successfully connected to GunDB!', 'success')
     log('💡 Tip: Open another tab to see real-time sync!', 'info')
   } catch (error) {
@@ -322,9 +328,72 @@ function setupPubSubChat(provider: GenericProvider) {
   log('💬 Pub/Sub chat ready!', 'success')
 }
 
+// Setup connect button handler
+function setupConnectionForm() {
+  const connectBtn = document.getElementById('connect-btn') as HTMLButtonElement
+  const configPanel = document.getElementById('config-panel')!
+  const mainContent = document.getElementById('main-content')!
+
+  const configRoom = document.getElementById('config-room') as HTMLInputElement
+  const configPeers = document.getElementById('config-peers') as HTMLTextAreaElement
+  const configBatchInterval = document.getElementById('config-batch-interval') as HTMLInputElement
+  const configDebug = document.getElementById('config-debug') as HTMLInputElement
+  const configLocalStorage = document.getElementById('config-localstorage') as HTMLInputElement
+
+  connectBtn.addEventListener('click', async () => {
+    // Validate room name
+    const room = configRoom.value.trim()
+    if (!room) {
+      alert('Please enter a room name')
+      configRoom.focus()
+      return
+    }
+
+    // Parse peers (one per line, filter empty lines)
+    const peersText = configPeers.value
+    const peers = peersText
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+
+    // Get other config
+    const batchInterval = parseInt(configBatchInterval.value) || 100
+    const debug = configDebug.checked
+    const localStorage = configLocalStorage.checked
+
+    // Disable button
+    connectBtn.disabled = true
+    connectBtn.textContent = '⏳ Connecting...'
+
+    try {
+      // Hide config panel, show main content
+      configPanel.classList.add('hidden')
+      mainContent.classList.remove('hidden')
+
+      // Initialize with config
+      await initWithConfig({
+        room,
+        peers,
+        debug,
+        batchInterval,
+        localStorage,
+      })
+    } catch (error) {
+      console.error('Connection failed:', error)
+      alert(`Failed to connect: ${error}`)
+      
+      // Show config panel again
+      configPanel.classList.remove('hidden')
+      mainContent.classList.add('hidden')
+      connectBtn.disabled = false
+      connectBtn.textContent = '🚀 Connect'
+    }
+  })
+}
+
 // Start when DOM is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', init)
+  document.addEventListener('DOMContentLoaded', setupConnectionForm)
 } else {
-  init()
+  setupConnectionForm()
 }

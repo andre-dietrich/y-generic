@@ -104,7 +104,7 @@ export class GunTransport implements Transport {
   private throttleTimeout?: ReturnType<typeof setTimeout>
   private pendingUpdates: Map<string, any> = new Map()
   private updateSlot: number = 0
-  private readonly BUFFER_SIZE = 50 // Circular buffer size
+  private readonly BUFFER_SIZE = 20 // Circular buffer size
 
   /**
    * Create a new Gun transport.
@@ -178,21 +178,58 @@ export class GunTransport implements Transport {
   private setupUpdateListener(): void {
     let lastProcessTime = 0
     const THROTTLE_MS = 300 // Process updates at most every 300ms
+    let hasLoadedInitial = false
 
-    // Listen to the 'updates' collection in the room
-    // Using throttled processing to prevent "1K+ records" warning
+    // Best Practice: Use .once() for initial load, then .on() only for new inserts
+    // This prevents Gun from continuously syncing 1K+ historical records
+
+    // Step 1: Load initial state once
+    this.roomNode.get('updates').once((allUpdates: any) => {
+      if (!allUpdates) {
+        hasLoadedInitial = true
+        this.log('📭 No existing updates found')
+        return
+      }
+
+      this.log('📥 Loading initial state...')
+
+      // Process all existing updates once
+      Object.keys(allUpdates).forEach((key) => {
+        if (key === '_') return // Skip Gun metadata
+
+        const update = allUpdates[key]
+        if (!update || !update.data) return
+
+        const sequence = update.sequence || Math.floor(update.timestamp / 100)
+        const updateKey = `${key}-${sequence}`
+
+        if (!this.processedUpdates.has(updateKey)) {
+          this.pendingUpdates.set(updateKey, update)
+        }
+      })
+
+      // Process initial batch
+      this.processPendingUpdates()
+      hasLoadedInitial = true
+      this.log('✅ Initial state loaded')
+    })
+
+    // Step 2: Listen only for NEW inserts (not historical data)
     this.updateListener = this.roomNode
       .get('updates')
       .map()
       .on((update: any, updateId: string) => {
+        // Skip until initial load is complete
+        if (!hasLoadedInitial) return
+
         if (!update || !update.data) return
 
-        // Skip updates from before we connected (avoid initial flood)
-        if (update.timestamp && update.timestamp < this.connectionTime - 5000) {
+        // Only process updates newer than our connection time
+        if (update.timestamp && update.timestamp < this.connectionTime) {
           return
         }
 
-        // Use sequence number for deduplication (more stable than timestamp)
+        // Use sequence number for deduplication
         const sequence = update.sequence || Math.floor(update.timestamp / 100)
         const updateKey = `${updateId}-${sequence}`
         if (this.processedUpdates.has(updateKey)) {
@@ -202,10 +239,9 @@ export class GunTransport implements Transport {
         // Store update for throttled processing
         this.pendingUpdates.set(updateKey, update)
 
-        // Throttle processing
+        // Throttle processing (batching)
         const now = Date.now()
         if (now - lastProcessTime < THROTTLE_MS) {
-          // Schedule processing if not already scheduled
           if (!this.throttleTimeout) {
             this.throttleTimeout = setTimeout(() => {
               this.processPendingUpdates()
@@ -221,7 +257,7 @@ export class GunTransport implements Transport {
         this.processPendingUpdates()
       })
 
-    this.log('👂 Listening for updates...')
+    this.log('👂 Listening for new updates...')
   }
 
   /**

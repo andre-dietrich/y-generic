@@ -281,10 +281,15 @@ export class GenericProvider extends Observable<string> {
       this._syncIntervalId = undefined
     }
 
-    // Clear any pending batched updates
+    // Flush any pending batched updates before disconnecting
     if (this._batchTimeoutId !== undefined) {
       clearTimeout(this._batchTimeoutId)
       this._batchTimeoutId = undefined
+
+      // Send pending update if transport is still connected
+      if (this._pendingUpdate && this.transport.isConnected) {
+        this._sendUpdate(this._pendingUpdate)
+      }
       this._pendingUpdate = null
     }
 
@@ -321,10 +326,15 @@ export class GenericProvider extends Observable<string> {
       this._syncIntervalId = undefined
     }
 
-    // Clear any pending batched updates
+    // Flush any pending batched updates before destroying
     if (this._batchTimeoutId !== undefined) {
       clearTimeout(this._batchTimeoutId)
       this._batchTimeoutId = undefined
+
+      // Send pending update if transport is still connected
+      if (this._pendingUpdate && this.transport.isConnected) {
+        this._sendUpdate(this._pendingUpdate)
+      }
       this._pendingUpdate = null
     }
 

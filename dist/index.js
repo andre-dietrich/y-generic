@@ -649,7 +649,7 @@ export class GenericProvider extends Observable {
             encoding.writeVarUint(encoder, MESSAGE_SYNC);
             syncProtocol.writeUpdate(encoder, update);
         }
-        this.transport.send(encoding.toUint8Array(encoder));
+        this._send(encoding.toUint8Array(encoder));
     }
     /**
      * Send awareness update to the transport.
@@ -658,7 +658,7 @@ export class GenericProvider extends Observable {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients));
-        this.transport.send(encoding.toUint8Array(encoder));
+        this._send(encoding.toUint8Array(encoder));
     }
     /**
      * Send a pub/sub message.
@@ -687,12 +687,6 @@ export class GenericProvider extends Observable {
             console.error('Error sending pub/sub message:', error);
         }
     }
-    /**
-     * Send ng.writeVarUint(encoder, MESSAGE_SYNC)
-      syncProtocol.writeUpdate(encoder, update)
-      this._send(encoding.toUint8Array(encoder))
-    }
-  
     /**
      * Broadcast awareness state for the specified clients.
      */
@@ -804,6 +798,22 @@ export class GenericProvider extends Observable {
     _setStatus(status) {
         this._status = status;
         this.emit('status', [status]);
+    }
+    /**
+     * TEST HELPER: Set local sequence number to a specific value.
+     * Used for testing sequence number overflow scenarios.
+     * @internal
+     */
+    _testSetSequenceNumber(seqNum) {
+        this._localSeqNum = seqNum;
+        console.warn(`[GenericProvider TEST] Sequence number set to ${seqNum} (MAX_SAFE_INTEGER: ${Number.MAX_SAFE_INTEGER})`);
+    }
+    /**
+     * TEST HELPER: Get current local sequence number.
+     * @internal
+     */
+    _testGetSequenceNumber() {
+        return this._localSeqNum;
     }
 }
 //# sourceMappingURL=index.js.map

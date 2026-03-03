@@ -327,9 +327,9 @@
           <button
             id="test-sequence-overflow"
             style="background: #ff5722; color: white; font-size: 12px"
-            title="Tests sequence number overflow handling"
+            title="Sets sequence number to MAX_SAFE_INTEGER-10 and triggers overflow. Takes ~285 years in real usage at 1000 msg/sec."
           >
-            🔢 Test Sequence Overflow
+            🔢 Test Sequence Overflow (9 Quadrillion)
           </button>
           <button
             id="test-merge-failure"
@@ -517,17 +517,34 @@
           </li>
           <li>
             <strong>💥 Enable data corruption</strong> - Use the "Data
-            Corruption" slider to corrupt network packets and test
-            Y.mergeUpdates error handling! Choose corruption type: Bit Flip
+            Corruption" slider to corrupt network packets and test message
+            integrity verification! Choose corruption type: Bit Flip
             (realistic), Truncate (incomplete), Garbage (worst case), or Insert
-            (protocol errors). Watch the provider gracefully handle corrupted
-            data.
+            (protocol errors). All messages are protected with CRC32 checksums -
+            corrupted messages are rejected immediately before decoding. Watch
+            console for "CRC32 checksum mismatch" warnings and automatic
+            re-sync!
           </li>
           <li>
             <strong>🧪 Run edge case tests</strong> - Click the red test buttons
-            to simulate specific sync failure scenarios (batch lost on
-            disconnect, sequence overflow, merge failures). Watch the activity
-            log for detailed results!
+            to simulate specific sync failure scenarios:
+            <ul style="margin-top: 5px; margin-left: 20px">
+              <li>
+                <strong>📦 Batch Lost</strong> - Disconnects while updates are
+                pending in batch buffer (tests flush-before-disconnect)
+              </li>
+              <li>
+                <strong>🔢 Sequence Overflow</strong> - Sets sequence number to
+                9,007,199,254,740,981 (near MAX_SAFE_INTEGER) to test overflow
+                handling. In real usage at 1000 msg/sec, this takes ~285 years!
+              </li>
+              <li>
+                <strong>💥 Merge Failure</strong> - Simulates Y.mergeUpdates
+                throwing an error during batch processing
+              </li>
+            </ul>
+            Watch the activity log for detailed test results and
+            recommendations!
           </li>
           <li>
             <strong>Important:</strong> BroadcastChannel is disabled to ensure

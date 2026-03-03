@@ -182,8 +182,12 @@ export class Dummy implements Transport {
           actualDelay = minDelay + Math.random() * (maxDelay - minDelay)
         }
 
-        // Apply data corruption if enabled
-        let dataToSend = data
+        // CRITICAL: Always copy data to avoid reference issues with async delivery
+        // Without copying, if sender modifies array before setTimeout fires,
+        // receiver gets corrupted data even at 0% corruption rate
+        let dataToSend = new Uint8Array(data)
+
+        // Apply data corruption if enabled (corrupts the copy)
         if (
           dataCorruptionRate > 0 &&
           Math.random() * 100 < dataCorruptionRate
@@ -191,7 +195,7 @@ export class Dummy implements Transport {
           console.warn(
             `[Dummy ${this.id}] 💥 CORRUPTING data (type: ${corruptionType})`,
           )
-          dataToSend = corruptData(data, corruptionType)
+          dataToSend = corruptData(dataToSend, corruptionType)
         }
 
         setTimeout(() => {
@@ -1049,59 +1053,79 @@ function testSequenceNumberOverflow(client: TestClient): void {
   log('🧪 TEST #2: Sequence Number Overflow')
   log('──────────────────────────────────────────────')
 
-  // Access private field (TypeScript hack for testing)
+  // Use the new test helper method
   const provider = client.provider as any
 
-  if (!provider._localSeqNum) {
+  if (!provider._testGetSequenceNumber) {
     log(
-      '⚠️ Cannot access _localSeqNum - provider may not have verifyUpdates enabled',
+      '⚠️ Provider does not have test helpers - verifyUpdates may be disabled',
     )
     return
   }
 
-  const currentSeq = provider._localSeqNum
-  log(`1️⃣ Current sequence number: ${currentSeq}`)
+  const currentSeq = provider._testGetSequenceNumber()
+  log(`1️⃣ Current sequence number: ${currentSeq.toLocaleString()}`)
 
-  // Set to near MAX_SAFE_INTEGER
+  // Set to near MAX_SAFE_INTEGER to trigger overflow quickly
   const testSeq = Number.MAX_SAFE_INTEGER - 10
-  provider._localSeqNum = testSeq
-  log(`2️⃣ Set sequence to near overflow: ${testSeq.toLocaleString()}`)
+  provider._testSetSequenceNumber(testSeq)
+  log(`2️⃣ Set sequence to: ${testSeq.toLocaleString()}`)
   log(`   (MAX_SAFE_INTEGER = ${Number.MAX_SAFE_INTEGER.toLocaleString()})`)
+  log(
+    `   (This simulates ~9 quadrillion messages - would take centuries at 1000 msg/sec)`,
+  )
 
   log('3️⃣ Making 15 changes to trigger overflow...')
+  log('   Watch console for "Duplicate or out-of-order" warnings')
 
   // Make changes that will increment past MAX_SAFE_INTEGER
   for (let i = 0; i < 15; i++) {
     client.ytext.insert(0, `[${i}]`)
-    const newSeq = provider._localSeqNum
+    const newSeq = provider._testGetSequenceNumber()
 
     // Check if we crossed the threshold
     if (i === 10) {
       log(`   After change ${i + 1}: seqNum = ${newSeq.toLocaleString()}`)
       if (newSeq > Number.MAX_SAFE_INTEGER) {
         log(`   🔴 OVERFLOW! Sequence exceeded MAX_SAFE_INTEGER`)
-        log(`   Sequence numbers are now unreliable!`)
+        log(`   JavaScript can no longer represent this integer safely!`)
       }
     }
   }
 
-  const finalSeq = provider._localSeqNum
+  const finalSeq = provider._testGetSequenceNumber()
   log(`4️⃣ Final sequence number: ${finalSeq.toLocaleString()}`)
 
   if (finalSeq > Number.MAX_SAFE_INTEGER) {
     log('❌ CONFIRMED: Sequence overflow occurred!')
-    log('   Bug location: index.ts line 157, 710')
-    log('   No wraparound or BigInt handling')
-    log('   Ordering and duplicate detection may fail')
+    log('📍 Affected code: _localSeqNum++ in _sendUpdate()')
+    log('⚠️ Consequences:')
+    log('   - Sequence numbers lose precision (start rounding)')
+    log('   - Duplicate detection may fail')
+    log('   - Out-of-order detection unreliable')
+    log('   - Sequence gaps appear incorrectly')
+    log('')
+    log('💡 Solutions:')
+    log('   1. Use BigInt for sequence numbers (breaking change)')
+    log('   2. Implement wraparound with modulo (2^32 or 2^53)')
+    log('   3. Reset counter periodically (requires coordination)')
+    log('   4. Accept it (overflow takes ~285 years at 1000 msg/sec)')
   } else {
     log('⚠️ Did not overflow in this test (needed more changes)')
   }
 
   log('──────────────────────────────────────────────')
-  log('💡 TIP: To see the real impact, watch for:')
-  log('   - "Duplicate or out-of-order" warnings')
-  log('   - Sequence gap warnings')
-  log('   - Failed duplicate detection')
+  log('🔍 To observe real impact:')
+  log('   1. Open browser DevTools Console')
+  log('   2. Run test again and make edits on BOTH clients')
+  log('   3. Look for warnings about duplicate/out-of-order messages')
+  log('   4. Sequence comparison will fail when numbers lose precision')
+  log('')
+  log('📊 Real-world relevance:')
+  log('   At 1000 messages/second:')
+  log('   - Takes ~285 years to reach MAX_SAFE_INTEGER')
+  log('   - In practice, this is a non-issue for most applications')
+  log('   - Long-running servers might need BigInt after decades')
 }
 
 /**

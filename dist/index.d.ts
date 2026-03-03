@@ -222,12 +222,6 @@ export declare class GenericProvider extends Observable<string> {
      */
     _sendPubSub(topic: string, message: any): void;
     /**
-     * Send ng.writeVarUint(encoder, MESSAGE_SYNC)
-      syncProtocol.writeUpdate(encoder, update)
-      this._send(encoding.toUint8Array(encoder))
-    }
-  
-    /**
      * Broadcast awareness state for the specified clients.
      */
     private _broadcastAwareness;
@@ -250,5 +244,16 @@ export declare class GenericProvider extends Observable<string> {
      * Update connection status and emit event.
      */
     private _setStatus;
+    /**
+     * TEST HELPER: Set local sequence number to a specific value.
+     * Used for testing sequence number overflow scenarios.
+     * @internal
+     */
+    _testSetSequenceNumber(seqNum: number): void;
+    /**
+     * TEST HELPER: Get current local sequence number.
+     * @internal
+     */
+    _testGetSequenceNumber(): number;
 }
 //# sourceMappingURL=index.d.ts.map

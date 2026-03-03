@@ -185,7 +185,7 @@ export class Dummy implements Transport {
         // CRITICAL: Always copy data to avoid reference issues with async delivery
         // Without copying, if sender modifies array before setTimeout fires,
         // receiver gets corrupted data even at 0% corruption rate
-        let dataToSend = new Uint8Array(data)
+        let dataToSend: Uint8Array = new Uint8Array(data)
 
         // Apply data corruption if enabled (corrupts the copy)
         if (
@@ -195,7 +195,7 @@ export class Dummy implements Transport {
           console.warn(
             `[Dummy ${this.id}] 💥 CORRUPTING data (type: ${corruptionType})`,
           )
-          dataToSend = corruptData(dataToSend, corruptionType)
+          dataToSend = corruptData(dataToSend, corruptionType) as Uint8Array
         }
 
         setTimeout(() => {
@@ -410,7 +410,7 @@ class TestClient {
       
       <div class="awareness" style="margin-top: 10px; padding: 10px; background: white; border-radius: 4px; font-size: 12px;">
         <strong>Users Online:</strong>
-        <div class="awareness-list"></div>
+        <div class="awareness-list" style="max-height: 110px; overflow-y: auto; margin-top: 5px;"></div>
       </div>
       
       <div class="pubsub-section" style="margin-top: 10px;">
@@ -674,16 +674,19 @@ class TestClient {
   private updateAwarenessDisplay(): void {
     const states = this.provider.awareness.getStates()
     const users: string[] = []
+    let userNumber = 1
 
     states.forEach((state: any, clientId: number) => {
       if (state.user) {
         const isSelf = clientId === this.doc.clientID
         users.push(`
           <div style="margin: 5px 0; padding: 5px; background: ${state.user.color}22; border-left: 3px solid ${state.user.color}; border-radius: 3px;">
+            <span style="display: inline-block; width: 25px; font-weight: bold; color: #666;">${userNumber}.</span>
             <strong>${state.user.name}</strong> ${isSelf ? '(you)' : ''}
             <span style="font-size: 10px; color: #666;"> - ID: ${clientId}</span>
           </div>
         `)
+        userNumber++
       }
     })
 

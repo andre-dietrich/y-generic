@@ -313,6 +313,21 @@ export class GenericProvider extends Observable<string> {
       throw new Error('Provider is being destroyed')
     }
 
+    // Prevent double connect race condition
+    if (this._status.state === 'connected') {
+      console.warn(
+        '[GenericProvider] Already connected, ignoring connect() call',
+      )
+      return
+    }
+
+    if (this._status.state === 'connecting') {
+      console.warn(
+        '[GenericProvider] Connection already in progress, ignoring connect() call',
+      )
+      return
+    }
+
     this._setStatus({ state: 'connecting' })
 
     try {

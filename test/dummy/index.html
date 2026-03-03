@@ -338,6 +338,13 @@
           >
             💥 Test Merge Updates Failure
           </button>
+          <button
+            id="test-rapid-connect"
+            style="background: #ff5722; color: white; font-size: 12px"
+            title="Calls connect() 3 times simultaneously to test race condition protection"
+          >
+            🔄 Test Rapid Connect Race
+          </button>
         </div>
 
         <div
@@ -541,6 +548,11 @@
               <li>
                 <strong>💥 Merge Failure</strong> - Simulates Y.mergeUpdates
                 throwing an error during batch processing
+              </li>
+              <li>
+                <strong>🔄 Rapid Connect</strong> - Calls connect() 3 times
+                simultaneously to test race condition protection (prevents
+                duplicate message handlers and memory leaks)
               </li>
             </ul>
             Watch the activity log for detailed test results and

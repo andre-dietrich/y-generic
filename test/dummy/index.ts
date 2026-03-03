@@ -755,6 +755,7 @@ async function init() {
     'test-sequence-overflow',
   )!
   const testMergeFailureBtn = document.getElementById('test-merge-failure')!
+  const testRapidConnectBtn = document.getElementById('test-rapid-connect')!
 
   testBatchDisconnectBtn.addEventListener('click', async () => {
     if (clients.length === 0) {
@@ -778,6 +779,10 @@ async function init() {
       return
     }
     testMergeUpdatesFailure(clients[0])
+  })
+
+  testRapidConnectBtn.addEventListener('click', async () => {
+    await testRapidConnect()
   })
 
   // Network toggle button
@@ -1234,6 +1239,91 @@ function testMergeUpdatesFailure(client: TestClient): void {
 
     log('──────────────────────────────────────────────')
   }, 150) // Wait longer than batch delay
+}
+
+/**
+ * Edge Case Test #4: Rapid Connect Race Condition
+ *
+ * This tests what happens when connect() is called multiple times simultaneously.
+ * Without proper guards, this can cause:
+ * - Multiple message handlers registered (memory leak + duplicate processing)
+ * - Multiple sync intervals started (only last one tracked, others leak)
+ * - Multiple BroadcastChannels created
+ * - Network spam from multiple periodic syncs
+ *
+ * Expected behavior: Second and third calls should be ignored with warning
+ * Actual behavior: With fix, warnings logged and subsequent calls ignored
+ */
+async function testRapidConnect(): Promise<void> {
+  log('🧪 TEST #4: Rapid Connect Race Condition')
+  log('──────────────────────────────────────────────')
+  log('1️⃣ Creating a test client...')
+
+  const testContainer = document.createElement('div')
+  testContainer.style.display = 'none' // Hidden test client
+  const testClient = new TestClient('RapidTest', '#cccccc', testContainer)
+
+  // Disconnect if already connected
+  if (testClient.transport.isConnected) {
+    testClient.disconnect()
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+
+  log('2️⃣ Calling connect() THREE times simultaneously...')
+  log('   (Simulating double-click or race condition in app code)')
+
+  // Track console warnings
+  let warningCount = 0
+  const originalWarn = console.warn
+  console.warn = function (...args: any[]) {
+    if (
+      args[0]?.includes?.('Already connected') ||
+      args[0]?.includes?.('Connection already in progress')
+    ) {
+      warningCount++
+    }
+    originalWarn.apply(console, args)
+  }
+
+  // Call connect() three times simultaneously (no await between calls)
+  const promise1 = testClient.connect()
+  const promise2 = testClient.connect()
+  const promise3 = testClient.connect()
+
+  // Wait for all to complete
+  await Promise.allSettled([promise1, promise2, promise3])
+
+  // Restore console.warn
+  console.warn = originalWarn
+
+  log(`3️⃣ Connect attempts completed`)
+  log(`   Warnings logged: ${warningCount}`)
+
+  if (warningCount >= 2) {
+    log('✅ SUCCESS: Duplicate connect() calls were detected and ignored!')
+    log('   Expected 2 warnings, got ' + warningCount)
+    log('')
+    log('🔍 WHAT WAS PREVENTED:')
+    log('   ✅ Multiple message handlers (would cause duplicate processing)')
+    log('   ✅ Multiple sync intervals (would cause memory leak + spam)')
+    log('   ✅ Multiple BroadcastChannels (would waste resources)')
+    log('   ✅ Network spam from redundant periodic syncs')
+    log('')
+    log('📍 Fix location: src/index.ts connect() method')
+    log('   Guard checks: state === "connected" || state === "connecting"')
+  } else {
+    log('❌ WARNING: Not enough guards detected!')
+    log('   Expected 2+ warnings for duplicate connect() calls')
+    log('   This could indicate race condition protection is missing')
+  }
+
+  // Cleanup
+  setTimeout(() => {
+    testClient.disconnect()
+    log('4️⃣ Test client cleaned up')
+  }, 100)
+
+  log('──────────────────────────────────────────────')
 }
 
 function log(message: string): void {

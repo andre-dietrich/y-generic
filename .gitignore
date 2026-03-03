@@ -2,3 +2,4 @@ node_modules/
 version/
 .parcel-cache/
 demos/
+examples/

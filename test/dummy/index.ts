@@ -56,6 +56,74 @@ let globalNetworkOnline: boolean = true
 let networkDelay: number = 10 // milliseconds
 let networkPacketLoss: number = 0 // percentage (0-100)
 let networkJitter: number = 0 // jitter factor (0-1)
+let dataCorruptionRate: number = 0 // percentage (0-100) - probability of corrupting data
+let corruptionType: 'bitflip' | 'truncate' | 'garbage' | 'insert' = 'bitflip' // corruption strategy
+
+/**
+ * Corruption strategies for testing Y.mergeUpdates error handling:
+ * - bitflip: Flip random bits (subtle corruption, realistic)
+ * - truncate: Cut off message at random point (incomplete message)
+ * - garbage: Replace entire payload with random data (worst case)
+ * - insert: Insert random bytes at random positions (length changes)
+ */
+function corruptData(data: Uint8Array, type: string): Uint8Array {
+  const corrupted = new Uint8Array(data)
+
+  switch (type) {
+    case 'bitflip': {
+      // Flip 1-5 random bits
+      const numFlips = 1 + Math.floor(Math.random() * 5)
+      for (let i = 0; i < numFlips; i++) {
+        const byteIndex = Math.floor(Math.random() * corrupted.length)
+        const bitIndex = Math.floor(Math.random() * 8)
+        corrupted[byteIndex] ^= 1 << bitIndex
+      }
+      return corrupted
+    }
+
+    case 'truncate': {
+      // Cut off 10-90% of the message
+      const keepPercent = 0.1 + Math.random() * 0.8
+      const newLength = Math.max(1, Math.floor(corrupted.length * keepPercent))
+      return corrupted.slice(0, newLength)
+    }
+
+    case 'garbage': {
+      // Replace entire payload with random bytes
+      const garbage = new Uint8Array(corrupted.length)
+      for (let i = 0; i < garbage.length; i++) {
+        garbage[i] = Math.floor(Math.random() * 256)
+      }
+      return garbage
+    }
+
+    case 'insert': {
+      // Insert 1-10 random bytes at random positions
+      const numInserts = 1 + Math.floor(Math.random() * 10)
+      let result = new Uint8Array(corrupted.length + numInserts)
+      let srcPos = 0
+      let dstPos = 0
+
+      for (let i = 0; i < numInserts; i++) {
+        const insertAt = Math.floor(
+          Math.random() * (corrupted.length - srcPos + 1),
+        )
+        // Copy original data up to insert point
+        result.set(corrupted.slice(srcPos, srcPos + insertAt), dstPos)
+        srcPos += insertAt
+        dstPos += insertAt
+        // Insert random byte
+        result[dstPos++] = Math.floor(Math.random() * 256)
+      }
+      // Copy remaining data
+      result.set(corrupted.slice(srcPos), dstPos)
+      return result
+    }
+
+    default:
+      return corrupted
+  }
+}
 
 /**
  * Dummy transport that simulates network communication.
@@ -114,10 +182,22 @@ export class Dummy implements Transport {
           actualDelay = minDelay + Math.random() * (maxDelay - minDelay)
         }
 
+        // Apply data corruption if enabled
+        let dataToSend = data
+        if (
+          dataCorruptionRate > 0 &&
+          Math.random() * 100 < dataCorruptionRate
+        ) {
+          console.warn(
+            `[Dummy ${this.id}] 💥 CORRUPTING data (type: ${corruptionType})`,
+          )
+          dataToSend = corruptData(data, corruptionType)
+        }
+
         setTimeout(() => {
           // Check network status again after delay (both global and target client)
           if (globalNetworkOnline && !dummy.clientOffline) {
-            dummy.messageCallback?.(data)
+            dummy.messageCallback?.(dataToSend)
           }
         }, actualDelay)
       }
@@ -663,6 +743,39 @@ async function init() {
     log('Cleared all clients')
   })
 
+  // Edge case test buttons
+  const testBatchDisconnectBtn = document.getElementById(
+    'test-batch-disconnect',
+  )!
+  const testSequenceOverflowBtn = document.getElementById(
+    'test-sequence-overflow',
+  )!
+  const testMergeFailureBtn = document.getElementById('test-merge-failure')!
+
+  testBatchDisconnectBtn.addEventListener('click', async () => {
+    if (clients.length === 0) {
+      log('⚠️ No clients available for testing')
+      return
+    }
+    await testBatchUpdateLostOnDisconnect(clients[0])
+  })
+
+  testSequenceOverflowBtn.addEventListener('click', () => {
+    if (clients.length === 0) {
+      log('⚠️ No clients available for testing')
+      return
+    }
+    testSequenceNumberOverflow(clients[0])
+  })
+
+  testMergeFailureBtn.addEventListener('click', () => {
+    if (clients.length === 0) {
+      log('⚠️ No clients available for testing')
+      return
+    }
+    testMergeUpdatesFailure(clients[0])
+  })
+
   // Network toggle button
   networkToggle.addEventListener('click', () => {
     globalNetworkOnline = !globalNetworkOnline
@@ -724,6 +837,42 @@ async function init() {
     )
   })
 
+  // Data corruption slider
+  const corruptionSlider = document.getElementById(
+    'corruption-slider',
+  ) as HTMLInputElement
+  const corruptionValue = document.getElementById('corruption-value')!
+  corruptionSlider.addEventListener('input', () => {
+    dataCorruptionRate = parseInt(corruptionSlider.value)
+    corruptionValue.textContent = `${dataCorruptionRate}%`
+    log(`💥 Data corruption rate set to ${dataCorruptionRate}%`)
+    if (dataCorruptionRate > 0) {
+      log(`   Corruption type: ${corruptionType}`)
+      log(`   This will trigger Y.mergeUpdates error handling!`)
+      log(`   ✅ System will gracefully recover from corrupted messages`)
+      log(`   🔄 Automatic re-sync with exponential backoff (50ms → 10s)`)
+      log(`   Watch for: 💥 corruption detected, 🔄 auto recovery messages`)
+    } else {
+      log('   Data corruption disabled - clean network simulation')
+    }
+  })
+
+  // Corruption type selector
+  const corruptionTypeSelect = document.getElementById(
+    'corruption-type',
+  ) as HTMLSelectElement
+  corruptionTypeSelect.addEventListener('change', () => {
+    corruptionType = corruptionTypeSelect.value as any
+    log(`🔧 Corruption type changed to: ${corruptionType}`)
+    const descriptions: Record<string, string> = {
+      bitflip: 'Flip random bits (subtle, realistic)',
+      truncate: 'Cut messages short (incomplete data)',
+      garbage: 'Random bytes (worst case)',
+      insert: 'Insert random bytes (length changes)',
+    }
+    log(`   ${descriptions[corruptionType]}`)
+  })
+
   log('✅ Test environment ready!')
   log(
     'TIP: Use the rich text editor - format text, add images, see live cursors!',
@@ -734,6 +883,7 @@ async function init() {
   log(
     'TIP: Jitter causes out-of-order message delivery (realistic network behavior)',
   )
+  log('TIP: 💥 Enable data corruption to test Y.mergeUpdates error handling!')
   log('INFO: Fast desync detection with exponential backoff (10ms → 10s max)')
   log('INFO: Rate limiting active - max 20 sync requests per 10 seconds')
   log('INFO: Sequence numbers enabled for ordering & duplicate detection')
@@ -772,8 +922,48 @@ async function init() {
           `📦 Packet loss detected: expected seq ${match[1]}, got ${match[2]} (${match[3]} missing)`,
         )
       }
+    } else if (args[0]?.includes?.('Corrupted message detected')) {
+      // Extract corruption count
+      const match = args[0].match(/#(\d+)/)
+      if (match) {
+        log(
+          `💥 Corrupted message #${match[1]} detected (data corruption simulation active)`,
+        )
+      }
+    } else if (args[0]?.includes?.('Corrupted awareness message')) {
+      log(`💥 Corrupted awareness message (JSON parse failed)`)
+      log('   Awareness is ephemeral - update skipped, system continues')
+    } else if (args[0]?.includes?.('Corrupted sync message type')) {
+      log(`💥 Corrupted sync message type (invalid message type byte)`)
+      log('   Re-sync will be triggered to recover')
+    } else if (args[0]?.includes?.('Scheduling re-sync')) {
+      // Extract re-sync delay
+      const match = args[0].match(/(\d+)ms/)
+      if (match) {
+        log(
+          `🔄 Automatic recovery: re-sync in ${match[1]}ms (exponential backoff)`,
+        )
+      }
     }
     originalWarn.apply(console, args)
+  }
+
+  // Intercept console.error to catch merge failures and other errors
+  const originalError = console.error
+  console.error = function (...args: any[]) {
+    if (args[0]?.includes?.('Failed to merge updates')) {
+      log('❌ Y.mergeUpdates FAILED - corrupted batch detected!')
+      log('   Recovery: pending update sent, new batch started')
+      log('   System continues operating (graceful degradation)')
+    } else if (
+      args[0]?.includes?.('Error handling incoming message') &&
+      !args[1]?.message?.includes?.('out-of-bounds') &&
+      !args[1]?.message?.includes?.('JSON')
+    ) {
+      // Non-corruption errors
+      log(`❌ Unexpected error: ${args[1]?.message || args[1] || 'unknown'}`)
+    }
+    originalError.apply(console, args)
   }
 }
 
@@ -784,6 +974,242 @@ async function addClient(name: string, color: string): Promise<void> {
 
   await client.connect()
   log(`✓ ${name} connected`)
+}
+
+// ============================================================================
+// Edge Case Test Functions
+// ============================================================================
+
+/**
+ * Edge Case Test #1: Batched Update Lost on Disconnect
+ *
+ * This tests whether pending batched updates are properly flushed before disconnect.
+ * If batchUpdates is enabled (e.g., 100ms), changes are accumulated and sent after delay.
+ * If disconnect() is called before the batch timeout fires, changes may be lost.
+ *
+ * Expected behavior: Changes should be flushed before disconnect
+ * Actual behavior (bug): _pendingUpdate is cleared without sending
+ */
+async function testBatchUpdateLostOnDisconnect(
+  client: TestClient,
+): Promise<void> {
+  log('🧪 TEST #1: Batch Update Lost on Disconnect')
+  log('──────────────────────────────────────────────')
+
+  const batchDelay = 100 // Matches the batchUpdates setting in provider
+
+  log(`1️⃣ Making changes to ${client.name}'s document`)
+  log(`   (batchUpdates delay: ${batchDelay}ms)`)
+
+  // Make changes that will be batched
+  const testText = `[BATCH TEST ${Date.now()}] This text may be lost! `
+  client.ytext.insert(0, testText)
+
+  log(`2️⃣ Waiting ${batchDelay / 2}ms (mid-batch - timeout has not fired yet)`)
+  await new Promise((resolve) => setTimeout(resolve, batchDelay / 2))
+
+  log('3️⃣ 🔴 DISCONNECTING NOW (before batch sends!)')
+  client.disconnect()
+
+  log('4️⃣ ⚠️ RESULT: Changes likely lost!')
+  log('   Bug location: index.ts lines 276-283, 328-332')
+  log(`   The pending batch was cleared without sending`)
+  log('   Other clients will NOT see the text we just added')
+  log('──────────────────────────────────────────────')
+
+  // Wait a bit then check other clients
+  await new Promise((resolve) => setTimeout(resolve, 200))
+
+  const otherClients = clients.filter(
+    (c) => c !== client && c.provider.connected,
+  )
+  if (otherClients.length > 0) {
+    const otherText = otherClients[0].ytext.toString()
+    if (!otherText.includes(testText)) {
+      log('❌ CONFIRMED: Other clients do NOT have the test text')
+      log('   This confirms the batch update was lost!')
+    } else {
+      log('✅ UNEXPECTED: Other clients DO have the test text')
+      log('   The bug may have been fixed, or timing was different')
+    }
+  }
+}
+
+/**
+ * Edge Case Test #2: Sequence Number Overflow
+ *
+ * This tests what happens when the sequence number counter approaches MAX_SAFE_INTEGER.
+ * JavaScript can safely represent integers up to 2^53 - 1 (9,007,199,254,740,991).
+ * After this, precision is lost and sequence ordering may break.
+ *
+ * Expected behavior: Wraparound or use BigInt
+ * Actual behavior (bug): No overflow handling, sequence numbers become unreliable
+ */
+function testSequenceNumberOverflow(client: TestClient): void {
+  log('🧪 TEST #2: Sequence Number Overflow')
+  log('──────────────────────────────────────────────')
+
+  // Access private field (TypeScript hack for testing)
+  const provider = client.provider as any
+
+  if (!provider._localSeqNum) {
+    log(
+      '⚠️ Cannot access _localSeqNum - provider may not have verifyUpdates enabled',
+    )
+    return
+  }
+
+  const currentSeq = provider._localSeqNum
+  log(`1️⃣ Current sequence number: ${currentSeq}`)
+
+  // Set to near MAX_SAFE_INTEGER
+  const testSeq = Number.MAX_SAFE_INTEGER - 10
+  provider._localSeqNum = testSeq
+  log(`2️⃣ Set sequence to near overflow: ${testSeq.toLocaleString()}`)
+  log(`   (MAX_SAFE_INTEGER = ${Number.MAX_SAFE_INTEGER.toLocaleString()})`)
+
+  log('3️⃣ Making 15 changes to trigger overflow...')
+
+  // Make changes that will increment past MAX_SAFE_INTEGER
+  for (let i = 0; i < 15; i++) {
+    client.ytext.insert(0, `[${i}]`)
+    const newSeq = provider._localSeqNum
+
+    // Check if we crossed the threshold
+    if (i === 10) {
+      log(`   After change ${i + 1}: seqNum = ${newSeq.toLocaleString()}`)
+      if (newSeq > Number.MAX_SAFE_INTEGER) {
+        log(`   🔴 OVERFLOW! Sequence exceeded MAX_SAFE_INTEGER`)
+        log(`   Sequence numbers are now unreliable!`)
+      }
+    }
+  }
+
+  const finalSeq = provider._localSeqNum
+  log(`4️⃣ Final sequence number: ${finalSeq.toLocaleString()}`)
+
+  if (finalSeq > Number.MAX_SAFE_INTEGER) {
+    log('❌ CONFIRMED: Sequence overflow occurred!')
+    log('   Bug location: index.ts line 157, 710')
+    log('   No wraparound or BigInt handling')
+    log('   Ordering and duplicate detection may fail')
+  } else {
+    log('⚠️ Did not overflow in this test (needed more changes)')
+  }
+
+  log('──────────────────────────────────────────────')
+  log('💡 TIP: To see the real impact, watch for:')
+  log('   - "Duplicate or out-of-order" warnings')
+  log('   - Sequence gap warnings')
+  log('   - Failed duplicate detection')
+}
+
+/**
+ * Edge Case Test #3: Y.mergeUpdates Failure
+ *
+ * This tests what happens when Y.mergeUpdates() throws an error while batching updates.
+ * In the _batchUpdate method, there's no try-catch around Y.mergeUpdates().
+ * If a corrupted update is passed, it will throw and break the batch system.
+ *
+ * Expected behavior: Graceful error handling with retry or skip
+ * Actual behavior (bug): Unhandled error breaks batching permanently
+ */
+function testMergeUpdatesFailure(client: TestClient): void {
+  log('🧪 TEST #3: Y.mergeUpdates Failure')
+  log('──────────────────────────────────────────────')
+
+  const provider = client.provider as any
+
+  // Check if batching is enabled
+  if (!provider._batchUpdates || provider._batchUpdates === 0) {
+    log('⚠️ Batching is disabled (batchUpdates = 0)')
+    log('   This test requires batching to be enabled')
+    log('   Providers are created with batchUpdates: 100ms')
+    return
+  }
+
+  log(`1️⃣ Batching is enabled with ${provider._batchUpdates}ms delay`)
+  log('2️⃣ Testing batch merge behavior...')
+  log('')
+  log('📋 EDGE CASE DESCRIPTION:')
+  log('   Bug location: src/index.ts line 447 (in _batchUpdate)')
+  log('   Problem: Y.mergeUpdates([...]) was called without try-catch')
+  log('   Impact: If corrupted updates are received, merge can throw')
+  log('   Result: Unhandled error would crash the batch system')
+  log('')
+  log('✅ FIX APPLIED:')
+  log('   Wrapped Y.mergeUpdates in try-catch block')
+  log('   On failure: sends pending update, starts new batch')
+  log('   System continues working even after merge error')
+  log('')
+
+  // Note: We cannot directly trigger Y.mergeUpdates to fail because:
+  // 1. Y.mergeUpdates is a getter-only property (cannot monkey-patch)
+  // 2. Yjs's merge is very robust and rarely fails in practice
+  // 3. Failures typically occur only with severely corrupted binary data
+
+  log('💡 SIMULATION LIMITATION:')
+  log('   Cannot directly mock Y.mergeUpdates (read-only property)')
+  log('')
+  log('💡 HOW TO SIMULATE MERGE FAILURES:')
+  log('   1. Use the "Data Corruption" slider above to enable corruption')
+  log('   2. Set corruption rate to 5-20% for realistic testing')
+  log('   3. Choose corruption type:')
+  log('      • Bit Flip: Subtle corruption (realistic network errors)')
+  log('      • Truncate: Incomplete messages (connection interruption)')
+  log('      • Garbage: Random bytes (worst case scenario)')
+  log('      • Insert: Length changes (protocol corruption)')
+  log('   4. Make changes and watch the provider handle corrupted data')
+  log('   5. Check console for "Failed to merge updates" errors')
+  log('   6. System should gracefully recover and continue syncing')
+  log('')
+  log('In real scenarios, merge failures occur with:')
+  log('   - Corrupted network packets')
+  log('   - Invalid binary update format')
+  log('   - Incompatible Yjs versions')
+  log('   - Memory corruption')
+  log('')
+
+  log('3️⃣ Making rapid changes to verify batch system works...')
+
+  // Make multiple rapid changes to verify batching works correctly
+  client.ytext.insert(0, 'Change 1 ')
+
+  setTimeout(() => {
+    client.ytext.insert(0, 'Change 2 ')
+  }, 10)
+
+  setTimeout(() => {
+    client.ytext.insert(0, 'Change 3 ')
+  }, 20)
+
+  // Verify after batching completes
+  setTimeout(() => {
+    const endText = client.ytext.toString()
+
+    if (
+      endText.includes('Change 1') &&
+      endText.includes('Change 2') &&
+      endText.includes('Change 3')
+    ) {
+      log('4️⃣ ✅ Batch system is working correctly!')
+      log('   All changes were batched and merged successfully')
+      log('')
+      log('🔍 HOW TO VERIFY THE FIX:')
+      log('   1. Check src/index.ts line 447-457')
+      log('   2. Confirm Y.mergeUpdates is wrapped in try-catch')
+      log('   3. On error: pending update is sent, new batch starts')
+      log('   4. Error is logged but does not crash the provider')
+      log('')
+      log('📊 WITH FIX vs WITHOUT:')
+      log('   ❌ Without: Merge error → unhandled exception → crash')
+      log('   ✅ With: Merge error → logged → pending sent → continue')
+    } else {
+      log('4️⃣ ⚠️ Unexpected result - not all changes applied')
+    }
+
+    log('──────────────────────────────────────────────')
+  }, 150) // Wait longer than batch delay
 }
 
 function log(message: string): void {

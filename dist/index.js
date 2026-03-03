@@ -11,6 +11,72 @@ const MESSAGE_AWARENESS = 1;
 const MESSAGE_PUBSUB = 2;
 const MESSAGE_SYNC_VERIFIED = 3; // Sync message with hash verification
 /**
+ * CRC32 lookup table for fast computation.
+ * Generated once and reused for all CRC calculations.
+ */
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let crc = i;
+        for (let j = 0; j < 8; j++) {
+            crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+        }
+        table[i] = crc;
+    }
+    return table;
+})();
+/**
+ * Compute CRC32 checksum of data for message integrity verification.
+ * Fast, non-cryptographic checksum optimized for corruption detection.
+ */
+function computeCRC32(data) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < data.length; i++) {
+        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ data[i]) & 0xff];
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+}
+/**
+ * Wrap message with CRC32 checksum for integrity verification.
+ * Format: [CRC32 (4 bytes)][message data]
+ */
+function wrapMessageWithChecksum(message) {
+    const crc = computeCRC32(message);
+    const wrapped = new Uint8Array(4 + message.length);
+    // Write CRC32 as 4 bytes (big-endian)
+    wrapped[0] = (crc >>> 24) & 0xff;
+    wrapped[1] = (crc >>> 16) & 0xff;
+    wrapped[2] = (crc >>> 8) & 0xff;
+    wrapped[3] = crc & 0xff;
+    // Copy message data
+    wrapped.set(message, 4);
+    return wrapped;
+}
+/**
+ * Unwrap and verify message integrity using CRC32 checksum.
+ * Returns the message data if valid, null if corrupted.
+ */
+function unwrapAndVerifyMessage(wrapped) {
+    if (wrapped.length < 4) {
+        return null; // Too short to contain CRC32
+    }
+    // Read CRC32 (big-endian)
+    const expectedCrc = ((wrapped[0] << 24) |
+        (wrapped[1] << 16) |
+        (wrapped[2] << 8) |
+        wrapped[3]) >>>
+        0;
+    // Extract message data
+    const message = wrapped.subarray(4);
+    // Compute actual CRC32
+    const actualCrc = computeCRC32(message);
+    // Verify integrity
+    if (actualCrc !== expectedCrc) {
+        return null; // Checksum mismatch - message corrupted
+    }
+    return message;
+}
+/**
  * Compute a simple hash of document state for verification.
  * Uses a fast non-cryptographic hash for performance.
  */
@@ -132,6 +198,9 @@ export class GenericProvider extends Observable {
         // Sequence numbers for causal ordering
         this._localSeqNum = 0; // Our sequence number counter
         this._remoteSeqNums = new Map(); // clientID -> last seen seqNum
+        // Message integrity tracking
+        this._corruptedMessageCount = 0; // Track rejected corrupted messages
+        this._lastCorruptedMessageTime = 0;
         // Update batching/debouncing
         this._batchUpdates = 0; // milliseconds delay (0 = disabled)
         this._pendingUpdate = null;
@@ -175,7 +244,13 @@ export class GenericProvider extends Observable {
             if (this._syncInterval > 0) {
                 this._syncIntervalId = setInterval(() => {
                     if (this.transport.isConnected && !this._destroying) {
-                        this._sendSyncStep1();
+                        // Check rate limit before syncing
+                        const now = Date.now();
+                        this._syncRequestTimes = this._syncRequestTimes.filter((t) => now - t < this._syncRequestWindowMs);
+                        if (this._syncRequestTimes.length < this._maxSyncRequestsPerWindow) {
+                            this._sendSyncStep1();
+                        }
+                        // If rate limited, skip this periodic sync - will try again next interval
                     }
                 }, this._syncInterval);
             }
@@ -198,10 +273,17 @@ export class GenericProvider extends Observable {
             clearInterval(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
-        // Clear any pending batched updates
+        // Reset corruption tracking
+        this._corruptedMessageCount = 0;
+        this._lastCorruptedMessageTime = 0;
+        // Flush any pending batched updates before disconnecting
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
             this._batchTimeoutId = undefined;
+            // Send pending update if transport is still connected
+            if (this._pendingUpdate && this.transport.isConnected) {
+                this._sendUpdate(this._pendingUpdate);
+            }
             this._pendingUpdate = null;
         }
         // Disconnect BroadcastChannel
@@ -227,10 +309,14 @@ export class GenericProvider extends Observable {
             clearInterval(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
-        // Clear any pending batched updates
+        // Flush any pending batched updates before destroying
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
             this._batchTimeoutId = undefined;
+            // Send pending update if transport is still connected
+            if (this._pendingUpdate && this.transport.isConnected) {
+                this._sendUpdate(this._pendingUpdate);
+            }
             this._pendingUpdate = null;
         }
         this.disconnect();
@@ -325,8 +411,17 @@ export class GenericProvider extends Observable {
     _batchUpdate(update) {
         // Merge with pending update if exists
         if (this._pendingUpdate) {
-            // Yjs automatically merges sequential updates
-            this._pendingUpdate = Y.mergeUpdates([this._pendingUpdate, update]);
+            try {
+                // Yjs automatically merges sequential updates
+                this._pendingUpdate = Y.mergeUpdates([this._pendingUpdate, update]);
+            }
+            catch (error) {
+                console.error('[GenericProvider] Failed to merge updates:', error);
+                // Send the pending update immediately to avoid data loss
+                this._sendUpdate(this._pendingUpdate);
+                // Start a new batch with the current update
+                this._pendingUpdate = update;
+            }
         }
         else {
             this._pendingUpdate = update;
@@ -367,11 +462,36 @@ export class GenericProvider extends Observable {
     }
     /**
      * Handle incoming messages from the transport.
-     * Decodes and processes sync messages and awareness updates.
+     * Verifies message integrity with CRC32 before processing.
+     * Corrupt messages are rejected immediately without attempting to decode.
      */
     _handleIncomingMessage(data) {
+        // Verify message integrity with CRC32 checksum
+        const message = unwrapAndVerifyMessage(data);
+        if (message === null) {
+            // Message is corrupted - reject it immediately
+            this._corruptedMessageCount++;
+            const now = Date.now();
+            // Reset counter if it's been stable for 10 seconds
+            if (now - this._lastCorruptedMessageTime > 10000) {
+                this._corruptedMessageCount = 1;
+            }
+            this._lastCorruptedMessageTime = now;
+            console.warn(`[GenericProvider] 💥 Corrupted message rejected (#${this._corruptedMessageCount}): CRC32 checksum mismatch. ` +
+                `This is expected if data corruption simulation is enabled.`);
+            // Request re-sync to recover any lost data
+            // Use exponential backoff: 100ms, 500ms, 2.5s, then cap at 5s
+            const delay = Math.min(5000, 100 * Math.pow(5, Math.min(this._corruptedMessageCount - 1, 3)));
+            setTimeout(() => {
+                if (this.transport.isConnected && !this._destroying) {
+                    this._sendSyncStep1();
+                }
+            }, delay);
+            return; // Don't process corrupted message
+        }
+        // Message integrity verified - safe to decode
         try {
-            const decoder = decoding.createDecoder(data);
+            const decoder = decoding.createDecoder(message);
             const messageType = decoding.readVarUint(decoder);
             switch (messageType) {
                 case MESSAGE_SYNC: {
@@ -478,7 +598,9 @@ export class GenericProvider extends Observable {
             }
         }
         catch (error) {
-            console.error('Error handling incoming message:', error);
+            // This should only happen for logic errors, not corruption
+            // (corruption is caught by CRC32 check above)
+            console.error('[GenericProvider] Error handling message:', error);
         }
     }
     /**
@@ -601,60 +723,33 @@ export class GenericProvider extends Observable {
             if (origin === this) {
                 return;
             }
-            // Process the message (will be from another tab)
+            // Messages from BroadcastChannel are already CRC32-wrapped
+            // Pass through to _handleIncomingMessage which will unwrap and verify
             const uint8Data = new Uint8Array(data);
-            const decoder = decoding.createDecoder(uint8Data);
-            const encoder = encoding.createEncoder();
-            const messageType = decoding.readVarUint(decoder);
-            // Handle sync messages received via BC
-            if (messageType === MESSAGE_SYNC ||
-                messageType === MESSAGE_SYNC_VERIFIED) {
-                encoding.writeVarUint(encoder, MESSAGE_SYNC);
-                // Skip sequence number and clientID if it's a verified message
-                if (messageType === MESSAGE_SYNC_VERIFIED) {
-                    decoding.readVarUint(decoder); // seqNum
-                    decoding.readVarUint(decoder); // clientID
-                }
-                const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
-                // Mark as synced if we received SyncStep2
-                if (syncMessageType === syncProtocol.messageYjsSyncStep2 &&
-                    !this._synced) {
-                    this._synced = true;
-                    this.emit('synced', [true]);
-                }
-                // Send reply via BC if needed
-                if (encoding.length(encoder) > 1) {
-                    bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this);
-                }
-            }
-            else {
-                // For other messages, just apply them directly
-                // (Move decoder position back to include message type)
-                this._handleIncomingMessage(uint8Data);
-            }
+            this._handleIncomingMessage(uint8Data);
         };
         // Subscribe to the channel
         bc.subscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = true;
-        // Send initial sync via BroadcastChannel
+        // Send initial sync via BroadcastChannel (wrapped with CRC32)
         // This allows syncing with other tabs immediately
         const encoderSync = encoding.createEncoder();
         encoding.writeVarUint(encoderSync, MESSAGE_SYNC);
         syncProtocol.writeSyncStep1(encoderSync, this.doc);
-        bc.publish(this._bcChannel, encoding.toUint8Array(encoderSync), this);
-        // Broadcast local state via BroadcastChannel
+        bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)), this);
+        // Broadcast local state via BroadcastChannel (wrapped with CRC32)
         const encoderState = encoding.createEncoder();
         encoding.writeVarUint(encoderState, MESSAGE_SYNC);
         syncProtocol.writeSyncStep2(encoderState, this.doc);
-        bc.publish(this._bcChannel, encoding.toUint8Array(encoderState), this);
-        // Broadcast local awareness state via BroadcastChannel
+        bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoderState)), this);
+        // Broadcast local awareness state via BroadcastChannel (wrapped with CRC32)
         if (this.awareness.getLocalState() !== null) {
             const encoderAwareness = encoding.createEncoder();
             encoding.writeVarUint(encoderAwareness, MESSAGE_AWARENESS);
             encoding.writeVarUint8Array(encoderAwareness, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [
                 this.doc.clientID,
             ]));
-            bc.publish(this._bcChannel, encoding.toUint8Array(encoderAwareness), this);
+            bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)), this);
         }
     }
     /**
@@ -664,11 +759,11 @@ export class GenericProvider extends Observable {
         if (!this._bcConnected || !this._bcSubscriber) {
             return;
         }
-        // Broadcast awareness state with null (indicating disconnect)
+        // Broadcast awareness state with null (indicating disconnect) - wrapped with CRC32
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID], new Map()));
-        bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this);
+        bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoder)), this);
         // Unsubscribe from channel
         bc.unsubscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = false;
@@ -676,19 +771,22 @@ export class GenericProvider extends Observable {
     }
     /**
      * Send data through both BroadcastChannel (if connected) and transport.
-     * This ensures updates reach both local tabs and remote peers.
+     * All messages are wrapped with CRC32 checksum for integrity verification.
+     * This ensures updates reach both local tabs and remote peers with corruption detection.
      */
     _send(data) {
+        // Wrap message with CRC32 checksum
+        const wrappedData = wrapMessageWithChecksum(data);
         // Send via BroadcastChannel to other tabs first
         if (this._bcConnected) {
-            bc.publish(this._bcChannel, data, this);
+            bc.publish(this._bcChannel, wrappedData, this);
         }
         // Send via network transport
         if (!this.transport.isConnected) {
             return;
         }
         try {
-            const result = this.transport.send(data);
+            const result = this.transport.send(wrappedData);
             // Handle async send
             if (result instanceof Promise) {
                 result.catch((error) => {

@@ -301,6 +301,46 @@
         </div>
 
         <div
+          class="controls"
+          style="
+            margin-top: 10px;
+            border-top: 2px solid #e0e0e0;
+            padding-top: 10px;
+          "
+        >
+          <strong
+            style="
+              display: block;
+              margin-bottom: 8px;
+              color: #ff5722;
+              font-size: 14px;
+            "
+            >🧪 Edge Case Tests</strong
+          >
+          <button
+            id="test-batch-disconnect"
+            style="background: #ff5722; color: white; font-size: 12px"
+            title="Tests if pending batched updates are lost on disconnect"
+          >
+            📦 Test Batch Lost on Disconnect
+          </button>
+          <button
+            id="test-sequence-overflow"
+            style="background: #ff5722; color: white; font-size: 12px"
+            title="Tests sequence number overflow handling"
+          >
+            🔢 Test Sequence Overflow
+          </button>
+          <button
+            id="test-merge-failure"
+            style="background: #ff5722; color: white; font-size: 12px"
+            title="Tests Y.mergeUpdates failure handling"
+          >
+            💥 Test Merge Updates Failure
+          </button>
+        </div>
+
+        <div
           style="
             margin-top: 15px;
             padding: 15px;
@@ -391,6 +431,58 @@
                 style="width: 100%"
               />
             </div>
+            <div>
+              <label
+                style="
+                  display: block;
+                  font-size: 12px;
+                  margin-bottom: 5px;
+                  color: #666;
+                "
+              >
+                Data Corruption:
+                <span
+                  id="corruption-value"
+                  style="font-weight: bold; color: #f44336"
+                  >0%</span
+                >
+              </label>
+              <input
+                type="range"
+                id="corruption-slider"
+                min="0"
+                max="100"
+                value="0"
+                style="width: 100%"
+              />
+            </div>
+            <div>
+              <label
+                style="
+                  display: block;
+                  font-size: 12px;
+                  margin-bottom: 5px;
+                  color: #666;
+                "
+              >
+                Corruption Type:
+              </label>
+              <select
+                id="corruption-type"
+                style="
+                  width: 100%;
+                  padding: 5px;
+                  border: 1px solid #ccc;
+                  border-radius: 5px;
+                  font-size: 12px;
+                "
+              >
+                <option value="bitflip">Bit Flip (subtle)</option>
+                <option value="truncate">Truncate (incomplete)</option>
+                <option value="garbage">Garbage (random bytes)</option>
+                <option value="insert">Insert (length change)</option>
+              </select>
+            </div>
           </div>
         </div>
       </header>
@@ -422,6 +514,20 @@
             <strong>Adjust delay/packet loss/jitter</strong> - Test sync
             resilience under adverse network conditions. Jitter causes
             out-of-order delivery!
+          </li>
+          <li>
+            <strong>💥 Enable data corruption</strong> - Use the "Data
+            Corruption" slider to corrupt network packets and test
+            Y.mergeUpdates error handling! Choose corruption type: Bit Flip
+            (realistic), Truncate (incomplete), Garbage (worst case), or Insert
+            (protocol errors). Watch the provider gracefully handle corrupted
+            data.
+          </li>
+          <li>
+            <strong>🧪 Run edge case tests</strong> - Click the red test buttons
+            to simulate specific sync failure scenarios (batch lost on
+            disconnect, sequence overflow, merge failures). Watch the activity
+            log for detailed results!
           </li>
           <li>
             <strong>Important:</strong> BroadcastChannel is disabled to ensure

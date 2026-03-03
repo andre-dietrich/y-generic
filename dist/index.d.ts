@@ -94,6 +94,8 @@ export declare class GenericProvider extends Observable<string> {
     private _syncRequestWindowMs;
     private _localSeqNum;
     private _remoteSeqNums;
+    private _corruptedMessageCount;
+    private _lastCorruptedMessageTime;
     private _batchUpdates;
     private _pendingUpdate;
     private _batchTimeoutId?;
@@ -194,7 +196,8 @@ export declare class GenericProvider extends Observable<string> {
     private _setupAwarenessSync;
     /**
      * Handle incoming messages from the transport.
-     * Decodes and processes sync messages and awareness updates.
+     * Verifies message integrity with CRC32 before processing.
+     * Corrupt messages are rejected immediately without attempting to decode.
      */
     private _handleIncomingMessage;
     /**
@@ -239,7 +242,8 @@ export declare class GenericProvider extends Observable<string> {
     private _disconnectBroadcastChannel;
     /**
      * Send data through both BroadcastChannel (if connected) and transport.
-     * This ensures updates reach both local tabs and remote peers.
+     * All messages are wrapped with CRC32 checksum for integrity verification.
+     * This ensures updates reach both local tabs and remote peers with corruption detection.
      */
     private _send;
     /**

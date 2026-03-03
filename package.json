@@ -57,6 +57,7 @@
   ],
   "scripts": {
     "dev:dummy": "npx parcel serve test/dummy/index.html --open --port 3011",
+    "dev:edge-cases": "npx parcel serve test/dummy/edge-cases.html --open --port 3012",
     "dev:simple-peer": "npx parcel serve test/simple-peer/index.html --open --port 3002",
     "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
     "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
@@ -69,6 +70,7 @@
     "build": "rm -rf dist && tsc",
     "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",
     "build:demo:dummy": "npx parcel build test/dummy/index.html --dist-dir demos/dummy --public-url ./ --no-source-maps",
+    "build:demo:edge-cases": "npx parcel build test/dummy/edge-cases.html --dist-dir demos/edge-cases --public-url ./ --no-source-maps",
     "build:demo:simple-peer": "npx parcel build test/simple-peer/index.html --dist-dir demos/simple-peer --public-url ./ --no-source-maps",
     "build:demo:peerjs": "npx parcel build test/peerjs/index.html --dist-dir demos/peerjs --public-url ./ --no-source-maps",
     "build:demo:indexeddb": "npx parcel build test/indexeddb/index.html --dist-dir demos/indexeddb --public-url ./ --no-source-maps",
@@ -77,7 +79,7 @@
     "build:demo:pubnub": "npx parcel build test/pubnub/index.html --dist-dir demos/pubnub --public-url ./ --no-source-maps",
     "build:demo:websocket": "npx parcel build test/websocket/index.html --dist-dir demos/websocket --public-url ./ --no-source-maps",
     "build:demo:matrix": "npx parcel build test/matrix/index.html --dist-dir demos/matrix --public-url ./ --no-source-maps",
-    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix"
+    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:edge-cases && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix"
   },
   "dependencies": {
     "lib0": "^0.2.98",

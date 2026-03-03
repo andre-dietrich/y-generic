@@ -555,8 +555,11 @@ export class GenericProvider extends Observable {
                     }
                     // Check for sequence gap (potential packet loss)
                     if (lastSeq >= 0 && seqNum > lastSeq + 1) {
-                        console.warn(`[GenericProvider] Sequence gap detected from client ${senderClientID}: expected ${lastSeq + 1}, got ${seqNum} (gap of ${seqNum - lastSeq - 1} messages)`);
-                        // Continue processing but log the gap - Yjs will handle missing updates
+                        const gapSize = seqNum - lastSeq - 1;
+                        console.warn(`[GenericProvider] Sequence gap detected from client ${senderClientID}: expected ${lastSeq + 1}, got ${seqNum} (gap of ${gapSize} messages)`);
+                        // Immediately request sync to recover missing updates
+                        // This is more proactive than waiting for periodic sync or hash mismatch
+                        this._sendSyncStep1();
                     }
                     // Update sequence tracker
                     this._remoteSeqNums.set(senderClientID, seqNum);

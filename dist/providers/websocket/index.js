@@ -1,3 +1,42 @@
+// ---------------------------------------------------------------------------
+// CRC32 translation helpers
+//
+// GenericProvider wraps every message as [CRC32 (4 bytes)][payload] before
+// calling transport.send(), and expects the same format from onMessage().
+// The y-websocket server however speaks plain Yjs wire format (no header).
+// These helpers translate between the two worlds at the transport boundary.
+// ---------------------------------------------------------------------------
+const _CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let j = 0; j < 8; j++)
+            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[i] = c;
+    }
+    return table;
+})();
+function _crc32(data) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < data.length; i++)
+        crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff];
+    return (crc ^ 0xffffffff) >>> 0;
+}
+/** Strip the 4-byte CRC32 header that GenericProvider prepends. */
+function stripCRC32Header(data) {
+    return data.length >= 4 ? data.subarray(4) : data;
+}
+/** Add a valid CRC32 header so GenericProvider accepts the message. */
+function addCRC32Header(data) {
+    const crc = _crc32(data);
+    const wrapped = new Uint8Array(4 + data.length);
+    wrapped[0] = (crc >>> 24) & 0xff;
+    wrapped[1] = (crc >>> 16) & 0xff;
+    wrapped[2] = (crc >>> 8) & 0xff;
+    wrapped[3] = crc & 0xff;
+    wrapped.set(data, 4);
+    return wrapped;
+}
 /**
  * WebSocket Transport for Yjs
  *
@@ -9,7 +48,6 @@
  * - Automatic reconnection
  * - Binary message support
  * - Low latency real-time sync
- * - Optional password encryption (AES-GCM)
  *
  * @example
  * ```ts
@@ -26,15 +64,6 @@
  *   room: 'my-room'
  * })
  * ```
- *
- * @example Password-protected room
- * ```ts
- * await provider.connect({
- *   serverUrl: 'wss://example.com',
- *   room: 'secure-room',
- *   password: 'my-secret-password'  // E2E encrypted
- * })
- * ```
  */
 export class WebSocketTransport {
     constructor() {
@@ -46,8 +75,6 @@ export class WebSocketTransport {
         this.intentionalDisconnect = false;
         this.messageQueue = []; // Queue messages until connected
         this.receivedBuffer = []; // Buffer messages received before callback registered
-        this.cryptoKey = null; // Derived encryption key
-        this.encryptionEnabled = false;
     }
     get isConnected() {
         return this._isConnected;
@@ -64,10 +91,6 @@ export class WebSocketTransport {
         }
         if (!config.room) {
             throw new Error('Room name is required');
-        }
-        // Initialize encryption if password provided
-        if (config.password) {
-            await this.initEncryption(config.password);
         }
         // Build URL with room (y-websocket compatible)
         let wsUrl = config.serverUrl;
@@ -148,37 +171,11 @@ export class WebSocketTransport {
             this.messageQueue.push(data);
             return;
         }
-        // Encrypt if password is set (async but we don't await - fire and forget)
-        if (this.encryptionEnabled && this.cryptoKey) {
-            this.encryptAndSend(data);
-        }
-        else {
-            this.sendRaw(data);
-        }
-    }
-    /**
-     * Encrypt and send data
-     */
-    async encryptAndSend(data) {
         try {
-            const encrypted = await this.encrypt(data);
-            this.sendRaw(encrypted);
-        }
-        catch (error) {
-            this.log('❌ Encryption error:', error);
-        }
-    }
-    /**
-     * Send raw data without encryption
-     */
-    sendRaw(data) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            return;
-        }
-        try {
-            // Send raw binary data (y-websocket compatible)
-            this.ws.send(data);
-            this.log(`📤 Sent ${data.length} bytes${this.encryptionEnabled ? ' (encrypted)' : ''}`);
+            // Strip CRC32 header added by GenericProvider before sending to server
+            const raw = stripCRC32Header(data);
+            this.ws.send(raw);
+            this.log(`📤 Sent ${raw.length} bytes (${data.length} with header)`);
         }
         catch (error) {
             this.log('❌ Send error:', error);
@@ -204,27 +201,16 @@ export class WebSocketTransport {
     /**
      * Handle incoming WebSocket message
      */
-    async handleMessage(data) {
+    handleMessage(data) {
         try {
             if (typeof data === 'string') {
                 // Handle text messages (control messages)
                 this.log('📨 Received text message:', data);
                 return;
             }
-            // Binary message
-            let uint8Data = new Uint8Array(data);
-            // Decrypt if encryption is enabled
-            if (this.encryptionEnabled && this.cryptoKey) {
-                try {
-                    const decrypted = await this.decrypt(uint8Data);
-                    uint8Data = new Uint8Array(decrypted);
-                }
-                catch (error) {
-                    this.log('❌ Decryption failed (wrong password?):', error);
-                    return;
-                }
-            }
-            this.log(`📨 Received ${uint8Data.length} bytes${this.encryptionEnabled ? ' (decrypted)' : ''}`);
+            // Wrap plain y-websocket message with CRC32 header expected by GenericProvider
+            const uint8Data = addCRC32Header(new Uint8Array(data));
+            this.log(`📨 Received ${uint8Data.length - 4} bytes`);
             if (this.messageCallback) {
                 this.messageCallback(uint8Data);
             }
@@ -281,64 +267,6 @@ export class WebSocketTransport {
         if (this.debug) {
             console.log(`[WebSocketTransport] ${message}`, ...args);
         }
-    }
-    /**
-     * Initialize encryption with password using PBKDF2 key derivation.
-     */
-    async initEncryption(password) {
-        if (typeof crypto === 'undefined' || !crypto.subtle) {
-            throw new Error('WebCrypto API not available - cannot use password encryption');
-        }
-        // Use room name + password as key material for domain separation
-        const keyMaterial = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits', 'deriveKey']);
-        // Derive AES-GCM key using PBKDF2
-        // Use room name as salt for domain separation between rooms
-        const salt = new TextEncoder().encode(`yjs-websocket-${this.config?.room || 'default'}`);
-        this.cryptoKey = await crypto.subtle.deriveKey({
-            name: 'PBKDF2',
-            salt: salt,
-            iterations: 100000,
-            hash: 'SHA-256',
-        }, keyMaterial, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-        this.encryptionEnabled = true;
-        this.log('🔐 Encryption enabled (AES-256-GCM)');
-    }
-    /**
-     * Encrypt data using AES-GCM.
-     * Format: [IV (12 bytes)][ciphertext][auth tag (16 bytes)]
-     */
-    async encrypt(data) {
-        if (!this.cryptoKey) {
-            throw new Error('Encryption key not initialized');
-        }
-        // Generate random IV (12 bytes for AES-GCM)
-        const iv = crypto.getRandomValues(new Uint8Array(12));
-        // Ensure data is backed by ArrayBuffer (not SharedArrayBuffer)
-        const dataBuffer = new Uint8Array(data).buffer;
-        // Encrypt with AES-GCM
-        const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, this.cryptoKey, dataBuffer);
-        // Prepend IV to ciphertext
-        const result = new Uint8Array(iv.length + ciphertext.byteLength);
-        result.set(iv, 0);
-        result.set(new Uint8Array(ciphertext), iv.length);
-        return result;
-    }
-    /**
-     * Decrypt data using AES-GCM.
-     */
-    async decrypt(data) {
-        if (!this.cryptoKey) {
-            throw new Error('Encryption key not initialized');
-        }
-        if (data.length < 12) {
-            throw new Error('Invalid encrypted data (too short)');
-        }
-        // Extract IV (first 12 bytes)
-        const iv = new Uint8Array(data.slice(0, 12));
-        const ciphertext = new Uint8Array(data.slice(12));
-        // Decrypt with AES-GCM
-        const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: iv.buffer }, this.cryptoKey, ciphertext.buffer);
-        return new Uint8Array(plaintext);
     }
 }
 //# sourceMappingURL=index.js.map

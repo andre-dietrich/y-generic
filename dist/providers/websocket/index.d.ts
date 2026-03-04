@@ -15,13 +15,6 @@ export interface WebSocketConfig extends ConnectionConfig {
     protocols?: string | string[];
     /** Enable debug logging */
     debug?: boolean;
-    /**
-     * Password for end-to-end encryption.
-     * When set, all messages are encrypted with AES-GCM before sending.
-     * All peers in the room must use the same password.
-     * @default undefined (no encryption)
-     */
-    password?: string;
 }
 /**
  * WebSocket Transport for Yjs
@@ -34,7 +27,6 @@ export interface WebSocketConfig extends ConnectionConfig {
  * - Automatic reconnection
  * - Binary message support
  * - Low latency real-time sync
- * - Optional password encryption (AES-GCM)
  *
  * @example
  * ```ts
@@ -51,15 +43,6 @@ export interface WebSocketConfig extends ConnectionConfig {
  *   room: 'my-room'
  * })
  * ```
- *
- * @example Password-protected room
- * ```ts
- * await provider.connect({
- *   serverUrl: 'wss://example.com',
- *   room: 'secure-room',
- *   password: 'my-secret-password'  // E2E encrypted
- * })
- * ```
  */
 export declare class WebSocketTransport implements Transport {
     private ws;
@@ -72,8 +55,6 @@ export declare class WebSocketTransport implements Transport {
     private intentionalDisconnect;
     private messageQueue;
     private receivedBuffer;
-    private cryptoKey;
-    private encryptionEnabled;
     get isConnected(): boolean;
     /**
      * Connect to WebSocket server
@@ -87,14 +68,6 @@ export declare class WebSocketTransport implements Transport {
      * Send data to server
      */
     send(data: Uint8Array): void;
-    /**
-     * Encrypt and send data
-     */
-    private encryptAndSend;
-    /**
-     * Send raw data without encryption
-     */
-    private sendRaw;
     /**
      * Register message callback
      */
@@ -115,18 +88,5 @@ export declare class WebSocketTransport implements Transport {
      * Debug logging
      */
     private log;
-    /**
-     * Initialize encryption with password using PBKDF2 key derivation.
-     */
-    private initEncryption;
-    /**
-     * Encrypt data using AES-GCM.
-     * Format: [IV (12 bytes)][ciphertext][auth tag (16 bytes)]
-     */
-    private encrypt;
-    /**
-     * Decrypt data using AES-GCM.
-     */
-    private decrypt;
 }
 //# sourceMappingURL=index.d.ts.map

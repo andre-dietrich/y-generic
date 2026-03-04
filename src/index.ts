@@ -421,10 +421,19 @@ export class GenericProvider extends Observable<string> {
       this._pendingUpdate = null
     }
 
-    // Clear pending awareness updates (don't send - we're disconnecting)
+    // Flush pending awareness updates before disconnecting
     if (this._awarenessTimeoutId !== undefined) {
       clearTimeout(this._awarenessTimeoutId)
       this._awarenessTimeoutId = undefined
+
+      // Send pending awareness if transport is still connected
+      if (
+        this._pendingAwarenessClients.size > 0 &&
+        this.transport.isConnected
+      ) {
+        const clientsToSend = Array.from(this._pendingAwarenessClients)
+        this._sendAwarenessNow(clientsToSend)
+      }
     }
     this._pendingAwarenessClients.clear()
 

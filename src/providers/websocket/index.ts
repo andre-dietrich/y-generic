@@ -16,13 +16,6 @@ export interface WebSocketConfig extends ConnectionConfig {
   protocols?: string | string[]
   /** Enable debug logging */
   debug?: boolean
-  /**
-   * Password for end-to-end encryption.
-   * When set, all messages are encrypted with AES-GCM before sending.
-   * All peers in the room must use the same password.
-   * @default undefined (no encryption)
-   */
-  password?: string
 }
 
 /**
@@ -36,7 +29,6 @@ export interface WebSocketConfig extends ConnectionConfig {
  * - Automatic reconnection
  * - Binary message support
  * - Low latency real-time sync
- * - Optional password encryption (AES-GCM)
  *
  * @example
  * ```ts
@@ -53,15 +45,6 @@ export interface WebSocketConfig extends ConnectionConfig {
  *   room: 'my-room'
  * })
  * ```
- *
- * @example Password-protected room
- * ```ts
- * await provider.connect({
- *   serverUrl: 'wss://example.com',
- *   room: 'secure-room',
- *   password: 'my-secret-password'  // E2E encrypted
- * })
- * ```
  */
 export class WebSocketTransport implements Transport {
   private ws: WebSocket | null = null
@@ -74,8 +57,6 @@ export class WebSocketTransport implements Transport {
   private intentionalDisconnect: boolean = false
   private messageQueue: Uint8Array[] = [] // Queue messages until connected
   private receivedBuffer: Uint8Array[] = [] // Buffer messages received before callback registered
-  private cryptoKey: CryptoKey | null = null // Derived encryption key
-  private encryptionEnabled: boolean = false
 
   get isConnected(): boolean {
     return this._isConnected
@@ -95,11 +76,6 @@ export class WebSocketTransport implements Transport {
 
     if (!config.room) {
       throw new Error('Room name is required')
-    }
-
-    // Initialize encryption if password provided
-    if (config.password) {
-      await this.initEncryption(config.password)
     }
 
     // Build URL with room (y-websocket compatible)
@@ -199,40 +175,10 @@ export class WebSocketTransport implements Transport {
       return
     }
 
-    // Encrypt if password is set (async but we don't await - fire and forget)
-    if (this.encryptionEnabled && this.cryptoKey) {
-      this.encryptAndSend(data)
-    } else {
-      this.sendRaw(data)
-    }
-  }
-
-  /**
-   * Encrypt and send data
-   */
-  private async encryptAndSend(data: Uint8Array): Promise<void> {
-    try {
-      const encrypted = await this.encrypt(data)
-      this.sendRaw(encrypted)
-    } catch (error) {
-      this.log('❌ Encryption error:', error)
-    }
-  }
-
-  /**
-   * Send raw data without encryption
-   */
-  private sendRaw(data: Uint8Array): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return
-    }
-
     try {
       // Send raw binary data (y-websocket compatible)
       this.ws.send(data)
-      this.log(
-        `📤 Sent ${data.length} bytes${this.encryptionEnabled ? ' (encrypted)' : ''}`,
-      )
+      this.log(`📤 Sent ${data.length} bytes`)
     } catch (error) {
       this.log('❌ Send error:', error)
     }
@@ -263,7 +209,7 @@ export class WebSocketTransport implements Transport {
   /**
    * Handle incoming WebSocket message
    */
-  private async handleMessage(data: ArrayBuffer | string): Promise<void> {
+  private handleMessage(data: ArrayBuffer | string): void {
     try {
       if (typeof data === 'string') {
         // Handle text messages (control messages)
@@ -271,23 +217,9 @@ export class WebSocketTransport implements Transport {
         return
       }
 
-      // Binary message
-      let uint8Data: Uint8Array = new Uint8Array(data)
-
-      // Decrypt if encryption is enabled
-      if (this.encryptionEnabled && this.cryptoKey) {
-        try {
-          const decrypted = await this.decrypt(uint8Data)
-          uint8Data = new Uint8Array(decrypted)
-        } catch (error) {
-          this.log('❌ Decryption failed (wrong password?):', error)
-          return
-        }
-      }
-
-      this.log(
-        `📨 Received ${uint8Data.length} bytes${this.encryptionEnabled ? ' (decrypted)' : ''}`,
-      )
+      // Binary message - pass through directly (y-websocket compatible)
+      const uint8Data = new Uint8Array(data)
+      this.log(`📨 Received ${uint8Data.length} bytes`)
 
       if (this.messageCallback) {
         this.messageCallback(uint8Data)
@@ -352,103 +284,5 @@ export class WebSocketTransport implements Transport {
     if (this.debug) {
       console.log(`[WebSocketTransport] ${message}`, ...args)
     }
-  }
-
-  /**
-   * Initialize encryption with password using PBKDF2 key derivation.
-   */
-  private async initEncryption(password: string): Promise<void> {
-    if (typeof crypto === 'undefined' || !crypto.subtle) {
-      throw new Error(
-        'WebCrypto API not available - cannot use password encryption',
-      )
-    }
-
-    // Use room name + password as key material for domain separation
-    const keyMaterial = await crypto.subtle.importKey(
-      'raw',
-      new TextEncoder().encode(password),
-      'PBKDF2',
-      false,
-      ['deriveBits', 'deriveKey'],
-    )
-
-    // Derive AES-GCM key using PBKDF2
-    // Use room name as salt for domain separation between rooms
-    const salt = new TextEncoder().encode(
-      `yjs-websocket-${this.config?.room || 'default'}`,
-    )
-
-    this.cryptoKey = await crypto.subtle.deriveKey(
-      {
-        name: 'PBKDF2',
-        salt: salt,
-        iterations: 100000,
-        hash: 'SHA-256',
-      },
-      keyMaterial,
-      { name: 'AES-GCM', length: 256 },
-      false,
-      ['encrypt', 'decrypt'],
-    )
-
-    this.encryptionEnabled = true
-    this.log('🔐 Encryption enabled (AES-256-GCM)')
-  }
-
-  /**
-   * Encrypt data using AES-GCM.
-   * Format: [IV (12 bytes)][ciphertext][auth tag (16 bytes)]
-   */
-  private async encrypt(data: Uint8Array): Promise<Uint8Array> {
-    if (!this.cryptoKey) {
-      throw new Error('Encryption key not initialized')
-    }
-
-    // Generate random IV (12 bytes for AES-GCM)
-    const iv = crypto.getRandomValues(new Uint8Array(12))
-
-    // Ensure data is backed by ArrayBuffer (not SharedArrayBuffer)
-    const dataBuffer = new Uint8Array(data).buffer
-
-    // Encrypt with AES-GCM
-    const ciphertext = await crypto.subtle.encrypt(
-      { name: 'AES-GCM', iv },
-      this.cryptoKey,
-      dataBuffer,
-    )
-
-    // Prepend IV to ciphertext
-    const result = new Uint8Array(iv.length + ciphertext.byteLength)
-    result.set(iv, 0)
-    result.set(new Uint8Array(ciphertext), iv.length)
-
-    return result
-  }
-
-  /**
-   * Decrypt data using AES-GCM.
-   */
-  private async decrypt(data: Uint8Array): Promise<Uint8Array> {
-    if (!this.cryptoKey) {
-      throw new Error('Encryption key not initialized')
-    }
-
-    if (data.length < 12) {
-      throw new Error('Invalid encrypted data (too short)')
-    }
-
-    // Extract IV (first 12 bytes)
-    const iv = new Uint8Array(data.slice(0, 12))
-    const ciphertext = new Uint8Array(data.slice(12))
-
-    // Decrypt with AES-GCM
-    const plaintext = await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: iv.buffer },
-      this.cryptoKey,
-      ciphertext.buffer,
-    )
-
-    return new Uint8Array(plaintext)
   }
 }

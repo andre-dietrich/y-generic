@@ -9,14 +9,19 @@ import * as Y from 'yjs'
 import Quill from 'quill'
 import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
-import Peer from 'simple-peer'
 import { GenericProvider } from '../../src/index'
-import { SimplePeerTransport } from '../../src/providers/simple-peer/index'
+import {
+  SimplePeerTransport,
+  type IceServer,
+} from '../../src/providers/simple-peer/index'
 
 const BlockEmbed = Quill.import('blots/block/embed') as any
 
 // Register QuillCursors module for collaborative cursors
 Quill.register('modules/cursors', QuillCursors)
+
+// Peer is loaded from CDN as a global variable
+declare const SimplePeer: any
 
 // Custom Video Blot for HTML5 video support
 class VideoBlot extends BlockEmbed {
@@ -52,15 +57,210 @@ Quill.register(VideoBlot, true)
 
 // Configuration
 const ROOM_NAME = 'simple-peer-test'
-const SIGNALING_SERVERS = [
-  // 'wss://signaling.yjs.dev',
-  'wss://0.peerjs.com/peerjs',
-  // Fallback signaling server if needed
-  // 'wss://y-webrtc-signaling-eu.herokuapp.com',
-]
+const CONFIG_STORAGE_KEY = 'simplepeer-config'
 
 // Generate random user ID
 const userId = Math.random().toString(36).substring(7)
+
+// Default configuration
+const defaultConfig: {
+  signaling: string[]
+  iceServers: IceServer[]
+} = {
+  // Use official y-webrtc signaling server (most reliable)
+  signaling: ['wss://signaling.yjs.dev'],
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ],
+}
+
+// Load configuration from localStorage or use defaults
+function loadConfig(): typeof defaultConfig {
+  try {
+    const stored = localStorage.getItem(CONFIG_STORAGE_KEY)
+    if (stored) {
+      const parsed = JSON.parse(stored)
+      log('📁 Loaded configuration from localStorage', 'info')
+      return parsed
+    }
+  } catch (error) {
+    console.error('Failed to load config from localStorage:', error)
+  }
+  return defaultConfig
+}
+
+// Save configuration to localStorage
+function saveConfig(config: typeof defaultConfig): void {
+  try {
+    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config))
+    log('💾 Configuration saved to localStorage', 'success')
+  } catch (error) {
+    console.error('Failed to save config to localStorage:', error)
+  }
+}
+
+// Configuration state
+let currentConfig = loadConfig()
+
+// Populate configuration form fields with current config
+function populateConfigForm(): void {
+  const signalingInput = document.getElementById(
+    'signaling-servers',
+  ) as HTMLTextAreaElement
+  const stunInput = document.getElementById(
+    'stun-servers',
+  ) as HTMLTextAreaElement
+  const turnInput = document.getElementById(
+    'turn-servers',
+  ) as HTMLTextAreaElement
+
+  if (!signalingInput || !stunInput || !turnInput) {
+    return // Form not ready yet
+  }
+
+  // Populate signaling servers
+  signalingInput.value = currentConfig.signaling.join('\n')
+
+  // Separate STUN and TURN servers
+  const stunServers: string[] = []
+  const turnServers: string[] = []
+
+  for (const server of currentConfig.iceServers) {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls]
+    for (const url of urls) {
+      if (url.startsWith('stun:')) {
+        stunServers.push(url)
+      } else if (url.startsWith('turn:')) {
+        // TURN server - format as JSON
+        turnServers.push(JSON.stringify(server))
+        break // Only add once per server object
+      }
+    }
+  }
+
+  stunInput.value = stunServers.join('\n')
+  turnInput.value = turnServers.join('\n')
+
+  log('📝 Configuration form populated', 'info')
+}
+
+// Configuration UI functions
+;(window as any).toggleConfig = () => {
+  const content = document.getElementById('config-content')!
+  const toggle = document.querySelector('.config-toggle')!
+  content.classList.toggle('expanded')
+  toggle.classList.toggle('collapsed')
+}
+;(window as any).applyConfig = () => {
+  const signalingInput = document.getElementById(
+    'signaling-servers',
+  ) as HTMLTextAreaElement
+  const stunInput = document.getElementById(
+    'stun-servers',
+  ) as HTMLTextAreaElement
+  const turnInput = document.getElementById(
+    'turn-servers',
+  ) as HTMLTextAreaElement
+
+  try {
+    // Parse signaling servers
+    const signaling = signalingInput.value
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+
+    if (signaling.length === 0) {
+      alert('Please provide at least one signaling server')
+      return
+    }
+
+    // Parse STUN servers
+    const stunServers = stunInput.value
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .map((url) => ({ urls: url }))
+
+    // Parse TURN servers
+    const turnLines = turnInput.value
+      .split('\n')
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+
+    const turnServers = []
+    for (const line of turnLines) {
+      try {
+        const turnConfig = JSON.parse(line)
+        if (!turnConfig.urls) {
+          throw new Error('TURN config must have "urls" field')
+        }
+        turnServers.push(turnConfig)
+      } catch (error) {
+        alert(`Invalid TURN server config: ${line}\n\nError: ${error}`)
+        return
+      }
+    }
+
+    // Combine ICE servers
+    const iceServers = [...stunServers, ...turnServers]
+
+    if (iceServers.length === 0) {
+      alert('Please provide at least one STUN or TURN server')
+      return
+    }
+
+    // Update config
+    const newConfig = { signaling, iceServers }
+
+    // Save to localStorage
+    saveConfig(newConfig)
+    currentConfig = newConfig
+
+    log('✅ Configuration updated and saved!', 'success')
+    log(`Signaling servers: ${signaling.length}`, 'info')
+    log(`STUN servers: ${stunServers.length}`, 'info')
+    log(`TURN servers: ${turnServers.length}`, 'info')
+    log('⏳ Reloading page to apply changes...', 'info')
+
+    // Reload page after a short delay to show the log messages
+    setTimeout(() => {
+      window.location.reload()
+    }, 1000)
+  } catch (error) {
+    alert(`Error parsing configuration: ${error}`)
+  }
+}
+;(window as any).resetConfig = () => {
+  if (confirm('Reset configuration to defaults?')) {
+    const signalingInput = document.getElementById(
+      'signaling-servers',
+    ) as HTMLTextAreaElement
+    const stunInput = document.getElementById(
+      'stun-servers',
+    ) as HTMLTextAreaElement
+    const turnInput = document.getElementById(
+      'turn-servers',
+    ) as HTMLTextAreaElement
+
+    signalingInput.value = 'wss://signaling.yjs.dev\nwss://0.peerjs.com/peerjs'
+    stunInput.value =
+      'stun:stun.l.google.com:19302\nstun:stun1.l.google.com:19302'
+    turnInput.value = ''
+
+    // Save default config
+    saveConfig(defaultConfig)
+    currentConfig = defaultConfig
+
+    log('✅ Configuration reset to defaults', 'success')
+    log('⏳ Reloading page to apply changes...', 'info')
+
+    // Reload page after a short delay
+    setTimeout(() => {
+      window.location.reload()
+    }, 1000)
+  }
+}
 
 // Log function
 function log(message: string, type: 'info' | 'success' | 'error' = 'info') {
@@ -131,7 +331,8 @@ function updateUserList(awareness: any) {
   }
 
   userListEl.innerHTML = states
-    .map(([clientId, state]: [any, any]) => {
+    .map((entry) => {
+      const [clientId, state] = entry as [number, any]
       const user = state.user || {}
       const name = user.name || `User ${clientId}`
       const color = user.color || '#999'
@@ -157,10 +358,26 @@ async function init() {
 
   // Create SimplePeer transport
   log('📡 Creating SimplePeer transport...', 'info')
+  log(`📋 Configuration:`, 'info')
+  log(`  • Signaling servers: ${currentConfig.signaling.length}`, 'info')
+  currentConfig.signaling.forEach((s) => log(`    - ${s}`, 'info'))
+  log(`  • ICE servers: ${currentConfig.iceServers.length}`, 'info')
+  currentConfig.iceServers.forEach((ice) => {
+    const urls = Array.isArray(ice.urls) ? ice.urls : [ice.urls]
+    urls.forEach((url) => {
+      if (ice.username) {
+        log(`    - ${url} (auth: ${ice.username})`, 'info')
+      } else {
+        log(`    - ${url}`, 'info')
+      }
+    })
+  })
+
   const transport = new SimplePeerTransport({
-    peer: Peer, // Pass the simple-peer constructor
-    signaling: SIGNALING_SERVERS,
-    debug: true, // Enable debug logging in console
+    peer: SimplePeer, // Pass the simple-peer constructor
+    signaling: currentConfig.signaling,
+    iceServers: currentConfig.iceServers,
+    debug: false, // Enable debug logging in console
   })
 
   // Create provider
@@ -332,6 +549,9 @@ async function init() {
   window.addEventListener('beforeunload', () => {
     provider.disconnect()
   })
+
+  // Populate configuration form with current settings
+  populateConfigForm()
 
   log('✅ Setup complete! Ready to collaborate.', 'success')
 }

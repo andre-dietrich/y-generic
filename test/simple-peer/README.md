@@ -22,7 +22,15 @@ This demo tests peer-to-peer synchronization using SimplePeer transport (WebRTC 
    
    const transport = new SimplePeerTransport({
      peer: Peer, // Pass the simple-peer constructor
-     signaling: ['wss://signaling.yjs.dev']
+     signaling: ['wss://signaling.yjs.dev'],
+     iceServers: [
+       { urls: 'stun:stun.l.google.com:19302' },
+       {
+         urls: 'turn:turn.example.com:3478',
+         username: 'user',
+         credential: 'pass'
+       }
+     ]
    })
    ```
 
@@ -69,19 +77,84 @@ This demo tests peer-to-peer synchronization using SimplePeer transport (WebRTC 
 - Verify reconnection behavior
 - Check sync recovery after reconnection
 
-## Signaling Servers
+## WebRTC Configuration
 
-Default signaling server: `wss://signaling.yjs.dev`
+### Signaling Servers
 
-You can add more signaling servers in [index.ts](./index.ts):
+Signaling servers are used for peer discovery only (not for data transfer).
 
+**Default**: `wss://signaling.yjs.dev`, `wss://0.peerjs.com/peerjs`
+
+**In the UI**: Click "⚙️ WebRTC Configuration" to configure signaling servers in the browser.
+
+**In code** (see [index.ts](./index.ts)):
 ```typescript
-const SIGNALING_SERVERS = [
-  'wss://signaling.yjs.dev',
-  'wss://y-webrtc-signaling-eu.herokuapp.com',
-  // Add your own signaling server
-]
+const transport = new SimplePeerTransport({
+  peer: SimplePeer,
+  signaling: [
+    'wss://signaling.yjs.dev',
+    'wss://y-webrtc-signaling-eu.herokuapp.com',
+    // Add your own signaling server
+  ]
+})
 ```
+
+### STUN Servers
+
+STUN servers help establish direct peer connections through NAT.
+
+**Default**: 
+- `stun:stun.l.google.com:19302`
+- `stun:stun1.l.google.com:19302`
+
+**In the UI**: Configure STUN servers in the "⚙️ WebRTC Configuration" panel.
+
+**In code**:
+```typescript
+const transport = new SimplePeerTransport({
+  peer: SimplePeer,
+  signaling: ['wss://signaling.yjs.dev'],
+  iceServers: [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    // Add more STUN servers for redundancy
+  ]
+})
+```
+
+### TURN Servers
+
+TURN servers relay traffic when direct connections fail (e.g., behind strict firewalls).
+
+**Default**: None (TURN servers typically require authentication)
+
+**In the UI**: Configure TURN servers in JSON format in the "⚙️ WebRTC Configuration" panel.
+
+**In code**:
+```typescript
+const transport = new SimplePeerTransport({
+  peer: SimplePeer,
+  signaling: ['wss://signaling.yjs.dev'],
+  iceServers: [
+    // STUN servers (no auth required)
+    { urls: 'stun:stun.l.google.com:19302' },
+    
+    // TURN servers (auth required)
+    {
+      urls: 'turn:turn.example.com:3478',
+      username: 'myusername',
+      credential: 'mypassword'
+    },
+    {
+      urls: ['turn:turn.example.com:3478?transport=tcp', 'turn:turn.example.com:3478?transport=udp'],
+      username: 'myusername',
+      credential: 'mypassword'
+    }
+  ]
+})
+```
+
+**Note**: TURN servers are typically paid services. Free STUN servers are usually sufficient for most use cases.
 
 ## Troubleshooting
 
@@ -90,11 +163,24 @@ const SIGNALING_SERVERS = [
 - Verify simple-peer is installed: `npm list simple-peer`
 - Try a different signaling server
 - Check if WebRTC is blocked by firewall/network
+- **NAT/Firewall issues**: If peers can't connect directly, add TURN servers (relay traffic)
+- Try different STUN servers or add multiple STUN servers for redundancy
+
+### Connection fails behind corporate firewall
+- WebRTC may be blocked by network policies
+- **Solution**: Configure TURN servers to relay traffic
+- TURN servers can traverse strict firewalls by relaying data (at the cost of bandwidth)
 
 ### Slow sync
 - WebRTC may take a few seconds to establish connections
 - Check peer count - if 0, signaling may have failed
 - Try refreshing all browser tabs
+- If using TURN relay, expect slower performance than direct P2P
+
+### Configuration not applying
+- After changing settings in the UI, **reload the page** to apply
+- Check browser console for configuration errors
+- Verify TURN server JSON format is valid
 
 ### Build errors
 - Ensure TypeScript build succeeded: `npm run build`

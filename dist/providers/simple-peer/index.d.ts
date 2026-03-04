@@ -34,6 +34,26 @@ import type { Transport, ConnectionConfig } from '../../transport';
  */
 export type SimplePeerConstructor = any;
 /**
+ * ICE server configuration for STUN/TURN servers.
+ * Used to establish WebRTC connections through NAT/firewalls.
+ */
+export interface IceServer {
+    /**
+     * STUN/TURN server URLs.
+     * @example ['stun:stun.l.google.com:19302']
+     * @example ['turn:turn.example.com:3478']
+     */
+    urls: string | string[];
+    /**
+     * Username for TURN server authentication.
+     */
+    username?: string;
+    /**
+     * Credential for TURN server authentication.
+     */
+    credential?: string;
+}
+/**
  * Configuration options for SimplePeer transport.
  */
 export interface SimplePeerTransportOptions {
@@ -54,6 +74,23 @@ export interface SimplePeerTransportOptions {
      */
     signaling?: string[];
     /**
+     * ICE servers for STUN/TURN configuration.
+     * Used to establish WebRTC connections through NAT/firewalls.
+     * @default [{ urls: 'stun:stun.l.google.com:19302' }]
+     * @example
+     * ```typescript
+     * iceServers: [
+     *   { urls: 'stun:stun.l.google.com:19302' },
+     *   {
+     *     urls: 'turn:turn.example.com:3478',
+     *     username: 'user',
+     *     credential: 'pass'
+     *   }
+     * ]
+     * ```
+     */
+    iceServers?: IceServer[];
+    /**
      * Optional password for encrypting messages.
      * When provided, all messages are encrypted before sending.
      * @default undefined
@@ -68,6 +105,7 @@ export interface SimplePeerTransportOptions {
     /**
      * Options passed to simple-peer.
      * See https://github.com/feross/simple-peer#api
+     * Note: iceServers will be merged into peerOpts.config if not already present
      * @default {}
      */
     peerOpts?: Record<string, any>;
@@ -90,6 +128,7 @@ export declare class SimplePeerTransport implements Transport {
     private peers;
     private signalingConns;
     private announcedPeers;
+    private announceInterval?;
     /**
      * Create a new SimplePeer transport.
      *
@@ -106,8 +145,19 @@ export declare class SimplePeerTransport implements Transport {
     disconnect(): void;
     /**
      * Send data to all connected peers.
+     * Large messages are automatically chunked to fit within WebRTC DataChannel limits.
      */
     send(data: Uint8Array): void;
+    /**
+     * Send data to a single peer, chunking if necessary.
+     * Uses flow control to avoid overwhelming the WebRTC buffer.
+     */
+    private sendToPeer;
+    /**
+     * Send chunks with backpressure handling.
+     * Waits for buffer to drain before sending more data.
+     */
+    private sendChunksWithFlowControl;
     /**
      * Register callback for incoming messages.
      */

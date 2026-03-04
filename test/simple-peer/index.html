@@ -287,6 +287,132 @@
         margin-right: 8px;
       }
 
+      /* Configuration panel styles */
+      .config-panel {
+        background: white;
+        padding: 20px;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        margin-bottom: 20px;
+      }
+
+      .config-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .config-header h3 {
+        margin: 0;
+        color: #333;
+        font-size: 18px;
+      }
+
+      .config-toggle {
+        font-size: 20px;
+        transition: transform 0.3s;
+      }
+
+      .config-toggle.collapsed {
+        transform: rotate(-90deg);
+      }
+
+      .config-content {
+        margin-top: 20px;
+        display: none;
+      }
+
+      .config-content.expanded {
+        display: block;
+      }
+
+      .config-section {
+        margin-bottom: 20px;
+      }
+
+      .config-section:last-child {
+        margin-bottom: 0;
+      }
+
+      .config-section h4 {
+        margin: 0 0 10px 0;
+        color: #555;
+        font-size: 14px;
+        font-weight: 600;
+      }
+
+      .config-section label {
+        display: block;
+        margin-bottom: 5px;
+        color: #666;
+        font-size: 13px;
+      }
+
+      .config-section input,
+      .config-section textarea {
+        width: 100%;
+        padding: 10px;
+        border: 1px solid #ddd;
+        border-radius: 5px;
+        font-family: 'Courier New', monospace;
+        font-size: 13px;
+        transition: border-color 0.2s;
+      }
+
+      .config-section input:focus,
+      .config-section textarea:focus {
+        outline: none;
+        border-color: #667eea;
+      }
+
+      .config-section textarea {
+        resize: vertical;
+        min-height: 80px;
+      }
+
+      .config-section small {
+        display: block;
+        color: #999;
+        font-size: 12px;
+        margin-top: 5px;
+      }
+
+      .config-actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 15px;
+      }
+
+      .btn {
+        padding: 10px 20px;
+        border: none;
+        border-radius: 5px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.2s;
+      }
+
+      .btn-primary {
+        background: #667eea;
+        color: white;
+      }
+
+      .btn-primary:hover {
+        background: #5568d3;
+      }
+
+      .btn-secondary {
+        background: #e0e0e0;
+        color: #333;
+      }
+
+      .btn-secondary:hover {
+        background: #d0d0d0;
+      }
+
       /* Responsive design */
       @media (max-width: 768px) {
         body {
@@ -379,6 +505,81 @@
             sync activity in real-time
           </li>
         </ul>
+      </div>
+
+      <div class="config-panel">
+        <div class="config-header" onclick="toggleConfig()">
+          <h3>⚙️ WebRTC Configuration</h3>
+          <span class="config-toggle collapsed">▼</span>
+        </div>
+        <div class="config-content" id="config-content">
+          <div class="config-section">
+            <h4>Signaling Servers</h4>
+            <label> WebSocket URLs for peer discovery (one per line) </label>
+            <textarea
+              id="signaling-servers"
+              placeholder="wss://signaling.yjs.dev&#10;wss://0.peerjs.com/peerjs"
+            >
+wss://signaling.yjs.dev
+wss://0.peerjs.com/peerjs</textarea
+            >
+            <small
+              >Signaling servers are only used for peer discovery, not for data
+              transfer</small
+            >
+          </div>
+
+          <div class="config-section">
+            <h4>STUN Servers</h4>
+            <label> STUN server URLs for NAT traversal (one per line) </label>
+            <textarea
+              id="stun-servers"
+              placeholder="stun:stun.l.google.com:19302&#10;stun:stun1.l.google.com:19302"
+            >
+stun:stun.l.google.com:19302
+stun:stun1.l.google.com:19302</textarea
+            >
+            <small
+              >STUN servers help establish direct peer connections through
+              NAT</small
+            >
+          </div>
+
+          <div class="config-section">
+            <h4>TURN Servers (Optional)</h4>
+            <label>
+              TURN server configuration (JSON format, one object per line)
+            </label>
+            <textarea
+              id="turn-servers"
+              placeholder='{"urls": "turn:turn.example.com:3478", "username": "user", "credential": "pass"}'
+            ></textarea>
+            <small
+              >TURN servers relay traffic when direct connections fail. Format:
+              {"urls": "turn:server:port", "username": "user", "credential":
+              "pass"}</small
+            >
+          </div>
+
+          <div class="config-actions">
+            <button class="btn btn-primary" onclick="applyConfig()">
+              💾 Apply & Reload
+            </button>
+            <button class="btn btn-secondary" onclick="resetConfig()">
+              🔄 Reset to Defaults
+            </button>
+          </div>
+          <small
+            style="
+              display: block;
+              margin-top: 10px;
+              color: #666;
+              text-align: center;
+            "
+          >
+            Configuration is saved and page will reload automatically
+          </small>
+        </div>
       </div>
 
       <div class="editor-section">
@@ -478,6 +679,7 @@
       </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/simple-peer@9.11.1/simplepeer.min.js"></script>
     <script type="module" src="./index.ts"></script>
   </body>
 </html>

@@ -241,6 +241,12 @@ export class GenericProvider extends Observable<string> {
   private _pendingUpdate: Uint8Array | null = null
   private _batchTimeoutId?: ReturnType<typeof setTimeout>
 
+  // Awareness throttling - prevents awareness from flooding document sync
+  private _awarenessInterval: number = 100 // ms between awareness broadcasts
+  private _pendingAwarenessClients: Set<number> = new Set()
+  private _awarenessTimeoutId?: ReturnType<typeof setTimeout>
+  private _lastAwarenessTime: number = 0
+
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
   private _unsubscribeTransport?: () => void
@@ -286,6 +292,14 @@ export class GenericProvider extends Observable<string> {
        * @default false (BroadcastChannel enabled)
        */
       disableBc?: boolean
+      /**
+       * Throttle awareness updates to reduce network traffic.
+       * Awareness updates (cursors, presence) are batched and sent at this interval.
+       * Set to 0 for immediate transmission (not recommended for high-frequency updates).
+       * This prevents awareness from flooding document sync on limited transports.
+       * @default 100 (100ms between awareness broadcasts)
+       */
+      awarenessInterval?: number
     } = {},
   ) {
     super()
@@ -298,6 +312,7 @@ export class GenericProvider extends Observable<string> {
     this._verifyUpdates = options.verifyUpdates ?? true
     this._batchUpdates = options.batchUpdates ?? 0
     this._disableBc = options.disableBc ?? false
+    this._awarenessInterval = options.awarenessInterval ?? 100
 
     this._setupDocumentSync()
     this._setupAwarenessSync()
@@ -405,6 +420,13 @@ export class GenericProvider extends Observable<string> {
       }
       this._pendingUpdate = null
     }
+
+    // Clear pending awareness updates (don't send - we're disconnecting)
+    if (this._awarenessTimeoutId !== undefined) {
+      clearTimeout(this._awarenessTimeoutId)
+      this._awarenessTimeoutId = undefined
+    }
+    this._pendingAwarenessClients.clear()
 
     // Disconnect BroadcastChannel
     this._disconnectBroadcastChannel()
@@ -942,10 +964,52 @@ export class GenericProvider extends Observable<string> {
 
   /**
    * Broadcast awareness state for the specified clients.
+   * Throttled to prevent awareness updates from flooding document sync.
+   * Multiple rapid updates are batched together.
    */
   private _broadcastAwareness(clients: number[]): void {
     if (clients.length === 0) return
 
+    // If throttling is disabled, send immediately
+    if (this._awarenessInterval <= 0) {
+      this._sendAwarenessNow(clients)
+      return
+    }
+
+    // Add clients to pending set
+    for (const client of clients) {
+      this._pendingAwarenessClients.add(client)
+    }
+
+    // If we already have a scheduled broadcast, let it handle the batched clients
+    if (this._awarenessTimeoutId !== undefined) {
+      return
+    }
+
+    // Calculate delay - respect minimum interval since last broadcast
+    const now = Date.now()
+    const timeSinceLastBroadcast = now - this._lastAwarenessTime
+    const delay = Math.max(0, this._awarenessInterval - timeSinceLastBroadcast)
+
+    // Schedule the batched broadcast
+    this._awarenessTimeoutId = setTimeout(() => {
+      this._awarenessTimeoutId = undefined
+      this._lastAwarenessTime = Date.now()
+
+      // Send all pending clients in one message
+      const clientsToSend = Array.from(this._pendingAwarenessClients)
+      this._pendingAwarenessClients.clear()
+
+      if (clientsToSend.length > 0) {
+        this._sendAwarenessNow(clientsToSend)
+      }
+    }, delay)
+  }
+
+  /**
+   * Send awareness update immediately without throttling.
+   */
+  private _sendAwarenessNow(clients: number[]): void {
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
     encoding.writeVarUint8Array(

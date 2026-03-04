@@ -204,6 +204,10 @@ export class GenericProvider extends Observable {
         // Update batching/debouncing
         this._batchUpdates = 0; // milliseconds delay (0 = disabled)
         this._pendingUpdate = null;
+        // Awareness throttling - prevents awareness from flooding document sync
+        this._awarenessInterval = 100; // ms between awareness broadcasts
+        this._pendingAwarenessClients = new Set();
+        this._lastAwarenessTime = 0;
         this.doc = doc;
         this.transport = transport;
         this.pubsub = new PubSubChannel(this);
@@ -212,6 +216,7 @@ export class GenericProvider extends Observable {
         this._verifyUpdates = options.verifyUpdates ?? true;
         this._batchUpdates = options.batchUpdates ?? 0;
         this._disableBc = options.disableBc ?? false;
+        this._awarenessInterval = options.awarenessInterval ?? 100;
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -295,6 +300,12 @@ export class GenericProvider extends Observable {
             }
             this._pendingUpdate = null;
         }
+        // Clear pending awareness updates (don't send - we're disconnecting)
+        if (this._awarenessTimeoutId !== undefined) {
+            clearTimeout(this._awarenessTimeoutId);
+            this._awarenessTimeoutId = undefined;
+        }
+        this._pendingAwarenessClients.clear();
         // Disconnect BroadcastChannel
         this._disconnectBroadcastChannel();
         if (this._unsubscribeTransport) {
@@ -701,10 +712,45 @@ export class GenericProvider extends Observable {
     }
     /**
      * Broadcast awareness state for the specified clients.
+     * Throttled to prevent awareness updates from flooding document sync.
+     * Multiple rapid updates are batched together.
      */
     _broadcastAwareness(clients) {
         if (clients.length === 0)
             return;
+        // If throttling is disabled, send immediately
+        if (this._awarenessInterval <= 0) {
+            this._sendAwarenessNow(clients);
+            return;
+        }
+        // Add clients to pending set
+        for (const client of clients) {
+            this._pendingAwarenessClients.add(client);
+        }
+        // If we already have a scheduled broadcast, let it handle the batched clients
+        if (this._awarenessTimeoutId !== undefined) {
+            return;
+        }
+        // Calculate delay - respect minimum interval since last broadcast
+        const now = Date.now();
+        const timeSinceLastBroadcast = now - this._lastAwarenessTime;
+        const delay = Math.max(0, this._awarenessInterval - timeSinceLastBroadcast);
+        // Schedule the batched broadcast
+        this._awarenessTimeoutId = setTimeout(() => {
+            this._awarenessTimeoutId = undefined;
+            this._lastAwarenessTime = Date.now();
+            // Send all pending clients in one message
+            const clientsToSend = Array.from(this._pendingAwarenessClients);
+            this._pendingAwarenessClients.clear();
+            if (clientsToSend.length > 0) {
+                this._sendAwarenessNow(clientsToSend);
+            }
+        }, delay);
+    }
+    /**
+     * Send awareness update immediately without throttling.
+     */
+    _sendAwarenessNow(clients) {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, clients));

@@ -11,6 +11,7 @@
  * - Real-time updates via .on()
  * - Optional relay servers
  * - Graph-based data structure
+ * - Password-protected rooms with AES encryption (via SEA)
  *
  * @example
  * ```typescript
@@ -26,9 +27,28 @@
  * const provider = new GenericProvider(doc, transport)
  * await provider.connect({ room: 'my-room' })
  * ```
+ *
+ * @example Password-protected room
+ * ```typescript
+ * import Gun from 'gun'
+ * import 'gun/sea'  // Required for encryption
+ *
+ * const transport = new GunTransport({
+ *   gun: Gun,
+ *   sea: Gun.SEA,  // Provide SEA module
+ *   password: 'my-secret-room-password',
+ *   peers: ['https://gun-relay.herokuapp.com/gun']
+ * })
+ * ```
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
+
+// Message type identifiers (must match GenericProvider)
+const MESSAGE_SYNC = 0
+const MESSAGE_AWARENESS = 1
+// MESSAGE_PUBSUB = 2 (not needed for routing)
+// MESSAGE_SYNC_VERIFIED = 3 (treated same as MESSAGE_SYNC)
 
 /**
  * Gun constructor type (from gun library).
@@ -82,6 +102,29 @@ export interface GunTransportOptions {
    * @default 100
    */
   batchInterval?: number
+
+  /**
+   * Password for room encryption.
+   * When set, all data is encrypted with AES using Gun's SEA module.
+   * All peers in the room must use the same password.
+   * Requires the SEA module to be provided.
+   * @default undefined (no encryption)
+   * @example 'my-secret-password'
+   */
+  password?: string
+
+  /**
+   * Gun SEA (Security, Encryption, Authorization) module.
+   * Required when using password encryption.
+   * @example
+   * ```typescript
+   * import Gun from 'gun'
+   * import 'gun/sea'
+   * const SEA = Gun.SEA
+   * const transport = new GunTransport({ gun: Gun, sea: SEA, password: 'secret' })
+   * ```
+   */
+  sea?: any
 }
 
 /**
@@ -89,7 +132,10 @@ export interface GunTransportOptions {
  * Creates decentralized P2P connections using Gun graph database.
  */
 export class GunTransport implements Transport {
-  private options: Required<GunTransportOptions>
+  private options: Required<Omit<GunTransportOptions, 'password' | 'sea'>> & {
+    password?: string
+    sea?: any
+  }
   private _connected: boolean = false
   private _room: string = ''
   private _callback?: (data: Uint8Array) => void
@@ -105,6 +151,9 @@ export class GunTransport implements Transport {
   private pendingUpdates: Map<string, any> = new Map()
   private updateSlot: number = 0
   private readonly BUFFER_SIZE = 20 // Circular buffer size
+  private awarenessListener: any = null
+  private lastAwarenessId: string = '' // Track last awareness ID to avoid processing our own
+  private encryptionEnabled: boolean = false
 
   /**
    * Create a new Gun transport.
@@ -120,12 +169,27 @@ export class GunTransport implements Transport {
       )
     }
 
+    // Validate SEA is provided when using password
+    if (options.password && !options.sea) {
+      throw new Error(
+        'GunTransport requires the "sea" option when using password encryption. ' +
+          'Please provide Gun.SEA: import "gun/sea"; new GunTransport({ gun: Gun, sea: Gun.SEA, password: "..." })',
+      )
+    }
+
     this.options = {
       gun: options.gun,
       peers: options.peers ?? [],
       gunOptions: options.gunOptions ?? {},
       debug: options.debug ?? false,
       batchInterval: options.batchInterval ?? 100, // Debounce: wait 100ms after last update
+      password: options.password,
+      sea: options.sea,
+    }
+
+    this.encryptionEnabled = !!(options.password && options.sea)
+    if (this.encryptionEnabled) {
+      this.log('🔐 Encryption enabled')
     }
   }
 
@@ -166,8 +230,9 @@ export class GunTransport implements Transport {
     // of update nodes in Gun's graph. This prevents the "1K+ records" warning.
     // Each update overwrites one of the slots (slot-0 through slot-9).
 
-    // Subscribe to updates from Gun
+    // Subscribe to updates from Gun (both doc sync and awareness)
     this.setupUpdateListener()
+    this.setupAwarenessListener()
 
     this._connected = true
   }
@@ -263,7 +328,7 @@ export class GunTransport implements Transport {
   /**
    * Process all pending updates at once.
    */
-  private processPendingUpdates(): void {
+  private async processPendingUpdates(): Promise<void> {
     if (this.pendingUpdates.size === 0) return
 
     const updates = Array.from(this.pendingUpdates.entries())
@@ -282,8 +347,19 @@ export class GunTransport implements Transport {
       }
 
       try {
+        let payload = update.data
+
+        // Decrypt if encrypted
+        if (update.encrypted && this.encryptionEnabled) {
+          payload = await this.decrypt(payload)
+          if (!payload) {
+            this.log('❌ Failed to decrypt update (wrong password?)')
+            continue
+          }
+        }
+
         // Decode base64 back to Uint8Array
-        const decoded = this.base64ToUint8Array(update.data)
+        const decoded = this.base64ToUint8Array(payload)
 
         // Pass to Yjs
         if (this._callback) {
@@ -291,7 +367,12 @@ export class GunTransport implements Transport {
         }
 
         if (updates.length === 1) {
-          this.log('📥 Received update:', decoded.length, 'bytes')
+          this.log(
+            '📥 Received update:',
+            decoded.length,
+            'bytes',
+            update.encrypted ? '(decrypted)' : '',
+          )
         }
       } catch (error) {
         this.log('❌ Error processing update:', error)
@@ -329,11 +410,14 @@ export class GunTransport implements Transport {
     // Flush any pending updates
     this.flushBatch()
 
-    // Remove listener
+    // Remove listeners
     if (this.updateListener) {
       // Gun doesn't have a clear off() method for map listeners
       // The listener will be garbage collected
       this.updateListener = null
+    }
+    if (this.awarenessListener) {
+      this.awarenessListener = null
     }
 
     this.roomNode = null
@@ -347,7 +431,8 @@ export class GunTransport implements Transport {
 
   /**
    * Send data to all peers via Gun.
-   * Uses debouncing - each new update resets the timer.
+   * Routes awareness to a separate volatile node, doc sync to circular buffer.
+   * Uses debouncing for doc sync - each new update resets the timer.
    */
   send(data: Uint8Array): void {
     if (!this._connected || !this.roomNode) {
@@ -355,7 +440,16 @@ export class GunTransport implements Transport {
       return
     }
 
-    // Add to batch
+    // Peek message type (after CRC32 header: 4 bytes CRC + 1 byte type)
+    const messageType = this.peekMessageType(data)
+
+    // Route awareness to separate volatile node (immediate, no buffer)
+    if (messageType === MESSAGE_AWARENESS) {
+      this.sendAwareness(data)
+      return
+    }
+
+    // Doc sync goes through batched circular buffer
     this.updateBatch.push(data)
 
     // Clear existing timeout (debouncing - resets timer on each update)
@@ -370,10 +464,101 @@ export class GunTransport implements Transport {
   }
 
   /**
+   * Peek at the message type from CRC32-wrapped data.
+   * Format: [CRC32 (4 bytes)][message type (varint)]...
+   * Returns -1 if cannot determine type.
+   */
+  private peekMessageType(data: Uint8Array): number {
+    // Need at least 5 bytes: 4 for CRC32 + 1 for message type
+    if (data.length < 5) return -1
+    // Message type is stored as varint after CRC32, but for small values (0-3)
+    // it's just a single byte
+    return data[4]
+  }
+
+  /**
+   * Send awareness update to a separate volatile node.
+   * Awareness is ephemeral - only the latest state matters.
+   * Each client writes to its own awareness slot to avoid overwrites.
+   */
+  private async sendAwareness(data: Uint8Array): Promise<void> {
+    let payload = this.uint8ArrayToBase64(data)
+
+    // Encrypt if password is set
+    if (this.encryptionEnabled) {
+      payload = await this.encrypt(payload)
+    }
+
+    const awarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
+
+    // Track this ID so we don't process our own update
+    this.lastAwarenessId = awarenessId
+
+    // Write to a single volatile awareness node
+    // Each update overwrites the previous - awareness only needs latest state
+    this.roomNode.get('awareness').put({
+      data: payload,
+      id: awarenessId,
+      timestamp: Date.now(),
+      encrypted: this.encryptionEnabled,
+    })
+
+    this.log(
+      '📤 Sent awareness update',
+      this.encryptionEnabled ? '(encrypted)' : '',
+    )
+  }
+
+  /**
+   * Setup listener for awareness updates (separate from doc sync).
+   */
+  private setupAwarenessListener(): void {
+    this.awarenessListener = this.roomNode
+      .get('awareness')
+      .on(async (awareness: any) => {
+        if (!awareness || !awareness.data) return
+
+        // Skip our own awareness updates
+        if (awareness.id === this.lastAwarenessId) return
+
+        // Only process updates newer than our connection
+        if (awareness.timestamp && awareness.timestamp < this.connectionTime) {
+          return
+        }
+
+        try {
+          let payload = awareness.data
+
+          // Decrypt if encrypted
+          if (awareness.encrypted && this.encryptionEnabled) {
+            payload = await this.decrypt(payload)
+            if (!payload) {
+              this.log('❌ Failed to decrypt awareness (wrong password?)')
+              return
+            }
+          }
+
+          const decoded = this.base64ToUint8Array(payload)
+          if (this._callback) {
+            this._callback(decoded)
+          }
+          this.log(
+            '📥 Received awareness update',
+            awareness.encrypted ? '(decrypted)' : '',
+          )
+        } catch (error) {
+          this.log('❌ Error processing awareness:', error)
+        }
+      })
+
+    this.log('👂 Listening for awareness updates...')
+  }
+
+  /**
    * Flush batched updates to Gun.
    * Called after debounce period (no new updates for batchInterval ms).
    */
-  private flushBatch(): void {
+  private async flushBatch(): Promise<void> {
     if (this.updateBatch.length === 0) return
 
     // Merge all batched updates into one
@@ -392,7 +577,12 @@ export class GunTransport implements Transport {
     this.updateBatch = []
 
     // Convert to base64 for Gun storage
-    const base64Data = this.uint8ArrayToBase64(merged)
+    let payload = this.uint8ArrayToBase64(merged)
+
+    // Encrypt if password is set
+    if (this.encryptionEnabled) {
+      payload = await this.encrypt(payload)
+    }
 
     // Create update object with circular buffer slot
     const updateId = this.generateUpdateId()
@@ -405,13 +595,19 @@ export class GunTransport implements Transport {
     // Store in Gun using circular buffer slot
     const updates = this.roomNode.get('updates')
     updates.get(updateId).put({
-      data: base64Data,
+      data: payload,
       timestamp: timestamp,
       sequence: sequence,
       size: merged.length,
+      encrypted: this.encryptionEnabled,
     })
 
-    this.log('📤 Sent update:', merged.length, 'bytes')
+    this.log(
+      '📤 Sent update:',
+      merged.length,
+      'bytes',
+      this.encryptionEnabled ? '(encrypted)' : '',
+    )
   }
 
   /**
@@ -462,6 +658,36 @@ export class GunTransport implements Transport {
       bytes[i] = binary.charCodeAt(i)
     }
     return bytes
+  }
+
+  /**
+   * Encrypt data using SEA with the configured password.
+   */
+  private async encrypt(data: string): Promise<string> {
+    if (!this.options.sea || !this.options.password) {
+      return data
+    }
+    return await this.options.sea.encrypt(data, this.options.password)
+  }
+
+  /**
+   * Decrypt data using SEA with the configured password.
+   * Returns null if decryption fails (wrong password).
+   */
+  private async decrypt(data: string): Promise<string | null> {
+    if (!this.options.sea || !this.options.password) {
+      return data
+    }
+    try {
+      const decrypted = await this.options.sea.decrypt(
+        data,
+        this.options.password,
+      )
+      return decrypted || null
+    } catch (error) {
+      this.log('❌ Decryption failed:', error)
+      return null
+    }
   }
 
   /**

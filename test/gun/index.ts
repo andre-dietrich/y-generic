@@ -95,6 +95,8 @@ async function initWithConfig(config: {
   // Create Gun transport
   log('🔗 Creating Gun transport...', 'info')
 
+  console.log('Peers:', config)
+
   const transport = new GunTransport({
     gun: Gun,
     peers: config.peers,

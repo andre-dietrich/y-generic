@@ -99,6 +99,10 @@ export declare class GenericProvider extends Observable<string> {
     private _batchUpdates;
     private _pendingUpdate;
     private _batchTimeoutId?;
+    private _awarenessInterval;
+    private _pendingAwarenessClients;
+    private _awarenessTimeoutId?;
+    private _lastAwarenessTime;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
     private _unsubscribeTransport?;
@@ -140,6 +144,14 @@ export declare class GenericProvider extends Observable<string> {
          * @default false (BroadcastChannel enabled)
          */
         disableBc?: boolean;
+        /**
+         * Throttle awareness updates to reduce network traffic.
+         * Awareness updates (cursors, presence) are batched and sent at this interval.
+         * Set to 0 for immediate transmission (not recommended for high-frequency updates).
+         * This prevents awareness from flooding document sync on limited transports.
+         * @default 100 (100ms between awareness broadcasts)
+         */
+        awarenessInterval?: number;
     });
     /**
      * Connect to the backend and start syncing.
@@ -223,8 +235,14 @@ export declare class GenericProvider extends Observable<string> {
     _sendPubSub(topic: string, message: any): void;
     /**
      * Broadcast awareness state for the specified clients.
+     * Throttled to prevent awareness updates from flooding document sync.
+     * Multiple rapid updates are batched together.
      */
     private _broadcastAwareness;
+    /**
+     * Send awareness update immediately without throttling.
+     */
+    private _sendAwarenessNow;
     /**
      * Setup BroadcastChannel for cross-tab communication.
      * Automatically disabled in non-browser environments.

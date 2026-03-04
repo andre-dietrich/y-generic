@@ -11,6 +11,7 @@
  * - Real-time updates via .on()
  * - Optional relay servers
  * - Graph-based data structure
+ * - Password-protected rooms with AES encryption (via SEA)
  *
  * @example
  * ```typescript
@@ -26,7 +27,23 @@
  * const provider = new GenericProvider(doc, transport)
  * await provider.connect({ room: 'my-room' })
  * ```
+ *
+ * @example Password-protected room
+ * ```typescript
+ * import Gun from 'gun'
+ * import 'gun/sea'  // Required for encryption
+ *
+ * const transport = new GunTransport({
+ *   gun: Gun,
+ *   sea: Gun.SEA,  // Provide SEA module
+ *   password: 'my-secret-room-password',
+ *   peers: ['https://gun-relay.herokuapp.com/gun']
+ * })
+ * ```
  */
+// Message type identifiers (must match GenericProvider)
+const MESSAGE_SYNC = 0;
+const MESSAGE_AWARENESS = 1;
 /**
  * GunDB transport implementation.
  * Creates decentralized P2P connections using Gun graph database.
@@ -50,10 +67,18 @@ export class GunTransport {
         this.pendingUpdates = new Map();
         this.updateSlot = 0;
         this.BUFFER_SIZE = 20; // Circular buffer size
+        this.awarenessListener = null;
+        this.lastAwarenessId = ''; // Track last awareness ID to avoid processing our own
+        this.encryptionEnabled = false;
         if (!options.gun) {
             throw new Error('GunTransport requires the "gun" option. ' +
                 'Please provide the Gun constructor: ' +
                 'import Gun from "gun"; new GunTransport({ gun: Gun, ... })');
+        }
+        // Validate SEA is provided when using password
+        if (options.password && !options.sea) {
+            throw new Error('GunTransport requires the "sea" option when using password encryption. ' +
+                'Please provide Gun.SEA: import "gun/sea"; new GunTransport({ gun: Gun, sea: Gun.SEA, password: "..." })');
         }
         this.options = {
             gun: options.gun,
@@ -61,7 +86,13 @@ export class GunTransport {
             gunOptions: options.gunOptions ?? {},
             debug: options.debug ?? false,
             batchInterval: options.batchInterval ?? 100, // Debounce: wait 100ms after last update
+            password: options.password,
+            sea: options.sea,
         };
+        this.encryptionEnabled = !!(options.password && options.sea);
+        if (this.encryptionEnabled) {
+            this.log('🔐 Encryption enabled');
+        }
     }
     /**
      * Connect to the room and start syncing.
@@ -91,8 +122,9 @@ export class GunTransport {
         // Note: We use a circular buffer (10 slots) to prevent infinite accumulation
         // of update nodes in Gun's graph. This prevents the "1K+ records" warning.
         // Each update overwrites one of the slots (slot-0 through slot-9).
-        // Subscribe to updates from Gun
+        // Subscribe to updates from Gun (both doc sync and awareness)
         this.setupUpdateListener();
+        this.setupAwarenessListener();
         this._connected = true;
     }
     /**
@@ -173,7 +205,7 @@ export class GunTransport {
     /**
      * Process all pending updates at once.
      */
-    processPendingUpdates() {
+    async processPendingUpdates() {
         if (this.pendingUpdates.size === 0)
             return;
         const updates = Array.from(this.pendingUpdates.entries());
@@ -189,14 +221,23 @@ export class GunTransport {
                 });
             }
             try {
+                let payload = update.data;
+                // Decrypt if encrypted
+                if (update.encrypted && this.encryptionEnabled) {
+                    payload = await this.decrypt(payload);
+                    if (!payload) {
+                        this.log('❌ Failed to decrypt update (wrong password?)');
+                        continue;
+                    }
+                }
                 // Decode base64 back to Uint8Array
-                const decoded = this.base64ToUint8Array(update.data);
+                const decoded = this.base64ToUint8Array(payload);
                 // Pass to Yjs
                 if (this._callback) {
                     this._callback(decoded);
                 }
                 if (updates.length === 1) {
-                    this.log('📥 Received update:', decoded.length, 'bytes');
+                    this.log('📥 Received update:', decoded.length, 'bytes', update.encrypted ? '(decrypted)' : '');
                 }
             }
             catch (error) {
@@ -228,11 +269,14 @@ export class GunTransport {
         this.processPendingUpdates();
         // Flush any pending updates
         this.flushBatch();
-        // Remove listener
+        // Remove listeners
         if (this.updateListener) {
             // Gun doesn't have a clear off() method for map listeners
             // The listener will be garbage collected
             this.updateListener = null;
+        }
+        if (this.awarenessListener) {
+            this.awarenessListener = null;
         }
         this.roomNode = null;
         this.gun = null;
@@ -243,14 +287,22 @@ export class GunTransport {
     }
     /**
      * Send data to all peers via Gun.
-     * Uses debouncing - each new update resets the timer.
+     * Routes awareness to a separate volatile node, doc sync to circular buffer.
+     * Uses debouncing for doc sync - each new update resets the timer.
      */
     send(data) {
         if (!this._connected || !this.roomNode) {
             this.log('⚠️ Not connected, cannot send');
             return;
         }
-        // Add to batch
+        // Peek message type (after CRC32 header: 4 bytes CRC + 1 byte type)
+        const messageType = this.peekMessageType(data);
+        // Route awareness to separate volatile node (immediate, no buffer)
+        if (messageType === MESSAGE_AWARENESS) {
+            this.sendAwareness(data);
+            return;
+        }
+        // Doc sync goes through batched circular buffer
         this.updateBatch.push(data);
         // Clear existing timeout (debouncing - resets timer on each update)
         if (this.batchTimeout) {
@@ -262,10 +314,85 @@ export class GunTransport {
         }, this.options.batchInterval);
     }
     /**
+     * Peek at the message type from CRC32-wrapped data.
+     * Format: [CRC32 (4 bytes)][message type (varint)]...
+     * Returns -1 if cannot determine type.
+     */
+    peekMessageType(data) {
+        // Need at least 5 bytes: 4 for CRC32 + 1 for message type
+        if (data.length < 5)
+            return -1;
+        // Message type is stored as varint after CRC32, but for small values (0-3)
+        // it's just a single byte
+        return data[4];
+    }
+    /**
+     * Send awareness update to a separate volatile node.
+     * Awareness is ephemeral - only the latest state matters.
+     * Each client writes to its own awareness slot to avoid overwrites.
+     */
+    async sendAwareness(data) {
+        let payload = this.uint8ArrayToBase64(data);
+        // Encrypt if password is set
+        if (this.encryptionEnabled) {
+            payload = await this.encrypt(payload);
+        }
+        const awarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+        // Track this ID so we don't process our own update
+        this.lastAwarenessId = awarenessId;
+        // Write to a single volatile awareness node
+        // Each update overwrites the previous - awareness only needs latest state
+        this.roomNode.get('awareness').put({
+            data: payload,
+            id: awarenessId,
+            timestamp: Date.now(),
+            encrypted: this.encryptionEnabled,
+        });
+        this.log('📤 Sent awareness update', this.encryptionEnabled ? '(encrypted)' : '');
+    }
+    /**
+     * Setup listener for awareness updates (separate from doc sync).
+     */
+    setupAwarenessListener() {
+        this.awarenessListener = this.roomNode
+            .get('awareness')
+            .on(async (awareness) => {
+            if (!awareness || !awareness.data)
+                return;
+            // Skip our own awareness updates
+            if (awareness.id === this.lastAwarenessId)
+                return;
+            // Only process updates newer than our connection
+            if (awareness.timestamp && awareness.timestamp < this.connectionTime) {
+                return;
+            }
+            try {
+                let payload = awareness.data;
+                // Decrypt if encrypted
+                if (awareness.encrypted && this.encryptionEnabled) {
+                    payload = await this.decrypt(payload);
+                    if (!payload) {
+                        this.log('❌ Failed to decrypt awareness (wrong password?)');
+                        return;
+                    }
+                }
+                const decoded = this.base64ToUint8Array(payload);
+                if (this._callback) {
+                    this._callback(decoded);
+                }
+                this.log('📥 Received awareness update', awareness.encrypted ? '(decrypted)' : '');
+            }
+            catch (error) {
+                this.log('❌ Error processing awareness:', error);
+            }
+        });
+        this.log('👂 Listening for awareness updates...');
+    }
+    /**
      * Flush batched updates to Gun.
      * Called after debounce period (no new updates for batchInterval ms).
      */
-    flushBatch() {
+    async flushBatch() {
         if (this.updateBatch.length === 0)
             return;
         // Merge all batched updates into one
@@ -279,7 +406,11 @@ export class GunTransport {
         // Clear batch
         this.updateBatch = [];
         // Convert to base64 for Gun storage
-        const base64Data = this.uint8ArrayToBase64(merged);
+        let payload = this.uint8ArrayToBase64(merged);
+        // Encrypt if password is set
+        if (this.encryptionEnabled) {
+            payload = await this.encrypt(payload);
+        }
         // Create update object with circular buffer slot
         const updateId = this.generateUpdateId();
         const timestamp = Date.now();
@@ -289,12 +420,13 @@ export class GunTransport {
         // Store in Gun using circular buffer slot
         const updates = this.roomNode.get('updates');
         updates.get(updateId).put({
-            data: base64Data,
+            data: payload,
             timestamp: timestamp,
             sequence: sequence,
             size: merged.length,
+            encrypted: this.encryptionEnabled,
         });
-        this.log('📤 Sent update:', merged.length, 'bytes');
+        this.log('📤 Sent update:', merged.length, 'bytes', this.encryptionEnabled ? '(encrypted)' : '');
     }
     /**
      * Register callback for incoming messages.
@@ -340,6 +472,32 @@ export class GunTransport {
             bytes[i] = binary.charCodeAt(i);
         }
         return bytes;
+    }
+    /**
+     * Encrypt data using SEA with the configured password.
+     */
+    async encrypt(data) {
+        if (!this.options.sea || !this.options.password) {
+            return data;
+        }
+        return await this.options.sea.encrypt(data, this.options.password);
+    }
+    /**
+     * Decrypt data using SEA with the configured password.
+     * Returns null if decryption fails (wrong password).
+     */
+    async decrypt(data) {
+        if (!this.options.sea || !this.options.password) {
+            return data;
+        }
+        try {
+            const decrypted = await this.options.sea.decrypt(data, this.options.password);
+            return decrypted || null;
+        }
+        catch (error) {
+            this.log('❌ Decryption failed:', error);
+            return null;
+        }
     }
     /**
      * Log debug messages if enabled.

@@ -11,6 +11,7 @@
  * - Real-time updates via .on()
  * - Optional relay servers
  * - Graph-based data structure
+ * - Password-protected rooms with AES encryption (via SEA)
  *
  * @example
  * ```typescript
@@ -25,6 +26,19 @@
  * })
  * const provider = new GenericProvider(doc, transport)
  * await provider.connect({ room: 'my-room' })
+ * ```
+ *
+ * @example Password-protected room
+ * ```typescript
+ * import Gun from 'gun'
+ * import 'gun/sea'  // Required for encryption
+ *
+ * const transport = new GunTransport({
+ *   gun: Gun,
+ *   sea: Gun.SEA,  // Provide SEA module
+ *   password: 'my-secret-room-password',
+ *   peers: ['https://gun-relay.herokuapp.com/gun']
+ * })
  * ```
  */
 import type { Transport, ConnectionConfig } from '../../transport';
@@ -75,6 +89,27 @@ export interface GunTransportOptions {
      * @default 100
      */
     batchInterval?: number;
+    /**
+     * Password for room encryption.
+     * When set, all data is encrypted with AES using Gun's SEA module.
+     * All peers in the room must use the same password.
+     * Requires the SEA module to be provided.
+     * @default undefined (no encryption)
+     * @example 'my-secret-password'
+     */
+    password?: string;
+    /**
+     * Gun SEA (Security, Encryption, Authorization) module.
+     * Required when using password encryption.
+     * @example
+     * ```typescript
+     * import Gun from 'gun'
+     * import 'gun/sea'
+     * const SEA = Gun.SEA
+     * const transport = new GunTransport({ gun: Gun, sea: SEA, password: 'secret' })
+     * ```
+     */
+    sea?: any;
 }
 /**
  * GunDB transport implementation.
@@ -97,6 +132,9 @@ export declare class GunTransport implements Transport {
     private pendingUpdates;
     private updateSlot;
     private readonly BUFFER_SIZE;
+    private awarenessListener;
+    private lastAwarenessId;
+    private encryptionEnabled;
     /**
      * Create a new Gun transport.
      *
@@ -121,9 +159,26 @@ export declare class GunTransport implements Transport {
     disconnect(): void;
     /**
      * Send data to all peers via Gun.
-     * Uses debouncing - each new update resets the timer.
+     * Routes awareness to a separate volatile node, doc sync to circular buffer.
+     * Uses debouncing for doc sync - each new update resets the timer.
      */
     send(data: Uint8Array): void;
+    /**
+     * Peek at the message type from CRC32-wrapped data.
+     * Format: [CRC32 (4 bytes)][message type (varint)]...
+     * Returns -1 if cannot determine type.
+     */
+    private peekMessageType;
+    /**
+     * Send awareness update to a separate volatile node.
+     * Awareness is ephemeral - only the latest state matters.
+     * Each client writes to its own awareness slot to avoid overwrites.
+     */
+    private sendAwareness;
+    /**
+     * Setup listener for awareness updates (separate from doc sync).
+     */
+    private setupAwarenessListener;
     /**
      * Flush batched updates to Gun.
      * Called after debounce period (no new updates for batchInterval ms).
@@ -150,6 +205,15 @@ export declare class GunTransport implements Transport {
      * Convert base64 string to Uint8Array.
      */
     private base64ToUint8Array;
+    /**
+     * Encrypt data using SEA with the configured password.
+     */
+    private encrypt;
+    /**
+     * Decrypt data using SEA with the configured password.
+     * Returns null if decryption fails (wrong password).
+     */
+    private decrypt;
     /**
      * Log debug messages if enabled.
      */

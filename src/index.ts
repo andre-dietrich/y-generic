@@ -219,15 +219,9 @@ export class GenericProvider extends Observable<string> {
   private _bcConnected: boolean = false
   private _bcSubscriber?: (data: ArrayBuffer, origin: any) => void
 
-  // Hash verification tracking
+  // Hash verification tracking for exponential backoff
   private _hashMismatchCount: number = 0
   private _lastHashMismatchTime: number = 0
-  private _hashMismatchTimerId?: ReturnType<typeof setTimeout> // deduplicating recovery timer
-
-  // P2P bidirectional sync: when we receive a SyncStep1, we respond with SyncStep2
-  // (handled by y-protocols), but we also need to send our OWN SyncStep1 so the
-  // requester can reply with the data THEY have that WE might be missing.
-  private _peerSyncTimerId?: ReturnType<typeof setTimeout> // deduplicating response timer
 
   // Rate limiting for sync requests
   private _syncRequestTimes: number[] = []
@@ -425,16 +419,6 @@ export class GenericProvider extends Observable<string> {
         this._sendUpdate(this._pendingUpdate)
       }
       this._pendingUpdate = null
-    }
-
-    // Cancel any pending P2P sync / hash-mismatch recovery timers
-    if (this._peerSyncTimerId !== undefined) {
-      clearTimeout(this._peerSyncTimerId)
-      this._peerSyncTimerId = undefined
-    }
-    if (this._hashMismatchTimerId !== undefined) {
-      clearTimeout(this._hashMismatchTimerId)
-      this._hashMismatchTimerId = undefined
     }
 
     // Flush pending awareness updates before disconnecting
@@ -739,22 +723,6 @@ export class GenericProvider extends Observable<string> {
             this.emit('synced', [true])
           }
 
-          // P2P bidirectional handshake: when we receive a SyncStep1 we reply with
-          // SyncStep2 (handled above via encoder), but we must ALSO send our own
-          // SyncStep1 so the requester can send us THEIR SyncStep2 with data we
-          // might be missing (e.g. concurrent changes made while offline).
-          // A deduplicating timer prevents a rapid ping-pong loop.
-          if (syncMessageType === syncProtocol.messageYjsSyncStep1) {
-            if (this._peerSyncTimerId === undefined) {
-              this._peerSyncTimerId = setTimeout(() => {
-                this._peerSyncTimerId = undefined
-                if (this.transport.isConnected && !this._destroying) {
-                  this._sendSyncStep1()
-                }
-              }, 150)
-            }
-          }
-
           // Send reply if needed
           if (encoding.length(encoder) > 1) {
             this._send(encoding.toUint8Array(encoder))
@@ -842,25 +810,27 @@ export class GenericProvider extends Observable<string> {
           // Verify hash match
           if (localHash !== expectedHash) {
             this._hashMismatchCount++
-            this._lastHashMismatchTime = Date.now()
+            const now = Date.now()
+
+            // Reset counter if it's been stable for 10 seconds
+            if (now - this._lastHashMismatchTime > 10000) {
+              this._hashMismatchCount = 1
+            }
+            this._lastHashMismatchTime = now
+
+            // Exponential backoff: 10ms, 50ms, 250ms, 1.25s, 6.25s, then cap at 10s
+            const delay = Math.min(
+              10000,
+              10 * Math.pow(5, this._hashMismatchCount - 1),
+            )
 
             console.warn(
               `[GenericProvider] Hash mismatch #${this._hashMismatchCount} detected! Local: ${localHash}, Expected: ${expectedHash}`,
             )
+            console.warn(`[GenericProvider] Re-sync scheduled in ${delay}ms...`)
 
-            // Schedule a single deduplicating recovery. Multiple incoming
-            // SYNC_VERIFIED messages can all trigger mismatches simultaneously;
-            // we only need ONE SyncStep1 to kick off the bidirectional handshake
-            // (the MESSAGE_SYNC handler's _peerSyncTimerId ensures the other side
-            // also sends their SyncStep1 back, giving us a full two-way exchange).
-            if (this._hashMismatchTimerId === undefined) {
-              this._hashMismatchTimerId = setTimeout(() => {
-                this._hashMismatchTimerId = undefined
-                if (this.transport.isConnected && !this._destroying) {
-                  this._sendSyncStep1()
-                }
-              }, 500)
-            }
+            // Request sync only (don't send our full state to avoid loop)
+            setTimeout(() => this._sendSyncStep1(), delay)
           } else {
             // Hash matched - reset failure counter
             this._hashMismatchCount = 0

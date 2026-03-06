@@ -185,6 +185,7 @@ export class SimplePeerTransport implements Transport {
   private _connected: boolean = false
   private _room: string = ''
   private _callback?: (data: Uint8Array) => void
+  private _peerConnectCallback?: (peerId: string) => void
   private peerId: string
   private peers: Map<string, PeerConnection> = new Map()
   private signalingConns: WebSocket[] = []
@@ -458,6 +459,16 @@ export class SimplePeerTransport implements Transport {
     this._callback = callback
     return () => {
       this._callback = undefined
+    }
+  }
+
+  /**
+   * Register callback for new peer data-channel connections.
+   */
+  onPeerConnect(callback: (peerId: string) => void): () => void {
+    this._peerConnectCallback = callback
+    return () => {
+      this._peerConnectCallback = undefined
     }
   }
 
@@ -748,6 +759,8 @@ export class SimplePeerTransport implements Transport {
     peer.on('connect', () => {
       this.log('✅ Peer connected:', remotePeerId)
       peerConn.connected = true
+      // Notify provider so it can push its local state to this new peer
+      this._peerConnectCallback?.(remotePeerId)
     })
 
     // Handle ICE connection state for debugging

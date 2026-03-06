@@ -252,6 +252,15 @@ export class PeerJSTransport {
         this._connected = false;
     }
     /**
+     * Register callback for new peer data-channel connections.
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        return () => {
+            this._peerConnectCallback = undefined;
+        };
+    }
+    /**
      * Send data to all connected peers.
      */
     send(data) {
@@ -392,6 +401,8 @@ export class PeerJSTransport {
                     };
                     this.peers.set(this.coordinatorPeerId, peerConn);
                     this.knownPeers.add(this.coordinatorPeerId);
+                    // Notify provider of the coordinator channel opening
+                    this._peerConnectCallback?.(this.coordinatorPeerId);
                     // Request peer list from coordinator (send as JSON-encoded binary)
                     this.sendCoordinationMessage(conn, {
                         type: 'join',
@@ -518,6 +529,19 @@ export class PeerJSTransport {
             this.log('⏭️ Re-election already in progress, skipping');
             return;
         }
+        // If we are currently offline the coordinator disconnected because WE lost
+        // the network, not because the coordinator disappeared.  Any attempt to
+        // create a new PeerJS peer will fail immediately with "Lost connection to
+        // server".  Defer the whole re-election until we are back online.
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            this.log('📴 Offline – deferring re-election until network returns');
+            const handler = () => {
+                this.log('🌐 Network restored – resuming re-election');
+                this.handleCoordinatorDisconnect();
+            };
+            window.addEventListener('online', handler, { once: true });
+            return;
+        }
         this.log('🗳️ Coordinator disconnected, starting re-election');
         this.reElectionInProgress = true;
         this.coordinatorConn = undefined;
@@ -640,10 +664,61 @@ export class PeerJSTransport {
         catch (error) {
             this.log('❌ Failed to transition to coordinator:', error);
             this.reElectionInProgress = false; // Re-election failed
-            // Fallback: recreate as regular peer
+            // Fallback: recreate as regular peer and connect to whoever won the election
             this.log('🔄 Falling back to regular peer');
-            // Just stay disconnected for now - the other peers might succeed
+            this.reestablishAsRegularPeer();
         }
+    }
+    /**
+     * Recreate the local peer with a fresh random ID and reconnect to the
+     * coordinator (whoever won the election while we were transitioning).
+     * Called when transitionToCoordinator() fails.
+     */
+    reestablishAsRegularPeer() {
+        const peerIdSuffix = Math.random().toString(36).substring(7);
+        this.peerId = `yjs-${this._room}-${peerIdSuffix}`;
+        this.isCoordinator = false;
+        this.peer = new this.options.peer(this.peerId, {
+            debug: this.options.debug ? 3 : 0,
+            ...this.options.peerOptions,
+        });
+        this.peer.on('open', (id) => {
+            this.peerId = id;
+            this._connected = true;
+            this.log('✅ Reestablished as regular peer:', id);
+            this.setupPeerDiscovery();
+            this.peer.on('connection', (conn) => {
+                this.handleIncomingConnection(conn);
+            });
+            this.peer.on('disconnected', () => {
+                this.log('Peer disconnected, attempting reconnect...');
+            });
+            // Connect to whoever is now coordinator
+            this.attemptCoordinatorConnection();
+        });
+        this.peer.on('error', (error) => {
+            this.log('❌ Error reestablishing as regular peer:', error);
+            // Destroy the dead peer object so we don't hold a stale reference
+            try {
+                this.peer?.destroy();
+            }
+            catch (_) { }
+            this.peer = null;
+            this._connected = false;
+            // If the failure is due to being offline, wait for the network to return
+            // and then try again from scratch.
+            const retryOnline = () => {
+                this.log('🌐 Network restored – retrying reestablish as regular peer');
+                this.reestablishAsRegularPeer();
+            };
+            if (typeof navigator !== 'undefined' && !navigator.onLine) {
+                window.addEventListener('online', retryOnline, { once: true });
+            }
+            else {
+                // We appear online but still failed – back off briefly and retry
+                setTimeout(retryOnline, 3000);
+            }
+        });
     }
     /**
      * Connect to a peer by ID.
@@ -743,6 +818,8 @@ export class PeerJSTransport {
         conn.on('open', () => {
             peerConn.connected = true;
             this.knownPeers.add(remotePeerId);
+            // Notify provider so it can push its local state to this new peer
+            this._peerConnectCallback?.(remotePeerId);
         });
         conn.on('data', (data) => {
             // Convert to Uint8Array if needed

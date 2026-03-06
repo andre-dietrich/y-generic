@@ -218,6 +218,17 @@ async function initWithConfig(config: {
   const roomNameEl = document.getElementById('room-name')!
   roomNameEl.textContent = config.room
 
+  let uid = localStorage.getItem('simplepeer-uid')
+
+  if (!uid) {
+    uid = Math.random().toString(36).substring(2, 10)
+    localStorage.setItem('simplepeer-uid', uid)
+    log(`🔑 Generated new user ID: ${uid}`, 'info')
+  } else {
+    log(`🔑 Loaded user ID from localStorage: ${uid}`, 'info')
+  }
+
+  //doc.clientID = uid
   // Create Yjs document
   const doc = new Y.Doc()
   const yText = doc.getText('quill')

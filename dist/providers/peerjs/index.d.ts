@@ -85,6 +85,7 @@ export declare class PeerJSTransport implements Transport {
     private _connected;
     private _room;
     private _callback?;
+    private _peerConnectCallback?;
     private peer;
     private peerId;
     private peers;
@@ -114,6 +115,10 @@ export declare class PeerJSTransport implements Transport {
      * Disconnect from all peers and cleanup.
      */
     disconnect(): void;
+    /**
+     * Register callback for new peer data-channel connections.
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
      * Send data to all connected peers.
      */
@@ -166,6 +171,12 @@ export declare class PeerJSTransport implements Transport {
      * Transition from regular peer to coordinator by reconnecting with coordinator ID.
      */
     private transitionToCoordinator;
+    /**
+     * Recreate the local peer with a fresh random ID and reconnect to the
+     * coordinator (whoever won the election while we were transitioning).
+     * Called when transitionToCoordinator() fails.
+     */
+    private reestablishAsRegularPeer;
     /**
      * Connect to a peer by ID.
      * To avoid race conditions, only the peer with the lower ID initiates the connection.

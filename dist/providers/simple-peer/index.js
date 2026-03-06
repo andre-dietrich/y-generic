@@ -281,6 +281,15 @@ export class SimplePeerTransport {
         };
     }
     /**
+     * Register callback for new peer data-channel connections.
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        return () => {
+            this._peerConnectCallback = undefined;
+        };
+    }
+    /**
      * Check if connected.
      */
     get isConnected() {
@@ -511,6 +520,8 @@ export class SimplePeerTransport {
         peer.on('connect', () => {
             this.log('✅ Peer connected:', remotePeerId);
             peerConn.connected = true;
+            // Notify provider so it can push its local state to this new peer
+            this._peerConnectCallback?.(remotePeerId);
         });
         // Handle ICE connection state for debugging
         if (peer._pc) {

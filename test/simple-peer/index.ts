@@ -14,6 +14,7 @@ import {
   SimplePeerTransport,
   type IceServer,
 } from '../../src/providers/simple-peer/index'
+import { math } from 'lib0'
 
 const BlockEmbed = Quill.import('blots/block/embed') as any
 
@@ -352,8 +353,21 @@ function updateUserList(awareness: any) {
 async function init() {
   log('🚀 Initializing SimplePeer test...', 'info')
 
+  let uid = localStorage.getItem('simplepeer-uid')
+
+  if (!uid) {
+    uid = Math.random().toString(36).substring(2, 10)
+    localStorage.setItem('simplepeer-uid', uid)
+    log(`🔑 Generated new user ID: ${uid}`, 'info')
+  } else {
+    log(`🔑 Loaded user ID from localStorage: ${uid}`, 'info')
+  }
+
   // Create Yjs document
   const doc = new Y.Doc()
+  //doc.clientID = uid
+
+  //doc.clientID = parseInt(uid, 36) // Convert to number for better compatibility with some transports
   const yText = doc.getText('quill')
 
   // Create SimplePeer transport

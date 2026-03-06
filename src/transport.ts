@@ -37,6 +37,16 @@ export interface Transport {
   onMessage(callback: (data: Uint8Array) => void): () => void
 
   /**
+   * Optional: register a callback that fires whenever a new peer data channel
+   * opens. The provider uses this to push its local state to the new peer
+   * immediately (syncNow), which is required for correct P2P reconnect sync.
+   *
+   * @param callback - Function to call with the new peer's ID
+   * @returns Cleanup function to unregister the callback
+   */
+  onPeerConnect?(callback: (peerId: string) => void): () => void
+
+  /**
    * Check if the transport is currently connected.
    */
   readonly isConnected: boolean

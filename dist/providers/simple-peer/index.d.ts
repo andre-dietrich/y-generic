@@ -124,6 +124,7 @@ export declare class SimplePeerTransport implements Transport {
     private _connected;
     private _room;
     private _callback?;
+    private _peerConnectCallback?;
     private peerId;
     private peers;
     private signalingConns;
@@ -162,6 +163,10 @@ export declare class SimplePeerTransport implements Transport {
      * Register callback for incoming messages.
      */
     onMessage(callback: (data: Uint8Array) => void): () => void;
+    /**
+     * Register callback for new peer data-channel connections.
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
      * Check if connected.
      */

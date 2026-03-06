@@ -248,9 +248,25 @@ export class GenericProvider extends Observable {
             this._unsubscribeTransport = this.transport.onMessage((data) => {
                 this._handleIncomingMessage(data);
             });
+            // When a new WebRTC peer channel opens, immediately push our full state
+            // so peers that reconnected after offline edits receive our changes.
+            if (this.transport.onPeerConnect) {
+                const unsubPeer = this.transport.onPeerConnect((_peerId) => {
+                    if (!this._destroying)
+                        this.syncNow();
+                });
+                const originalUnsub = this._unsubscribeTransport;
+                this._unsubscribeTransport = () => {
+                    originalUnsub?.();
+                    unsubPeer();
+                };
+            }
             this._setStatus({ state: 'connected' });
-            // Send initial sync message (SyncStep1)
-            this._sendSyncStep1();
+            // Send initial sync pushing our local state plus requesting remote state.
+            // syncNow() is used instead of _sendSyncStep1() so that any offline edits
+            // made before this connect() call are pushed to currently-connected peers
+            // (e.g. same-browser tabs via BroadcastChannel).
+            this.syncNow();
             // Broadcast local awareness state
             this._broadcastAwareness([this.doc.clientID]);
             // Start periodic sync to handle packet loss
@@ -602,8 +618,15 @@ export class GenericProvider extends Observable {
                         const delay = Math.min(10000, 10 * Math.pow(5, this._hashMismatchCount - 1));
                         console.warn(`[GenericProvider] Hash mismatch #${this._hashMismatchCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
                         console.warn(`[GenericProvider] Re-sync scheduled in ${delay}ms...`);
-                        // Request sync only (don't send our full state to avoid loop)
-                        setTimeout(() => this._sendSyncStep1(), delay);
+                        // Push our full state AND request theirs.
+                        // A hash mismatch means the two peers have diverged — one side may
+                        // have edits the other lacks.  Calling only _sendSyncStep1() (pull)
+                        // never delivers our own surplus edits to the other side.
+                        setTimeout(() => {
+                            if (this.transport.isConnected && !this._destroying) {
+                                this.syncNow();
+                            }
+                        }, delay);
                     }
                     else {
                         // Hash matched - reset failure counter

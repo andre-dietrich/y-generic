@@ -353,16 +353,6 @@ function updateUserList(awareness: any) {
 async function init() {
   log('🚀 Initializing SimplePeer test...', 'info')
 
-  let uid = localStorage.getItem('simplepeer-uid')
-
-  if (!uid) {
-    uid = Math.random().toString(36).substring(2, 10)
-    localStorage.setItem('simplepeer-uid', uid)
-    log(`🔑 Generated new user ID: ${uid}`, 'info')
-  } else {
-    log(`🔑 Loaded user ID from localStorage: ${uid}`, 'info')
-  }
-
   // Create Yjs document
   const doc = new Y.Doc()
   //doc.clientID = uid
@@ -391,7 +381,7 @@ async function init() {
     peer: SimplePeer, // Pass the simple-peer constructor
     signaling: currentConfig.signaling,
     iceServers: currentConfig.iceServers,
-    debug: false, // Enable debug logging in console
+    debug: true, // Enable debug logging in console
   })
 
   // Create provider

@@ -93,15 +93,7 @@ export class SimplePeerTransport {
         };
         // Generate unique peer ID
         this.peerId = this.generatePeerId();
-        // Log configuration in debug mode
-        if (this.options.debug) {
-            console.log('[SimplePeerTransport] Configuration:', {
-                signaling: this.options.signaling,
-                iceServers: peerOpts.config?.iceServers,
-                maxConns: this.options.maxConns,
-                peerId: this.peerId,
-            });
-        }
+        this.log(`Initialized — peerId: ${this.peerId}, maxConns: ${this.options.maxConns}`, `\n  signaling: [${this.options.signaling.join(', ')}]`, `\n  iceServers: [${(peerOpts.config?.iceServers ?? []).map((s) => (Array.isArray(s.urls) ? s.urls[0] : s.urls)).join(', ')}]`);
     }
     /**
      * Connect to the room via signaling servers and start discovering peers.
@@ -111,6 +103,7 @@ export class SimplePeerTransport {
             throw new Error('Already connected');
         }
         this._room = config.room;
+        this.log(`🔌 Connecting to room "${config.room}" as ${this.peerId}`);
         // Try to connect to signaling servers
         // Use Promise.allSettled to allow partial success
         const results = await Promise.allSettled(this.options.signaling.map((url) => this.connectSignaling(url)));
@@ -118,23 +111,21 @@ export class SimplePeerTransport {
         const successCount = results.filter((r) => r.status === 'fulfilled').length;
         const failCount = results.filter((r) => r.status === 'rejected').length;
         if (successCount > 0) {
-            this.log(`Connected to ${successCount}/${this.options.signaling.length} signaling servers`);
+            this.log(`📡 Signaling: ${successCount}/${this.options.signaling.length} server(s) connected`);
         }
-        else if (failCount > 0) {
-            console.warn('[SimplePeerTransport] No signaling servers available. ' +
-                'WebRTC peer discovery disabled. ' +
+        else {
+            console.warn('[SimplePeerTransport] ⚠️ No signaling servers reachable — WebRTC peer discovery disabled. ' +
                 'Cross-tab sync via BroadcastChannel will still work.');
-            // Log individual errors for debugging
             results.forEach((result, index) => {
                 if (result.status === 'rejected') {
-                    console.warn(`[SimplePeerTransport] Signaling server ${this.options.signaling[index]} failed:`, result.reason);
+                    console.warn(`[SimplePeerTransport]   ✗ ${this.options.signaling[index]}:`, result.reason?.message ?? result.reason);
                 }
             });
         }
         // Still mark as connected even if no signaling servers work
         // This allows BroadcastChannel-only mode for same-browser tabs
         this._connected = true;
-        this.log('Connected to room:', this._room);
+        this.log(`✅ Connected to room "${this._room}" — ${this.signalingConns.length}/${this.options.signaling.length} signaling server(s)`);
         // Start periodic re-announce to help late joiners discover us
         this.announceInterval = setInterval(() => {
             if (this.peers.size < this.options.maxConns &&
@@ -156,7 +147,7 @@ export class SimplePeerTransport {
     disconnect() {
         if (!this._connected)
             return;
-        this.log('Disconnecting...');
+        this.log(`🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`);
         // Stop re-announce interval
         if (this.announceInterval) {
             clearInterval(this.announceInterval);
@@ -197,11 +188,18 @@ export class SimplePeerTransport {
                     sentCount++;
                 }
                 catch (error) {
-                    this.log('Error sending to peer:', peerConn.peerId, error);
+                    this.log(`❌ Send failed to ${peerConn.peerId}:`, error.message);
                 }
             }
         }
-        this.log(`Sent to ${sentCount}/${this.peers.size} peers`);
+        // Only log when the picture is non-trivial (missing peers or no peers at all)
+        if (sentCount === 0) {
+            this.log(`⚠️ Send: 0 peers connected — ${data.length}B dropped`);
+        }
+        else if (sentCount < this.peers.size) {
+            const skipped = this.peers.size - sentCount;
+            this.log(`📤 Sent ${data.length}B to ${sentCount}/${this.peers.size} peer(s) — ${skipped} not yet connected`);
+        }
     }
     /**
      * Send data to a single peer, chunking if necessary.
@@ -219,7 +217,7 @@ export class SimplePeerTransport {
         // Large messages need chunking with flow control
         const messageId = messageIdCounter++;
         const totalChunks = Math.ceil(data.length / (CHUNK_SIZE - 13));
-        this.log(`Chunking message: ${data.length} bytes into ${totalChunks} chunks`);
+        this.log(`📦 Chunking ${data.length}B → ${totalChunks} chunks (msgId=${messageId})`);
         // Queue all chunks and send with backpressure handling
         const chunks = [];
         for (let i = 0; i < totalChunks; i++) {
@@ -251,9 +249,11 @@ export class SimplePeerTransport {
                 const channel = peer._channel;
                 if (channel && channel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                     // Wait for buffer to drain
+                    this.log(`⏸️ Backpressure on ${peerConn.peerId}: buffered ${channel.bufferedAmount}B, waiting...`);
                     channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
                     channel.onbufferedamountlow = () => {
                         channel.onbufferedamountlow = null;
+                        this.log(`▶️ Buffer drained on ${peerConn.peerId}, resuming chunks`);
                         sendNext();
                     };
                     return;
@@ -309,7 +309,7 @@ export class SimplePeerTransport {
             const ws = new WebSocket(url);
             let resolved = false;
             ws.onopen = () => {
-                this.log('Signaling connected:', url);
+                this.log(`🟢 Signaling connected: ${url}`);
                 // Subscribe to room
                 this.sendSignaling(ws, {
                     type: 'subscribe',
@@ -339,23 +339,25 @@ export class SimplePeerTransport {
             ws.onmessage = (event) => {
                 try {
                     const msg = JSON.parse(event.data);
-                    // Log all received messages with full details
-                    this.log('📩 Received:', msg.type, msg.from ? `from: ${msg.from}` : '', msg.to ? `to: ${msg.to}` : '', msg.signal ? `signal: ${msg.signal.type || 'candidate'}` : '');
+                    // Only log signal-bearing messages to avoid flooding with pure topology pings
+                    if (msg.signal || msg.type === 'announce') {
+                        this.log(`📩 Signaling ‹${msg.type}›`, msg.from ? `from=${msg.from.slice(0, 8)}` : '', msg.to ? `to=${msg.to.slice(0, 8)}` : '', msg.signal ? `signal=${msg.signal.type ?? 'candidate'}` : '');
+                    }
                     this.handleSignalingMessage(msg);
                 }
                 catch (error) {
-                    this.log('Error parsing signaling message:', error, 'Raw:', event.data);
+                    this.log(`❌ Failed to parse signaling message: ${error.message}  raw=${event.data}`);
                 }
             };
             ws.onerror = (error) => {
-                this.log('Signaling error:', url, error);
+                this.log(`❌ Signaling error: ${url}`, error);
                 if (!resolved) {
                     resolved = true;
                     reject(error);
                 }
             };
             ws.onclose = () => {
-                this.log('Signaling disconnected:', url);
+                this.log(`🔴 Signaling disconnected: ${url}`);
                 const index = this.signalingConns.indexOf(ws);
                 if (index > -1) {
                     this.signalingConns.splice(index, 1);
@@ -365,6 +367,7 @@ export class SimplePeerTransport {
             setTimeout(() => {
                 if (!resolved) {
                     resolved = true;
+                    this.log(`⏱️ Signaling connection timeout: ${url}`);
                     reject(new Error('Signaling connection timeout'));
                 }
             }, 10000);
@@ -375,10 +378,8 @@ export class SimplePeerTransport {
      */
     handleSignalingMessage(msg) {
         // Skip messages from ourselves
-        if (msg.from && msg.from === this.peerId) {
-            this.log('Ignoring own message');
+        if (msg.from && msg.from === this.peerId)
             return;
-        }
         switch (msg.type) {
             case 'publish':
                 // y-webrtc protocol: messages are published to topics
@@ -388,17 +389,14 @@ export class SimplePeerTransport {
                     if (!this.peers.has(msg.from) &&
                         this.peers.size < this.options.maxConns &&
                         !this.announcedPeers.has(msg.from)) {
-                        this.log('Discovered peer via publish:', msg.from);
-                        this.announcedPeers.add(msg.from);
-                        // Use alphabetical comparison for initiator tiebreaker
-                        // Higher peerId becomes initiator to avoid both sides initiating
                         const shouldInitiate = this.peerId > msg.from;
-                        this.log('Initiator tiebreaker:', this.peerId, '>', msg.from, '=', shouldInitiate);
+                        this.log(`📡 Peer discovered via publish: ${msg.from} — role: ${shouldInitiate ? 'initiator' : 'non-initiator'}`, `(peers: ${this.peers.size + 1}/${this.options.maxConns})`);
+                        this.announcedPeers.add(msg.from);
                         this.createPeerConnection(msg.from, shouldInitiate);
                         // If we're NOT the initiator, immediately re-announce so the initiator
                         // can discover us (they may have missed our initial publish)
                         if (!shouldInitiate) {
-                            this.log('Re-announcing for initiator discovery...');
+                            this.log('📢 Re-announcing so initiator can find us...');
                             for (const ws of this.signalingConns) {
                                 this.sendSignaling(ws, {
                                     type: 'publish',
@@ -412,7 +410,6 @@ export class SimplePeerTransport {
                 // Handle embedded signal if present
                 if (msg.signal && msg.from) {
                     if (!msg.to || msg.to === this.peerId) {
-                        this.log('Received embedded signal from:', msg.from);
                         this.handlePeerSignal(msg.from, msg.signal);
                     }
                 }
@@ -426,15 +423,13 @@ export class SimplePeerTransport {
                 if (!this.peers.has(msg.from) &&
                     this.peers.size < this.options.maxConns &&
                     !this.announcedPeers.has(msg.from)) {
-                    this.log('Creating connection to announced peer:', msg.from);
-                    this.announcedPeers.add(msg.from);
-                    // Use alphabetical comparison for initiator tiebreaker
                     const shouldInitiate = this.peerId > msg.from;
-                    this.log('Initiator tiebreaker:', this.peerId, '>', msg.from, '=', shouldInitiate);
+                    this.log(`📡 Peer announced: ${msg.from} — role: ${shouldInitiate ? 'initiator' : 'non-initiator'}`, `(peers: ${this.peers.size + 1}/${this.options.maxConns})`);
+                    this.announcedPeers.add(msg.from);
                     this.createPeerConnection(msg.from, shouldInitiate);
                 }
-                else {
-                    this.log('Skipping peer (already connected or at max):', msg.from);
+                else if (this.peers.size >= this.options.maxConns) {
+                    this.log(`⚠️ Peer limit reached (${this.options.maxConns}), ignoring announce from ${msg.from}`);
                 }
                 break;
             case 'signal':
@@ -444,19 +439,15 @@ export class SimplePeerTransport {
                 }
                 // Received WebRTC signal from peer
                 if (msg.to === this.peerId && msg.signal) {
-                    this.log('Received signal from peer:', msg.from);
                     this.handlePeerSignal(msg.from, msg.signal);
                 }
-                else if (msg.to && msg.to !== this.peerId) {
-                    // Signal for another peer, ignore
-                }
-                else {
-                    this.log('Signal without target - handling anyway');
+                else if (!msg.to && msg.signal) {
+                    // Signal without explicit target — handle anyway (some servers strip `to`)
                     this.handlePeerSignal(msg.from, msg.signal);
                 }
                 break;
             default:
-                this.log('Unknown signaling message type:', msg.type);
+                this.log(`❓ Unknown signaling message type: ${msg.type}`);
         }
     }
     /**
@@ -464,7 +455,6 @@ export class SimplePeerTransport {
      */
     sendSignaling(ws, msg) {
         if (ws.readyState === WebSocket.OPEN) {
-            this.log('Signaling send:', msg.type, msg.to ? `to: ${msg.to}` : '');
             ws.send(JSON.stringify(msg));
         }
     }
@@ -481,10 +471,10 @@ export class SimplePeerTransport {
      */
     createPeerConnection(remotePeerId, initiator) {
         if (this.peers.has(remotePeerId)) {
-            this.log('Peer connection already exists:', remotePeerId);
+            this.log(`⏭️ Peer connection already exists: ${remotePeerId}`);
             return;
         }
-        this.log('Creating peer connection:', remotePeerId, 'initiator:', initiator);
+        this.log(`🤝 Creating ${initiator ? 'outbound (initiator)' : 'inbound (non-initiator)'} connection to ${remotePeerId}`);
         const peer = new this.options.peer({
             initiator,
             ...this.options.peerOpts,
@@ -498,8 +488,10 @@ export class SimplePeerTransport {
         this.peers.set(remotePeerId, peerConn);
         // Handle signaling data (ICE candidates and SDP)
         peer.on('signal', (signal) => {
-            this.log('📤 Sending signal to peer:', remotePeerId, 'type:', signal.type || 'candidate');
-            // Send as 'publish' type for y-webrtc compatibility (many signaling servers only route publish)
+            this.log(`📤 Signal to ${remotePeerId}: ${signal.type ?? 'candidate'}`);
+            // Send as 'publish' only — broadcasting as BOTH 'publish' and 'signal' causes the
+            // receiving peer to apply the same SDP offer twice, which triggers a WebRTC error
+            // and destroys the peer before it can fully connect.
             this.broadcastSignaling({
                 type: 'publish',
                 from: this.peerId,
@@ -507,33 +499,34 @@ export class SimplePeerTransport {
                 signal,
                 topic: this._room,
             });
-            // Also send as 'signal' type for servers that support it directly
-            this.broadcastSignaling({
-                type: 'signal',
-                from: this.peerId,
-                to: remotePeerId,
-                signal,
-                topic: this._room,
-            });
         });
-        // Handle connection
-        peer.on('connect', () => {
-            this.log('✅ Peer connected:', remotePeerId);
+        // Mark channel open and notify provider — called by either 'connect' or the first
+        // 'data' event, whichever fires first (WebRTC can deliver data before 'connect' on
+        // some browsers, causing replies to be dropped if we wait for 'connect' only).
+        const onChannelOpen = (via) => {
+            if (peerConn.connected)
+                return; // already fired
             peerConn.connected = true;
-            // Notify provider so it can push its local state to this new peer
+            const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
+            this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`);
             this._peerConnectCallback?.(remotePeerId);
-        });
+        };
+        // Handle connection
+        peer.on('connect', () => onChannelOpen('connect'));
         // Handle ICE connection state for debugging
         if (peer._pc) {
             peer._pc.oniceconnectionstatechange = () => {
-                this.log('ICE state:', remotePeerId, peer._pc.iceConnectionState);
+                this.log(`🧊 ICE ${remotePeerId}: ${peer._pc.iceConnectionState}`);
             };
             peer._pc.onconnectionstatechange = () => {
-                this.log('Connection state:', remotePeerId, peer._pc.connectionState);
+                this.log(`🔗 Connection ${remotePeerId}: ${peer._pc.connectionState}`);
             };
         }
         // Handle incoming data
         peer.on('data', (data) => {
+            // Data flowing proves the channel is open — handle the race where 'data' fires
+            // before 'connect' (seen on Chrome when the remote initiator sends immediately).
+            onChannelOpen('data');
             if (!this._callback)
                 return;
             try {
@@ -585,7 +578,7 @@ export class SimplePeerTransport {
                             ? this.decrypt(fullMessage, this.options.password)
                             : fullMessage;
                         this._callback(decryptedData);
-                        this.log(`Reassembled chunked message: ${totalLength} bytes from ${totalChunks} chunks`);
+                        this.log(`📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`);
                     }
                 }
                 else {
@@ -602,12 +595,13 @@ export class SimplePeerTransport {
         });
         // Handle errors
         peer.on('error', (error) => {
-            this.log('❌ Peer error:', remotePeerId, error.message || error);
+            this.log(`❌ Peer error [${remotePeerId}]: ${error.message ?? error}`);
             this.removePeer(remotePeerId);
         });
         // Handle close
         peer.on('close', () => {
-            this.log('Peer closed:', remotePeerId);
+            const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected && p.peerId !== remotePeerId).length;
+            this.log(`🔴 Peer channel closed: ${remotePeerId} — ${connectedCount}/${this.peers.size - 1} remaining`);
             this.removePeer(remotePeerId);
         });
     }
@@ -615,25 +609,22 @@ export class SimplePeerTransport {
      * Handle WebRTC signal from peer.
      */
     handlePeerSignal(remotePeerId, signal) {
-        this.log('⬇️ handlePeerSignal from:', remotePeerId, 'type:', signal?.type || 'candidate');
         let peerConn = this.peers.get(remotePeerId);
         if (!peerConn) {
-            // Create peer connection as non-initiator
-            this.log('Creating peer as non-initiator for signal from:', remotePeerId);
+            this.log(`📶 Signal from unknown peer ${remotePeerId} (${signal?.type ?? 'candidate'}) — creating non-initiator connection`);
             this.createPeerConnection(remotePeerId, false);
             peerConn = this.peers.get(remotePeerId);
         }
         if (peerConn) {
             try {
-                this.log('Passing signal to peer:', remotePeerId);
                 peerConn.peer.signal(signal);
             }
             catch (error) {
-                this.log('Error signaling peer:', remotePeerId, error);
+                this.log(`❌ Failed to apply signal from ${remotePeerId}: ${error.message}`);
             }
         }
         else {
-            this.log('Failed to get peer connection for:', remotePeerId);
+            this.log(`❌ Could not create peer connection for signal from ${remotePeerId}`);
         }
     }
     /**
@@ -650,6 +641,8 @@ export class SimplePeerTransport {
             }
             this.peers.delete(peerId);
             this.announcedPeers.delete(peerId);
+            const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
+            this.log(`🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`);
         }
     }
     /**

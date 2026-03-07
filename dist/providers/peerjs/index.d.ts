@@ -97,6 +97,7 @@ export declare class PeerJSTransport implements Transport {
     private coordinatorConn?;
     private roomPeers;
     private reElectionInProgress;
+    private _destroying;
     /**
      * Create a new PeerJS transport.
      *
@@ -115,6 +116,13 @@ export declare class PeerJSTransport implements Transport {
      * Disconnect from all peers and cleanup.
      */
     disconnect(): void;
+    /**
+     * Handle unexpected disconnect from the PeerJS signaling server.
+     * Happens on network changes (WiFi ↔ mobile), server restarts, etc.
+     * PeerJS keeps the same Peer ID — we call reconnect() then re-open
+     * DataConnections to all peers we already knew about.
+     */
+    private _handlePeerServerDisconnect;
     /**
      * Register callback for new peer data-channel connections.
      */

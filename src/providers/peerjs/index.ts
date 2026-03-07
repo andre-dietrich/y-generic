@@ -113,6 +113,7 @@ export class PeerJSTransport implements Transport {
   private coordinatorConn?: any // Connection to coordinator (if not coordinator)
   private roomPeers: Set<string> = new Set() // All peers in room (coordinator tracks this)
   private reElectionInProgress: boolean = false // Prevent duplicate re-elections
+  private _destroying: boolean = false // Set during disconnect() to suppress reconnects
 
   /**
    * Create a new PeerJS transport.
@@ -191,6 +192,14 @@ export class PeerJSTransport implements Transport {
             this.peer.on('connection', (conn: any) => {
               this.handleIncomingConnection(conn)
             })
+
+            this.peer.on('disconnected', () => {
+              this.log(
+                'Peer disconnected from PeerJS server, attempting reconnect...',
+              )
+              this._handlePeerServerDisconnect()
+            })
+
             resolve()
           }
         })
@@ -273,8 +282,8 @@ export class PeerJSTransport implements Transport {
     })
 
     this.peer.on('disconnected', () => {
-      this.log('Peer disconnected, attempting reconnect...')
-      // PeerJS will auto-reconnect
+      this.log('Peer disconnected from PeerJS server, attempting reconnect...')
+      this._handlePeerServerDisconnect()
     })
   }
 
@@ -284,7 +293,7 @@ export class PeerJSTransport implements Transport {
   disconnect(): void {
     if (!this._connected) return
 
-    // Disconnecting
+    this._destroying = true
 
     // Clear discovery interval
     if (this.discoveryInterval) {
@@ -357,6 +366,70 @@ export class PeerJSTransport implements Transport {
     }
 
     this._connected = false
+    this._destroying = false
+  }
+
+  /**
+   * Handle unexpected disconnect from the PeerJS signaling server.
+   * Happens on network changes (WiFi ↔ mobile), server restarts, etc.
+   * PeerJS keeps the same Peer ID — we call reconnect() then re-open
+   * DataConnections to all peers we already knew about.
+   */
+  private _handlePeerServerDisconnect(): void {
+    if (this._destroying) return
+
+    // Defer until network is back if we are offline
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      this.log('📴 Offline – deferring PeerJS reconnect until network returns')
+      window.addEventListener(
+        'online',
+        () => {
+          this.log('🌐 Network restored – reconnecting to PeerJS server')
+          this._handlePeerServerDisconnect()
+        },
+        { once: true },
+      )
+      return
+    }
+
+    // peer.reconnect() re-registers the same ID with the PeerJS server
+    try {
+      this.peer.reconnect()
+      this.log(`🔄 PeerJS reconnect initiated (peer ID: ${this.peerId})`)
+    } catch (err) {
+      this.log('❌ peer.reconnect() failed:', err)
+      return
+    }
+
+    // Once the server accepts us again, re-open DataConnections to known peers
+    this.peer.once('open', () => {
+      this.log(
+        `✅ Reconnected to PeerJS server — re-connecting to ${this.knownPeers.size} known peer(s)`,
+      )
+
+      // Drop stale (disconnected) DataConnection entries from before the network change
+      for (const [peerId, peerConn] of this.peers.entries()) {
+        if (!peerConn.connected) {
+          try {
+            peerConn.conn.close()
+          } catch (_) {}
+          this.peers.delete(peerId)
+        }
+      }
+
+      // Re-establish connections to all known peers
+      for (const peerId of this.knownPeers) {
+        if (!this.peers.has(peerId) && peerId !== this.peerId) {
+          this.log(`🔌 Re-connecting to known peer: ${peerId}`)
+          this.connectToPeer(peerId)
+        }
+      }
+
+      // Regular peer: if coordinator connection was lost, reconnect to coordinator
+      if (!this.isCoordinator && this.coordinatorConn == null) {
+        setTimeout(() => this.attemptCoordinatorConnection(), 1000)
+      }
+    })
   }
 
   /**
@@ -877,7 +950,10 @@ export class PeerJSTransport implements Transport {
       })
 
       this.peer.on('disconnected', () => {
-        this.log('Peer disconnected, attempting reconnect...')
+        this.log(
+          'Peer disconnected from PeerJS server, attempting reconnect...',
+        )
+        this._handlePeerServerDisconnect()
       })
 
       // Connect to whoever is now coordinator

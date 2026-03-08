@@ -50,6 +50,10 @@
     "./providers/matrix": {
       "types": "./dist/providers/matrix/index.d.ts",
       "default": "./dist/providers/matrix/index.js"
+    },
+    "./providers/supabase": {
+      "types": "./dist/providers/supabase/index.d.ts",
+      "default": "./dist/providers/supabase/index.js"
     }
   },
   "files": [
@@ -66,6 +70,7 @@
     "dev:pubnub": "npx parcel serve test/pubnub/index.html --open --port 3007",
     "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
     "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
+    "dev:supabase": "npx parcel serve test/supabase/index.html --open --port 3010",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc",
     "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",
@@ -77,8 +82,8 @@
     "build:demo:trystero": "npx parcel build test/trystero/index.html --dist-dir demos/trystero --public-url ./ --no-source-maps",
     "build:demo:pubnub": "npx parcel build test/pubnub/index.html --dist-dir demos/pubnub --public-url ./ --no-source-maps",
     "build:demo:websocket": "npx parcel build test/websocket/index.html --dist-dir demos/websocket --public-url ./ --no-source-maps",
-    "build:demo:matrix": "npx parcel build test/matrix/index.html --dist-dir demos/matrix --public-url ./ --no-source-maps",
-    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix"
+    "build:demo:supabase": "npx parcel build test/supabase/index.html --dist-dir demos/supabase --public-url ./ --no-source-maps",
+    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase"
   },
   "dependencies": {
     "lib0": "^0.2.98",
@@ -89,12 +94,15 @@
     "y-quill": "^1.0.0",
     "yjs": "^13.6.29"
   },
-  "peerDependencies": {
+  "pe@supabase/supabase-js": {
+    "optional": true
+  },
+  "erDependencies": {
     "gun": "^0.2020.1240",
     "peerjs": "^1.5.0",
     "simple-peer": "^9.11.0"
   },
-  "peerDependenciesMeta": {
+  "erDependenciesMeta": {
     "gun": {
       "optional": true
     },
@@ -115,5 +123,8 @@
     "typescript": "^5.0.0",
     "y-webrtc": "^10.3.0",
     "y-websocket": "^3.0.0"
+  },
+  "peerDependencies": {
+    "@supabase/supabase-js": "^2.98.0"
   }
 }

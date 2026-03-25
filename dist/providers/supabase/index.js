@@ -1,5 +1,3 @@
-import * as Y from 'yjs';
-import { createClient, } from '@supabase/supabase-js';
 // ---------------------------------------------------------------------------
 // CRC32 helpers (GenericProvider wraps messages with CRC32 header)
 // ---------------------------------------------------------------------------
@@ -55,60 +53,34 @@ async function hashPassword(password) {
  *
  * Provides real-time synchronization using Supabase Realtime channels.
  *
- * Features:
- * - Ephemeral mode: Peer-to-peer sync via Supabase Realtime (no database)
- * - Persistent mode: Database-backed sync with automatic persistence
- * - Optional password protection
- * - Room-based collaboration
- * - Debounced database updates
- * - Automatic retry on database errors
- *
  * @example
  * ```ts
- * // Ephemeral mode (states lost when all peers disconnect)
  * import * as Y from 'yjs'
  * import { GenericProvider } from 'y-generic'
  * import { SupabaseTransport } from 'y-generic/providers/supabase'
  *
  * const doc = new Y.Doc()
- * const transport = new SupabaseTransport()
- *
- * await provider.connect({
- *   supabaseUrl: 'https://xxxxx.supabase.co',
- *   supabaseKey: 'your-anon-key',
- *   room: 'my-room',
- *   persistent: false
+ * const transport = new SupabaseTransport({
+ *   createClient: (globalThis as any).supabase.createClient,
  * })
+ * const provider = new GenericProvider(doc, transport)
  *
- * // Persistent mode (states stored in database)
  * await provider.connect({
  *   supabaseUrl: 'https://xxxxx.supabase.co',
  *   supabaseKey: 'your-anon-key',
  *   room: 'my-room',
- *   persistent: true,
- *   password: 'optional-password'
  * })
  * ```
  */
 export class SupabaseTransport {
-    constructor() {
+    constructor(options) {
+        this.options = options;
         this.supabase = null;
         this.channel = null;
         this.config = null;
         this._isConnected = false;
         this.debug = false;
-        // Persistent mode
-        this.persistentMode = false;
-        this.tableName = 'yjs_documents';
-        this.columnName = 'content';
-        this.idColumnName = 'id';
         this.roomId = '';
-        this.persistDebounceMs = 2000;
-        this.doc = null;
-        this.isWritingToDb = false;
-        this.savePending = false;
-        // Buffer for data loaded from DB before onMessage callback is registered
-        this.pendingLoad = null;
     }
     get isConnected() {
         return this._isConnected;
@@ -116,28 +88,19 @@ export class SupabaseTransport {
     async connect(config) {
         this.config = config;
         this.debug = config.debug || false;
-        this.persistentMode = config.persistent || false;
-        this.tableName = config.tableName || 'yjs_documents';
-        this.columnName = config.columnName || 'content';
-        this.idColumnName = config.idColumnName || 'id';
-        this.persistDebounceMs = config.persistDebounceMs || 2000;
         if (!config.supabaseUrl || !config.supabaseKey) {
             throw new Error('SupabaseTransport: supabaseUrl and supabaseKey are required');
         }
         if (!config.room) {
             throw new Error('SupabaseTransport: room name is required');
         }
-        if (config.persistent && !config.doc) {
-            throw new Error('SupabaseTransport: a Y.Doc must be provided via config.doc when persistent is true');
-        }
-        this.doc = config.doc || null;
-        // Create Supabase client
-        this.supabase = createClient(config.supabaseUrl, config.supabaseKey);
+        // Create Supabase client using the injected createClient function
+        this.supabase = this.options.createClient(config.supabaseUrl, config.supabaseKey);
         // Generate room ID (with optional password hashing)
         this.roomId = config.password
             ? `${config.room}-${await hashPassword(config.password)}`
             : config.room;
-        this.log('Connecting to room:', this.roomId, this.persistentMode ? '(persistent)' : '(ephemeral)');
+        this.log('Connecting to room:', this.roomId);
         // Create and subscribe to channel
         this.channel = this.supabase.channel(this.roomId);
         // Listen for messages
@@ -161,24 +124,9 @@ export class SupabaseTransport {
                 }
             });
         });
-        // Load from database AFTER connect() resolves so the onMessage callback
-        // is already registered by GenericProvider before we deliver the data.
-        // We store it in pendingLoad and flush it in onMessage().
-        if (this.persistentMode) {
-            await this.loadFromDatabase();
-        }
     }
     async disconnect() {
         this.log('Disconnecting...');
-        // Flush pending updates
-        if (this.persistTimer) {
-            clearTimeout(this.persistTimer);
-            this.persistTimer = undefined;
-        }
-        if (this.persistentMode && this.doc) {
-            await this.saveToDatabase();
-        }
-        // Unsubscribe from channel
         if (this.channel) {
             await this.channel.unsubscribe();
             this.channel = null;
@@ -203,22 +151,9 @@ export class SupabaseTransport {
             event: 'message',
             payload: base64,
         });
-        // Queue for database persistence if enabled
-        if (this.persistentMode) {
-            this.queuePersist();
-        }
     }
     onMessage(callback) {
         this.messageCallback = callback;
-        // Flush any data that was loaded from the database before this callback
-        // was registered (loadFromDatabase runs after connect() resolves, but
-        // GenericProvider calls onMessage() immediately after connect() returns).
-        if (this.pendingLoad) {
-            const data = this.pendingLoad;
-            this.pendingLoad = null;
-            // Defer by one microtask so GenericProvider finishes its setup first
-            Promise.resolve().then(() => callback(data));
-        }
         return () => {
             this.messageCallback = undefined;
         };
@@ -240,91 +175,6 @@ export class SupabaseTransport {
         }
         catch (error) {
             this.log('Error handling message:', error);
-        }
-    }
-    async loadFromDatabase() {
-        if (!this.supabase || !this.persistentMode)
-            return;
-        try {
-            this.log('Loading from database...');
-            const { data, error } = await this.supabase
-                .from(this.tableName)
-                .select(this.columnName)
-                .eq(this.idColumnName, this.roomId)
-                .single();
-            if (error) {
-                if (error.code === 'PGRST116') {
-                    // No document found, will be created on first save
-                    this.log('No existing document found in database');
-                    return;
-                }
-                throw error;
-            }
-            if (data && data[this.columnName]) {
-                const content = data[this.columnName];
-                const uint8Array = this.base64ToUint8Array(content);
-                if (uint8Array.length > 0) {
-                    const wrapped = addCRC32Header(uint8Array);
-                    if (this.messageCallback) {
-                        // Callback already registered — deliver immediately
-                        this.messageCallback(wrapped);
-                    }
-                    else {
-                        // Callback not yet registered — buffer until onMessage() is called
-                        this.pendingLoad = wrapped;
-                    }
-                    this.log('Loaded', uint8Array.length, 'bytes from database');
-                }
-            }
-        }
-        catch (error) {
-            this.log('Error loading from database:', error.message);
-            console.warn('SupabaseTransport: Failed to load from database:', error);
-        }
-    }
-    queuePersist() {
-        // Clear existing timer — always save the latest full state, not a specific delta
-        if (this.persistTimer) {
-            clearTimeout(this.persistTimer);
-        }
-        this.persistTimer = setTimeout(() => {
-            this.saveToDatabase();
-        }, this.persistDebounceMs);
-    }
-    async saveToDatabase() {
-        if (!this.supabase || !this.persistentMode || !this.doc)
-            return;
-        // If a write is in progress, mark a save as pending and return.
-        // The finally block will re-trigger with the latest doc state when done.
-        if (this.isWritingToDb) {
-            this.savePending = true;
-            return;
-        }
-        this.isWritingToDb = true;
-        this.savePending = false;
-        try {
-            // Always encode the full current document state — never individual deltas
-            const state = Y.encodeStateAsUpdate(this.doc);
-            const base64 = this.uint8ArrayToBase64(state);
-            this.log('Saving to database...', state.length, 'bytes');
-            const { error } = await this.supabase
-                .from(this.tableName)
-                .upsert({ [this.idColumnName]: this.roomId, [this.columnName]: base64 });
-            if (error)
-                throw error;
-            this.log('Saved to database successfully');
-        }
-        catch (error) {
-            this.log('Error saving to database:', error.message);
-            console.warn('SupabaseTransport: Failed to save to database. Will retry later.', error);
-            this.savePending = true;
-        }
-        finally {
-            this.isWritingToDb = false;
-            // If the doc changed while we were writing, save the latest state now
-            if (this.savePending) {
-                setTimeout(() => this.saveToDatabase(), 1000);
-            }
         }
     }
     // Utility methods for base64 conversion

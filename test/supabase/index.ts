@@ -1,8 +1,7 @@
 /**
  * Supabase Provider Test
  *
- * This demo shows real-time synchronization using Supabase Realtime with
- * support for both ephemeral (peer-only) and persistent (database-backed) modes.
+ * This demo shows real-time synchronization using Supabase Realtime.
  */
 
 import * as Y from 'yjs'
@@ -28,7 +27,6 @@ Quill.register('modules/cursors', QuillCursors)
 let provider: GenericProvider | null = null
 let quill: Quill | null = null
 let binding: QuillBinding | null = null
-let currentMode: 'ephemeral' | 'persistent' = 'ephemeral'
 
 // Generate random user info
 const userColors = [
@@ -145,7 +143,7 @@ async function connect() {
   }
 
   try {
-    log(`Connecting to room "${room}" in ${currentMode} mode...`)
+    log(`Connecting to room "${room}"...`)
     updateStatus('connecting', 'Connecting...')
 
     // Initialize editor if not already done
@@ -156,7 +154,10 @@ async function connect() {
     const yText = doc.getText('quill')
 
     // Create transport and provider
-    const transport = new SupabaseTransport()
+    // createClient is loaded from the Supabase CDN script tag in index.html
+    const transport = new SupabaseTransport({
+      createClient: (globalThis as any).supabase.createClient,
+    })
     provider = new GenericProvider(doc, transport)
 
     // Connect with configuration
@@ -165,9 +166,6 @@ async function connect() {
       supabaseKey,
       room,
       password: password || undefined,
-      persistent: currentMode === 'persistent',
-      doc: currentMode === 'persistent' ? doc : undefined,
-      persistDebounceMs: 2000,
       debug: true,
     })
 
@@ -204,8 +202,6 @@ async function connect() {
 
     // Update UI
     updateStatus('connected', 'Connected')
-    document.getElementById('mode-text')!.textContent =
-      currentMode === 'persistent' ? 'Persistent' : 'Ephemeral'
     document.getElementById('room-text')!.textContent = room
     document.getElementById('connect-btn')!.style.display = 'none'
     document.getElementById('disconnect-btn')!.style.display = 'block'
@@ -217,10 +213,6 @@ async function connect() {
       true
     ;(document.getElementById('room-name') as HTMLInputElement).disabled = true
     ;(document.getElementById('password') as HTMLInputElement).disabled = true
-    document.querySelectorAll('.mode-button').forEach((btn) => {
-      ;(btn as HTMLElement).style.pointerEvents = 'none'
-      ;(btn as HTMLElement).style.opacity = '0.6'
-    })
 
     log('Connected successfully!')
   } catch (error: any) {
@@ -256,10 +248,6 @@ async function disconnect() {
       false
     ;(document.getElementById('room-name') as HTMLInputElement).disabled = false
     ;(document.getElementById('password') as HTMLInputElement).disabled = false
-    document.querySelectorAll('.mode-button').forEach((btn) => {
-      ;(btn as HTMLElement).style.pointerEvents = 'auto'
-      ;(btn as HTMLElement).style.opacity = '1'
-    })
 
     log('Disconnected successfully')
   } catch (error: any) {
@@ -270,25 +258,6 @@ async function disconnect() {
 // Setup UI event listeners
 document.getElementById('connect-btn')!.addEventListener('click', connect)
 document.getElementById('disconnect-btn')!.addEventListener('click', disconnect)
-
-// Mode selector
-document.querySelectorAll('.mode-button').forEach((button) => {
-  button.addEventListener('click', () => {
-    // Remove active class from all buttons
-    document.querySelectorAll('.mode-button').forEach((btn) => {
-      btn.classList.remove('active')
-    })
-
-    // Add active class to clicked button
-    button.classList.add('active')
-
-    // Update current mode
-    currentMode = (button as HTMLElement).dataset.mode as
-      | 'ephemeral'
-      | 'persistent'
-    log(`Mode selected: ${currentMode}`)
-  })
-})
 
 // Load saved config from localStorage
 const savedUrl = localStorage.getItem('supabase-url')

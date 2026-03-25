@@ -441,6 +441,21 @@ https://relay.peer.ooo/gun</textarea
           </div>
         </div>
 
+        <div class="control-group">
+          <div class="checkbox-group">
+            <input type="checkbox" id="config-persistent" />
+            <label for="config-persistent"
+              >Persistent mode &mdash; restore state when all peers
+              reconnect</label
+            >
+          </div>
+          <div class="help-text">
+            When enabled, the full document state is saved to Gun and loaded
+            back when peers come back online. When disabled, any previously
+            saved snapshot is cleared on connect so new sessions start blank.
+          </div>
+        </div>
+
         <div class="control-group" style="margin-top: 20px">
           <button id="connect-btn" class="btn">🚀 Connect</button>
         </div>

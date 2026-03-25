@@ -1,3 +1,4 @@
+import * as Y from 'yjs';
 import type { Transport, ConnectionConfig } from '../../transport';
 /**
  * Supabase transport configuration
@@ -21,6 +22,11 @@ export interface SupabaseConfig extends ConnectionConfig {
     idColumnName?: string;
     /** Debounce delay for database updates in ms (default: 2000) */
     persistDebounceMs?: number;
+    /**
+     * The Yjs document to persist. Required when persistent is true.
+     * The transport encodes the full document state on each debounced save.
+     */
+    doc?: Y.Doc;
     /** Enable debug logging */
     debug?: boolean;
 }
@@ -78,9 +84,10 @@ export declare class SupabaseTransport implements Transport {
     private roomId;
     private persistDebounceMs;
     private persistTimer?;
-    private pendingUpdate?;
-    private updateQueue;
+    private doc;
     private isWritingToDb;
+    private savePending;
+    private pendingLoad;
     get isConnected(): boolean;
     connect(config: SupabaseConfig): Promise<void>;
     disconnect(): Promise<void>;

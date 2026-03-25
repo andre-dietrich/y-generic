@@ -77,6 +77,7 @@ async function initWithConfig(config: {
   debug: boolean
   batchInterval: number
   localStorage: boolean
+  persistent: boolean
 }) {
   log('🚀 Initializing GunDB test...', 'info')
   log(
@@ -230,7 +231,11 @@ async function initWithConfig(config: {
   // Connect to room
   log(`🌐 Connecting to GunDB room: ${config.room}...`, 'info')
   try {
-    await provider.connect({ room: config.room })
+    await provider.connect({
+      room: config.room,
+      persistent: config.persistent,
+      doc: config.persistent ? doc : undefined,
+    })
     log('✅ Successfully connected to GunDB!', 'success')
     log('💡 Tip: Open another tab to see real-time sync!', 'info')
   } catch (error) {
@@ -354,6 +359,9 @@ function setupConnectionForm() {
   const configLocalStorage = document.getElementById(
     'config-localstorage',
   ) as HTMLInputElement
+  const configPersistent = document.getElementById(
+    'config-persistent',
+  ) as HTMLInputElement
 
   connectBtn.addEventListener('click', async () => {
     // Validate room name
@@ -375,6 +383,7 @@ function setupConnectionForm() {
     const batchInterval = parseInt(configBatchInterval.value) || 100
     const debug = configDebug.checked
     const localStorage = configLocalStorage.checked
+    const persistent = configPersistent.checked
 
     // Disable button
     connectBtn.disabled = true
@@ -392,6 +401,7 @@ function setupConnectionForm() {
         debug,
         batchInterval,
         localStorage,
+        persistent,
       })
     } catch (error) {
       console.error('Connection failed:', error)

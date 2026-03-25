@@ -41,6 +41,7 @@
  * })
  * ```
  */
+import * as Y from 'yjs';
 import type { Transport, ConnectionConfig } from '../../transport';
 /**
  * Gun constructor type (from gun library).
@@ -112,6 +113,28 @@ export interface GunTransportOptions {
     sea?: any;
 }
 /**
+ * Extended connection config with optional persistence settings.
+ */
+export interface GunConnectionConfig extends ConnectionConfig {
+    /**
+     * When true, a full Y.Doc snapshot is saved to Gun on every debounced
+     * update and loaded back when peers reconnect after all going offline.
+     * When false (default), any previously stored snapshot is cleared on
+     * connect so new sessions start from a blank state.
+     * @default false
+     */
+    persistent?: boolean;
+    /**
+     * The Y.Doc to snapshot. Required when persistent is true.
+     */
+    doc?: Y.Doc;
+    /**
+     * Debounce delay in ms before writing the snapshot to Gun.
+     * @default 2000
+     */
+    persistDebounceMs?: number;
+}
+/**
  * GunDB transport implementation.
  * Creates decentralized P2P connections using Gun graph database.
  */
@@ -135,6 +158,14 @@ export declare class GunTransport implements Transport {
     private awarenessListener;
     private lastAwarenessId;
     private encryptionEnabled;
+    private persistentMode;
+    private persistDoc;
+    private persistDebounceMs;
+    private persistTimer?;
+    private isWritingToGun;
+    private savePending;
+    /** Data loaded from Gun snapshot before onMessage callback is registered */
+    private pendingLoad;
     /**
      * Create a new Gun transport.
      *
@@ -144,7 +175,7 @@ export declare class GunTransport implements Transport {
     /**
      * Connect to the room and start syncing.
      */
-    connect(config: ConnectionConfig): Promise<void>;
+    connect(config: GunConnectionConfig): Promise<void>;
     /**
      * Setup listener for Gun updates.
      */
@@ -197,6 +228,22 @@ export declare class GunTransport implements Transport {
      * Uses only BUFFER_SIZE slots to prevent infinite accumulation.
      */
     private generateUpdateId;
+    /**
+     * Schedule a debounced snapshot write. Called on every doc update.
+     * Always saves the latest full state, never an individual delta.
+     */
+    private queuePersist;
+    /**
+     * Encode the full Y.Doc state as a proper y-protocols SYNC_STEP_2 message
+     * and write it to the Gun `snapshot` node.
+     * Using SYNC_STEP_2 format ensures GenericProvider interprets it correctly.
+     */
+    private saveSnapshot;
+    /**
+     * Load the snapshot from Gun and deliver it to the message callback.
+     * Uses a pendingLoad buffer in case the callback isn't registered yet.
+     */
+    private loadSnapshot;
     /**
      * Convert Uint8Array to base64 string.
      */

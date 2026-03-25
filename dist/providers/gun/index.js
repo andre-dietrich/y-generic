@@ -41,6 +41,37 @@
  * })
  * ```
  */
+import * as encoding from 'lib0/encoding';
+import * as syncProtocol from 'y-protocols/sync';
+// ---------------------------------------------------------------------------
+// CRC32 helpers — needed to wrap snapshot payloads for GenericProvider
+// ---------------------------------------------------------------------------
+const _CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let j = 0; j < 8; j++)
+            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[i] = c;
+    }
+    return table;
+})();
+function _crc32(data) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < data.length; i++)
+        crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff];
+    return (crc ^ 0xffffffff) >>> 0;
+}
+function addCRC32Header(data) {
+    const crc = _crc32(data);
+    const wrapped = new Uint8Array(4 + data.length);
+    wrapped[0] = (crc >>> 24) & 0xff;
+    wrapped[1] = (crc >>> 16) & 0xff;
+    wrapped[2] = (crc >>> 8) & 0xff;
+    wrapped[3] = crc & 0xff;
+    wrapped.set(data, 4);
+    return wrapped;
+}
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -70,6 +101,14 @@ export class GunTransport {
         this.awarenessListener = null;
         this.lastAwarenessId = ''; // Track last awareness ID to avoid processing our own
         this.encryptionEnabled = false;
+        // Persistence
+        this.persistentMode = false;
+        this.persistDoc = null;
+        this.persistDebounceMs = 2000;
+        this.isWritingToGun = false;
+        this.savePending = false;
+        /** Data loaded from Gun snapshot before onMessage callback is registered */
+        this.pendingLoad = null;
         if (!options.gun) {
             throw new Error('GunTransport requires the "gun" option. ' +
                 'Please provide the Gun constructor: ' +
@@ -103,6 +142,12 @@ export class GunTransport {
         }
         this._room = config.room;
         this.connectionTime = Date.now();
+        this.persistentMode = config.persistent ?? false;
+        this.persistDoc = config.doc ?? null;
+        this.persistDebounceMs = config.persistDebounceMs ?? 2000;
+        if (this.persistentMode && !this.persistDoc) {
+            throw new Error('GunTransport: a Y.Doc must be provided via config.doc when persistent is true');
+        }
         this.log('🔗 Initializing Gun...');
         // Initialize Gun
         const gunConfig = {
@@ -126,6 +171,16 @@ export class GunTransport {
         this.setupUpdateListener();
         this.setupAwarenessListener();
         this._connected = true;
+        // Persistence: load existing snapshot or clear it for a fresh session
+        if (this.persistentMode) {
+            this.loadSnapshot();
+        }
+        else {
+            // Overwrite any previously saved snapshot so reconnecting peers start fresh
+            this.roomNode
+                .get('snapshot')
+                .put({ cleared: true, timestamp: Date.now() });
+        }
     }
     /**
      * Setup listener for Gun updates.
@@ -260,6 +315,14 @@ export class GunTransport {
             clearTimeout(this.batchTimeout);
             this.batchTimeout = undefined;
         }
+        // Clear persist debounce and flush snapshot synchronously (Gun is async internally)
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = undefined;
+        }
+        if (this.persistentMode && this.persistDoc) {
+            this.saveSnapshot();
+        }
         // Clear throttle timeout
         if (this.throttleTimeout) {
             clearTimeout(this.throttleTimeout);
@@ -283,6 +346,9 @@ export class GunTransport {
         this._connected = false;
         this.processedUpdates.clear();
         this.pendingUpdates.clear();
+        this.persistentMode = false;
+        this.persistDoc = null;
+        this.pendingLoad = null;
         this.log('✅ Disconnected');
     }
     /**
@@ -312,6 +378,10 @@ export class GunTransport {
         this.batchTimeout = setTimeout(() => {
             this.flushBatch();
         }, this.options.batchInterval);
+        // Schedule a snapshot save for persistent mode
+        if (this.persistentMode) {
+            this.queuePersist();
+        }
     }
     /**
      * Peek at the message type from CRC32-wrapped data.
@@ -433,6 +503,13 @@ export class GunTransport {
      */
     onMessage(callback) {
         this._callback = callback;
+        // Flush any snapshot data that arrived before this callback was registered
+        if (this.pendingLoad) {
+            const data = this.pendingLoad;
+            this.pendingLoad = null;
+            // Defer by one microtask so GenericProvider finishes its own setup first
+            Promise.resolve().then(() => callback(data));
+        }
         return () => {
             this._callback = undefined;
         };
@@ -451,6 +528,101 @@ export class GunTransport {
         const slotId = `slot-${this.updateSlot}`;
         this.updateSlot = (this.updateSlot + 1) % this.BUFFER_SIZE;
         return slotId;
+    }
+    // ---------------------------------------------------------------------------
+    // Persistence helpers
+    // ---------------------------------------------------------------------------
+    /**
+     * Schedule a debounced snapshot write. Called on every doc update.
+     * Always saves the latest full state, never an individual delta.
+     */
+    queuePersist() {
+        if (this.persistTimer)
+            clearTimeout(this.persistTimer);
+        this.persistTimer = setTimeout(() => this.saveSnapshot(), this.persistDebounceMs);
+    }
+    /**
+     * Encode the full Y.Doc state as a proper y-protocols SYNC_STEP_2 message
+     * and write it to the Gun `snapshot` node.
+     * Using SYNC_STEP_2 format ensures GenericProvider interprets it correctly.
+     */
+    async saveSnapshot() {
+        if (!this.persistDoc || !this.persistentMode || !this.roomNode)
+            return;
+        if (this.isWritingToGun) {
+            this.savePending = true;
+            return;
+        }
+        this.isWritingToGun = true;
+        this.savePending = false;
+        try {
+            // Encode as a proper y-generic SYNC_STEP_2 message
+            const enc = encoding.createEncoder();
+            encoding.writeVarUint(enc, 0); // MESSAGE_SYNC
+            syncProtocol.writeSyncStep2(enc, this.persistDoc);
+            const snapshotBytes = encoding.toUint8Array(enc);
+            let payload = this.uint8ArrayToBase64(snapshotBytes);
+            if (this.encryptionEnabled) {
+                payload = await this.encrypt(payload);
+            }
+            this.roomNode.get('snapshot').put({
+                data: payload,
+                timestamp: Date.now(),
+                encrypted: this.encryptionEnabled,
+            });
+            this.log('💾 Snapshot saved', snapshotBytes.length, 'bytes');
+        }
+        catch (error) {
+            this.log('❌ Error saving snapshot:', error.message);
+            console.warn('GunTransport: Failed to save snapshot. Will retry later.', error);
+            this.savePending = true;
+        }
+        finally {
+            this.isWritingToGun = false;
+            if (this.savePending) {
+                setTimeout(() => this.saveSnapshot(), 1000);
+            }
+        }
+    }
+    /**
+     * Load the snapshot from Gun and deliver it to the message callback.
+     * Uses a pendingLoad buffer in case the callback isn't registered yet.
+     */
+    loadSnapshot() {
+        this.roomNode.get('snapshot').once(async (snap) => {
+            if (!snap || !snap.data || snap.cleared) {
+                this.log('📭 No snapshot found in Gun');
+                return;
+            }
+            try {
+                let payload = snap.data;
+                if (snap.encrypted && this.encryptionEnabled) {
+                    const decrypted = await this.decrypt(payload);
+                    if (!decrypted) {
+                        this.log('❌ Failed to decrypt snapshot (wrong password?)');
+                        return;
+                    }
+                    payload = decrypted;
+                }
+                const snapshotBytes = this.base64ToUint8Array(payload);
+                if (snapshotBytes.length > 0) {
+                    // Wrap with CRC32 so GenericProvider accepts it
+                    const wrapped = addCRC32Header(snapshotBytes);
+                    if (this._callback) {
+                        this._callback(wrapped);
+                    }
+                    else {
+                        // Callback not yet registered — buffer until onMessage() is called
+                        this.pendingLoad = wrapped;
+                    }
+                    this.log('💾 Loaded snapshot:', snapshotBytes.length, 'bytes');
+                }
+            }
+            catch (error) {
+                this.log('❌ Error loading snapshot:', error);
+                console.warn('GunTransport: Failed to load snapshot:', error);
+            }
+        });
     }
     /**
      * Convert Uint8Array to base64 string.

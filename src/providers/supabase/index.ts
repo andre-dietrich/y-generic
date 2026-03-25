@@ -1,3 +1,4 @@
+import * as Y from 'yjs'
 import type { Transport, ConnectionConfig } from '../../transport'
 import {
   createClient,
@@ -84,6 +85,11 @@ export interface SupabaseConfig extends ConnectionConfig {
   idColumnName?: string
   /** Debounce delay for database updates in ms (default: 2000) */
   persistDebounceMs?: number
+  /**
+   * The Yjs document to persist. Required when persistent is true.
+   * The transport encodes the full document state on each debounced save.
+   */
+  doc?: Y.Doc
   /** Enable debug logging */
   debug?: boolean
 }
@@ -148,9 +154,11 @@ export class SupabaseTransport implements Transport {
   private roomId: string = ''
   private persistDebounceMs: number = 2000
   private persistTimer?: ReturnType<typeof setTimeout>
-  private pendingUpdate?: Uint8Array
-  private updateQueue: Uint8Array[] = []
+  private doc: Y.Doc | null = null
   private isWritingToDb: boolean = false
+  private savePending: boolean = false
+  // Buffer for data loaded from DB before onMessage callback is registered
+  private pendingLoad: Uint8Array | null = null
 
   get isConnected(): boolean {
     return this._isConnected
@@ -175,6 +183,14 @@ export class SupabaseTransport implements Transport {
       throw new Error('SupabaseTransport: room name is required')
     }
 
+    if (config.persistent && !config.doc) {
+      throw new Error(
+        'SupabaseTransport: a Y.Doc must be provided via config.doc when persistent is true',
+      )
+    }
+
+    this.doc = config.doc || null
+
     // Create Supabase client
     this.supabase = createClient(config.supabaseUrl, config.supabaseKey)
 
@@ -188,11 +204,6 @@ export class SupabaseTransport implements Transport {
       this.roomId,
       this.persistentMode ? '(persistent)' : '(ephemeral)',
     )
-
-    // Load from database if persistent mode
-    if (this.persistentMode) {
-      await this.loadFromDatabase()
-    }
 
     // Create and subscribe to channel
     this.channel = this.supabase.channel(this.roomId)
@@ -219,6 +230,13 @@ export class SupabaseTransport implements Transport {
         }
       })
     })
+
+    // Load from database AFTER connect() resolves so the onMessage callback
+    // is already registered by GenericProvider before we deliver the data.
+    // We store it in pendingLoad and flush it in onMessage().
+    if (this.persistentMode) {
+      await this.loadFromDatabase()
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -229,9 +247,8 @@ export class SupabaseTransport implements Transport {
       clearTimeout(this.persistTimer)
       this.persistTimer = undefined
     }
-    if (this.pendingUpdate && this.persistentMode) {
-      await this.saveToDatabase(this.pendingUpdate)
-      this.pendingUpdate = undefined
+    if (this.persistentMode && this.doc) {
+      await this.saveToDatabase()
     }
 
     // Unsubscribe from channel
@@ -267,12 +284,23 @@ export class SupabaseTransport implements Transport {
 
     // Queue for database persistence if enabled
     if (this.persistentMode) {
-      this.queuePersist(payload)
+      this.queuePersist()
     }
   }
 
   onMessage(callback: (data: Uint8Array) => void): () => void {
     this.messageCallback = callback
+
+    // Flush any data that was loaded from the database before this callback
+    // was registered (loadFromDatabase runs after connect() resolves, but
+    // GenericProvider calls onMessage() immediately after connect() returns).
+    if (this.pendingLoad) {
+      const data = this.pendingLoad
+      this.pendingLoad = null
+      // Defer by one microtask so GenericProvider finishes its setup first
+      Promise.resolve().then(() => callback(data))
+    }
+
     return () => {
       this.messageCallback = undefined
     }
@@ -326,10 +354,15 @@ export class SupabaseTransport implements Transport {
         const content = (data as any)[this.columnName] as string
         const uint8Array = this.base64ToUint8Array(content)
 
-        // Add CRC32 header and pass to callback
-        if (this.messageCallback && uint8Array.length > 0) {
+        if (uint8Array.length > 0) {
           const wrapped = addCRC32Header(uint8Array)
-          this.messageCallback(wrapped)
+          if (this.messageCallback) {
+            // Callback already registered — deliver immediately
+            this.messageCallback(wrapped)
+          } else {
+            // Callback not yet registered — buffer until onMessage() is called
+            this.pendingLoad = wrapped
+          }
           this.log('Loaded', uint8Array.length, 'bytes from database')
         }
       }
@@ -339,63 +372,42 @@ export class SupabaseTransport implements Transport {
     }
   }
 
-  private queuePersist(data: Uint8Array): void {
-    this.pendingUpdate = data
-
-    // Clear existing timer
+  private queuePersist(): void {
+    // Clear existing timer — always save the latest full state, not a specific delta
     if (this.persistTimer) {
       clearTimeout(this.persistTimer)
     }
 
-    // Debounce: wait before saving
     this.persistTimer = setTimeout(() => {
-      if (this.pendingUpdate) {
-        this.saveToDatabase(this.pendingUpdate)
-        this.pendingUpdate = undefined
-      }
+      this.saveToDatabase()
     }, this.persistDebounceMs)
   }
 
-  private async saveToDatabase(data: Uint8Array): Promise<void> {
-    if (!this.supabase || !this.persistentMode) return
+  private async saveToDatabase(): Promise<void> {
+    if (!this.supabase || !this.persistentMode || !this.doc) return
 
-    // Queue if already writing
+    // If a write is in progress, mark a save as pending and return.
+    // The finally block will re-trigger with the latest doc state when done.
     if (this.isWritingToDb) {
-      this.updateQueue.push(data)
+      this.savePending = true
       return
     }
 
     this.isWritingToDb = true
+    this.savePending = false
 
     try {
-      const base64 = this.uint8ArrayToBase64(data)
+      // Always encode the full current document state — never individual deltas
+      const state = Y.encodeStateAsUpdate(this.doc)
+      const base64 = this.uint8ArrayToBase64(state)
 
-      this.log('Saving to database...', data.length, 'bytes')
+      this.log('Saving to database...', state.length, 'bytes')
 
-      // Try to update first
-      const { error: updateError } = await this.supabase
+      const { error } = await this.supabase
         .from(this.tableName)
-        .update({ [this.columnName]: base64 })
-        .eq(this.idColumnName, this.roomId)
+        .upsert({ [this.idColumnName]: this.roomId, [this.columnName]: base64 })
 
-      // If no rows updated, insert new row
-      if (
-        updateError?.code === 'PGRST116' ||
-        updateError?.message?.includes('0 rows')
-      ) {
-        const { error: insertError } = await this.supabase
-          .from(this.tableName)
-          .insert({
-            [this.idColumnName]: this.roomId,
-            [this.columnName]: base64,
-          })
-
-        if (insertError) {
-          throw insertError
-        }
-      } else if (updateError) {
-        throw updateError
-      }
+      if (error) throw error
 
       this.log('Saved to database successfully')
     } catch (error: any) {
@@ -404,18 +416,13 @@ export class SupabaseTransport implements Transport {
         'SupabaseTransport: Failed to save to database. Will retry later.',
         error,
       )
-
-      // Re-queue for retry
-      this.updateQueue.push(data)
+      this.savePending = true
     } finally {
       this.isWritingToDb = false
 
-      // Process queue
-      if (this.updateQueue.length > 0) {
-        const nextUpdate = this.updateQueue.shift()
-        if (nextUpdate) {
-          setTimeout(() => this.saveToDatabase(nextUpdate), 1000)
-        }
+      // If the doc changed while we were writing, save the latest state now
+      if (this.savePending) {
+        setTimeout(() => this.saveToDatabase(), 1000)
       }
     }
   }

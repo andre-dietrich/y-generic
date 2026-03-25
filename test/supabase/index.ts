@@ -166,6 +166,7 @@ async function connect() {
       room,
       password: password || undefined,
       persistent: currentMode === 'persistent',
+      doc: currentMode === 'persistent' ? doc : undefined,
       persistDebounceMs: 2000,
       debug: true,
     })

@@ -54,6 +54,10 @@
     "./providers/supabase": {
       "types": "./dist/providers/supabase/index.d.ts",
       "default": "./dist/providers/supabase/index.js"
+    },
+    "./providers/nostr": {
+      "types": "./dist/providers/nostr/index.d.ts",
+      "default": "./dist/providers/nostr/index.js"
     }
   },
   "files": [
@@ -71,6 +75,7 @@
     "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
     "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
     "dev:supabase": "npx parcel serve test/supabase/index.html --open --port 3010",
+    "dev:nostr": "npx parcel serve test/nostr/index.html --open --port 3013",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc",
     "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",
@@ -83,7 +88,8 @@
     "build:demo:pubnub": "npx parcel build test/pubnub/index.html --dist-dir demos/pubnub --public-url ./ --no-source-maps",
     "build:demo:websocket": "npx parcel build test/websocket/index.html --dist-dir demos/websocket --public-url ./ --no-source-maps",
     "build:demo:supabase": "npx parcel build test/supabase/index.html --dist-dir demos/supabase --public-url ./ --no-source-maps",
-    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase"
+    "build:demo:nostr": "npx parcel build test/nostr/index.html --dist-dir demos/nostr --public-url ./ --no-source-maps",
+    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase && npm run build:demo:nostr"
   },
   "dependencies": {
     "lib0": "^0.2.98",

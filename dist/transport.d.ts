@@ -51,6 +51,39 @@ export interface Transport {
      */
     onPeerConnect?(callback: (peerId: string) => void): () => void;
     /**
+     * Optional: register a callback that fires when a connected peer disconnects
+     * (channel close or error). Consumers use this for presence/leave tracking.
+     *
+     * @param callback - Function to call with the departed peer's ID
+     * @returns Cleanup function to unregister the callback
+     */
+    onPeerDisconnect?(callback: (peerId: string) => void): () => void;
+    /**
+     * Optional: per-peer control side-channel that bypasses the provider pipe.
+     * For consumer-defined out-of-band exchanges (identity/auth handshakes) that
+     * must not be CRC-verified or decoded as Yjs/pubsub data. Only transports
+     * with a peer concept implement these.
+     *
+     * @param peerId - Target peer's ID
+     * @param payload - Small binary payload (not chunked/encrypted by the transport)
+     */
+    sendControl?(peerId: string, payload: Uint8Array): void;
+    /**
+     * Optional: tear down a single peer connection (e.g. reject a peer that
+     * failed an out-of-band handshake). Only transports with a peer concept
+     * implement this.
+     *
+     * @param peerId - Peer to disconnect
+     */
+    disconnectPeer?(peerId: string): void;
+    /**
+     * Optional: register a callback for incoming control frames.
+     *
+     * @param callback - Function called with (senderPeerId, payload)
+     * @returns Cleanup function to unregister the callback
+     */
+    onControlFrame?(callback: (peerId: string, payload: Uint8Array) => void): () => void;
+    /**
      * Check if the transport is currently connected.
      */
     readonly isConnected: boolean;

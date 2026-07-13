@@ -125,6 +125,8 @@ export declare class SimplePeerTransport implements Transport {
     private _room;
     private _callback?;
     private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
+    private _controlCallback?;
     private peerId;
     private peers;
     private signalingConns;
@@ -171,6 +173,26 @@ export declare class SimplePeerTransport implements Transport {
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
+    /**
+     * Register callback for peer disconnects (channel close or error). Only fires
+     * for peers that had reached the connected state.
+     */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
+    /**
+     * Register callback for consumer control frames (MSG_TYPE_CONTROL).
+     * These bypass the provider pipe — use for per-peer handshakes/auth.
+     */
+    onControlFrame(callback: (peerId: string, payload: Uint8Array) => void): () => void;
+    /**
+     * Tear down a single peer connection (e.g. to reject a peer that failed an
+     * out-of-band handshake). Fires onPeerDisconnect if the peer was connected.
+     */
+    disconnectPeer(peerId: string): void;
+    /**
+     * Send a control frame to a single peer. Not chunked or encrypted — keep
+     * payloads small (they must fit one DataChannel message).
+     */
+    sendControl(peerId: string, payload: Uint8Array): void;
     /**
      * Check if connected.
      */

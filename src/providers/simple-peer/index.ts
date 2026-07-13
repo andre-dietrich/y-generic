@@ -153,9 +153,12 @@ const MAX_BUFFERED_AMOUNT = 16 * 1024
  * Message type markers for chunking protocol.
  * - 0x00: Complete message (no chunking, raw data)
  * - 0x01: Chunked message with header
+ * - 0x02: Consumer control frame — per-peer side-channel via sendControl()/
+ *   onControlFrame(), never reaches the provider pipe. Not chunked/encrypted.
  */
 const MSG_TYPE_COMPLETE = 0x00
 const MSG_TYPE_CHUNKED = 0x01
+const MSG_TYPE_CONTROL = 0x02
 
 /** Counter for generating unique message IDs */
 let messageIdCounter = 0
@@ -186,6 +189,8 @@ export class SimplePeerTransport implements Transport {
   private _room: string = ''
   private _callback?: (data: Uint8Array) => void
   private _peerConnectCallback?: (peerId: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
+  private _controlCallback?: (peerId: string, payload: Uint8Array) => void
   private peerId: string
   private peers: Map<string, PeerConnection> = new Map()
   private signalingConns: WebSocket[] = []
@@ -513,6 +518,58 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
+   * Register callback for peer disconnects (channel close or error). Only fires
+   * for peers that had reached the connected state.
+   */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
+    }
+  }
+
+  /**
+   * Register callback for consumer control frames (MSG_TYPE_CONTROL).
+   * These bypass the provider pipe — use for per-peer handshakes/auth.
+   */
+  onControlFrame(
+    callback: (peerId: string, payload: Uint8Array) => void,
+  ): () => void {
+    this._controlCallback = callback
+    return () => {
+      this._controlCallback = undefined
+    }
+  }
+
+  /**
+   * Tear down a single peer connection (e.g. to reject a peer that failed an
+   * out-of-band handshake). Fires onPeerDisconnect if the peer was connected.
+   */
+  disconnectPeer(peerId: string): void {
+    this.removePeer(peerId)
+  }
+
+  /**
+   * Send a control frame to a single peer. Not chunked or encrypted — keep
+   * payloads small (they must fit one DataChannel message).
+   */
+  sendControl(peerId: string, payload: Uint8Array): void {
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn || !peerConn.connected) {
+      this.log(`⚠️ sendControl: peer ${peerId} not connected — dropped`)
+      return
+    }
+    const msg = new Uint8Array(payload.length + 1)
+    msg[0] = MSG_TYPE_CONTROL
+    msg.set(payload, 1)
+    try {
+      peerConn.peer.send(msg)
+    } catch (error) {
+      this.log(`❌ sendControl failed to ${peerId}:`, (error as Error).message)
+    }
+  }
+
+  /**
    * Check if connected.
    */
   get isConnected(): boolean {
@@ -800,12 +857,24 @@ export class SimplePeerTransport implements Transport {
       // before 'connect' (seen on Chrome when the remote initiator sends immediately).
       onChannelOpen('data')
 
+      let uint8Data: Uint8Array
+      try {
+        uint8Data = new Uint8Array(data)
+      } catch (error) {
+        this.log('Error handling peer data:', error)
+        return
+      }
+      if (uint8Data.length === 0) return
+
+      // Control frames bypass the provider pipe (identity/auth handshakes etc.)
+      if (uint8Data[0] === MSG_TYPE_CONTROL) {
+        this._controlCallback?.(remotePeerId, uint8Data.slice(1))
+        return
+      }
+
       if (!this._callback) return
 
       try {
-        const uint8Data = new Uint8Array(data)
-        if (uint8Data.length === 0) return
-
         const msgType = uint8Data[0]
 
         if (msgType === MSG_TYPE_COMPLETE) {
@@ -926,6 +995,7 @@ export class SimplePeerTransport implements Transport {
   private removePeer(peerId: string): void {
     const peerConn = this.peers.get(peerId)
     if (peerConn) {
+      const wasConnected = peerConn.connected
       try {
         peerConn.peer.destroy()
       } catch (error) {
@@ -933,6 +1003,7 @@ export class SimplePeerTransport implements Transport {
       }
       this.peers.delete(peerId)
       this.announcedPeers.delete(peerId)
+      if (wasConnected) this._peerDisconnectCallback?.(peerId)
       const connectedCount = Array.from(this.peers.values()).filter(
         (p) => p.connected,
       ).length

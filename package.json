@@ -16,24 +16,24 @@
       "default": "./dist/lib.js"
     },
     "./providers/dummy": {
-      "types": "./dist/providers/dummy.d.ts",
-      "default": "./dist/providers/dummy.js"
+      "types": "./dist/providers/dummy/index.d.ts",
+      "default": "./dist/providers/dummy/index.js"
     },
     "./providers/simple-peer": {
-      "types": "./dist/providers/simple-peer.d.ts",
-      "default": "./dist/providers/simple-peer.js"
+      "types": "./dist/providers/simple-peer/index.d.ts",
+      "default": "./dist/providers/simple-peer/index.js"
     },
     "./providers/peerjs": {
-      "types": "./dist/providers/peerjs.d.ts",
-      "default": "./dist/providers/peerjs.js"
+      "types": "./dist/providers/peerjs/index.d.ts",
+      "default": "./dist/providers/peerjs/index.js"
     },
     "./providers/indexeddb": {
-      "types": "./dist/providers/indexeddb.d.ts",
-      "default": "./dist/providers/indexeddb.js"
+      "types": "./dist/providers/indexeddb/index.d.ts",
+      "default": "./dist/providers/indexeddb/index.js"
     },
     "./providers/gun": {
-      "types": "./dist/providers/gun.d.ts",
-      "default": "./dist/providers/gun.js"
+      "types": "./dist/providers/gun/index.d.ts",
+      "default": "./dist/providers/gun/index.js"
     },
     "./providers/trystero": {
       "types": "./dist/providers/trystero/index.d.ts",

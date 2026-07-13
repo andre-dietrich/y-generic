@@ -208,6 +208,8 @@ export class GenericProvider extends Observable {
         this._awarenessInterval = 100; // ms between awareness broadcasts
         this._pendingAwarenessClients = new Set();
         this._lastAwarenessTime = 0;
+        // Origins whose updates are never sent to the transport (local-only txns).
+        this._excludeOrigins = new Set();
         this.doc = doc;
         this.transport = transport;
         this.pubsub = new PubSubChannel(this);
@@ -217,6 +219,7 @@ export class GenericProvider extends Observable {
         this._batchUpdates = options.batchUpdates ?? 0;
         this._disableBc = options.disableBc ?? false;
         this._awarenessInterval = options.awarenessInterval ?? 100;
+        this._excludeOrigins = new Set(options.excludeOrigins ?? []);
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -433,15 +436,18 @@ export class GenericProvider extends Observable {
         this._updateHandler = (update, origin) => {
             // Don't send updates that originated from this provider
             // This prevents infinite loops when receiving updates
-            if (origin !== this) {
-                if (this._batchUpdates > 0) {
-                    // Batch mode: merge updates and debounce
-                    this._batchUpdate(update);
-                }
-                else {
-                    // Immediate mode: send right away
-                    this._sendUpdate(update);
-                }
+            if (origin === this)
+                return;
+            // Don't send updates from excluded origins (local-only txns)
+            if (this._excludeOrigins.has(origin))
+                return;
+            if (this._batchUpdates > 0) {
+                // Batch mode: merge updates and debounce
+                this._batchUpdate(update);
+            }
+            else {
+                // Immediate mode: send right away
+                this._sendUpdate(update);
             }
         };
         this.doc.on('update', this._updateHandler);

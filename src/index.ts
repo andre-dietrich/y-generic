@@ -247,6 +247,9 @@ export class GenericProvider extends Observable<string> {
   private _awarenessTimeoutId?: ReturnType<typeof setTimeout>
   private _lastAwarenessTime: number = 0
 
+  // Origins whose updates are never sent to the transport (local-only txns).
+  private _excludeOrigins: Set<any> = new Set()
+
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
   private _unsubscribeTransport?: () => void
@@ -300,6 +303,12 @@ export class GenericProvider extends Observable<string> {
        * @default 100 (100ms between awareness broadcasts)
        */
       awarenessInterval?: number
+      /**
+       * Transaction origins whose updates should not be sent to peers.
+       * Updates from these origins stay local (never reach the transport).
+       * @default [] (no origins excluded)
+       */
+      excludeOrigins?: any[]
     } = {},
   ) {
     super()
@@ -313,6 +322,7 @@ export class GenericProvider extends Observable<string> {
     this._batchUpdates = options.batchUpdates ?? 0
     this._disableBc = options.disableBc ?? false
     this._awarenessInterval = options.awarenessInterval ?? 100
+    this._excludeOrigins = new Set(options.excludeOrigins ?? [])
 
     this._setupDocumentSync()
     this._setupAwarenessSync()
@@ -583,14 +593,16 @@ export class GenericProvider extends Observable<string> {
     this._updateHandler = (update: Uint8Array, origin: any) => {
       // Don't send updates that originated from this provider
       // This prevents infinite loops when receiving updates
-      if (origin !== this) {
-        if (this._batchUpdates > 0) {
-          // Batch mode: merge updates and debounce
-          this._batchUpdate(update)
-        } else {
-          // Immediate mode: send right away
-          this._sendUpdate(update)
-        }
+      if (origin === this) return
+      // Don't send updates from excluded origins (local-only txns)
+      if (this._excludeOrigins.has(origin)) return
+
+      if (this._batchUpdates > 0) {
+        // Batch mode: merge updates and debounce
+        this._batchUpdate(update)
+      } else {
+        // Immediate mode: send right away
+        this._sendUpdate(update)
       }
     }
 

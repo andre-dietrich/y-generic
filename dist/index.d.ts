@@ -103,6 +103,7 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingAwarenessClients;
     private _awarenessTimeoutId?;
     private _lastAwarenessTime;
+    private _excludeOrigins;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
     private _unsubscribeTransport?;
@@ -152,6 +153,12 @@ export declare class GenericProvider extends Observable<string> {
          * @default 100 (100ms between awareness broadcasts)
          */
         awarenessInterval?: number;
+        /**
+         * Transaction origins whose updates should not be sent to peers.
+         * Updates from these origins stay local (never reach the transport).
+         * @default [] (no origins excluded)
+         */
+        excludeOrigins?: any[];
     });
     /**
      * Connect to the backend and start syncing.

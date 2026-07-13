@@ -95,11 +95,19 @@ function unwrapAndVerifyMessage(wrapped: Uint8Array): Uint8Array | null {
 }
 
 /**
- * Compute a simple hash of document state for verification.
+ * Compute a simple hash of document state for desync detection.
  * Uses a fast non-cryptographic hash for performance.
+ *
+ * Hashes the state VECTOR, not encodeStateAsUpdate: the full update byte stream
+ * is NOT canonical across CRDT-convergent replicas (client-block and tombstone
+ * ordering differ per peer), so hashing it flags false divergence and triggers
+ * an endless re-sync loop. The state vector (clientID -> clock) is serialized in
+ * sorted clientID order by Yjs, so two convergent docs hash identically, while a
+ * missed update still shows up as a differing clock — which is exactly the
+ * "did we fall behind?" signal this check exists to provide.
  */
 function computeDocHash(doc: Y.Doc): number {
-  const state = Y.encodeStateAsUpdate(doc)
+  const state = Y.encodeStateVector(doc)
   let hash = 0
   for (let i = 0; i < state.length; i++) {
     hash = ((hash << 5) - hash + state[i]) | 0

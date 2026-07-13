@@ -150,6 +150,10 @@ export declare class SimplePeerTransport implements Transport {
      */
     send(data: Uint8Array): void;
     /**
+     * Send data to a single connected peer by ID (targeted delivery).
+     */
+    sendTo(peerId: string, data: Uint8Array): void;
+    /**
      * Send data to a single peer, chunking if necessary.
      * Uses flow control to avoid overwhelming the WebRTC buffer.
      */

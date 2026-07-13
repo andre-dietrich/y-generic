@@ -382,6 +382,32 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
+   * Send data to a single connected peer by ID (targeted delivery).
+   */
+  sendTo(peerId: string, data: Uint8Array): void {
+    if (!this._connected) {
+      this.log('Not connected, cannot sendTo')
+      return
+    }
+
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn || !peerConn.connected) {
+      this.log(`⚠️ sendTo: peer ${peerId} not connected — ${data.length}B dropped`)
+      return
+    }
+
+    const dataToSend = this.options.password
+      ? this.encrypt(data, this.options.password)
+      : data
+
+    try {
+      this.sendToPeer(peerConn, dataToSend)
+    } catch (error) {
+      this.log(`❌ sendTo failed to ${peerId}:`, (error as Error).message)
+    }
+  }
+
+  /**
    * Send data to a single peer, chunking if necessary.
    * Uses flow control to avoid overwhelming the WebRTC buffer.
    */

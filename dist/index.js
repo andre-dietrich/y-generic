@@ -10,6 +10,7 @@ const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
 const MESSAGE_PUBSUB = 2;
 const MESSAGE_SYNC_VERIFIED = 3; // Sync message with hash verification
+const MESSAGE_PUBSUB_TARGETED = 4; // Pub/sub message aimed at a single target
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -111,6 +112,20 @@ export class PubSubChannel extends Observable {
      */
     publish(topic, message) {
         this.provider._sendPubSub(topic, message);
+    }
+    /**
+     * Publish a message to a single target instead of broadcasting.
+     *
+     * On transports with `sendTo`, `target` is the peer's ID and delivery is
+     * direct. On transports without it, the message is broadcast with the
+     * target embedded and dropped by every provider whose `localId` differs.
+     *
+     * @param target - Recipient id (transport peerId, or a `localId`)
+     * @param topic - Topic name
+     * @param message - Any JSON-serializable data
+     */
+    publishTo(target, topic, message) {
+        this.provider._sendPubSubTo(target, topic, message);
     }
     /**
      * Subscribe to messages on a topic.
@@ -220,6 +235,7 @@ export class GenericProvider extends Observable {
         this._disableBc = options.disableBc ?? false;
         this._awarenessInterval = options.awarenessInterval ?? 100;
         this._excludeOrigins = new Set(options.excludeOrigins ?? []);
+        this._localId = options.localId;
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -580,6 +596,23 @@ export class GenericProvider extends Observable {
                     }
                     break;
                 }
+                case MESSAGE_PUBSUB_TARGETED: {
+                    const target = decoding.readVarString(decoder);
+                    const topic = decoding.readVarString(decoder);
+                    const payloadBytes = decoding.readVarUint8Array(decoder);
+                    // Drop messages aimed at someone else (broadcast-and-filter path).
+                    if (this._localId !== undefined && target !== this._localId) {
+                        break;
+                    }
+                    try {
+                        const message = JSON.parse(new TextDecoder().decode(payloadBytes));
+                        this.pubsub._handleMessage(topic, message);
+                    }
+                    catch (error) {
+                        console.error('Error decoding targeted pub/sub message:', error);
+                    }
+                    break;
+                }
                 case MESSAGE_SYNC_VERIFIED: {
                     // Sync message with sequence number and hash verification
                     // Read sequence number and clientID first
@@ -743,6 +776,44 @@ export class GenericProvider extends Observable {
         }
         catch (error) {
             console.error('Error sending pub/sub message:', error);
+        }
+    }
+    /**
+     * Send a targeted pub/sub message.
+     * Uses transport.sendTo when available (direct delivery), otherwise
+     * broadcasts a targeted frame that non-target providers drop.
+     * Internal method called by PubSubChannel.
+     */
+    _sendPubSubTo(target, topic, message) {
+        if (!this.transport.isConnected) {
+            console.warn('Cannot send targeted pub/sub message: not connected');
+            return;
+        }
+        try {
+            const encoder = encoding.createEncoder();
+            encoding.writeVarUint(encoder, MESSAGE_PUBSUB_TARGETED);
+            encoding.writeVarString(encoder, target);
+            encoding.writeVarString(encoder, topic);
+            const messageBytes = new TextEncoder().encode(JSON.stringify(message));
+            encoding.writeVarUint8Array(encoder, messageBytes);
+            const frame = encoding.toUint8Array(encoder);
+            if (this.transport.sendTo) {
+                // Direct delivery to the target peer.
+                const wrapped = wrapMessageWithChecksum(frame);
+                const result = this.transport.sendTo(target, wrapped);
+                if (result instanceof Promise) {
+                    result.catch((error) => {
+                        console.error('Error sending targeted pub/sub message:', error);
+                    });
+                }
+            }
+            else {
+                // Broadcast-and-filter: dropped by non-target providers on receive.
+                this._send(frame);
+            }
+        }
+        catch (error) {
+            console.error('Error sending targeted pub/sub message:', error);
         }
     }
     /**

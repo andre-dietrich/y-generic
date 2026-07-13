@@ -25,6 +25,15 @@ export interface Transport {
      */
     send(data: Uint8Array): void | Promise<void>;
     /**
+     * Optional: send binary data to a single peer instead of broadcasting.
+     * Only transports with a peer concept (e.g. WebRTC) can implement this.
+     * When absent, the provider falls back to broadcast-and-filter.
+     *
+     * @param peerId - Target peer's ID
+     * @param data - Binary data to send
+     */
+    sendTo?(peerId: string, data: Uint8Array): void | Promise<void>;
+    /**
      * Register a callback for incoming binary data.
      * The transport calls this callback whenever data is received.
      *

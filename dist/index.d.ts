@@ -23,6 +23,18 @@ export declare class PubSubChannel extends Observable<string> {
      */
     publish(topic: string, message: any): void;
     /**
+     * Publish a message to a single target instead of broadcasting.
+     *
+     * On transports with `sendTo`, `target` is the peer's ID and delivery is
+     * direct. On transports without it, the message is broadcast with the
+     * target embedded and dropped by every provider whose `localId` differs.
+     *
+     * @param target - Recipient id (transport peerId, or a `localId`)
+     * @param topic - Topic name
+     * @param message - Any JSON-serializable data
+     */
+    publishTo(target: string, topic: string, message: any): void;
+    /**
      * Subscribe to messages on a topic.
      *
      * @param topic - Topic name to listen to (use '*' for all topics)
@@ -104,6 +116,7 @@ export declare class GenericProvider extends Observable<string> {
     private _awarenessTimeoutId?;
     private _lastAwarenessTime;
     private _excludeOrigins;
+    private _localId?;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
     private _unsubscribeTransport?;
@@ -159,6 +172,12 @@ export declare class GenericProvider extends Observable<string> {
          * @default [] (no origins excluded)
          */
         excludeOrigins?: any[];
+        /**
+         * This provider's identity for targeted pubsub (publishTo).
+         * On transports without sendTo, targeted messages are broadcast and
+         * dropped unless their target matches this id.
+         */
+        localId?: string;
     });
     /**
      * Connect to the backend and start syncing.
@@ -240,6 +259,13 @@ export declare class GenericProvider extends Observable<string> {
      * Internal method called by PubSubChannel.
      */
     _sendPubSub(topic: string, message: any): void;
+    /**
+     * Send a targeted pub/sub message.
+     * Uses transport.sendTo when available (direct delivery), otherwise
+     * broadcasts a targeted frame that non-target providers drop.
+     * Internal method called by PubSubChannel.
+     */
+    _sendPubSubTo(target: string, topic: string, message: any): void;
     /**
      * Broadcast awareness state for the specified clients.
      * Throttled to prevent awareness updates from flooding document sync.

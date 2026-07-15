@@ -124,9 +124,9 @@ export declare class SimplePeerTransport implements Transport {
     private _connected;
     private _room;
     private _callback?;
-    private _peerConnectCallback?;
-    private _peerDisconnectCallback?;
-    private _controlCallback?;
+    private _peerConnectCallbacks;
+    private _peerDisconnectCallbacks;
+    private _controlCallbacks;
     private peerId;
     private peers;
     private signalingConns;

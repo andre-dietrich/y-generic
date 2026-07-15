@@ -64,6 +64,11 @@ export class SimplePeerTransport {
     constructor(options) {
         this._connected = false;
         this._room = '';
+        // Multi-listener: several consumers (e.g. the provider itself plus a
+        // subclass/wrapper) can register on the same transport without clobbering.
+        this._peerConnectCallbacks = new Set();
+        this._peerDisconnectCallbacks = new Set();
+        this._controlCallbacks = new Set();
         this.peers = new Map();
         this.signalingConns = [];
         this.announcedPeers = new Set();
@@ -310,9 +315,9 @@ export class SimplePeerTransport {
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback) {
-        this._peerConnectCallback = callback;
+        this._peerConnectCallbacks.add(callback);
         return () => {
-            this._peerConnectCallback = undefined;
+            this._peerConnectCallbacks.delete(callback);
         };
     }
     /**
@@ -320,9 +325,9 @@ export class SimplePeerTransport {
      * for peers that had reached the connected state.
      */
     onPeerDisconnect(callback) {
-        this._peerDisconnectCallback = callback;
+        this._peerDisconnectCallbacks.add(callback);
         return () => {
-            this._peerDisconnectCallback = undefined;
+            this._peerDisconnectCallbacks.delete(callback);
         };
     }
     /**
@@ -330,9 +335,9 @@ export class SimplePeerTransport {
      * These bypass the provider pipe — use for per-peer handshakes/auth.
      */
     onControlFrame(callback) {
-        this._controlCallback = callback;
+        this._controlCallbacks.add(callback);
         return () => {
-            this._controlCallback = undefined;
+            this._controlCallbacks.delete(callback);
         };
     }
     /**
@@ -582,7 +587,8 @@ export class SimplePeerTransport {
             peerConn.connected = true;
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`);
-            this._peerConnectCallback?.(remotePeerId);
+            for (const cb of this._peerConnectCallbacks)
+                cb(remotePeerId);
         };
         // Handle connection
         peer.on('connect', () => onChannelOpen('connect'));
@@ -612,7 +618,9 @@ export class SimplePeerTransport {
                 return;
             // Control frames bypass the provider pipe (identity/auth handshakes etc.)
             if (uint8Data[0] === MSG_TYPE_CONTROL) {
-                this._controlCallback?.(remotePeerId, uint8Data.slice(1));
+                const payload = uint8Data.slice(1);
+                for (const cb of this._controlCallbacks)
+                    cb(remotePeerId, payload);
                 return;
             }
             if (!this._callback)
@@ -728,7 +736,8 @@ export class SimplePeerTransport {
             this.peers.delete(peerId);
             this.announcedPeers.delete(peerId);
             if (wasConnected)
-                this._peerDisconnectCallback?.(peerId);
+                for (const cb of this._peerDisconnectCallbacks)
+                    cb(peerId);
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`);
         }

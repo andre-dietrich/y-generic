@@ -188,9 +188,11 @@ export class SimplePeerTransport implements Transport {
   private _connected: boolean = false
   private _room: string = ''
   private _callback?: (data: Uint8Array) => void
-  private _peerConnectCallback?: (peerId: string) => void
-  private _peerDisconnectCallback?: (peerId: string) => void
-  private _controlCallback?: (peerId: string, payload: Uint8Array) => void
+  private _peerConnectCallbacks = new Set<(peerId: string) => void>()
+  private _peerDisconnectCallbacks = new Set<(peerId: string) => void>()
+  private _controlCallbacks = new Set<
+    (peerId: string, payload: Uint8Array) => void
+  >()
   private peerId: string
   private peers: Map<string, PeerConnection> = new Map()
   private signalingConns: WebSocket[] = []
@@ -511,9 +513,9 @@ export class SimplePeerTransport implements Transport {
    * Register callback for new peer data-channel connections.
    */
   onPeerConnect(callback: (peerId: string) => void): () => void {
-    this._peerConnectCallback = callback
+    this._peerConnectCallbacks.add(callback)
     return () => {
-      this._peerConnectCallback = undefined
+      this._peerConnectCallbacks.delete(callback)
     }
   }
 
@@ -522,9 +524,9 @@ export class SimplePeerTransport implements Transport {
    * for peers that had reached the connected state.
    */
   onPeerDisconnect(callback: (peerId: string) => void): () => void {
-    this._peerDisconnectCallback = callback
+    this._peerDisconnectCallbacks.add(callback)
     return () => {
-      this._peerDisconnectCallback = undefined
+      this._peerDisconnectCallbacks.delete(callback)
     }
   }
 
@@ -535,9 +537,9 @@ export class SimplePeerTransport implements Transport {
   onControlFrame(
     callback: (peerId: string, payload: Uint8Array) => void,
   ): () => void {
-    this._controlCallback = callback
+    this._controlCallbacks.add(callback)
     return () => {
-      this._controlCallback = undefined
+      this._controlCallbacks.delete(callback)
     }
   }
 
@@ -835,7 +837,7 @@ export class SimplePeerTransport implements Transport {
       this.log(
         `✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`,
       )
-      this._peerConnectCallback?.(remotePeerId)
+      for (const cb of this._peerConnectCallbacks) cb(remotePeerId)
     }
 
     // Handle connection
@@ -868,7 +870,8 @@ export class SimplePeerTransport implements Transport {
 
       // Control frames bypass the provider pipe (identity/auth handshakes etc.)
       if (uint8Data[0] === MSG_TYPE_CONTROL) {
-        this._controlCallback?.(remotePeerId, uint8Data.slice(1))
+        const payload = uint8Data.slice(1)
+        for (const cb of this._controlCallbacks) cb(remotePeerId, payload)
         return
       }
 
@@ -1003,7 +1006,8 @@ export class SimplePeerTransport implements Transport {
       }
       this.peers.delete(peerId)
       this.announcedPeers.delete(peerId)
-      if (wasConnected) this._peerDisconnectCallback?.(peerId)
+      if (wasConnected)
+        for (const cb of this._peerDisconnectCallbacks) cb(peerId)
       const connectedCount = Array.from(this.peers.values()).filter(
         (p) => p.connected,
       ).length

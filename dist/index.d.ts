@@ -117,6 +117,7 @@ export declare class GenericProvider extends Observable<string> {
     private _lastAwarenessTime;
     private _excludeOrigins;
     private _localId?;
+    private _syncMode;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
     private _unsubscribeTransport?;
@@ -178,6 +179,18 @@ export declare class GenericProvider extends Observable<string> {
          * dropped unless their target matches this id.
          */
         localId?: string;
+        /**
+         * Connect-time sync strategy.
+         * - 'push-pull' (default): push full local state to peers, then request
+         *   remote state. Correct for P2P transports where there is no
+         *   authoritative peer to pull from (e.g. offline edits must be pushed).
+         * - 'pull': only request remote state on connect (SyncStep1), never push
+         *   full local state. Use with relay/server transports (e.g. y-websocket)
+         *   where the server holds authoritative state and a reconnecting client
+         *   should adopt it rather than push a competing local copy.
+         * @default 'push-pull'
+         */
+        syncMode?: 'push-pull' | 'pull';
     });
     /**
      * Connect to the backend and start syncing.

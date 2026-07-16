@@ -64,8 +64,6 @@ export class SimplePeerTransport {
     constructor(options) {
         this._connected = false;
         this._room = '';
-        // Multi-listener: several consumers (e.g. the provider itself plus a
-        // subclass/wrapper) can register on the same transport without clobbering.
         this._peerConnectCallbacks = new Set();
         this._peerDisconnectCallbacks = new Set();
         this._controlCallbacks = new Set();

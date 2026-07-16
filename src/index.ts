@@ -277,6 +277,10 @@ export class GenericProvider extends Observable<string> {
   // This provider's identity, used to filter targeted pubsub messages.
   private _localId?: string
 
+  // Connect-time sync strategy: 'push-pull' (default) sends full local state
+  // then requests remote; 'pull' only requests remote state.
+  private _syncMode: 'push-pull' | 'pull' = 'push-pull'
+
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
   private _unsubscribeTransport?: () => void
@@ -342,6 +346,18 @@ export class GenericProvider extends Observable<string> {
        * dropped unless their target matches this id.
        */
       localId?: string
+      /**
+       * Connect-time sync strategy.
+       * - 'push-pull' (default): push full local state to peers, then request
+       *   remote state. Correct for P2P transports where there is no
+       *   authoritative peer to pull from (e.g. offline edits must be pushed).
+       * - 'pull': only request remote state on connect (SyncStep1), never push
+       *   full local state. Use with relay/server transports (e.g. y-websocket)
+       *   where the server holds authoritative state and a reconnecting client
+       *   should adopt it rather than push a competing local copy.
+       * @default 'push-pull'
+       */
+      syncMode?: 'push-pull' | 'pull'
     } = {},
   ) {
     super()
@@ -357,6 +373,7 @@ export class GenericProvider extends Observable<string> {
     this._awarenessInterval = options.awarenessInterval ?? 100
     this._excludeOrigins = new Set(options.excludeOrigins ?? [])
     this._localId = options.localId
+    this._syncMode = options.syncMode ?? 'push-pull'
 
     this._setupDocumentSync()
     this._setupAwarenessSync()
@@ -416,11 +433,16 @@ export class GenericProvider extends Observable<string> {
 
       this._setStatus({ state: 'connected' })
 
-      // Send initial sync pushing our local state plus requesting remote state.
-      // syncNow() is used instead of _sendSyncStep1() so that any offline edits
-      // made before this connect() call are pushed to currently-connected peers
-      // (e.g. same-browser tabs via BroadcastChannel).
-      this.syncNow()
+      // Send initial sync. In 'push-pull' mode, syncNow() pushes our local
+      // state (so offline edits reach currently-connected peers) then requests
+      // remote state. In 'pull' mode, only request remote state — a relay/server
+      // holds authoritative state and we adopt it rather than pushing a
+      // competing local copy on every (re)connect.
+      if (this._syncMode === 'pull') {
+        this._sendSyncStep1()
+      } else {
+        this.syncNow()
+      }
 
       // Broadcast local awareness state
       this._broadcastAwareness([this.doc.clientID])

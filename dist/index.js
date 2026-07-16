@@ -233,6 +233,9 @@ export class GenericProvider extends Observable {
         this._lastAwarenessTime = 0;
         // Origins whose updates are never sent to the transport (local-only txns).
         this._excludeOrigins = new Set();
+        // Connect-time sync strategy: 'push-pull' (default) sends full local state
+        // then requests remote; 'pull' only requests remote state.
+        this._syncMode = 'push-pull';
         this.doc = doc;
         this.transport = transport;
         this.pubsub = new PubSubChannel(this);
@@ -244,6 +247,7 @@ export class GenericProvider extends Observable {
         this._awarenessInterval = options.awarenessInterval ?? 100;
         this._excludeOrigins = new Set(options.excludeOrigins ?? []);
         this._localId = options.localId;
+        this._syncMode = options.syncMode ?? 'push-pull';
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -289,11 +293,17 @@ export class GenericProvider extends Observable {
                 };
             }
             this._setStatus({ state: 'connected' });
-            // Send initial sync pushing our local state plus requesting remote state.
-            // syncNow() is used instead of _sendSyncStep1() so that any offline edits
-            // made before this connect() call are pushed to currently-connected peers
-            // (e.g. same-browser tabs via BroadcastChannel).
-            this.syncNow();
+            // Send initial sync. In 'push-pull' mode, syncNow() pushes our local
+            // state (so offline edits reach currently-connected peers) then requests
+            // remote state. In 'pull' mode, only request remote state — a relay/server
+            // holds authoritative state and we adopt it rather than pushing a
+            // competing local copy on every (re)connect.
+            if (this._syncMode === 'pull') {
+                this._sendSyncStep1();
+            }
+            else {
+                this.syncNow();
+            }
             // Broadcast local awareness state
             this._broadcastAwareness([this.doc.clientID]);
             // Start periodic sync to handle packet loss

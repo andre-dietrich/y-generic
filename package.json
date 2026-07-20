@@ -1,5 +1,5 @@
 {
-  "name": "genericprovider",
+  "name": "@edryslabs/genericprovider",
   "version": "1.0.1",
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",

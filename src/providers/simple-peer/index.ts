@@ -686,6 +686,7 @@ export class SimplePeerTransport implements Transport {
         // This is an envelope, the actual message could be an announce or signal
         if (msg.from) {
           // Treat as announce if it's a publish from another peer
+          this.pruneStalePeer(msg.from)
           if (
             !this.peers.has(msg.from) &&
             this.peers.size < this.options.maxConns &&
@@ -727,6 +728,7 @@ export class SimplePeerTransport implements Transport {
           return
         }
         // Another peer announced - connect to them if we have capacity
+        this.pruneStalePeer(msg.from)
         if (
           !this.peers.has(msg.from) &&
           this.peers.size < this.options.maxConns &&
@@ -989,6 +991,14 @@ export class SimplePeerTransport implements Transport {
       this.log(
         `❌ Could not create peer connection for signal from ${remotePeerId}`,
       )
+    }
+  }
+
+  // Forget a peer we announced but hold no live connection to, so its next
+  // re-announce can reconnect instead of being deduped forever (ghost peer).
+  private pruneStalePeer(peerId: string): void {
+    if (this.announcedPeers.has(peerId) && !this.peers.has(peerId)) {
+      this.announcedPeers.delete(peerId)
     }
   }
 

@@ -225,6 +225,7 @@ export declare class SimplePeerTransport implements Transport {
      * Handle WebRTC signal from peer.
      */
     private handlePeerSignal;
+    private pruneStalePeer;
     /**
      * Remove and cleanup a peer connection.
      */

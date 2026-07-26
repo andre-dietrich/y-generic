@@ -621,26 +621,41 @@ export class GenericProvider extends Observable {
                     const localHash = computeDocHash(this.doc);
                     // Verify hash match
                     if (localHash !== expectedHash) {
-                        this._hashMismatchCount++;
-                        const now = Date.now();
-                        // Reset counter if it's been stable for 10 seconds
-                        if (now - this._lastHashMismatchTime > 10000) {
-                            this._hashMismatchCount = 1;
-                        }
-                        this._lastHashMismatchTime = now;
-                        // Exponential backoff: 10ms, 50ms, 250ms, 1.25s, 6.25s, then cap at 10s
-                        const delay = Math.min(10000, 10 * Math.pow(5, this._hashMismatchCount - 1));
-                        console.warn(`[GenericProvider] Hash mismatch #${this._hashMismatchCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
-                        console.warn(`[GenericProvider] Re-sync scheduled in ${delay}ms...`);
-                        // Push our full state AND request theirs.
-                        // A hash mismatch means the two peers have diverged — one side may
-                        // have edits the other lacks.  Calling only _sendSyncStep1() (pull)
-                        // never delivers our own surplus edits to the other side.
-                        setTimeout(() => {
-                            if (this.transport.isConnected && !this._destroying) {
-                                this.syncNow();
+                        // If we already know this sender has a suspected reordering gap
+                        // (see _trackRemoteSeq()/_scheduleGapCheck()), a hash mismatch
+                        // right now is the *expected* transient state — we're missing a
+                        // piece that's very likely still in flight, not actually
+                        // diverged. Let the pending gap-check grace period resolve it
+                        // instead of also escalating the hash-mismatch backoff: under
+                        // heavy reordering this previously caused a burst of mismatches
+                        // to rack up the exponential backoff to its 10s cap within a
+                        // single edit burst, purely from timing, not real divergence.
+                        // A hash mismatch with NO pending gap (in-order, but still
+                        // wrong) is not explained by reordering and still escalates
+                        // normally below.
+                        const reorderingSuspected = this._gapCheckTimers.has(senderClientID);
+                        if (!reorderingSuspected) {
+                            this._hashMismatchCount++;
+                            const now = Date.now();
+                            // Reset counter if it's been stable for 10 seconds
+                            if (now - this._lastHashMismatchTime > 10000) {
+                                this._hashMismatchCount = 1;
                             }
-                        }, delay);
+                            this._lastHashMismatchTime = now;
+                            // Exponential backoff: 10ms, 50ms, 250ms, 1.25s, 6.25s, then cap at 10s
+                            const delay = Math.min(10000, 10 * Math.pow(5, this._hashMismatchCount - 1));
+                            console.warn(`[GenericProvider] Hash mismatch #${this._hashMismatchCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
+                            console.warn(`[GenericProvider] Re-sync scheduled in ${delay}ms...`);
+                            // Push our full state AND request theirs.
+                            // A hash mismatch means the two peers have diverged — one side may
+                            // have edits the other lacks.  Calling only _sendSyncStep1() (pull)
+                            // never delivers our own surplus edits to the other side.
+                            setTimeout(() => {
+                                if (this.transport.isConnected && !this._destroying) {
+                                    this.syncNow();
+                                }
+                            }, delay);
+                        }
                     }
                     else {
                         // Hash matched - reset failure counter

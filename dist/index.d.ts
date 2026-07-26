@@ -233,6 +233,21 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _scheduleGapCheck;
     /**
+     * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`
+     * per `_syncRequestWindowMs`), recording the request if there's room.
+     * Shared by `_sendSyncStep1()` and `syncNow()` so a burst of triggers from
+     * different sources (periodic sync, hash-mismatch resyncs, gap-check
+     * confirmations) draws from one combined budget instead of each having
+     * its own uncapped or separately-capped allowance.
+     */
+    private _tryReserveSyncSlot;
+    /**
+     * Encode and send a SyncStep1 message requesting missing updates.
+     * Does not check the rate limiter itself - callers must reserve a slot
+     * via `_tryReserveSyncSlot()` first.
+     */
+    private _writeSyncStep1;
+    /**
      * Send SyncStep1 message to request missing updates.
      * This is sent when first connecting to sync with remote peers.
      * Note: SyncStep1 is just a request and doesn't include hash verification.

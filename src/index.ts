@@ -994,12 +994,14 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Send SyncStep1 message to request missing updates.
-   * This is sent when first connecting to sync with remote peers.
-   * Note: SyncStep1 is just a request and doesn't include hash verification.
-   * Rate limited to prevent spam.
+   * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`
+   * per `_syncRequestWindowMs`), recording the request if there's room.
+   * Shared by `_sendSyncStep1()` and `syncNow()` so a burst of triggers from
+   * different sources (periodic sync, hash-mismatch resyncs, gap-check
+   * confirmations) draws from one combined budget instead of each having
+   * its own uncapped or separately-capped allowance.
    */
-  private _sendSyncStep1(): void {
+  private _tryReserveSyncSlot(): boolean {
     const now = Date.now()
 
     // Clean up old entries outside the rate limit window
@@ -1007,23 +1009,43 @@ export class GenericProvider extends Observable<string> {
       (t) => now - t < this._syncRequestWindowMs,
     )
 
-    // Check rate limit
     if (this._syncRequestTimes.length >= this._maxSyncRequestsPerWindow) {
-      console.warn(
-        `[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`,
-      )
-      return // Drop the request
+      return false
     }
 
-    // Record this request
     this._syncRequestTimes.push(now)
+    return true
+  }
 
+  /**
+   * Encode and send a SyncStep1 message requesting missing updates.
+   * Does not check the rate limiter itself - callers must reserve a slot
+   * via `_tryReserveSyncSlot()` first.
+   */
+  private _writeSyncStep1(): void {
     const encoder = encoding.createEncoder()
     // SyncStep1 is always sent as standard MESSAGE_SYNC (no verification)
     // It's just a request, not an assertion of state
     encoding.writeVarUint(encoder, MESSAGE_SYNC)
     syncProtocol.writeSyncStep1(encoder, this.doc)
     this._send(encoding.toUint8Array(encoder))
+  }
+
+  /**
+   * Send SyncStep1 message to request missing updates.
+   * This is sent when first connecting to sync with remote peers.
+   * Note: SyncStep1 is just a request and doesn't include hash verification.
+   * Rate limited to prevent spam.
+   */
+  private _sendSyncStep1(): void {
+    if (!this._tryReserveSyncSlot()) {
+      console.warn(
+        `[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`,
+      )
+      return // Drop the request
+    }
+
+    this._writeSyncStep1()
   }
 
   /**

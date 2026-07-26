@@ -45,6 +45,89 @@ hypotheses about how cost scales with user count `N` in a room:
 These are hypotheses to be confirmed by measurement (Part 1) before any fix
 (Part 2/3) is applied — no fix ships without a benchmark number motivating it.
 
+## Part 1 results (measured, superseding the hypotheses above)
+
+`test/dummy/bench-user-scaling.ts` was implemented and run against `main`
+(post `c048682`). Full output is in the session log; the key numbers:
+
+**Fan-out (10-edit burst, already-synced room), messages delivered:**
+
+| N   | expected (10×(N-1)) | measured (WebSocket profile) | measured (Matrix profile) |
+|-----|---------------------|-------------------------------|----------------------------|
+| 25  | 240                 | 1,248                         | 5,688                      |
+| 50  | 490                 | 6,419                         | 27,979                     |
+| 100 | 990                 | 19,206                        | 206,514                    |
+
+**Join-burst (N clients connecting concurrently), messages delivered —
+nearly identical across all 4 latency profiles (i.e. NOT latency-driven):**
+
+| N   | messages | CPU time  |
+|-----|----------|-----------|
+| 10  | 585      | ~15-60ms  |
+| 25  | 8,400    | ~75-240ms |
+| 50  | 64,925   | ~400-570ms|
+| 100 | 509,850  | ~2.9-3.3s |
+
+A follow-up isolation run (fan-out, Matrix profile, `verifyUpdates` on vs.
+off) confirms the cause precisely:
+
+| N   | verifyUpdates=true | verifyUpdates=false (=expected baseline) |
+|-----|---------------------|-------------------------------------------|
+| 25  | 5,024               | 240                                       |
+| 50  | 29,128              | 490                                       |
+| 100 | 320,804             | 990                                       |
+
+With `verifyUpdates` off, message counts land exactly on the theoretical
+10×(N-1) baseline at every N — perfectly linear, no blow-up. The entire
+super-linear cost is attributable to `verifyUpdates`'s hash-mismatch path.
+
+**What's actually happening:** `syncNow()` (`src/index.ts:586`) has two
+parts: an *uncapped* push of the full local document state
+(`this._sendUpdate(update)`), and a *rate-limited* sync request
+(`this._sendSyncStep1()`, gated by the existing `_syncRequestTimes` /
+`_maxSyncRequestsPerWindow` limiter). `syncNow()` is called from the
+hash-mismatch handler (`src/index.ts:886`) every time a peer detects a hash
+mismatch. With many peers converging at once, hash mismatches are common
+(reordering across many concurrent senders) and each one triggers a full,
+*unthrottled* document-state broadcast to the entire room. Those broadcasts
+themselves cause more concurrent traffic, which causes more mismatches
+elsewhere, which trigger more broadcasts — a self-reinforcing cascade. This
+is confirmed as the sole driver (not `computeDocHash`'s O(N) per-call cost,
+which only shows up as a minor secondary cost proportional to the inflated
+message count itself — CPU-per-message stays roughly constant across N).
+
+**Hypothesis 1 (hash cost)**: not an independent bottleneck — its CPU cost
+tracks message count, which is driven by hypothesis 2's cascade. No fix
+needed beyond fixing hypothesis 2.
+
+**Hypothesis 2 (repeated full-state broadcasts)**: confirmed as the
+dominant cost, root-caused to `syncNow()`'s uncapped push, triggered
+primarily by the hash-mismatch handler (not `onPeerConnect`, which
+`DummyTransport` doesn't even implement — real mesh transports that do
+implement it would compound this further, but that path isn't reachable in
+this benchmark).
+
+**Hypothesis 3 (DummyHub timer volume)**: not a bottleneck at this scale —
+wall-clock time for fan-out stays within ~30-200ms even at 100 users and
+tens of thousands of deliveries; Node handles the timer volume fine. Dropped
+from scope.
+
+## Decision
+
+Part 2 is narrowed to a single fix: **gate `syncNow()`'s full-state push
+behind the same rate limiter that already gates `_sendSyncStep1()`**, as one
+combined check at the top of `syncNow()`, instead of only protecting the
+sync-request half. This directly caps the cascade at its source, reuses
+existing state (`_syncRequestTimes`/`_maxSyncRequestsPerWindow`/
+`_syncRequestWindowMs`, `src/index.ts:237-239`), and doesn't touch the
+primary edit-propagation path (`doc.on('update', ...)` → `_sendUpdate`,
+`src/index.ts:611-627`), which is unaffected by this limiter and still
+delivers every local edit immediately. The periodic-hash-verification idea
+from the original Part 2 draft is dropped — not supported by measurement.
+
+Part 3 (`DummyHub` timer batching) is dropped entirely — not supported by
+measurement at the target scale (up to 100 users).
+
 ## Scope
 
 - **In scope:** `src/index.ts` (wire protocol / provider logic),
@@ -100,38 +183,31 @@ the existing `bench-sync-latency.ts` (same run instructions: compile via
 This part alone confirms or refutes the three hypotheses above before
 anything else is touched.
 
-## Part 2 — Protocol changes (`src/index.ts`), conditional on Part 1 findings
+## Part 2 — Protocol change (`src/index.ts`)
 
-Two candidate fixes, each applied only if Part 1's numbers support it:
+Restructure `syncNow()` so the rate-limit check that currently only guards
+`_sendSyncStep1()` gates the *entire* method (full-state push + sync
+request) with a single check at the top. If the room is already over the
+`_syncRequestTimes`/`_maxSyncRequestsPerWindow` budget, `syncNow()` does
+nothing for either half and returns — the next successful periodic sync (or
+a future rate-limit window) catches up instead. Awareness broadcast stays
+outside this gate (it has its own independent, much cheaper throttle via
+`_awarenessInterval` and isn't part of the measured cascade).
 
-1. **Periodic instead of per-update hash verification.** Add a counter so
-   `_sendUpdate` computes/sends the verification hash every Kth update (or
-   after a short idle gap) rather than on every single update, when
-   `verifyUpdates` is on. Sequence-number gap detection continues to run on
-   every message regardless (it's cheap — O(1) `Set` ops per message) and
-   remains the primary defense; the hash becomes a periodic checkpoint. The
-   wire format gains a flag bit indicating whether a hash follows, since
-   messages without a fresh hash still need to be structurally valid.
-2. **Debounce `syncNow()` triggered by `onPeerConnect`.** Collapse multiple
-   `onPeerConnect` events arriving within a short window (e.g. via the same
-   debounce pattern already used for awareness batching) into a single
-   `syncNow()` call, instead of one per newly-connected peer.
+This is a small, surgical change: extract the existing
+check-then-record-timestamp logic (`src/index.ts:1002-1019`) into a shared
+private method (e.g. `_tryReserveSyncSlot(): boolean`), call it once at the
+top of `syncNow()`, and have `_sendSyncStep1()` skip its own now-redundant
+internal check when called from `syncNow()` (or simply call the encoder
+logic directly from `syncNow()` post-gate, since the rate limit was already
+consumed). The periodic-sync `setInterval` callback in `connect()`
+(`src/index.ts:409-425`) keeps its own existing inline check — it already
+calls `_sendSyncStep1()` only, not `syncNow()`, so it's unaffected by this
+change and needs no edit.
 
-Both are additive to the existing exponential-backoff/rate-limiting
-machinery already in the file — no removal of existing safety nets, only
-reduced trigger frequency where the measurement shows it's excessive.
+## Part 3 — dropped
 
-## Part 3 — `DummyHub` scheduling (`src/providers/dummy/index.ts`), conditional on Part 1 findings
-
-If Part 1 shows the benchmark itself bottlenecked by timer volume rather
-than by the code under test: change `DummyHub.broadcast()` to group
-recipients by their computed delay (recipients sharing the same
-latency/jitter profile can be bucketed) and fire one `setTimeout` per
-bucket that delivers to all recipients in that bucket, instead of one timer
-per recipient. Must preserve today's per-recipient independent jitter
-semantics (recipients can still land in different buckets) and per-recipient
-drop-rate behavior. Test-infrastructure-only change; does not affect the
-real wire protocol or any other provider.
+Not pursued; see "Part 1 results" above.
 
 ## Testing / verification plan
 
@@ -140,11 +216,13 @@ real wire protocol or any other provider.
   numbers, plus a manual smoke test via `npm run dev:dummy` /
   `test/dummy/edge-cases.html` to confirm normal 2-3 client sync still works
   visually after the `src/index.ts` changes.
-- Part 2 change #1 (periodic hash) must not regress the just-landed
-  reordering-tolerance fix in `c048682` — rerun
-  `test/dummy/bench-sync-latency.ts` after the change and confirm
-  hash-mismatch/backoff-cap counts stay at or below the current baseline
-  (21 mismatches / 0 backoff-cap hits across all profiles, captured above).
-- Each of Part 2/3's changes ships with a one-line before/after number in
-  its commit message (matching this repo's existing convention, e.g.
-  `c048682`'s "239 → 21" style), sourced from the Part 1 benchmark.
+- The Part 2 change must not regress the just-landed reordering-tolerance
+  fix in `c048682` — rerun `test/dummy/bench-sync-latency.ts` after the
+  change and confirm hash-mismatch/backoff-cap counts stay at or below the
+  current baseline (21 mismatches / 0 backoff-cap hits across all profiles,
+  captured above).
+- Rerun `test/dummy/bench-user-scaling.ts` after the change and confirm the
+  fan-out message counts at N=25/50/100 (Matrix profile: 5,688 / 27,979 /
+  206,514 before) land close to the `verifyUpdates=false` baseline (240 /
+  490 / 990) rather than the measured blow-up — this is the concrete
+  before/after number for the commit message.

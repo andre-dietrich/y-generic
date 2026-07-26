@@ -23,13 +23,13 @@ import * as Y from 'yjs'
 import { GenericProvider } from '../../src/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
 
-interface Profile {
+export interface Profile {
   name: string
   latency: number
   jitter: number
 }
 
-const PROFILES: Profile[] = [
+export const PROFILES: Profile[] = [
   { name: 'WebSocket/PubNub/Supabase (push)', latency: 15, jitter: 0.2 },
   { name: 'WebRTC steady-state (post-handshake)', latency: 20, jitter: 0.1 },
   { name: 'Gun (100ms debounce + 300ms throttle + relay)', latency: 250, jitter: 0.3 },
@@ -46,7 +46,7 @@ interface RunResult {
   bytes: number
 }
 
-function sleep(ms: number): Promise<void> {
+export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
@@ -55,7 +55,7 @@ function sleep(ms: number): Promise<void> {
  * deliveries (messages/bytes), not just broadcast() call count. dropRate is
  * always 0 in this benchmark, so getRoomSize(room) - 1 is exact.
  */
-function instrumentHub(hub: DummyHub) {
+export function instrumentHub(hub: DummyHub) {
   let messages = 0
   let bytes = 0
   const original = hub.broadcast.bind(hub)
@@ -85,7 +85,7 @@ function instrumentHub(hub: DummyHub) {
  * Prevents the provider's own diagnostic logging (hash mismatches, gap
  * warnings) from adding console I/O cost to the measured window.
  */
-async function silenced<T>(fn: () => Promise<T>): Promise<T> {
+export async function silenced<T>(fn: () => Promise<T>): Promise<T> {
   const warn = console.warn
   const error = console.error
   console.warn = () => {}
@@ -98,7 +98,7 @@ async function silenced<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function makeProviders(
+export function makeProviders(
   hub: DummyHub,
   profile: Profile,
   N: number,
@@ -250,7 +250,12 @@ async function main() {
   process.exit(0)
 }
 
-main().catch((err) => {
-  console.error(err)
-  process.exit(1)
-})
+// Guarded so this file can be `import`ed (e.g. by
+// bench-asymmetric-join.ts, which reuses makeProviders/sleep/silenced/
+// PROFILES) without also running the full suite above as a side effect.
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err)
+    process.exit(1)
+  })
+}

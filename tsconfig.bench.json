@@ -15,6 +15,7 @@
     "src/**/*",
     "test/dummy/bench-sync-latency.ts",
     "test/dummy/bench-user-scaling.ts",
+    "test/dummy/bench-asymmetric-join.ts",
     "test/dummy/repro-gun-batch-corruption.ts"
   ]
 }

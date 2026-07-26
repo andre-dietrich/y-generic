@@ -295,6 +295,86 @@ data. A future refinement could correlate replies to specific requests, but
 that needs a wire-format change and is not justified without evidence the
 coarse heuristic causes real problems at realistic scale.
 
+**Named case: asymmetric-empty-reply at N>=3, explicitly tested.** The
+general "coarse heuristic" language above covers it in principle, but it's
+worth naming precisely: in a room where peer A is empty and requesting, and
+both peer B (empty, would reply vacuously) and peer C (holds the real
+content, would reply with it) are eligible responders, the gate only
+guarantees "someone else will answer" — not "the *right* someone else will
+answer." If B's reply is scheduled/sent first, C's `_cancelPendingSyncReply()`
+fires and A never sees C's real reply via the request/reply path. The
+existing `bench-user-scaling.ts` scenarios can't surface this because every
+peer there starts with identical (empty) state, so a vacuous and a real
+reply are indistinguishable. `test/dummy/bench-asymmetric-join.ts` was added
+to close that gap: one peer is pre-loaded with real text content before
+connecting, the rest start empty, and the script asserts all peers converge
+to the real content. Run at N=5/10/25 (Matrix profile), 8 samples each,
+across two independent full runs (96 samples total): **48/48 converged**,
+mean convergence time ~900-1000ms regardless of N, well inside the 20s
+timeout. Instrumentation confirmed the suppression path is genuinely
+exercised in this scenario (tens of scheduled replies and roughly a third to
+a half of them cancelled per run, not zero) — this isn't passing merely
+because suppression never engages. It converges anyway because `syncNow()`'s
+connect-time full-state push (a direct broadcast, independent of the
+SyncStep2 reply-suppression path entirely) reaches any peer that was already
+joined by the time the pre-loaded peer connects, and the periodic/backoff
+safety nets exist for stragglers. **Conclusion: at this practical scale (up
+to 25 peers) this is a documentation gap rather than a live bug** — the
+mitigations named above (connect-time full push, the gate) are doing their
+job. This does not prove the failure mode is impossible at larger N or under
+different timing (e.g. a very late-joining empty peer racing a slow
+pre-loaded peer's connect); it's evidence at the scale actually tested, not a
+proof of correctness for all N.
+
+**A related resource-starvation surface, incremental not novel-in-kind:** a
+peer that repeatedly emits trivial/cheap SyncStep2-shaped messages (e.g. a
+misbehaving or buggy client replaying an empty-state reply on a timer) could
+cause other peers in a room of >=3 to perpetually cancel their own pending
+replies via `_cancelPendingSyncReply()`, effectively starving out anyone who
+would otherwise deliver real content. This codebase already has no trust
+model for peers in general (any peer can already send arbitrary sync/awareness
+traffic), so this is an incremental new angle on an existing lack of trust,
+not a new category of exposure.
+
+**Benchmark comparability caveat post-`c15ec16`:** `runJoinBurst`'s
+message-count totals (in the "Part 1 results" table above) are no longer
+directly comparable to a fresh run taken after `c15ec16` (the
+awareness-realism fix, which made `setLocalStateField` calls real instead of
+silently rejected at clock `0`). That fix means every peer's awareness state
+is now actually accepted by its room-mates instead of being silently
+rejected at genesis clock `0`, and `runJoinBurst` never resets its counters
+after connecting (it measures from before `connect()` through settle), so
+post-`c15ec16` totals include real awareness traffic the original table's
+numbers did not - confirmed empirically with a throwaway side-by-side (N=10,
+Matrix profile, 6 samples each): unamended consistently measured 585
+messages every run, amended measured 864-936, roughly +48-60%, not just
+noise. `runFanOut`'s numbers remain comparable across that fix since it
+resets its message/byte counters after the room settles, before starting the
+measured edit burst.
+
+**Reconciling Task 2's post-fix mean with the "~351,565" figure quoted for
+Task 3:** worth calling out explicitly since both numbers describe N=100
+Matrix-profile fan-out and a reader could otherwise misread them as
+sequential before/after snapshots implying regression between Task 2 and
+Task 3. Checked against `task-2-report.md`/`task-3-report.md` directly:
+**both** Task 2's post-fix mean of 224,132 (Addendum above) **and** the
+~351,565 figure `b57c976` cites as "pre-fix/gate-inert baseline" were
+measured against the *unamended* (pre-`c15ec16`) benchmark script - they are
+not an unamended/amended pair, they are two independent noisy samples of the
+*same* configuration (Task 2's rate-limit gate active, Task 3's suppression
+not yet written), taken in separate sampling sessions. Their ~1.5x spread is
+fully explained by the already-documented extreme variance at N=100 (a
+single 21-run set alone ranged 990-835,956 per the Addendum) and says
+nothing about Task 2's improvement being over- or under-stated - Task 2's own
+before/after comparison (~286,591 -> ~224,132, both same session, same
+script version) remains the correct apples-to-apples number for judging Task
+2 specifically. The comparison that genuinely does cross script versions,
+and is worth reading with that caveat, is Task 3's own headline number in
+`b57c976`: ~351,565 (unamended script) -> 70,342.8 (amended script, 15 runs) -
+a real ~5x reduction, but one side of it was measured before the
+awareness-clock benchmark bug was fixed and the other after, so it is not a
+same-conditions before/after in the way the Addendum's Task 2 numbers are.
+
 **Post-implementation correction — the shipped benchmark scripts didn't
 exercise the gate at all:** when Task 3 was actually implemented and
 re-verified against the unmodified `test/dummy/bench-user-scaling.ts` and

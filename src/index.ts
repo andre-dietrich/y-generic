@@ -450,6 +450,13 @@ export class GenericProvider extends Observable<string> {
     this._corruptedMessageCount = 0
     this._lastCorruptedMessageTime = 0
 
+    // Reset the sync rate-limit budget. Without this, a reconnect inherits
+    // whatever budget was left over from before the disconnect - and since
+    // syncNow()'s full-state push now shares this same limiter (see
+    // _tryReserveSyncSlot()), a rate-limited reconnect could silently skip
+    // the very push that delivers edits made while offline.
+    this._syncRequestTimes = []
+
     // Drop any pending suppressed sync reply - safe to simply discard (not
     // flush/send like batched updates/awareness below), since a suppressed
     // reply is by design redundant with whatever the room already has.
@@ -785,18 +792,15 @@ export class GenericProvider extends Observable<string> {
             this, // transaction origin
           )
 
-          // If we received SyncStep2, we're synced
-          if (
-            syncMessageType === syncProtocol.messageYjsSyncStep2 &&
-            !this._synced
-          ) {
-            this._synced = true
-            this.emit('synced', [true])
-          }
-
-          // Someone else's SyncStep2 reply just arrived - our own pending
-          // reply (if any) is now most likely redundant.
           if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+            // If we received SyncStep2, we're synced
+            if (!this._synced) {
+              this._synced = true
+              this.emit('synced', [true])
+            }
+
+            // Someone else's SyncStep2 reply just arrived - our own pending
+            // reply (if any) is now most likely redundant.
             this._cancelPendingSyncReply()
           }
 
@@ -962,10 +966,24 @@ export class GenericProvider extends Observable<string> {
    * sending immediately. If another peer's reply is overheard in the
    * meantime (`_cancelPendingSyncReply`), this reply is dropped as
    * redundant - the requester likely already got what it needed.
+   *
+   * A reply that is already pending when this is called answers a
+   * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
+   * later by peer B's) - it must not be silently overwritten by the new
+   * one. Flush it immediately, then schedule the new reply fresh. The only
+   * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
+   * because we overheard someone else's SyncStep2 for the SAME request.
    */
   private _scheduleSyncReply(reply: Uint8Array): void {
+    if (this._pendingSyncReplyTimeoutId !== undefined) {
+      if (this._pendingSyncReply) {
+        this._send(this._pendingSyncReply)
+      }
+      clearTimeout(this._pendingSyncReplyTimeoutId)
+      this._pendingSyncReplyTimeoutId = undefined
+    }
+
     this._pendingSyncReply = reply
-    if (this._pendingSyncReplyTimeoutId !== undefined) return
     const delay = Math.random() * this._syncReplySuppressionMs
     this._pendingSyncReplyTimeoutId = setTimeout(() => {
       this._pendingSyncReplyTimeoutId = undefined

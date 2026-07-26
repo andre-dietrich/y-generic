@@ -224,6 +224,13 @@ export declare class GenericProvider extends Observable<string> {
      * sending immediately. If another peer's reply is overheard in the
      * meantime (`_cancelPendingSyncReply`), this reply is dropped as
      * redundant - the requester likely already got what it needed.
+     *
+     * A reply that is already pending when this is called answers a
+     * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
+     * later by peer B's) - it must not be silently overwritten by the new
+     * one. Flush it immediately, then schedule the new reply fresh. The only
+     * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
+     * because we overheard someone else's SyncStep2 for the SAME request.
      */
     private _scheduleSyncReply;
     /** Cancel a pending suppressed reply, if any. */

@@ -406,21 +406,12 @@ export class GenericProvider extends Observable<string> {
 
       // Start periodic sync to handle packet loss
       // Just request sync without sending full state (avoid redundant broadcasts)
+      // _sendSyncStep1() already checks the shared rate limiter internally
+      // and silently drops the request if it's exceeded.
       if (this._syncInterval > 0) {
         this._syncIntervalId = setInterval(() => {
           if (this.transport.isConnected && !this._destroying) {
-            // Check rate limit before syncing
-            const now = Date.now()
-            this._syncRequestTimes = this._syncRequestTimes.filter(
-              (t) => now - t < this._syncRequestWindowMs,
-            )
-
-            if (
-              this._syncRequestTimes.length < this._maxSyncRequestsPerWindow
-            ) {
-              this._sendSyncStep1()
-            }
-            // If rate limited, skip this periodic sync - will try again next interval
+            this._sendSyncStep1()
           }
         }, this._syncInterval)
       }
@@ -589,17 +580,32 @@ export class GenericProvider extends Observable<string> {
       return
     }
 
-    // Send our current document state to all peers
-    // This ensures any changes made while offline are transmitted
-    const update = Y.encodeStateAsUpdate(this.doc)
-    if (update.length > 0) {
-      this._sendUpdate(update)
+    // Push (full document state) and pull (SyncStep1 request) share a
+    // single rate-limit reservation. syncNow() is called from several
+    // triggers that can all fire in a short window when many peers are
+    // converging at once (hash-mismatch resyncs, gap-check confirmations,
+    // per-peer connect events on mesh transports) - without this gate the
+    // push above had NO limit at all, so each trigger broadcast the full
+    // document state to the whole room, and those broadcasts caused more
+    // reordering/mismatches elsewhere, causing more triggers. Measured in
+    // test/dummy/bench-user-scaling.ts: at 100 simulated users this drove
+    // message counts to 20-200x the theoretical linear cost. See
+    // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md.
+    if (this._tryReserveSyncSlot()) {
+      // Send our current document state to all peers
+      // This ensures any changes made while offline are transmitted
+      const update = Y.encodeStateAsUpdate(this.doc)
+      if (update.length > 0) {
+        this._sendUpdate(update)
+      }
+
+      // Send sync request to get updates from others
+      this._writeSyncStep1()
     }
 
-    // Send sync request to get updates from others
-    this._sendSyncStep1()
-
-    // Broadcast current awareness state
+    // Broadcast current awareness state - independently throttled and much
+    // cheaper than a full document push, so it isn't gated by the sync
+    // rate limiter above even when the sync half is skipped.
     this._broadcastAwareness([this.doc.clientID])
   }
 

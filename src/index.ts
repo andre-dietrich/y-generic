@@ -450,6 +450,11 @@ export class GenericProvider extends Observable<string> {
     this._corruptedMessageCount = 0
     this._lastCorruptedMessageTime = 0
 
+    // Drop any pending suppressed sync reply - safe to simply discard (not
+    // flush/send like batched updates/awareness below), since a suppressed
+    // reply is by design redundant with whatever the room already has.
+    this._cancelPendingSyncReply()
+
     // Flush any pending batched updates before disconnecting
     if (this._batchTimeoutId !== undefined) {
       clearTimeout(this._batchTimeoutId)
@@ -516,6 +521,10 @@ export class GenericProvider extends Observable<string> {
       clearTimeout(timer)
     }
     this._gapCheckTimers.clear()
+
+    // Drop any pending suppressed sync reply (disconnect() will also do
+    // this, but be explicit)
+    this._cancelPendingSyncReply()
 
     // Flush any pending batched updates before destroying
     if (this._batchTimeoutId !== undefined) {

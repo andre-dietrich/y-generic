@@ -209,6 +209,92 @@ change and needs no edit.
 
 Not pursued; see "Part 1 results" above.
 
+## Addendum (post-implementation): Part 2 measured impact was smaller than expected, and the real driver found
+
+Task 2 (the `syncNow()` rate-limit gate) was implemented and, before committing,
+verified against the plan's own pass bar — rerunning `bench-user-scaling.ts`
+repeatedly (not just once) at N=100. That repeated sampling revealed two things
+the single-sample baseline above didn't:
+
+1. **The benchmark is far noisier at N=100 than one sample suggests.** 21 runs
+   per side (Matrix profile, fan-out) gave: pre-fix mean ~286,591 (range
+   990-835,956), post-fix mean ~224,132 (range 990-616,473) — only a ~1.3x
+   mean reduction, not the 5-10x expected, and not clearly outside the noise.
+   The originally-recorded `206,514` baseline sat at the low end of the
+   pre-fix distribution by chance.
+2. **Root cause: the rate-limit gate barely engages in this scenario.**
+   Instrumentation across all 100 clients showed only 0.6-3.6 `syncNow()`
+   calls per client on average — far under the 20-per-10s cap — so the gate
+   cannot be the mechanism producing any real reduction here.
+
+The actual dominant cost: `DummyHub.broadcast()` (`src/providers/dummy/index.ts:98-140`)
+has no unicast — every client's SyncStep1 *request* fans out to all N-1 peers,
+and because `syncProtocol.readSyncMessage` answers a SyncStep1 by writing a
+SyncStep2 reply, **every one of those N-1 peers independently generates and
+broadcasts its own reply**, each again fanning out to N-1 peers. A single
+`syncNow()` call's pull half costs O(N²) from this reply pile-up alone — which
+dwarfs anything the per-client push cap saves, and which Task 2 never touched.
+This matches the "Out of scope" note under Scope (adding targeted send was
+deferred as "bigger than this task justifies") — that deferred item turned out
+to be the dominant cost after all.
+
+Task 2 was still committed (it's a real, if modest, improvement — see its
+commit message for the honest ~1.3x number), and this addendum's finding
+became Part 4 below.
+
+## Part 4 — SyncStep2 reply suppression (validated, replaces the Transport-unicast idea)
+
+Adding real point-to-point send to `Transport` (deferred above as too large)
+turns out to be unnecessary. The redundant-reply problem can be solved
+entirely inside `GenericProvider`, using the classic NACK-suppression pattern
+from reliable multicast (e.g. Scalable Reliable Multicast): instead of
+replying to a SyncStep1 request immediately, each peer that would reply waits
+a short random delay; if it overhears another peer's SyncStep2 reply during
+that delay (it will, since all replies are broadcast to everyone anyway), it
+assumes the requester is now satisfied and drops its own redundant reply.
+
+**Validated by prototype** (built and measured directly against
+`test/dummy/bench-user-scaling.ts` and `test/dummy/bench-sync-latency.ts`,
+then discarded — Task 3 below implements it properly):
+
+- First version (suppress unconditionally on overhearing any SyncStep2):
+  N=100 Matrix-profile fan-out, 15 repeated samples: mean 96,304 (range
+  78,727-112,914) vs. the pre-fix mean of ~286,591 and worst-case of 835,956
+  — roughly a 3x mean reduction and a **~7.4x reduction in worst-case**,
+  collapsing the wild run-to-run variance into a tight band.
+- That first version broke 2-peer correctness: `bench-sync-latency.ts` showed
+  30 consecutive hash mismatches in one run, with one peer staying at an empty
+  document ("Local: 0") far too long. Cause: with only 2 total peers, there is
+  no "someone else" to rely on — suppressing the only viable reply just
+  because *some* SyncStep2 was overheard (even one answering a different
+  request entirely) silences the one reply the requester actually needed.
+- **Fix:** gate suppression behind a cheap, already-available peer-count
+  estimate — `this.awareness.getStates().size >= 3` (i.e. at least 2 other
+  known peers besides self). Below that threshold, reply immediately as
+  today; at/above it, suppression is safe because redundant repliers
+  genuinely exist. After this gate: `bench-sync-latency.ts` ran clean across
+  multiple repeated full runs (0 convergence timeouts; hash-mismatch counts
+  of 10/14/40 across 3 runs, within the same noise range the un-suppressed
+  baseline itself shows), and the N=100 improvement was retained.
+
+**Decision:** implement this as Task 3 of the implementation plan, gated on
+`awareness.getStates().size`, with a fixed suppression window (30ms in the
+prototype — tune based on Task 3's own measurement, not hard-coded from the
+prototype without re-verification). This stays entirely within
+`src/index.ts` — no `Transport` interface change, no changes to any provider
+under `src/providers/`.
+
+**Known limitation, accepted:** the peer-count gate and the "any overheard
+SyncStep2 cancels my pending reply" heuristic are coarse — a reply can still
+be wrongly suppressed if it was answering a *different* request than the one
+the observer has queued. This is acceptable because the system already
+tolerates eventual (not immediate) consistency via redundant mechanisms
+(periodic sync every `syncInterval` ms, hash-mismatch-triggered resync) — a
+wrongly-suppressed reply just delays catch-up slightly rather than losing
+data. A future refinement could correlate replies to specific requests, but
+that needs a wire-format change and is not justified without evidence the
+coarse heuristic causes real problems at realistic scale.
+
 ## Testing / verification plan
 
 - No existing automated test suite (per `CLAUDE.md`) — verification is
@@ -226,3 +312,12 @@ Not pursued; see "Part 1 results" above.
   206,514 before) land close to the `verifyUpdates=false` baseline (240 /
   490 / 990) rather than the measured blow-up — this is the concrete
   before/after number for the commit message.
+- **Single-sample comparisons at N=100 are not reliable** (see the Addendum
+  above) — any before/after claim for Task 3 must use repeated sampling
+  (10+ runs per side) and report mean and range, not one run.
+- Task 3 specifically must be verified against `bench-sync-latency.ts`
+  (2-peer scenario) with multiple repeated full runs, not once — the
+  prototype's first version passed a single run before failing on a later
+  one. No `Timeout waiting for convergence` errors on any run is the hard
+  requirement; mismatch/backoff-cap counts should stay within the
+  established noisy-baseline range, not a hard exact number.

@@ -117,6 +117,13 @@ function makeProviders(
       verifyUpdates: true,
       syncInterval: 0,
     })
+    // Bump local awareness state past the library's genesis clock (0) -
+    // every real consumer app does this for presence/cursors, and it's a
+    // precondition for Task 3's SyncStep2-reply-suppression peer-count gate
+    // (this.awareness.getStates().size >= 3) to ever see other peers. See
+    // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md
+    // "Part 4" for why this line matters.
+    provider.awareness.setLocalStateField('user', { id: i })
     docs.push(doc)
     providers.push(provider)
   }

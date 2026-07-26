@@ -102,6 +102,16 @@ async function runOnce(
     verifyUpdates: cfg.verifyUpdates,
     syncInterval: 0,
   })
+  // Bump local awareness state past the library's genesis clock (0), same as
+  // bench-user-scaling.ts - see that file's comment and
+  // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md
+  // "Part 4". Note this is inherently a 2-peer scenario, so
+  // awareness.getStates().size can reach at most 2 here - Task 3's `>= 3`
+  // suppression gate structurally never engages in this file regardless of
+  // this fix; this change only makes the two peers correctly see each other
+  // in awareness (1 -> 2), it does not newly exercise the suppression path.
+  providerA.awareness.setLocalStateField('user', { id: 'A' })
+  providerB.awareness.setLocalStateField('user', { id: 'B' })
 
   await providerA.connect({ room })
   await providerB.connect({ room })

@@ -295,6 +295,55 @@ data. A future refinement could correlate replies to specific requests, but
 that needs a wire-format change and is not justified without evidence the
 coarse heuristic causes real problems at realistic scale.
 
+**Post-implementation correction — the shipped benchmark scripts didn't
+exercise the gate at all:** when Task 3 was actually implemented and
+re-verified against the unmodified `test/dummy/bench-user-scaling.ts` and
+`test/dummy/bench-sync-latency.ts`, the peer-count gate
+(`awareness.getStates().size >= 3`) never became true in either script, and
+the N=100 fan-out numbers showed no improvement over the pre-fix baseline
+(mean ~351,565, same wild variance as before). Root cause, confirmed with an
+isolated unit test against `y-protocols/awareness`: the library's `Awareness`
+constructor sets the local state via `setLocalState({})`, which leaves the
+local meta clock at its genesis value of `0`. `applyAwarenessUpdate` only
+accepts an incoming state when `currClock < clock` (or the null/removal
+case) — for a clientID the receiver has never seen, `currClock` defaults to
+`0`, so a sender whose clock is *also* still `0` is silently rejected. The
+clock only advances once a consumer calls `setLocalState`/
+`setLocalStateField` with real content (every actual consumer app does this
+for cursor/presence). Neither benchmark script ever did, so
+`awareness.getStates().size` stayed at `1` (self only) for every peer for the
+whole run in both scripts — a benchmark gap, not a defect in the fix itself:
+a throwaway patch adding one `provider.awareness.setLocalStateField(...)`
+call per peer reproduced the originally-claimed numbers almost exactly (mean
+63,830, range 990-108,009 over 12 runs on the fan-out scenario).
+
+Both benchmark scripts were amended to call `setLocalStateField` once per
+provider right after construction (`test/dummy/bench-user-scaling.ts`'s
+`makeProviders()`, `test/dummy/bench-sync-latency.ts`'s `providerA`/
+`providerB`) so they match what real consumer apps already do, and Task 3 was
+re-verified against the amended scripts — see Task 3's commit message for the
+resulting numbers. Note `bench-sync-latency.ts` is inherently a 2-peer
+scenario, so `awareness.getStates().size` can reach at most `2` there even
+after this fix — the `>= 3` gate structurally can never engage in that
+script; the amendment only fixes the two peers' mutual awareness visibility
+(1 -> 2), it does not and cannot exercise the suppression path itself. That
+script's value is (and remains) purely a 2-peer *correctness* check — proving
+the gate correctly stays closed (no suppression, no stall) when there's
+genuinely no redundancy, not a demonstration of the suppression benefit.
+
+**Documented limitation of the fix itself (not just the benchmark):** because
+suppression is gated on awareness activity, an application that never touches
+`awareness.setLocalState`/`setLocalStateField` (no cursors, no presence, pure
+headless sync) gets **no** suppression benefit from Task 3, in exactly the
+same way the unmodified benchmarks didn't — the gate's condition is simply
+never satisfied, so the code always takes the pre-Task-3 "reply immediately"
+path. This causes no regression (that path is identical to before Task 3),
+but it does mean the O(N²) reply-storm fix is conditional on the app exercising
+awareness at all, which is not guaranteed by `GenericProvider`'s API surface
+itself. This is accepted as a known limitation rather than fixed here (fixing
+it — e.g., decoupling the redundancy estimate from awareness — is a possible
+future refinement, not in scope for Task 3).
+
 ## Testing / verification plan
 
 - No existing automated test suite (per `CLAUDE.md`) — verification is

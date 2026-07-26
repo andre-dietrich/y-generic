@@ -238,6 +238,17 @@ export class GenericProvider extends Observable<string> {
   private _maxSyncRequestsPerWindow: number = 20 // max requests per 10 seconds
   private _syncRequestWindowMs: number = 10000 // 10 second window
 
+  // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
+  // a SyncStep1 request briefly, and drop it if another peer's reply is
+  // overheard first - since every reply is broadcast to the whole room
+  // anyway, this avoids every peer answering the same request redundantly.
+  // Only engages when there's genuine redundancy (see _handleIncomingMessage's
+  // MESSAGE_SYNC case) - with 0-1 other known peers there's no "someone
+  // else" to rely on, so replies go out immediately as before.
+  private _pendingSyncReply: Uint8Array | null = null
+  private _pendingSyncReplyTimeoutId?: ReturnType<typeof setTimeout>
+  private readonly _syncReplySuppressionMs = 30
+
   // Sequence numbers for causal ordering
   private _localSeqNum: number = 0 // Our sequence number counter
 
@@ -774,9 +785,21 @@ export class GenericProvider extends Observable<string> {
             this.emit('synced', [true])
           }
 
-          // Send reply if needed
+          // Someone else's SyncStep2 reply just arrived - our own pending
+          // reply (if any) is now most likely redundant.
+          if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+            this._cancelPendingSyncReply()
+          }
+
+          // Send reply if needed. Suppression only engages with genuine
+          // redundancy (>=2 other known peers via awareness) - below that,
+          // there's no "someone else" to rely on, so reply immediately.
           if (encoding.length(encoder) > 1) {
-            this._send(encoding.toUint8Array(encoder))
+            if (this.awareness.getStates().size >= 3) {
+              this._scheduleSyncReply(encoding.toUint8Array(encoder))
+            } else {
+              this._send(encoding.toUint8Array(encoder))
+            }
           }
           break
         }
@@ -923,6 +946,34 @@ export class GenericProvider extends Observable<string> {
       // (corruption is caught by CRC32 check above)
       console.error('[GenericProvider] Error handling message:', error)
     }
+  }
+
+  /**
+   * Schedule a SyncStep2 reply after a short random delay instead of
+   * sending immediately. If another peer's reply is overheard in the
+   * meantime (`_cancelPendingSyncReply`), this reply is dropped as
+   * redundant - the requester likely already got what it needed.
+   */
+  private _scheduleSyncReply(reply: Uint8Array): void {
+    this._pendingSyncReply = reply
+    if (this._pendingSyncReplyTimeoutId !== undefined) return
+    const delay = Math.random() * this._syncReplySuppressionMs
+    this._pendingSyncReplyTimeoutId = setTimeout(() => {
+      this._pendingSyncReplyTimeoutId = undefined
+      if (this._pendingSyncReply) {
+        this._send(this._pendingSyncReply)
+        this._pendingSyncReply = null
+      }
+    }, delay)
+  }
+
+  /** Cancel a pending suppressed reply, if any. */
+  private _cancelPendingSyncReply(): void {
+    if (this._pendingSyncReplyTimeoutId !== undefined) {
+      clearTimeout(this._pendingSyncReplyTimeoutId)
+      this._pendingSyncReplyTimeoutId = undefined
+    }
+    this._pendingSyncReply = null
   }
 
   /**

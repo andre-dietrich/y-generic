@@ -92,6 +92,9 @@ export declare class GenericProvider extends Observable<string> {
     private _syncRequestTimes;
     private _maxSyncRequestsPerWindow;
     private _syncRequestWindowMs;
+    private _pendingSyncReply;
+    private _pendingSyncReplyTimeoutId?;
+    private readonly _syncReplySuppressionMs;
     private _localSeqNum;
     private _remoteSeqInfo;
     private _gapCheckTimers;
@@ -216,6 +219,15 @@ export declare class GenericProvider extends Observable<string> {
      * Corrupt messages are rejected immediately without attempting to decode.
      */
     private _handleIncomingMessage;
+    /**
+     * Schedule a SyncStep2 reply after a short random delay instead of
+     * sending immediately. If another peer's reply is overheard in the
+     * meantime (`_cancelPendingSyncReply`), this reply is dropped as
+     * redundant - the requester likely already got what it needed.
+     */
+    private _scheduleSyncReply;
+    /** Cancel a pending suppressed reply, if any. */
+    private _cancelPendingSyncReply;
     /**
      * Track a received sequence number for reordering-tolerant gap detection.
      * Does not gate whether the update gets applied — only decides whether a

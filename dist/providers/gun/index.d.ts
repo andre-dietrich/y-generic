@@ -137,6 +137,11 @@ export interface GunConnectionConfig extends ConnectionConfig {
 /**
  * GunDB transport implementation.
  * Creates decentralized P2P connections using Gun graph database.
+ *
+ * Note: deliberately does NOT set `preferredBatchMs` on the Transport
+ * interface. send() already debounces internally via `batchInterval`
+ * (see flushBatch()) — an additional GenericProvider-level batch delay
+ * would just stack a second debounce in front of this one for no benefit.
  */
 export declare class GunTransport implements Transport {
     private options;
@@ -210,6 +215,19 @@ export declare class GunTransport implements Transport {
      * Setup listener for awareness updates (separate from doc sync).
      */
     private setupAwarenessListener;
+    /**
+     * Frame a list of independently-wrapped envelopes with 4-byte big-endian
+     * length prefixes so they can be split back apart after transmission as
+     * one combined Gun record. See unframeUpdates() for the inverse.
+     */
+    private frameUpdates;
+    /**
+     * Split a buffer produced by frameUpdates() back into the individual
+     * envelopes it contains. Malformed/truncated framing stops early rather
+     * than throwing, since a partial batch is still recoverable via periodic
+     * sync / hash verification.
+     */
+    private unframeUpdates;
     /**
      * Flush batched updates to Gun.
      * Called after debounce period (no new updates for batchInterval ms).

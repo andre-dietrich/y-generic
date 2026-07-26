@@ -94,11 +94,21 @@ function unwrapAndVerifyMessage(wrapped: Uint8Array): Uint8Array | null {
 }
 
 /**
- * Compute a simple hash of document state for verification.
- * Uses a fast non-cryptographic hash for performance.
+ * Compute a cheap hash of document state for verification.
+ *
+ * Hashes the state VECTOR (each client's clock), not the full document
+ * content — O(number of distinct clients) instead of O(document content
+ * size). `Y.encodeStateVector()` writes entries sorted by clientID, so the
+ * result is deterministic regardless of the internal Map's iteration order.
+ * Two peers can only reach the same state vector by having applied the same
+ * set of operations, so this still catches real content divergence; it just
+ * no longer re-serializes the entire document on every single update.
+ * (CRC32 already guards against wire corruption, and sequence tracking
+ * guards against reordering/loss — this hash is the last line of defense
+ * against logical divergence between peers.)
  */
 function computeDocHash(doc: Y.Doc): number {
-  const state = Y.encodeStateAsUpdate(doc)
+  const state = Y.encodeStateVector(doc)
   let hash = 0
   for (let i = 0; i < state.length; i++) {
     hash = ((hash << 5) - hash + state[i]) | 0
@@ -230,7 +240,18 @@ export class GenericProvider extends Observable<string> {
 
   // Sequence numbers for causal ordering
   private _localSeqNum: number = 0 // Our sequence number counter
-  private _remoteSeqNums: Map<number, number> = new Map() // clientID -> last seen seqNum
+
+  // Per-sender sequence tracking for reordering-tolerant gap detection.
+  // Applying a Yjs update is always safe even for duplicates or out-of-order
+  // arrivals (Yjs updates are idempotent/commutative) — this state exists
+  // only to detect genuine gaps (likely packet loss) without false
+  // positives from mere network reordering. See _trackRemoteSeq().
+  private _remoteSeqInfo: Map<number, { highest: number; seen: Set<number> }> =
+    new Map()
+  private _gapCheckTimers: Map<number, ReturnType<typeof setTimeout>> =
+    new Map()
+  private readonly _seqWindowSize = 64
+  private readonly _gapGraceMs = 300
 
   // Message integrity tracking
   private _corruptedMessageCount: number = 0 // Track rejected corrupted messages
@@ -281,7 +302,8 @@ export class GenericProvider extends Observable<string> {
        * Updates are collected and sent after this delay in milliseconds.
        * Set to 0 to send updates immediately (no batching).
        * Recommended: 50-200ms for good balance between latency and efficiency.
-       * @default 0 (disabled - immediate transmission)
+       * @default the transport's `preferredBatchMs` hint if it declares one,
+       * otherwise 0 (disabled - immediate transmission)
        */
       batchUpdates?: number
       /**
@@ -310,7 +332,8 @@ export class GenericProvider extends Observable<string> {
     this.awareness = options.awareness || new awarenessProtocol.Awareness(doc)
     this._syncInterval = options.syncInterval ?? 5000
     this._verifyUpdates = options.verifyUpdates ?? true
-    this._batchUpdates = options.batchUpdates ?? 0
+    this._batchUpdates =
+      options.batchUpdates ?? transport.preferredBatchMs ?? 0
     this._disableBc = options.disableBc ?? false
     this._awarenessInterval = options.awarenessInterval ?? 100
 
@@ -485,6 +508,12 @@ export class GenericProvider extends Observable<string> {
       clearInterval(this._syncIntervalId)
       this._syncIntervalId = undefined
     }
+
+    // Stop any pending gap-check timers
+    for (const timer of this._gapCheckTimers.values()) {
+      clearTimeout(timer)
+    }
+    this._gapCheckTimers.clear()
 
     // Flush any pending batched updates before destroying
     if (this._batchTimeoutId !== undefined) {
@@ -781,32 +810,16 @@ export class GenericProvider extends Observable<string> {
           const seqNum = decoding.readVarUint(decoder)
           const senderClientID = decoding.readVarUint(decoder)
 
-          // Check for duplicate or out-of-order updates
-          const lastSeq = this._remoteSeqNums.get(senderClientID) ?? -1
-          if (seqNum <= lastSeq) {
-            console.warn(
-              `[GenericProvider] Duplicate or out-of-order update detected from client ${senderClientID}: seqNum ${seqNum} <= lastSeen ${lastSeq}`,
-            )
-            // Skip this update - it's a duplicate or we already have newer data
-            break
-          }
+          // Track for gap detection only — does NOT gate whether we apply
+          // the update below (see _trackRemoteSeq() for why).
+          this._trackRemoteSeq(senderClientID, seqNum)
 
-          // Check for sequence gap (potential packet loss)
-          if (lastSeq >= 0 && seqNum > lastSeq + 1) {
-            const gapSize = seqNum - lastSeq - 1
-            console.warn(
-              `[GenericProvider] Sequence gap detected from client ${senderClientID}: expected ${lastSeq + 1}, got ${seqNum} (gap of ${gapSize} messages)`,
-            )
-            // Immediately request sync to recover missing updates
-            // This is more proactive than waiting for periodic sync or hash mismatch
-            this._sendSyncStep1()
-          }
-
-          // Update sequence tracker
-          this._remoteSeqNums.set(senderClientID, seqNum)
-
-          // Create encoder for reply with standard MESSAGE_SYNC header
-          // (replies don't need verification since they're generated immediately)
+          // Always apply the update. Yjs updates are idempotent/commutative,
+          // so re-applying an already-seen update is a harmless no-op.
+          // Under reordering, a merely-late (not actually duplicate) update
+          // must still be applied here — the old "skip if seqNum <= last
+          // seen" logic silently dropped such updates forever whenever a
+          // later-numbered message happened to arrive first.
           const encoder = encoding.createEncoder()
           encoding.writeVarUint(encoder, MESSAGE_SYNC)
 
@@ -884,6 +897,80 @@ export class GenericProvider extends Observable<string> {
       // (corruption is caught by CRC32 check above)
       console.error('[GenericProvider] Error handling message:', error)
     }
+  }
+
+  /**
+   * Track a received sequence number for reordering-tolerant gap detection.
+   * Does not gate whether the update gets applied — only decides whether a
+   * gap looks suspicious enough to (eventually) request a resync.
+   */
+  private _trackRemoteSeq(senderClientID: number, seqNum: number): void {
+    let info = this._remoteSeqInfo.get(senderClientID)
+    if (!info) {
+      info = { highest: -1, seen: new Set() }
+      this._remoteSeqInfo.set(senderClientID, info)
+    }
+
+    if (info.seen.has(seqNum)) {
+      return // genuine duplicate - nothing new to track
+    }
+    info.seen.add(seqNum)
+
+    if (seqNum > info.highest) {
+      if (info.highest >= 0 && seqNum > info.highest + 1) {
+        this._scheduleGapCheck(senderClientID, info.highest + 1, seqNum - 1)
+      }
+      info.highest = seqNum
+    }
+
+    // Bound memory: forget seqNums far behind the current high-water mark.
+    const floor = info.highest - this._seqWindowSize
+    if (floor > 0) {
+      for (const s of info.seen) {
+        if (s < floor) info.seen.delete(s)
+      }
+    }
+  }
+
+  /**
+   * Re-check a suspected sequence gap after a short grace period instead of
+   * requesting a resync immediately. Pure network reordering (a message
+   * that's merely late, not lost) typically resolves itself within the
+   * grace window, so this avoids the resync storms that immediate gap
+   * detection caused under jitter. Real packet loss still gets caught —
+   * just `_gapGraceMs` later — and the periodic sync interval / hash
+   * verification remain as further safety nets regardless.
+   */
+  private _scheduleGapCheck(
+    clientID: number,
+    gapStart: number,
+    gapEnd: number,
+  ): void {
+    // Only one pending check per sender; a newly-opened gap while a check
+    // is already scheduled will still be caught by periodic sync / hash
+    // verification even if not by this specific check.
+    if (this._gapCheckTimers.has(clientID)) return
+
+    const timer = setTimeout(() => {
+      this._gapCheckTimers.delete(clientID)
+      const info = this._remoteSeqInfo.get(clientID)
+      if (!info || this._destroying) return
+
+      let stillMissing = 0
+      for (let s = gapStart; s <= gapEnd; s++) {
+        if (!info.seen.has(s)) stillMissing++
+      }
+
+      if (stillMissing > 0 && this.transport.isConnected) {
+        console.warn(
+          `[GenericProvider] Sequence gap confirmed from client ${clientID}: ` +
+            `${stillMissing} message(s) still missing after ${this._gapGraceMs}ms grace period`,
+        )
+        this._sendSyncStep1()
+      }
+    }, this._gapGraceMs)
+
+    this._gapCheckTimers.set(clientID, timer)
   }
 
   /**

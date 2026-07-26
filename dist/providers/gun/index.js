@@ -78,6 +78,11 @@ const MESSAGE_AWARENESS = 1;
 /**
  * GunDB transport implementation.
  * Creates decentralized P2P connections using Gun graph database.
+ *
+ * Note: deliberately does NOT set `preferredBatchMs` on the Transport
+ * interface. send() already debounces internally via `batchInterval`
+ * (see flushBatch()) — an additional GenericProvider-level batch delay
+ * would just stack a second debounce in front of this one for no benefit.
  */
 export class GunTransport {
     /**
@@ -285,14 +290,19 @@ export class GunTransport {
                         continue;
                     }
                 }
-                // Decode base64 back to Uint8Array
+                // Decode base64 back to Uint8Array, then split the length-prefixed
+                // framing back into the individual envelopes flushBatch() combined
+                // (see frameUpdates()/unframeUpdates()) — a flush may contain
+                // several independently CRC32-wrapped GenericProvider messages.
                 const decoded = this.base64ToUint8Array(payload);
-                // Pass to Yjs
+                const frames = this.unframeUpdates(decoded);
                 if (this._callback) {
-                    this._callback(decoded);
+                    for (const frame of frames) {
+                        this._callback(frame);
+                    }
                 }
                 if (updates.length === 1) {
-                    this.log('📥 Received update:', decoded.length, 'bytes', update.encrypted ? '(decrypted)' : '');
+                    this.log('📥 Received update:', frames.length, frames.length === 1 ? 'message' : 'messages', update.encrypted ? '(decrypted)' : '');
                 }
             }
             catch (error) {
@@ -459,20 +469,59 @@ export class GunTransport {
         this.log('👂 Listening for awareness updates...');
     }
     /**
+     * Frame a list of independently-wrapped envelopes with 4-byte big-endian
+     * length prefixes so they can be split back apart after transmission as
+     * one combined Gun record. See unframeUpdates() for the inverse.
+     */
+    frameUpdates(updates) {
+        const totalLength = updates.reduce((sum, arr) => sum + 4 + arr.length, 0);
+        const merged = new Uint8Array(totalLength);
+        const view = new DataView(merged.buffer);
+        let offset = 0;
+        for (const update of updates) {
+            view.setUint32(offset, update.length, false);
+            merged.set(update, offset + 4);
+            offset += 4 + update.length;
+        }
+        return merged;
+    }
+    /**
+     * Split a buffer produced by frameUpdates() back into the individual
+     * envelopes it contains. Malformed/truncated framing stops early rather
+     * than throwing, since a partial batch is still recoverable via periodic
+     * sync / hash verification.
+     */
+    unframeUpdates(data) {
+        const frames = [];
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        let offset = 0;
+        while (offset + 4 <= data.length) {
+            const len = view.getUint32(offset, false);
+            offset += 4;
+            if (len < 0 || offset + len > data.length) {
+                this.log('⚠️ Malformed batch framing, stopping split early');
+                break;
+            }
+            frames.push(data.subarray(offset, offset + len));
+            offset += len;
+        }
+        return frames;
+    }
+    /**
      * Flush batched updates to Gun.
      * Called after debounce period (no new updates for batchInterval ms).
      */
     async flushBatch() {
         if (this.updateBatch.length === 0)
             return;
-        // Merge all batched updates into one
-        const totalLength = this.updateBatch.reduce((sum, arr) => sum + arr.length, 0);
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const update of this.updateBatch) {
-            merged.set(update, offset);
-            offset += update.length;
-        }
+        // Frame each queued update with a 4-byte big-endian length prefix so
+        // multiple independently CRC32-wrapped GenericProvider envelopes can be
+        // split back apart on the receiving side (see processPendingUpdates()).
+        // Each entry in updateBatch is already a complete, self-checksummed
+        // envelope — naively concatenating them without a delimiter made the
+        // combined blob fail CRC32 verification (and get silently dropped)
+        // whenever 2+ updates landed in the same flush.
+        const merged = this.frameUpdates(this.updateBatch);
         // Clear batch
         this.updateBatch = [];
         // Convert to base64 for Gun storage

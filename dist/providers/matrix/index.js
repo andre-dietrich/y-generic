@@ -28,6 +28,12 @@
  */
 export class MatrixTransport {
     constructor() {
+        /**
+         * Every send() is its own HTTP PUT request with no internal coalescing —
+         * unlike push-style transports, there's no cheaper round trip to lose by
+         * batching. Recommends GenericProvider debounce rapid edits by default.
+         */
+        this.preferredBatchMs = 150;
         this.config = null;
         this._isConnected = false;
         this.debug = false;

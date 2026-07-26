@@ -93,7 +93,10 @@ export declare class GenericProvider extends Observable<string> {
     private _maxSyncRequestsPerWindow;
     private _syncRequestWindowMs;
     private _localSeqNum;
-    private _remoteSeqNums;
+    private _remoteSeqInfo;
+    private _gapCheckTimers;
+    private readonly _seqWindowSize;
+    private readonly _gapGraceMs;
     private _corruptedMessageCount;
     private _lastCorruptedMessageTime;
     private _batchUpdates;
@@ -133,7 +136,8 @@ export declare class GenericProvider extends Observable<string> {
          * Updates are collected and sent after this delay in milliseconds.
          * Set to 0 to send updates immediately (no batching).
          * Recommended: 50-200ms for good balance between latency and efficiency.
-         * @default 0 (disabled - immediate transmission)
+         * @default the transport's `preferredBatchMs` hint if it declares one,
+         * otherwise 0 (disabled - immediate transmission)
          */
         batchUpdates?: number;
         /**
@@ -212,6 +216,22 @@ export declare class GenericProvider extends Observable<string> {
      * Corrupt messages are rejected immediately without attempting to decode.
      */
     private _handleIncomingMessage;
+    /**
+     * Track a received sequence number for reordering-tolerant gap detection.
+     * Does not gate whether the update gets applied — only decides whether a
+     * gap looks suspicious enough to (eventually) request a resync.
+     */
+    private _trackRemoteSeq;
+    /**
+     * Re-check a suspected sequence gap after a short grace period instead of
+     * requesting a resync immediately. Pure network reordering (a message
+     * that's merely late, not lost) typically resolves itself within the
+     * grace window, so this avoids the resync storms that immediate gap
+     * detection caused under jitter. Real packet loss still gets caught —
+     * just `_gapGraceMs` later — and the periodic sync interval / hash
+     * verification remain as further safety nets regardless.
+     */
+    private _scheduleGapCheck;
     /**
      * Send SyncStep1 message to request missing updates.
      * This is sent when first connecting to sync with remote peers.

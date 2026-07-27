@@ -102,6 +102,7 @@ export function makeProviders(
   hub: DummyHub,
   profile: Profile,
   N: number,
+  dropRate: number = 0,
 ): { docs: Y.Doc[]; providers: GenericProvider[] } {
   const docs: Y.Doc[] = []
   const providers: GenericProvider[] = []
@@ -111,6 +112,7 @@ export function makeProviders(
       hub,
       latency: profile.latency,
       jitter: profile.jitter,
+      dropRate,
     })
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,

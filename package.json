@@ -1,6 +1,6 @@
 {
   "name": "@edryslabs/genericprovider",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
   "author": "André Dietrich",

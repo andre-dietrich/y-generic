@@ -1178,6 +1178,19 @@ export class GenericProvider extends Observable<string> {
    * own surplus edits made during a divergence window.
    */
   private _requestResync(): void {
+    // Coalesced: if a resync is already pending (regardless of which
+    // trigger scheduled it), this trigger is absorbed into it instead of
+    // stacking another independent timer/broadcast. Escalation only
+    // advances when we actually schedule a NEW timer below - incrementing
+    // unconditionally here (once per absorbed trigger too) would let a
+    // burst of many corrupted/mismatched messages while one resync is
+    // already pending ratchet the counter straight to its cap, so the
+    // *next* resync (after this one fires) always schedules at the max
+    // backoff instead of escalating gradually.
+    if (this._pendingResyncTimeoutId !== undefined) {
+      return
+    }
+
     this._resyncAttemptCount++
     const now = Date.now()
 
@@ -1194,20 +1207,15 @@ export class GenericProvider extends Observable<string> {
       100 * Math.pow(5, Math.min(this._resyncAttemptCount - 1, 3)),
     )
 
-    // Coalesced: if a resync is already pending (regardless of which
-    // trigger scheduled it), this trigger is absorbed into it instead of
-    // stacking another independent timer/broadcast.
-    if (this._pendingResyncTimeoutId === undefined) {
-      console.warn(
-        `[GenericProvider] Resync scheduled in ${delay}ms (attempt #${this._resyncAttemptCount})...`,
-      )
-      this._pendingResyncTimeoutId = setTimeout(() => {
-        this._pendingResyncTimeoutId = undefined
-        if (this.transport.isConnected && !this._destroying) {
-          this.syncNow()
-        }
-      }, delay)
-    }
+    console.warn(
+      `[GenericProvider] Resync scheduled in ${delay}ms (attempt #${this._resyncAttemptCount})...`,
+    )
+    this._pendingResyncTimeoutId = setTimeout(() => {
+      this._pendingResyncTimeoutId = undefined
+      if (this.transport.isConnected && !this._destroying) {
+        this.syncNow()
+      }
+    }, delay)
   }
 
   /**

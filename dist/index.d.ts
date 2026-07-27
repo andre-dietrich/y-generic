@@ -88,6 +88,7 @@ export declare class GenericProvider extends Observable<string> {
     readonly doc: Y.Doc;
     readonly transport: Transport;
     readonly awareness: awarenessProtocol.Awareness;
+    readonly appAwareness: awarenessProtocol.Awareness;
     readonly pubsub: PubSubChannel;
     private _status;
     private _synced;
@@ -115,11 +116,15 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingAwarenessClients;
     private _awarenessTimeoutId?;
     private _lastAwarenessTime;
+    private _pendingAppAwarenessClients;
+    private _appAwarenessTimeoutId?;
+    private _lastAppAwarenessTime;
     private _excludeOrigins;
     private _localId?;
     private _syncMode;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
+    private _appAwarenessUpdateHandler?;
     private _unsubscribeTransport?;
     private _beforeUnloadHandler?;
     /**
@@ -131,6 +136,7 @@ export declare class GenericProvider extends Observable<string> {
      */
     constructor(doc: Y.Doc, transport: Transport, options?: {
         awareness?: awarenessProtocol.Awareness;
+        appAwareness?: awarenessProtocol.Awareness;
         /**
          * Interval in milliseconds for periodic sync retries.
          * Helps recover from packet loss. Set to 0 to disable.
@@ -264,10 +270,6 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _sendUpdate;
     /**
-     * Send awareness update to the transport.
-     */
-    private _sendAwarenessUpdate;
-    /**
      * Send a pub/sub message.
      * Internal method called by PubSubChannel.
      */
@@ -294,6 +296,10 @@ export declare class GenericProvider extends Observable<string> {
      * Automatically disabled in non-browser environments.
      */
     private _setupBroadcastChannel;
+    /**
+     * Encode and publish an awareness update for the local client to the BroadcastChannel.
+     */
+    private _publishAwarenessToBroadcastChannel;
     /**
      * Disconnect from BroadcastChannel and mark local client as offline.
      */

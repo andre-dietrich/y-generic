@@ -15,6 +15,10 @@ const MESSAGE_PUBSUB = 2
 const MESSAGE_SYNC_VERIFIED = 3 // Sync message with hash verification
 const MESSAGE_PUBSUB_TARGETED = 4 // Pub/sub message aimed at a single target
 
+// Sub-channel inside a MESSAGE_AWARENESS frame: [opcode 1][channel][update].
+const AWARENESS_CHANNEL_MAIN = 0
+const AWARENESS_CHANNEL_APP = 1
+
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -228,6 +232,9 @@ export class GenericProvider extends Observable<string> {
   public readonly doc: Y.Doc
   public readonly transport: Transport
   public readonly awareness: awarenessProtocol.Awareness
+  // Independent Awareness for app/module use (cursors, presence): isolated
+  // from `awareness`, synced over the same opcode via a channel byte.
+  public readonly appAwareness: awarenessProtocol.Awareness
   public readonly pubsub: PubSubChannel
 
   private _status: ConnectionStatus = { state: 'disconnected' }
@@ -270,6 +277,10 @@ export class GenericProvider extends Observable<string> {
   private _pendingAwarenessClients: Set<number> = new Set()
   private _awarenessTimeoutId?: ReturnType<typeof setTimeout>
   private _lastAwarenessTime: number = 0
+  // Independent throttle state for the app awareness channel.
+  private _pendingAppAwarenessClients: Set<number> = new Set()
+  private _appAwarenessTimeoutId?: ReturnType<typeof setTimeout>
+  private _lastAppAwarenessTime: number = 0
 
   // Origins whose updates are never sent to the transport (local-only txns).
   private _excludeOrigins: Set<any> = new Set()
@@ -283,6 +294,7 @@ export class GenericProvider extends Observable<string> {
 
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
+  private _appAwarenessUpdateHandler?: (changed: any, origin: any) => void
   private _unsubscribeTransport?: () => void
   private _beforeUnloadHandler?: () => void
 
@@ -298,6 +310,8 @@ export class GenericProvider extends Observable<string> {
     transport: Transport,
     options: {
       awareness?: awarenessProtocol.Awareness
+      // Optional second Awareness for app/module use; created if omitted.
+      appAwareness?: awarenessProtocol.Awareness
       /**
        * Interval in milliseconds for periodic sync retries.
        * Helps recover from packet loss. Set to 0 to disable.
@@ -366,6 +380,8 @@ export class GenericProvider extends Observable<string> {
     this.transport = transport
     this.pubsub = new PubSubChannel(this)
     this.awareness = options.awareness || new awarenessProtocol.Awareness(doc)
+    this.appAwareness =
+      options.appAwareness || new awarenessProtocol.Awareness(doc)
     this._syncInterval = options.syncInterval ?? 5000
     this._verifyUpdates = options.verifyUpdates ?? true
     this._batchUpdates = options.batchUpdates ?? 0
@@ -446,6 +462,7 @@ export class GenericProvider extends Observable<string> {
 
       // Broadcast local awareness state
       this._broadcastAwareness([this.doc.clientID])
+      this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP)
 
       // Start periodic sync to handle packet loss
       // Just request sync without sending full state (avoid redundant broadcasts)
@@ -519,6 +536,23 @@ export class GenericProvider extends Observable<string> {
     }
     this._pendingAwarenessClients.clear()
 
+    // Flush pending app awareness updates before disconnecting
+    if (this._appAwarenessTimeoutId !== undefined) {
+      clearTimeout(this._appAwarenessTimeoutId)
+      this._appAwarenessTimeoutId = undefined
+
+      if (
+        this._pendingAppAwarenessClients.size > 0 &&
+        this.transport.isConnected
+      ) {
+        this._sendAwarenessNow(
+          Array.from(this._pendingAppAwarenessClients),
+          AWARENESS_CHANNEL_APP,
+        )
+      }
+    }
+    this._pendingAppAwarenessClients.clear()
+
     // Disconnect BroadcastChannel
     this._disconnectBroadcastChannel()
 
@@ -530,6 +564,11 @@ export class GenericProvider extends Observable<string> {
     // Mark local client as offline in awareness
     awarenessProtocol.removeAwarenessStates(
       this.awareness,
+      [this.doc.clientID],
+      'disconnect',
+    )
+    awarenessProtocol.removeAwarenessStates(
+      this.appAwareness,
       [this.doc.clientID],
       'disconnect',
     )
@@ -572,10 +611,14 @@ export class GenericProvider extends Observable<string> {
       this._updateHandler = undefined
     }
 
-    // Remove awareness update listener
+    // Remove awareness update listeners
     if (this._awarenessUpdateHandler) {
       this.awareness.off('update', this._awarenessUpdateHandler)
       this._awarenessUpdateHandler = undefined
+    }
+    if (this._appAwarenessUpdateHandler) {
+      this.appAwareness.off('update', this._appAwarenessUpdateHandler)
+      this._appAwarenessUpdateHandler = undefined
     }
 
     // Remove beforeunload handler
@@ -585,6 +628,7 @@ export class GenericProvider extends Observable<string> {
     }
 
     this.awareness.destroy()
+    this.appAwareness.destroy()
     super.destroy()
   }
 
@@ -638,6 +682,7 @@ export class GenericProvider extends Observable<string> {
 
     // Broadcast current awareness state
     this._broadcastAwareness([this.doc.clientID])
+    this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP)
   }
 
   /**
@@ -725,11 +770,33 @@ export class GenericProvider extends Observable<string> {
 
     this.awareness.on('update', this._awarenessUpdateHandler)
 
+    this._appAwarenessUpdateHandler = (
+      {
+        added,
+        updated,
+        removed,
+      }: {
+        added: number[]
+        updated: number[]
+        removed: number[]
+      },
+      _origin: any,
+    ) => {
+      const changedClients = added.concat(updated).concat(removed)
+      this._broadcastAwareness(changedClients, AWARENESS_CHANNEL_APP)
+    }
+    this.appAwareness.on('update', this._appAwarenessUpdateHandler)
+
     // Cleanup: mark as offline and disconnect BC when page unloads
     if (typeof window !== 'undefined') {
       this._beforeUnloadHandler = () => {
         awarenessProtocol.removeAwarenessStates(
           this.awareness,
+          [this.doc.clientID],
+          'window unload',
+        )
+        awarenessProtocol.removeAwarenessStates(
+          this.appAwareness,
           [this.doc.clientID],
           'window unload',
         )
@@ -815,8 +882,11 @@ export class GenericProvider extends Observable<string> {
         }
 
         case MESSAGE_AWARENESS: {
+          const channel = decoding.readVarUint(decoder)
           awarenessProtocol.applyAwarenessUpdate(
-            this.awareness,
+            channel === AWARENESS_CHANNEL_APP
+              ? this.appAwareness
+              : this.awareness,
             decoding.readVarUint8Array(decoder),
             this, // origin
           )
@@ -1036,19 +1106,6 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Send awareness update to the transport.
-   */
-  private _sendAwarenessUpdate(changedClients: number[]): void {
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
-    encoding.writeVarUint8Array(
-      encoder,
-      awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients),
-    )
-    this._send(encoding.toUint8Array(encoder))
-  }
-
-  /**
    * Send a pub/sub message.
    * Internal method called by PubSubChannel.
    */
@@ -1127,54 +1184,79 @@ export class GenericProvider extends Observable<string> {
    * Throttled to prevent awareness updates from flooding document sync.
    * Multiple rapid updates are batched together.
    */
-  private _broadcastAwareness(clients: number[]): void {
+  private _broadcastAwareness(
+    clients: number[],
+    channel: number = AWARENESS_CHANNEL_MAIN,
+  ): void {
     if (clients.length === 0) return
+
+    const isApp = channel === AWARENESS_CHANNEL_APP
+    const pending = isApp
+      ? this._pendingAppAwarenessClients
+      : this._pendingAwarenessClients
 
     // If throttling is disabled, send immediately
     if (this._awarenessInterval <= 0) {
-      this._sendAwarenessNow(clients)
+      this._sendAwarenessNow(clients, channel)
       return
     }
 
     // Add clients to pending set
     for (const client of clients) {
-      this._pendingAwarenessClients.add(client)
+      pending.add(client)
     }
 
     // If we already have a scheduled broadcast, let it handle the batched clients
-    if (this._awarenessTimeoutId !== undefined) {
+    if (
+      (isApp ? this._appAwarenessTimeoutId : this._awarenessTimeoutId) !==
+      undefined
+    ) {
       return
     }
 
     // Calculate delay - respect minimum interval since last broadcast
     const now = Date.now()
-    const timeSinceLastBroadcast = now - this._lastAwarenessTime
-    const delay = Math.max(0, this._awarenessInterval - timeSinceLastBroadcast)
+    const lastTime = isApp ? this._lastAppAwarenessTime : this._lastAwarenessTime
+    const delay = Math.max(0, this._awarenessInterval - (now - lastTime))
 
     // Schedule the batched broadcast
-    this._awarenessTimeoutId = setTimeout(() => {
-      this._awarenessTimeoutId = undefined
-      this._lastAwarenessTime = Date.now()
+    const timeoutId = setTimeout(() => {
+      if (isApp) {
+        this._appAwarenessTimeoutId = undefined
+        this._lastAppAwarenessTime = Date.now()
+      } else {
+        this._awarenessTimeoutId = undefined
+        this._lastAwarenessTime = Date.now()
+      }
 
       // Send all pending clients in one message
-      const clientsToSend = Array.from(this._pendingAwarenessClients)
-      this._pendingAwarenessClients.clear()
+      const clientsToSend = Array.from(pending)
+      pending.clear()
 
       if (clientsToSend.length > 0) {
-        this._sendAwarenessNow(clientsToSend)
+        this._sendAwarenessNow(clientsToSend, channel)
       }
     }, delay)
+
+    if (isApp) this._appAwarenessTimeoutId = timeoutId
+    else this._awarenessTimeoutId = timeoutId
   }
 
   /**
    * Send awareness update immediately without throttling.
    */
-  private _sendAwarenessNow(clients: number[]): void {
+  private _sendAwarenessNow(
+    clients: number[],
+    channel: number = AWARENESS_CHANNEL_MAIN,
+  ): void {
+    const aw =
+      channel === AWARENESS_CHANNEL_APP ? this.appAwareness : this.awareness
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint(encoder, channel)
     encoding.writeVarUint8Array(
       encoder,
-      awarenessProtocol.encodeAwarenessUpdate(this.awareness, clients),
+      awarenessProtocol.encodeAwarenessUpdate(aw, clients),
     )
     this._send(encoding.toUint8Array(encoder))
   }
@@ -1236,20 +1318,38 @@ export class GenericProvider extends Observable<string> {
 
     // Broadcast local awareness state via BroadcastChannel (wrapped with CRC32)
     if (this.awareness.getLocalState() !== null) {
-      const encoderAwareness = encoding.createEncoder()
-      encoding.writeVarUint(encoderAwareness, MESSAGE_AWARENESS)
-      encoding.writeVarUint8Array(
-        encoderAwareness,
-        awarenessProtocol.encodeAwarenessUpdate(this.awareness, [
-          this.doc.clientID,
-        ]),
-      )
-      bc.publish(
-        this._bcChannel,
-        wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)),
-        this,
+      this._publishAwarenessToBroadcastChannel(
+        this.awareness,
+        AWARENESS_CHANNEL_MAIN,
       )
     }
+    if (this.appAwareness.getLocalState() !== null) {
+      this._publishAwarenessToBroadcastChannel(
+        this.appAwareness,
+        AWARENESS_CHANNEL_APP,
+      )
+    }
+  }
+
+  /**
+   * Encode and publish an awareness update for the local client to the BroadcastChannel.
+   */
+  private _publishAwarenessToBroadcastChannel(
+    awareness: awarenessProtocol.Awareness,
+    channel: number,
+  ): void {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint(encoder, channel)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(awareness, [this.doc.clientID]),
+    )
+    bc.publish(
+      this._bcChannel,
+      wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
+      this,
+    )
   }
 
   /**
@@ -1261,21 +1361,27 @@ export class GenericProvider extends Observable<string> {
     }
 
     // Broadcast awareness state with null (indicating disconnect) - wrapped with CRC32
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
-    encoding.writeVarUint8Array(
-      encoder,
-      awarenessProtocol.encodeAwarenessUpdate(
-        this.awareness,
-        [this.doc.clientID],
-        new Map(),
-      ),
-    )
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
-      this,
-    )
+    for (const [awareness, channel] of [
+      [this.awareness, AWARENESS_CHANNEL_MAIN],
+      [this.appAwareness, AWARENESS_CHANNEL_APP],
+    ] as const) {
+      const encoder = encoding.createEncoder()
+      encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+      encoding.writeVarUint(encoder, channel)
+      encoding.writeVarUint8Array(
+        encoder,
+        awarenessProtocol.encodeAwarenessUpdate(
+          awareness,
+          [this.doc.clientID],
+          new Map(),
+        ),
+      )
+      bc.publish(
+        this._bcChannel,
+        wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
+        this,
+      )
+    }
 
     // Unsubscribe from channel
     bc.unsubscribe(this._bcChannel, this._bcSubscriber)

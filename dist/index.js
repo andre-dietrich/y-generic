@@ -203,17 +203,15 @@ export class GenericProvider extends Observable {
         this._lastHashMismatchTime = 0;
         // Rate limiting for sync requests
         this._syncRequestTimes = [];
-        this._maxSyncRequestsPerWindow = 20; // max requests per 10 seconds
-        this._syncRequestWindowMs = 10000; // 10 second window
         // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
         // a SyncStep1 request briefly, and drop it if another peer's reply is
         // overheard first - since every reply is broadcast to the whole room
         // anyway, this avoids every peer answering the same request redundantly.
         // Only engages when there's genuine redundancy (see _handleIncomingMessage's
-        // MESSAGE_SYNC case) - with 0-1 other known peers there's no "someone
-        // else" to rely on, so replies go out immediately as before.
+        // MESSAGE_SYNC and MESSAGE_SYNC_VERIFIED cases) - with 0-1 other known
+        // peers there's no "someone else" to rely on, so replies go out
+        // immediately as before.
         this._pendingSyncReply = null;
-        this._syncReplySuppressionMs = 30;
         // Sequence numbers for causal ordering
         this._localSeqNum = 0; // Our sequence number counter
         // Per-sender sequence tracking for reordering-tolerant gap detection.
@@ -223,8 +221,6 @@ export class GenericProvider extends Observable {
         // positives from mere network reordering. See _trackRemoteSeq().
         this._remoteSeqInfo = new Map();
         this._gapCheckTimers = new Map();
-        this._seqWindowSize = 64;
-        this._gapGraceMs = 300;
         // Message integrity tracking
         this._corruptedMessageCount = 0; // Track rejected corrupted messages
         this._lastCorruptedMessageTime = 0;
@@ -245,6 +241,11 @@ export class GenericProvider extends Observable {
             options.batchUpdates ?? transport.preferredBatchMs ?? 0;
         this._disableBc = options.disableBc ?? false;
         this._awarenessInterval = options.awarenessInterval ?? 100;
+        this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20;
+        this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000;
+        this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30;
+        this._gapGraceMs = options.gapGraceMs ?? 300;
+        this._seqWindowSize = options.seqWindowSize ?? 64;
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -330,6 +331,13 @@ export class GenericProvider extends Observable {
         // Reset corruption tracking
         this._corruptedMessageCount = 0;
         this._lastCorruptedMessageTime = 0;
+        // Cancel any pending hash-mismatch-triggered resync - it would otherwise
+        // still fire syncNow() after disconnect/reconnect against a transport
+        // that may be in a completely different state by then.
+        if (this._pendingHashMismatchResyncId !== undefined) {
+            clearTimeout(this._pendingHashMismatchResyncId);
+            this._pendingHashMismatchResyncId = undefined;
+        }
         // Reset the sync rate-limit budget. Without this, a reconnect inherits
         // whatever budget was left over from before the disconnect - and since
         // syncNow()'s full-state push now shares this same limiter (see
@@ -659,6 +667,14 @@ export class GenericProvider extends Observable {
                     const encoder = encoding.createEncoder();
                     encoding.writeVarUint(encoder, MESSAGE_SYNC);
                     const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
+                    // Someone else's SyncStep2 reply just arrived - our own pending
+                    // reply (if any) is now most likely redundant. Mirrors the
+                    // MESSAGE_SYNC case: the reply encoded above is always a plain
+                    // MESSAGE_SYNC-typed message regardless of which message type
+                    // triggered it, so the same suppression scheme applies here too.
+                    if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+                        this._cancelPendingSyncReply();
+                    }
                     // Read the expected hash from sender (signed integer)
                     const expectedHash = decoding.readVarInt(decoder);
                     // Compute our local hash after applying the update
@@ -694,11 +710,17 @@ export class GenericProvider extends Observable {
                             // A hash mismatch means the two peers have diverged — one side may
                             // have edits the other lacks.  Calling only _sendSyncStep1() (pull)
                             // never delivers our own surplus edits to the other side.
-                            setTimeout(() => {
-                                if (this.transport.isConnected && !this._destroying) {
-                                    this.syncNow();
-                                }
-                            }, delay);
+                            // Coalesced: if a resync is already pending, this mismatch is
+                            // absorbed by it rather than stacking another independent
+                            // timer/broadcast (see _pendingHashMismatchResyncId's comment).
+                            if (this._pendingHashMismatchResyncId === undefined) {
+                                this._pendingHashMismatchResyncId = setTimeout(() => {
+                                    this._pendingHashMismatchResyncId = undefined;
+                                    if (this.transport.isConnected && !this._destroying) {
+                                        this.syncNow();
+                                    }
+                                }, delay);
+                            }
                         }
                     }
                     else {
@@ -712,9 +734,20 @@ export class GenericProvider extends Observable {
                         this._synced = true;
                         this.emit('synced', [true]);
                     }
-                    // Send reply if needed (as standard MESSAGE_SYNC)
+                    // Send reply if needed (as standard MESSAGE_SYNC). Suppression
+                    // only engages with genuine redundancy (>=2 other known peers via
+                    // awareness) - below that, reply immediately. Matches the
+                    // MESSAGE_SYNC case's gate exactly; without this, a hash-mismatch
+                    // resync burst under packet loss bypassed suppression entirely,
+                    // since every peer answering a post-mismatch SyncStep1 replied
+                    // immediately via this path.
                     if (encoding.length(encoder) > 1) {
-                        this._send(encoding.toUint8Array(encoder));
+                        if (this.awareness.getStates().size >= 3) {
+                            this._scheduleSyncReply(encoding.toUint8Array(encoder));
+                        }
+                        else {
+                            this._send(encoding.toUint8Array(encoder));
+                        }
                     }
                     break;
                 }

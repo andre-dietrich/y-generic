@@ -89,17 +89,18 @@ export declare class GenericProvider extends Observable<string> {
     private _bcSubscriber?;
     private _hashMismatchCount;
     private _lastHashMismatchTime;
+    private _pendingHashMismatchResyncId?;
     private _syncRequestTimes;
     private _maxSyncRequestsPerWindow;
     private _syncRequestWindowMs;
     private _pendingSyncReply;
     private _pendingSyncReplyTimeoutId?;
-    private readonly _syncReplySuppressionMs;
+    private _syncReplySuppressionMs;
     private _localSeqNum;
     private _remoteSeqInfo;
     private _gapCheckTimers;
-    private readonly _seqWindowSize;
-    private readonly _gapGraceMs;
+    private _seqWindowSize;
+    private _gapGraceMs;
     private _corruptedMessageCount;
     private _lastCorruptedMessageTime;
     private _batchUpdates;
@@ -159,6 +160,47 @@ export declare class GenericProvider extends Observable<string> {
          * @default 100 (100ms between awareness broadcasts)
          */
         awarenessInterval?: number;
+        /**
+         * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
+         * combined) this provider will send within `syncRequestWindowMs`.
+         * Protects against self-inflicted resync storms (e.g. many hash
+         * mismatches firing in a short window under packet loss). Raise this
+         * if legitimate resyncs are being throttled under heavy loss; lower
+         * it to bound worst-case traffic more aggressively per peer.
+         * @default 20
+         */
+        maxSyncRequestsPerWindow?: number;
+        /**
+         * Rolling time window (ms) over which `maxSyncRequestsPerWindow` is
+         * enforced.
+         * @default 10000
+         */
+        syncRequestWindowMs?: number;
+        /**
+         * Max random delay (ms) before replying to a SyncStep1 request, used
+         * to let other peers' replies pre-empt a redundant one (NACK-style
+         * suppression). Only engages once at least 2 other peers are known via
+         * awareness. Larger values suppress more redundant traffic in large
+         * rooms at the cost of higher requester-perceived latency.
+         * @default 30
+         */
+        syncReplySuppressionMs?: number;
+        /**
+         * Grace period (ms) after detecting a suspected sequence-number gap
+         * before requesting a resync. Tolerates mere network reordering
+         * without treating it as loss; lower it to detect genuine packet loss
+         * faster at the risk of more false-positive resyncs under jitter.
+         * @default 300
+         */
+        gapGraceMs?: number;
+        /**
+         * Number of recent sequence numbers retained per remote peer for
+         * duplicate/gap detection. Raise if a transport can deliver messages
+         * extremely out of order across a wide window; the default is ample
+         * for typical reordering/jitter.
+         * @default 64
+         */
+        seqWindowSize?: number;
     });
     /**
      * Connect to the backend and start syncing.

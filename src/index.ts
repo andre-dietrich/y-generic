@@ -241,6 +241,19 @@ export class GenericProvider extends Observable<string> {
   // already scheduled are absorbed by it instead of scheduling another.
   private _pendingHashMismatchResyncId?: ReturnType<typeof setTimeout>
 
+  // Coalesces corrupted-message-triggered resyncs the same way as above.
+  // Without this, sustained wire corruption across many peers (each
+  // CRC32-rejected message scheduling its OWN independent
+  // _sendSyncStep1() timer) caused a resync storm: every scheduled
+  // SyncStep1 is itself a room-wide broadcast, and any of ITS replies can
+  // also land corrupted on some peer, triggering yet more independent
+  // timers. Measured in test/dummy/bench-corruption-storm.ts: at 10
+  // simulated peers, just 5% per-link corruption drove message volume to
+  // ~11x the corruption-free baseline. Only one resync is kept pending at
+  // a time; extra corrupted messages that arrive while one is already
+  // scheduled are absorbed by it instead of scheduling another.
+  private _pendingCorruptedResyncId?: ReturnType<typeof setTimeout>
+
   // Rate limiting for sync requests
   private _syncRequestTimes: number[] = []
   private _maxSyncRequestsPerWindow: number // max requests per window
@@ -511,6 +524,12 @@ export class GenericProvider extends Observable<string> {
     if (this._pendingHashMismatchResyncId !== undefined) {
       clearTimeout(this._pendingHashMismatchResyncId)
       this._pendingHashMismatchResyncId = undefined
+    }
+
+    // Same for a pending corrupted-message-triggered resync.
+    if (this._pendingCorruptedResyncId !== undefined) {
+      clearTimeout(this._pendingCorruptedResyncId)
+      this._pendingCorruptedResyncId = undefined
     }
 
     // Reset the sync rate-limit budget. Without this, a reconnect inherits
@@ -829,11 +848,17 @@ export class GenericProvider extends Observable<string> {
         100 * Math.pow(5, Math.min(this._corruptedMessageCount - 1, 3)),
       )
 
-      setTimeout(() => {
-        if (this.transport.isConnected && !this._destroying) {
-          this._sendSyncStep1()
-        }
-      }, delay)
+      // Coalesced: if a resync is already pending, this corrupted message
+      // is absorbed by it rather than stacking another independent
+      // timer/broadcast (see _pendingCorruptedResyncId's comment).
+      if (this._pendingCorruptedResyncId === undefined) {
+        this._pendingCorruptedResyncId = setTimeout(() => {
+          this._pendingCorruptedResyncId = undefined
+          if (this.transport.isConnected && !this._destroying) {
+            this._sendSyncStep1()
+          }
+        }, delay)
+      }
 
       return // Don't process corrupted message
     }

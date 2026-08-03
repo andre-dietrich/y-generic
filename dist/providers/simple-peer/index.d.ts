@@ -132,6 +132,8 @@ export declare class SimplePeerTransport implements Transport {
     private signalingConns;
     private announcedPeers;
     private announceInterval?;
+    private _reconnectAttempts;
+    private _reconnectTimers;
     /**
      * Create a new SimplePeer transport.
      *
@@ -195,12 +197,39 @@ export declare class SimplePeerTransport implements Transport {
     sendControl(peerId: string, payload: Uint8Array): void;
     /**
      * Check if connected.
+     *
+     * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
+     * a health check — it stays true with zero signaling servers, which is what
+     * makes BroadcastChannel-only mode work. For "can we still discover peers?"
+     * use `signalingHealth`.
      */
     get isConnected(): boolean;
     /**
      * Get number of connected peers (for debugging).
      */
     get connectedPeers(): number;
+    /**
+     * Signaling/discovery health, for diagnostics and monitoring.
+     *
+     * `isConnected` deliberately cannot express this: a transport whose signaling
+     * sockets have all dropped still reports connected, and peer discovery is
+     * silently dead until they come back.
+     */
+    get signalingHealth(): {
+        open: number;
+        configured: number;
+        reconnecting: number;
+        peers: number;
+        connectedPeers: number;
+    };
+    /**
+     * Reconnect to a signaling server after it drops, with exponential backoff.
+     *
+     * Mirrors lib0's WebsocketClient (what y-webrtc gets for free): delay grows
+     * as log10(attempts + 1) * 1200ms, capped at 30s. No-ops after an explicit
+     * disconnect(), and never stacks duplicate timers for the same URL.
+     */
+    private scheduleSignalingReconnect;
     /**
      * Connect to a signaling server.
      */

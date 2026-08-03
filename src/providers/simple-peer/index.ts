@@ -198,6 +198,11 @@ export class SimplePeerTransport implements Transport {
   private signalingConns: WebSocket[] = []
   private announcedPeers: Set<string> = new Set()
   private announceInterval?: ReturnType<typeof setInterval>
+  // Signaling reconnect state, per URL: consecutive failures (for backoff) and
+  // the pending retry timer (so disconnect() can cancel it).
+  private _reconnectAttempts: Map<string, number> = new Map()
+  private _reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
+    new Map()
 
   /**
    * Create a new SimplePeer transport.
@@ -296,20 +301,27 @@ export class SimplePeerTransport implements Transport {
       `✅ Connected to room "${this._room}" — ${this.signalingConns.length}/${this.options.signaling.length} signaling server(s)`,
     )
 
-    // Start periodic re-announce to help late joiners discover us
+    // Start periodic re-subscribe + re-announce to help late joiners discover us.
+    // Deliberately NOT gated on `peers.size < maxConns`: a full mesh must keep
+    // advertising, or peers that later drop out can never rediscover us.
     this.announceInterval = setInterval(() => {
-      if (
-        this.peers.size < this.options.maxConns &&
-        this.signalingConns.length > 0
-      ) {
-        this.log('Re-announcing presence...')
-        for (const ws of this.signalingConns) {
-          this.sendSignaling(ws, {
-            type: 'publish',
-            topic: this._room,
-            from: this.peerId,
-          })
-        }
+      if (this.signalingConns.length === 0) return
+
+      this.log('Re-announcing presence...')
+      for (const ws of this.signalingConns) {
+        // Re-subscribe every tick: a signaling server can silently drop a
+        // subscription while the socket stays open (ping/pong alive), which
+        // makes us invisible to newcomers with no other symptom. `subscribe`
+        // is otherwise only sent once, in onopen.
+        this.sendSignaling(ws, {
+          type: 'subscribe',
+          topics: [this._room],
+        })
+        this.sendSignaling(ws, {
+          type: 'publish',
+          topic: this._room,
+          from: this.peerId,
+        })
       }
     }, 5000) // Re-announce every 5 seconds for better peer discovery
   }
@@ -324,11 +336,23 @@ export class SimplePeerTransport implements Transport {
       `🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`,
     )
 
+    // Clear BEFORE closing sockets: ws.close() fires onclose asynchronously,
+    // and scheduleSignalingReconnect() keys off this flag to tell a deliberate
+    // disconnect from a dropped connection.
+    this._connected = false
+
     // Stop re-announce interval
     if (this.announceInterval) {
       clearInterval(this.announceInterval)
       this.announceInterval = undefined
     }
+
+    // Cancel any pending signaling reconnects
+    for (const timer of this._reconnectTimers.values()) {
+      clearTimeout(timer)
+    }
+    this._reconnectTimers.clear()
+    this._reconnectAttempts.clear()
 
     // Close all peer connections
     for (const peerConn of this.peers.values()) {
@@ -342,7 +366,6 @@ export class SimplePeerTransport implements Transport {
     }
     this.signalingConns = []
 
-    this._connected = false
     this.announcedPeers.clear()
   }
 
@@ -573,6 +596,11 @@ export class SimplePeerTransport implements Transport {
 
   /**
    * Check if connected.
+   *
+   * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
+   * a health check — it stays true with zero signaling servers, which is what
+   * makes BroadcastChannel-only mode work. For "can we still discover peers?"
+   * use `signalingHealth`.
    */
   get isConnected(): boolean {
     return this._connected
@@ -586,6 +614,61 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
+   * Signaling/discovery health, for diagnostics and monitoring.
+   *
+   * `isConnected` deliberately cannot express this: a transport whose signaling
+   * sockets have all dropped still reports connected, and peer discovery is
+   * silently dead until they come back.
+   */
+  get signalingHealth(): {
+    open: number
+    configured: number
+    reconnecting: number
+    peers: number
+    connectedPeers: number
+  } {
+    return {
+      open: this.signalingConns.filter((ws) => ws.readyState === 1).length,
+      configured: this.options.signaling.length,
+      reconnecting: this._reconnectTimers.size,
+      peers: this.peers.size,
+      connectedPeers: this.connectedPeers,
+    }
+  }
+
+  /**
+   * Reconnect to a signaling server after it drops, with exponential backoff.
+   *
+   * Mirrors lib0's WebsocketClient (what y-webrtc gets for free): delay grows
+   * as log10(attempts + 1) * 1200ms, capped at 30s. No-ops after an explicit
+   * disconnect(), and never stacks duplicate timers for the same URL.
+   */
+  private scheduleSignalingReconnect(url: string): void {
+    if (!this._connected) return // deliberate disconnect(), not a drop
+    if (this._reconnectTimers.has(url)) return // retry already pending
+
+    const attempts = (this._reconnectAttempts.get(url) ?? 0) + 1
+    this._reconnectAttempts.set(url, attempts)
+
+    const delay = Math.min(Math.log10(attempts + 1) * 1200, 30000)
+    this.log(
+      `🔄 Signaling reconnect #${attempts} for ${url} in ${Math.round(delay)}ms`,
+    )
+
+    this._reconnectTimers.set(
+      url,
+      setTimeout(() => {
+        this._reconnectTimers.delete(url)
+        if (!this._connected) return
+        this.connectSignaling(url).catch(() => {
+          // connectSignaling rejects on error/timeout; onclose schedules the
+          // next attempt, so swallow here to avoid an unhandled rejection.
+        })
+      }, delay),
+    )
+  }
+
+  /**
    * Connect to a signaling server.
    */
   private async connectSignaling(url: string): Promise<void> {
@@ -595,6 +678,9 @@ export class SimplePeerTransport implements Transport {
 
       ws.onopen = () => {
         this.log(`🟢 Signaling connected: ${url}`)
+
+        // Reached a good state — restart backoff from zero for the next drop.
+        this._reconnectAttempts.delete(url)
 
         // Subscribe to room
         this.sendSignaling(ws, {
@@ -659,6 +745,17 @@ export class SimplePeerTransport implements Transport {
         const index = this.signalingConns.indexOf(ws)
         if (index > -1) {
           this.signalingConns.splice(index, 1)
+        }
+        // Without this, a single socket drop is terminal: the re-announce loop
+        // is gated on `signalingConns.length > 0`, so peer discovery stops
+        // forever while `isConnected` still reports true.
+        this.scheduleSignalingReconnect(url)
+
+        if (!resolved) {
+          // Closed before ever opening — settle connect()'s promise so
+          // Promise.allSettled() in connect() isn't left hanging.
+          resolved = true
+          reject(new Error(`Signaling closed before open: ${url}`))
         }
       }
 

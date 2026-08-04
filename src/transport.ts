@@ -97,6 +97,18 @@ export interface Transport {
    * Check if the transport is currently connected.
    */
   readonly isConnected: boolean
+
+  /**
+   * Optional hint: recommended `batchUpdates` delay (ms) for this transport,
+   * used as GenericProvider's default when the caller doesn't explicitly
+   * pass `batchUpdates`. Transports with a high per-message round-trip cost
+   * (HTTP polling, internally-debounced relays) should set this so rapid
+   * edits collapse into fewer round trips by default. Low-latency push
+   * transports (WebSocket, PubNub, Supabase, connected WebRTC) should leave
+   * this undefined — for those, batching only adds a fixed delay floor
+   * without reducing round trips that were already cheap.
+   */
+  readonly preferredBatchMs?: number
 }
 
 /**

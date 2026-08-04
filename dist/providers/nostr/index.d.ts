@@ -149,6 +149,13 @@ export interface NostrConfig extends ConnectionConfig {
  * to matching events from peers. Works in both browser and Node.js environments.
  */
 export declare class NostrTransport implements Transport {
+    /**
+     * Every send() signs and publishes its own event to every configured
+     * relay with no internal coalescing. Recommends GenericProvider debounce
+     * rapid edits by default to cut down on signing overhead and relay
+     * round trips.
+     */
+    readonly preferredBatchMs = 150;
     private readonly opts;
     private _connected;
     private _callback?;

@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "CommonJS",
+    "lib": ["ES2020", "DOM"],
+    "outDir": "./bench-dist",
+    "rootDir": ".",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "moduleResolution": "node",
+    "types": ["node"]
+  },
+  "include": [
+    "src/**/*",
+    "test/dummy/bench-sync-latency.ts",
+    "test/dummy/bench-user-scaling.ts",
+    "test/dummy/bench-asymmetric-join.ts",
+    "test/dummy/bench-packet-loss.ts",
+    "test/dummy/bench-late-join.ts",
+    "test/dummy/repro-gun-batch-corruption.ts",
+    "test/dummy/bench-corruption-storm.ts"
+  ]
+}

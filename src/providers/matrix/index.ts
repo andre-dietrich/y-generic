@@ -45,6 +45,13 @@ export interface MatrixConfig extends ConnectionConfig {
  * ```
  */
 export class MatrixTransport implements Transport {
+  /**
+   * Every send() is its own HTTP PUT request with no internal coalescing —
+   * unlike push-style transports, there's no cheaper round trip to lose by
+   * batching. Recommends GenericProvider debounce rapid edits by default.
+   */
+  readonly preferredBatchMs = 150
+
   private config: MatrixConfig | null = null
   private messageCallback?: (data: Uint8Array) => void
   private _isConnected: boolean = false

@@ -191,6 +191,7 @@ export class TrysteroTransport implements Transport {
     | null = null
   private peers: Set<string> = new Set()
   private onJoinErrorCallback?: (details: any) => void
+  private _peerConnectCallback?: (peerId: string) => void
 
   constructor(options: TrysteroTransportOptions) {
     this.options = {
@@ -288,6 +289,7 @@ export class TrysteroTransport implements Transport {
     this.room.onPeerJoin((peerId) => {
       this.peers.add(peerId)
       this.log(`Peer joined: ${peerId} (${this.peers.size} total)`)
+      this._peerConnectCallback?.(peerId)
     })
 
     this.room.onPeerLeave((peerId) => {
@@ -339,6 +341,21 @@ export class TrysteroTransport implements Transport {
     return () => {
       this._callback = undefined
       this.log('Message callback unregistered')
+    }
+  }
+
+  /**
+   * Register callback for new peer data-channel connections. Lets
+   * GenericProvider push our current doc/awareness state to a peer as
+   * soon as their channel opens, instead of only at our own connect()
+   * time (which fires before any mesh connection exists) or the next
+   * periodic sync tick.
+   */
+  onPeerConnect(callback: (peerId: string) => void): () => void {
+    this._peerConnectCallback = callback
+
+    return () => {
+      this._peerConnectCallback = undefined
     }
   }
 

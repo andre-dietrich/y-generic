@@ -158,6 +158,7 @@ export declare class TrysteroTransport implements Transport {
     private sendUpdate;
     private peers;
     private onJoinErrorCallback?;
+    private _peerConnectCallback?;
     constructor(options: TrysteroTransportOptions);
     private log;
     get isConnected(): boolean;
@@ -165,6 +166,14 @@ export declare class TrysteroTransport implements Transport {
     disconnect(): void;
     send(data: Uint8Array): Promise<void>;
     onMessage(callback: (data: Uint8Array) => void): () => void;
+    /**
+     * Register callback for new peer data-channel connections. Lets
+     * GenericProvider push our current doc/awareness state to a peer as
+     * soon as their channel opens, instead of only at our own connect()
+     * time (which fires before any mesh connection exists) or the next
+     * periodic sync tick.
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
      * Set a callback for join errors (optional).
      */

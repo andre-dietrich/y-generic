@@ -162,6 +162,7 @@ export declare class GunTransport implements Transport {
     private readonly BUFFER_SIZE;
     private awarenessListener;
     private lastAwarenessId;
+    private ownAwarenessId;
     private encryptionEnabled;
     private persistentMode;
     private persistDoc;
@@ -206,13 +207,17 @@ export declare class GunTransport implements Transport {
      */
     private peekMessageType;
     /**
-     * Send awareness update to a separate volatile node.
-     * Awareness is ephemeral - only the latest state matters.
-     * Each client writes to its own awareness slot to avoid overwrites.
+     * Send awareness update to a per-client slot under the awareness node.
+     * Awareness is ephemeral - only the latest state per client matters.
+     * Each client writes to its own slot (keyed by a stable per-connection id)
+     * so peers never overwrite each other's presence data.
      */
     private sendAwareness;
     /**
      * Setup listener for awareness updates (separate from doc sync).
+     * Uses .map() so every existing per-client slot is replayed on subscribe
+     * (late joiners learn about already-present peers), not just the most
+     * recently written one.
      */
     private setupAwarenessListener;
     /**

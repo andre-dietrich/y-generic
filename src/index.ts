@@ -479,6 +479,13 @@ export class GenericProvider extends Observable<string> {
         this._syncIntervalId = setInterval(() => {
           if (this.transport.isConnected && !this._destroying) {
             this._sendSyncStep1()
+            // Also re-announce awareness. Transports without onPeerConnect
+            // (e.g. WebSocket, PubNub, Trystero strategies that don't
+            // support it) never otherwise re-broadcast presence to peers
+            // that joined after our last broadcast — this bounds that gap
+            // to one interval instead of leaving it unbounded. Cheap: same
+            // throttled path as any other awareness change.
+            this._broadcastAwareness([this.doc.clientID])
           }
         }, this._syncInterval)
       }

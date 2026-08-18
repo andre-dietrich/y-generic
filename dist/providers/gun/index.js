@@ -105,6 +105,7 @@ export class GunTransport {
         this.BUFFER_SIZE = 20; // Circular buffer size
         this.awarenessListener = null;
         this.lastAwarenessId = ''; // Track last awareness ID to avoid processing our own
+        this.ownAwarenessId = null; // Stable per-client slot key under the awareness node
         this.encryptionEnabled = false;
         // Persistence
         this.persistentMode = false;
@@ -407,9 +408,10 @@ export class GunTransport {
         return data[4];
     }
     /**
-     * Send awareness update to a separate volatile node.
-     * Awareness is ephemeral - only the latest state matters.
-     * Each client writes to its own awareness slot to avoid overwrites.
+     * Send awareness update to a per-client slot under the awareness node.
+     * Awareness is ephemeral - only the latest state per client matters.
+     * Each client writes to its own slot (keyed by a stable per-connection id)
+     * so peers never overwrite each other's presence data.
      */
     async sendAwareness(data) {
         let payload = this.uint8ArrayToBase64(data);
@@ -417,12 +419,16 @@ export class GunTransport {
         if (this.encryptionEnabled) {
             payload = await this.encrypt(payload);
         }
-        const awarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+        // Generated once per connection and reused for every broadcast, so all
+        // of this client's updates land in the same slot instead of each
+        // clobbering a shared node.
+        if (!this.ownAwarenessId) {
+            this.ownAwarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+        }
+        const awarenessId = this.ownAwarenessId;
         // Track this ID so we don't process our own update
         this.lastAwarenessId = awarenessId;
-        // Write to a single volatile awareness node
-        // Each update overwrites the previous - awareness only needs latest state
-        this.roomNode.get('awareness').put({
+        this.roomNode.get('awareness').get(awarenessId).put({
             data: payload,
             id: awarenessId,
             timestamp: Date.now(),
@@ -432,20 +438,20 @@ export class GunTransport {
     }
     /**
      * Setup listener for awareness updates (separate from doc sync).
+     * Uses .map() so every existing per-client slot is replayed on subscribe
+     * (late joiners learn about already-present peers), not just the most
+     * recently written one.
      */
     setupAwarenessListener() {
         this.awarenessListener = this.roomNode
             .get('awareness')
+            .map()
             .on(async (awareness) => {
             if (!awareness || !awareness.data)
                 return;
             // Skip our own awareness updates
             if (awareness.id === this.lastAwarenessId)
                 return;
-            // Only process updates newer than our connection
-            if (awareness.timestamp && awareness.timestamp < this.connectionTime) {
-                return;
-            }
             try {
                 let payload = awareness.data;
                 // Decrypt if encrypted

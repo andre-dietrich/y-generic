@@ -198,9 +198,21 @@ export class GenericProvider extends Observable {
         // BroadcastChannel state for cross-tab sync
         this._bcChannel = '';
         this._bcConnected = false;
-        // Hash verification tracking for exponential backoff
-        this._hashMismatchCount = 0;
-        this._lastHashMismatchTime = 0;
+        // Unified resync-request coordinator. Previously hash-mismatch,
+        // corrupted-message, and gap-confirmed triggers each coalesced only
+        // against themselves (three separate pending-timer fields, three
+        // separate escalation counters), so under sustained wire corruption they
+        // could each independently burn through the shared _tryReserveSyncSlot()
+        // budget in the same window - a resync storm that grew combinatorially
+        // with peer count (see test/dummy/bench-corruption-storm.ts: at 10
+        // simulated peers, 5% per-link corruption drove message volume to ~11x
+        // the corruption-free baseline). Now there is exactly ONE pending timer
+        // and ONE shared escalation counter for all three triggers - only one
+        // resync is ever in flight at a time, and any trigger that fires while
+        // one is already pending is absorbed into it instead of scheduling its
+        // own. See _requestResync().
+        this._resyncAttemptCount = 0;
+        this._lastResyncAttemptTime = 0;
         // Rate limiting for sync requests
         this._syncRequestTimes = [];
         // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
@@ -221,9 +233,6 @@ export class GenericProvider extends Observable {
         // positives from mere network reordering. See _trackRemoteSeq().
         this._remoteSeqInfo = new Map();
         this._gapCheckTimers = new Map();
-        // Message integrity tracking
-        this._corruptedMessageCount = 0; // Track rejected corrupted messages
-        this._lastCorruptedMessageTime = 0;
         // Update batching/debouncing
         this._batchUpdates = 0; // milliseconds delay (0 = disabled)
         this._pendingUpdate = null;
@@ -306,6 +315,13 @@ export class GenericProvider extends Observable {
                 this._syncIntervalId = setInterval(() => {
                     if (this.transport.isConnected && !this._destroying) {
                         this._sendSyncStep1();
+                        // Also re-announce awareness. Transports without onPeerConnect
+                        // (e.g. WebSocket, PubNub, Trystero strategies that don't
+                        // support it) never otherwise re-broadcast presence to peers
+                        // that joined after our last broadcast — this bounds that gap
+                        // to one interval instead of leaving it unbounded. Cheap: same
+                        // throttled path as any other awareness change.
+                        this._broadcastAwareness([this.doc.clientID]);
                     }
                 }, this._syncInterval);
             }
@@ -328,15 +344,15 @@ export class GenericProvider extends Observable {
             clearInterval(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
-        // Reset corruption tracking
-        this._corruptedMessageCount = 0;
-        this._lastCorruptedMessageTime = 0;
-        // Cancel any pending hash-mismatch-triggered resync - it would otherwise
-        // still fire syncNow() after disconnect/reconnect against a transport
-        // that may be in a completely different state by then.
-        if (this._pendingHashMismatchResyncId !== undefined) {
-            clearTimeout(this._pendingHashMismatchResyncId);
-            this._pendingHashMismatchResyncId = undefined;
+        // Reset resync escalation tracking
+        this._resyncAttemptCount = 0;
+        this._lastResyncAttemptTime = 0;
+        // Cancel any pending unified resync - it would otherwise still fire
+        // syncNow() after disconnect/reconnect against a transport that may be
+        // in a completely different state by then.
+        if (this._pendingResyncTimeoutId !== undefined) {
+            clearTimeout(this._pendingResyncTimeoutId);
+            this._pendingResyncTimeoutId = undefined;
         }
         // Reset the sync rate-limit budget. Without this, a reconnect inherits
         // whatever budget was left over from before the disconnect - and since
@@ -577,23 +593,12 @@ export class GenericProvider extends Observable {
         const message = unwrapAndVerifyMessage(data);
         if (message === null) {
             // Message is corrupted - reject it immediately
-            this._corruptedMessageCount++;
-            const now = Date.now();
-            // Reset counter if it's been stable for 10 seconds
-            if (now - this._lastCorruptedMessageTime > 10000) {
-                this._corruptedMessageCount = 1;
-            }
-            this._lastCorruptedMessageTime = now;
-            console.warn(`[GenericProvider] 💥 Corrupted message rejected (#${this._corruptedMessageCount}): CRC32 checksum mismatch. ` +
+            console.warn(`[GenericProvider] 💥 Corrupted message rejected: CRC32 checksum mismatch. ` +
                 `This is expected if data corruption simulation is enabled.`);
-            // Request re-sync to recover any lost data
-            // Use exponential backoff: 100ms, 500ms, 2.5s, then cap at 5s
-            const delay = Math.min(5000, 100 * Math.pow(5, Math.min(this._corruptedMessageCount - 1, 3)));
-            setTimeout(() => {
-                if (this.transport.isConnected && !this._destroying) {
-                    this._sendSyncStep1();
-                }
-            }, delay);
+            // Request re-sync to recover any lost data - routed through the
+            // shared coordinator so this doesn't stack an independent timer on
+            // top of any hash-mismatch/gap-confirmed resync already pending.
+            this._requestResync();
             return; // Don't process corrupted message
         }
         // Message integrity verified - safe to decode
@@ -617,13 +622,14 @@ export class GenericProvider extends Observable {
                     }
                     // Send reply if needed. Suppression only engages with genuine
                     // redundancy (>=2 other known peers via awareness) - below that,
-                    // there's no "someone else" to rely on, so reply immediately.
+                    // there's no "someone else" to rely on, so reply immediately
+                    // (still rate-limited via _sendSyncReply() as a hard backstop).
                     if (encoding.length(encoder) > 1) {
                         if (this.awareness.getStates().size >= 3) {
                             this._scheduleSyncReply(encoding.toUint8Array(encoder));
                         }
                         else {
-                            this._send(encoding.toUint8Array(encoder));
+                            this._sendSyncReply(encoding.toUint8Array(encoder));
                         }
                     }
                     break;
@@ -695,37 +701,21 @@ export class GenericProvider extends Observable {
                         // normally below.
                         const reorderingSuspected = this._gapCheckTimers.has(senderClientID);
                         if (!reorderingSuspected) {
-                            this._hashMismatchCount++;
-                            const now = Date.now();
-                            // Reset counter if it's been stable for 10 seconds
-                            if (now - this._lastHashMismatchTime > 10000) {
-                                this._hashMismatchCount = 1;
-                            }
-                            this._lastHashMismatchTime = now;
-                            // Exponential backoff: 10ms, 50ms, 250ms, 1.25s, 6.25s, then cap at 10s
-                            const delay = Math.min(10000, 10 * Math.pow(5, this._hashMismatchCount - 1));
-                            console.warn(`[GenericProvider] Hash mismatch #${this._hashMismatchCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
-                            console.warn(`[GenericProvider] Re-sync scheduled in ${delay}ms...`);
-                            // Push our full state AND request theirs.
-                            // A hash mismatch means the two peers have diverged — one side may
-                            // have edits the other lacks.  Calling only _sendSyncStep1() (pull)
-                            // never delivers our own surplus edits to the other side.
-                            // Coalesced: if a resync is already pending, this mismatch is
-                            // absorbed by it rather than stacking another independent
-                            // timer/broadcast (see _pendingHashMismatchResyncId's comment).
-                            if (this._pendingHashMismatchResyncId === undefined) {
-                                this._pendingHashMismatchResyncId = setTimeout(() => {
-                                    this._pendingHashMismatchResyncId = undefined;
-                                    if (this.transport.isConnected && !this._destroying) {
-                                        this.syncNow();
-                                    }
-                                }, delay);
-                            }
+                            // Push our full state AND request theirs (syncNow() does
+                            // both). A hash mismatch means the two peers have diverged -
+                            // one side may have edits the other lacks. Routed through the
+                            // shared coordinator so this doesn't stack an independent
+                            // timer on top of any corrupted-message/gap-confirmed resync
+                            // already pending.
+                            this._requestResync();
+                            // Logged with the shared attempt counter (kept as "#N" for
+                            // compatibility with existing tooling/benchmarks that grep
+                            // for this exact "Hash mismatch #" pattern) - it now reflects
+                            // the unified resync-attempt count rather than a
+                            // hash-mismatch-specific one, since the two escalation
+                            // counters were merged.
+                            console.warn(`[GenericProvider] Hash mismatch #${this._resyncAttemptCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
                         }
-                    }
-                    else {
-                        // Hash matched - reset failure counter
-                        this._hashMismatchCount = 0;
                     }
                     // If we received SyncStep2, we're synced (unless hash mismatched)
                     if (syncMessageType === syncProtocol.messageYjsSyncStep2 &&
@@ -736,7 +726,8 @@ export class GenericProvider extends Observable {
                     }
                     // Send reply if needed (as standard MESSAGE_SYNC). Suppression
                     // only engages with genuine redundancy (>=2 other known peers via
-                    // awareness) - below that, reply immediately. Matches the
+                    // awareness) - below that, reply immediately (still rate-limited
+                    // via _sendSyncReply() as a hard backstop). Matches the
                     // MESSAGE_SYNC case's gate exactly; without this, a hash-mismatch
                     // resync burst under packet loss bypassed suppression entirely,
                     // since every peer answering a post-mismatch SyncStep1 replied
@@ -746,7 +737,7 @@ export class GenericProvider extends Observable {
                             this._scheduleSyncReply(encoding.toUint8Array(encoder));
                         }
                         else {
-                            this._send(encoding.toUint8Array(encoder));
+                            this._sendSyncReply(encoding.toUint8Array(encoder));
                         }
                     }
                     break;
@@ -777,7 +768,7 @@ export class GenericProvider extends Observable {
     _scheduleSyncReply(reply) {
         if (this._pendingSyncReplyTimeoutId !== undefined) {
             if (this._pendingSyncReply) {
-                this._send(this._pendingSyncReply);
+                this._sendSyncReply(this._pendingSyncReply);
             }
             clearTimeout(this._pendingSyncReplyTimeoutId);
             this._pendingSyncReplyTimeoutId = undefined;
@@ -787,7 +778,7 @@ export class GenericProvider extends Observable {
         this._pendingSyncReplyTimeoutId = setTimeout(() => {
             this._pendingSyncReplyTimeoutId = undefined;
             if (this._pendingSyncReply) {
-                this._send(this._pendingSyncReply);
+                this._sendSyncReply(this._pendingSyncReply);
                 this._pendingSyncReply = null;
             }
         }, delay);
@@ -799,6 +790,31 @@ export class GenericProvider extends Observable {
             this._pendingSyncReplyTimeoutId = undefined;
         }
         this._pendingSyncReply = null;
+    }
+    /**
+     * Send a SyncStep2 reply, gated by the same shared per-peer budget as
+     * SyncStep1 requests/syncNow() pushes (`_tryReserveSyncSlot()`).
+     *
+     * Previously SyncStep2 replies were completely unrated - the only
+     * defense against redundant replies was the best-effort NACK-style
+     * suppression in `_scheduleSyncReply()`/`_cancelPendingSyncReply()`,
+     * which itself is just an ordinary broadcast message subject to the same
+     * wire corruption as everything else. Under sustained corruption, more
+     * competing repliers independently miss the "someone already answered"
+     * signal as peer count grows, and none of that traffic was bounded.
+     * Measured in test/dummy/bench-corruption-storm.ts: SyncStep2/SyncStep1
+     * ratio grew from ~1.1-1.3 at N=2 to ~4.5-5.9 at N=10 (should stay near
+     * 1 if suppression alone were sufficient). This is a hard backstop on
+     * top of that suppression, not a replacement for it - a rate-limited
+     * reply is dropped silently (no warn) since under normal, uncorrupted
+     * operation this path is rarely exercised and logging every drop here
+     * would itself become log spam exactly when things are already noisy.
+     */
+    _sendSyncReply(reply) {
+        if (!this._tryReserveSyncSlot()) {
+            return; // Rate limited - drop the reply silently
+        }
+        this._send(reply);
     }
     /**
      * Track a received sequence number for reordering-tolerant gap detection.
@@ -858,10 +874,64 @@ export class GenericProvider extends Observable {
             if (stillMissing > 0 && this.transport.isConnected) {
                 console.warn(`[GenericProvider] Sequence gap confirmed from client ${clientID}: ` +
                     `${stillMissing} message(s) still missing after ${this._gapGraceMs}ms grace period`);
-                this._sendSyncStep1();
+                // Routed through the shared coordinator (previously called
+                // _sendSyncStep1() directly with NO coalescing at all - the one
+                // remaining gap that let this trigger steal rate-limit slots
+                // independently of the hash-mismatch/corrupted-message triggers).
+                this._requestResync();
             }
         }, this._gapGraceMs);
         this._gapCheckTimers.set(clientID, timer);
+    }
+    /**
+     * Unified entry point for ALL resync triggers (hash mismatch, corrupted
+     * message, confirmed sequence gap). Coalesces them behind a single
+     * pending timer and a single shared escalation counter, so a burst of
+     * triggers from different causes in a short window schedules exactly one
+     * resync instead of three independent ones each able to draw on the
+     * shared `_tryReserveSyncSlot()` budget on their own.
+     *
+     * Always resolves to `syncNow()` (push + pull) rather than distinguishing
+     * a push-only/pull-only variant per trigger. `syncNow()`'s push half is
+     * already a no-op when there's nothing to send (it only calls
+     * `_sendUpdate()` when `update.length > 0`), so unifying on push+pull is
+     * strictly simpler than threading a `push` flag through a *shared*
+     * coordinator (where the "right" answer for an absorbed trigger is
+     * ambiguous anyway - was it push-worthy or not?). It also closes a latent
+     * gap where the corrupted-message and gap-confirmed triggers previously
+     * called pull-only `_sendSyncStep1()` and could never deliver this peer's
+     * own surplus edits made during a divergence window.
+     */
+    _requestResync() {
+        // Coalesced: if a resync is already pending (regardless of which
+        // trigger scheduled it), this trigger is absorbed into it instead of
+        // stacking another independent timer/broadcast. Escalation only
+        // advances when we actually schedule a NEW timer below - incrementing
+        // unconditionally here (once per absorbed trigger too) would let a
+        // burst of many corrupted/mismatched messages while one resync is
+        // already pending ratchet the counter straight to its cap, so the
+        // *next* resync (after this one fires) always schedules at the max
+        // backoff instead of escalating gradually.
+        if (this._pendingResyncTimeoutId !== undefined) {
+            return;
+        }
+        this._resyncAttemptCount++;
+        const now = Date.now();
+        // Reset the escalation counter if it's been stable for 10 seconds -
+        // same quiet-period reset the old per-trigger counters used.
+        if (now - this._lastResyncAttemptTime > 10000) {
+            this._resyncAttemptCount = 1;
+        }
+        this._lastResyncAttemptTime = now;
+        // Exponential backoff: 100ms, 500ms, 2.5s, then cap at 5s.
+        const delay = Math.min(5000, 100 * Math.pow(5, Math.min(this._resyncAttemptCount - 1, 3)));
+        console.warn(`[GenericProvider] Resync scheduled in ${delay}ms (attempt #${this._resyncAttemptCount})...`);
+        this._pendingResyncTimeoutId = setTimeout(() => {
+            this._pendingResyncTimeoutId = undefined;
+            if (this.transport.isConnected && !this._destroying) {
+                this.syncNow();
+            }
+        }, delay);
     }
     /**
      * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`

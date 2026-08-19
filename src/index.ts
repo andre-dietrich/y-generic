@@ -439,16 +439,18 @@ export class GenericProvider extends Observable<string> {
       // Setup BroadcastChannel for cross-tab sync (if enabled and available)
       this._setupBroadcastChannel(config)
 
-      // Connect the transport
-      await this.transport.connect(config)
-
-      // Register for incoming messages
+      // Register for incoming messages and new-peer notifications BEFORE
+      // connecting the transport. Some transports (e.g. PeerJS for a
+      // joining, non-coordinator peer) establish and fully open their first
+      // connection *inside* transport.connect() itself — so a peer-connect
+      // notification or an immediate reply from the other side can arrive
+      // before that promise resolves. Registering after the await left
+      // exactly that window uncovered: whatever arrived during it was
+      // silently dropped since neither callback was wired up yet.
       this._unsubscribeTransport = this.transport.onMessage((data) => {
         this._handleIncomingMessage(data)
       })
 
-      // When a new WebRTC peer channel opens, immediately push our full state
-      // so peers that reconnected after offline edits receive our changes.
       if (this.transport.onPeerConnect) {
         const unsubPeer = this.transport.onPeerConnect((_peerId: string) => {
           if (!this._destroying) this.syncNow()
@@ -459,6 +461,9 @@ export class GenericProvider extends Observable<string> {
           unsubPeer()
         }
       }
+
+      // Connect the transport
+      await this.transport.connect(config)
 
       this._setStatus({ state: 'connected' })
 

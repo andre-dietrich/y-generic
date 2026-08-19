@@ -211,7 +211,6 @@ export class GunTransport implements Transport {
   private updateBatch: Uint8Array[] = []
   private batchTimeout?: ReturnType<typeof setTimeout>
   private processedUpdates: Set<string> = new Set()
-  private connectionTime: number = 0
   private throttleTimeout?: ReturnType<typeof setTimeout>
   private pendingUpdates: Map<string, any> = new Map()
   private updateSlot: number = 0
@@ -278,7 +277,6 @@ export class GunTransport implements Transport {
     }
 
     this._room = config.room
-    this.connectionTime = Date.now()
 
     this.persistentMode = config.persistent ?? false
     this.persistDoc = config.doc ?? null
@@ -384,11 +382,6 @@ export class GunTransport implements Transport {
         if (!hasLoadedInitial) return
 
         if (!update || !update.data) return
-
-        // Only process updates newer than our connection time
-        if (update.timestamp && update.timestamp < this.connectionTime) {
-          return
-        }
 
         // Use sequence number for deduplication
         const sequence = update.sequence || Math.floor(update.timestamp / 100)

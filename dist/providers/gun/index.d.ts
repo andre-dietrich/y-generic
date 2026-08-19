@@ -155,7 +155,6 @@ export declare class GunTransport implements Transport {
     private updateBatch;
     private batchTimeout?;
     private processedUpdates;
-    private connectionTime;
     private throttleTimeout?;
     private pendingUpdates;
     private updateSlot;

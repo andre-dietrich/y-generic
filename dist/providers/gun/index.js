@@ -99,7 +99,6 @@ export class GunTransport {
         this.lastUpdateTime = 0;
         this.updateBatch = [];
         this.processedUpdates = new Set();
-        this.connectionTime = 0;
         this.pendingUpdates = new Map();
         this.updateSlot = 0;
         this.BUFFER_SIZE = 20; // Circular buffer size
@@ -147,7 +146,6 @@ export class GunTransport {
             throw new Error('Already connected');
         }
         this._room = config.room;
-        this.connectionTime = Date.now();
         this.persistentMode = config.persistent ?? false;
         this.persistDoc = config.doc ?? null;
         this.persistDebounceMs = config.persistDebounceMs ?? 2000;
@@ -233,10 +231,6 @@ export class GunTransport {
                 return;
             if (!update || !update.data)
                 return;
-            // Only process updates newer than our connection time
-            if (update.timestamp && update.timestamp < this.connectionTime) {
-                return;
-            }
             // Use sequence number for deduplication
             const sequence = update.sequence || Math.floor(update.timestamp / 100);
             const updateKey = `${updateId}-${sequence}`;

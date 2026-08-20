@@ -18,6 +18,7 @@ Explore 9 different transport implementations:
 - **PubNub** - Cloud pub/sub with global CDN
 - **WebSocket** - Standard client-server (y-websocket compatible)
 - **Matrix** - Federated communication protocol
+- **Ably** - Cloud pub/sub with global edge network
 
 ## Design Philosophy
 

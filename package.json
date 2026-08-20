@@ -58,6 +58,10 @@
     "./providers/nostr": {
       "types": "./dist/providers/nostr/index.d.ts",
       "default": "./dist/providers/nostr/index.js"
+    },
+    "./providers/ably": {
+      "types": "./dist/providers/ably/index.d.ts",
+      "default": "./dist/providers/ably/index.js"
     }
   },
   "files": [
@@ -76,6 +80,7 @@
     "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
     "dev:supabase": "npx parcel serve test/supabase/index.html --open --port 3010",
     "dev:nostr": "npx parcel serve test/nostr/index.html --open --port 3013",
+    "dev:ably": "npx parcel serve test/ably/index.html --open --port 3014",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc",
     "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",
@@ -89,7 +94,8 @@
     "build:demo:websocket": "npx parcel build test/websocket/index.html --dist-dir demos/websocket --public-url ./ --no-source-maps",
     "build:demo:supabase": "npx parcel build test/supabase/index.html --dist-dir demos/supabase --public-url ./ --no-source-maps",
     "build:demo:nostr": "npx parcel build test/nostr/index.html --dist-dir demos/nostr --public-url ./ --no-source-maps",
-    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase && npm run build:demo:nostr"
+    "build:demo:ably": "npx parcel build test/ably/index.html --dist-dir demos/ably --public-url ./ --no-source-maps",
+    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase && npm run build:demo:nostr && npm run build:demo:ably"
   },
   "dependencies": {
     "lib0": "^0.2.98",
@@ -98,11 +104,15 @@
     "yjs": "^13.6.29"
   },
   "peerDependencies": {
+    "ably": "^2.0.0",
     "gun": "^0.2020.1240",
     "peerjs": "^1.5.0",
     "simple-peer": "^9.11.0"
   },
   "peerDependenciesMeta": {
+    "ably": {
+      "optional": true
+    },
     "gun": {
       "optional": true
     },

@@ -114,6 +114,8 @@ export class GunTransport {
         this.savePending = false;
         /** Data loaded from Gun snapshot before onMessage callback is registered */
         this.pendingLoad = null;
+        /** True once loadSnapshot()'s initial Gun read has completed */
+        this.snapshotLoaded = false;
         if (!options.gun) {
             throw new Error('GunTransport requires the "gun" option. ' +
                 'Please provide the Gun constructor: ' +
@@ -176,6 +178,7 @@ export class GunTransport {
         this.setupAwarenessListener();
         this._connected = true;
         // Persistence: load existing snapshot or clear it for a fresh session
+        this.snapshotLoaded = false;
         if (this.persistentMode) {
             this.loadSnapshot();
         }
@@ -354,6 +357,7 @@ export class GunTransport {
         this.persistentMode = false;
         this.persistDoc = null;
         this.pendingLoad = null;
+        this.snapshotLoaded = false;
         this.log('✅ Disconnected');
     }
     /**
@@ -598,6 +602,13 @@ export class GunTransport {
     async saveSnapshot() {
         if (!this.persistDoc || !this.persistentMode || !this.roomNode)
             return;
+        if (!this.snapshotLoaded) {
+            // The initial Gun read hasn't resolved yet — saving now could clobber
+            // the real persisted state with our still-unmerged local doc. Retry
+            // shortly instead of writing.
+            this.persistTimer = setTimeout(() => this.saveSnapshot(), 100);
+            return;
+        }
         if (this.isWritingToGun) {
             this.savePending = true;
             return;
@@ -639,11 +650,11 @@ export class GunTransport {
      */
     loadSnapshot() {
         this.roomNode.get('snapshot').once(async (snap) => {
-            if (!snap || !snap.data || snap.cleared) {
-                this.log('📭 No snapshot found in Gun');
-                return;
-            }
             try {
+                if (!snap || !snap.data || snap.cleared) {
+                    this.log('📭 No snapshot found in Gun');
+                    return;
+                }
                 let payload = snap.data;
                 if (snap.encrypted && this.encryptionEnabled) {
                     const decrypted = await this.decrypt(payload);
@@ -670,6 +681,11 @@ export class GunTransport {
             catch (error) {
                 this.log('❌ Error loading snapshot:', error);
                 console.warn('GunTransport: Failed to load snapshot:', error);
+            }
+            finally {
+                // Only now is it safe for saveSnapshot() to write — the local doc
+                // has had a chance to merge in whatever Gun had stored.
+                this.snapshotLoaded = true;
             }
         });
     }

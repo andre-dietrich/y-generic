@@ -171,6 +171,8 @@ export declare class GunTransport implements Transport {
     private savePending;
     /** Data loaded from Gun snapshot before onMessage callback is registered */
     private pendingLoad;
+    /** True once loadSnapshot()'s initial Gun read has completed */
+    private snapshotLoaded;
     /**
      * Create a new Gun transport.
      *

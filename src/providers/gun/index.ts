@@ -229,6 +229,8 @@ export class GunTransport implements Transport {
   private savePending: boolean = false
   /** Data loaded from Gun snapshot before onMessage callback is registered */
   private pendingLoad: Uint8Array | null = null
+  /** True once loadSnapshot()'s initial Gun read has completed */
+  private snapshotLoaded: boolean = false
 
   /**
    * Create a new Gun transport.
@@ -321,6 +323,7 @@ export class GunTransport implements Transport {
     this._connected = true
 
     // Persistence: load existing snapshot or clear it for a fresh session
+    this.snapshotLoaded = false
     if (this.persistentMode) {
       this.loadSnapshot()
     } else {
@@ -531,6 +534,7 @@ export class GunTransport implements Transport {
     this.persistentMode = false
     this.persistDoc = null
     this.pendingLoad = null
+    this.snapshotLoaded = false
 
     this.log('✅ Disconnected')
   }
@@ -823,6 +827,14 @@ export class GunTransport implements Transport {
   private async saveSnapshot(): Promise<void> {
     if (!this.persistDoc || !this.persistentMode || !this.roomNode) return
 
+    if (!this.snapshotLoaded) {
+      // The initial Gun read hasn't resolved yet — saving now could clobber
+      // the real persisted state with our still-unmerged local doc. Retry
+      // shortly instead of writing.
+      this.persistTimer = setTimeout(() => this.saveSnapshot(), 100)
+      return
+    }
+
     if (this.isWritingToGun) {
       this.savePending = true
       return
@@ -871,12 +883,12 @@ export class GunTransport implements Transport {
    */
   private loadSnapshot(): void {
     this.roomNode.get('snapshot').once(async (snap: any) => {
-      if (!snap || !snap.data || snap.cleared) {
-        this.log('📭 No snapshot found in Gun')
-        return
-      }
-
       try {
+        if (!snap || !snap.data || snap.cleared) {
+          this.log('📭 No snapshot found in Gun')
+          return
+        }
+
         let payload = snap.data as string
         if (snap.encrypted && this.encryptionEnabled) {
           const decrypted = await this.decrypt(payload)
@@ -902,6 +914,10 @@ export class GunTransport implements Transport {
       } catch (error) {
         this.log('❌ Error loading snapshot:', error)
         console.warn('GunTransport: Failed to load snapshot:', error)
+      } finally {
+        // Only now is it safe for saveSnapshot() to write — the local doc
+        // has had a chance to merge in whatever Gun had stored.
+        this.snapshotLoaded = true
       }
     })
   }

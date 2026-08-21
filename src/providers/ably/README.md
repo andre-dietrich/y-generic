@@ -97,6 +97,47 @@ await provider.connect({
 | `room` | `string` | ✅ Yes | Room/channel name for collaboration |
 | `password` | `string` | ❌ No | Obfuscates the channel name (not encryption) |
 | `debug` | `boolean` | ❌ No | Enable debug logging (default: `false`) |
+| `persistent` | `boolean` | ❌ No | Save/restore full doc state via Ably LiveObjects (default: `false`) |
+| `doc` | `Y.Doc` | ⚠️ Required if `persistent: true` | The Y.Doc to snapshot |
+| `persistDebounceMs` | `number` | ❌ No | Debounce delay before writing a snapshot (default: `2000`) |
+
+## Persistent Mode
+
+By default, Ably pub/sub messages aren't retained — if every peer goes
+offline, the room's content is gone once they all reconnect with fresh
+documents. Setting `persistent: true` saves the full Y.Doc state to Ably's
+[LiveObjects](https://ably.com/docs/liveobjects) feature — a durably-stored,
+SLA-backed shared-state primitive — and restores it on connect, so the
+document survives everyone going offline.
+
+```typescript
+import * as Ably from 'ably'
+import { LiveObjects } from 'ably/liveobjects'
+import { AblyTransport } from 'y-generic/providers/ably'
+
+const transport = new AblyTransport({
+  Realtime: Ably.Realtime,
+  LiveObjects, // required only when using persistent mode
+})
+
+await provider.connect({
+  apiKey: 'your-ably-api-key',
+  room: 'my-collab-room',
+  persistent: true,
+  doc, // the same Y.Doc passed to `new GenericProvider(doc, transport)`
+})
+```
+
+**How it works**: the doc is encoded as a `y-protocols/sync` SYNC_STEP_2
+message and written across one or more LiveObjects `LiveMap` keys (large
+snapshots are chunked, since each write is capped at Ably's 64 KiB message
+size). On connect, any existing snapshot is read back and delivered before
+normal sync traffic begins.
+
+**Retention**: LiveObjects state is durably stored for 24h–90 days
+(configurable per app, Ably default 90 days) — good enough to resume after
+everyone's been offline for a while, not a replacement for a real backend if
+you need indefinite retention.
 
 ## Methods
 

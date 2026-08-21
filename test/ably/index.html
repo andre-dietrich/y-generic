@@ -7,6 +7,8 @@
 
     <!-- Ably SDK from CDN -->
     <script src="https://cdn.ably.com/lib/ably.min-2.js"></script>
+    <!-- LiveObjects plugin (only needed for persistent mode) — exposes window.AblyLiveObjectsPlugin -->
+    <script src="https://cdn.ably.com/lib/liveobjects.umd.min-2.js"></script>
 
     <!-- Quill CSS -->
     <link
@@ -483,6 +485,18 @@
               <span>Enable debug logging</span>
             </label>
             <div class="help-text">Show detailed logs in the console below</div>
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input type="checkbox" id="config-persistent" />
+              <span>Persistent mode — restore state via Ably LiveObjects</span>
+            </label>
+            <div class="help-text">
+              When enabled, the full document state is saved to Ably
+              LiveObjects and restored when peers reconnect after everyone
+              goes offline.
+            </div>
           </div>
 
           <button type="submit" class="connect-btn" id="connect-btn">

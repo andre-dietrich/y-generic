@@ -151,6 +151,7 @@ async function initWithConfig(config: {
   room: string
   password?: string
   debug: boolean
+  persistent: boolean
 }) {
   log('🚀 Initializing Ably test...', 'info')
   log(`📋 Configuration: Room="${config.room}", Debug=${config.debug}`, 'info')
@@ -168,6 +169,7 @@ async function initWithConfig(config: {
 
   const transport = new AblyTransport({
     Realtime: (globalThis as any).Ably.Realtime,
+    LiveObjects: (globalThis as any).AblyLiveObjectsPlugin?.LiveObjects,
   })
 
   // Create provider
@@ -207,6 +209,8 @@ async function initWithConfig(config: {
       room: config.room,
       password: config.password || undefined,
       debug: config.debug,
+      persistent: config.persistent,
+      doc: config.persistent ? doc : undefined,
     })
     log('✅ Successfully connected to Ably!', 'success')
   } catch (error) {
@@ -344,6 +348,9 @@ function setupConnectionForm() {
   const configDebug = document.getElementById(
     'config-debug',
   ) as HTMLInputElement
+  const configPersistent = document.getElementById(
+    'config-persistent',
+  ) as HTMLInputElement
 
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
@@ -368,6 +375,7 @@ function setupConnectionForm() {
     const authMethod = configAuthMethod.value as 'GET' | 'POST'
     const password = configPassword.value.trim() || undefined
     const debug = configDebug.checked
+    const persistent = configPersistent.checked
 
     // Disable button
     connectBtn.disabled = true
@@ -386,6 +394,7 @@ function setupConnectionForm() {
         room,
         password,
         debug,
+        persistent,
       })
     } catch (error) {
       console.error('Connection failed:', error)

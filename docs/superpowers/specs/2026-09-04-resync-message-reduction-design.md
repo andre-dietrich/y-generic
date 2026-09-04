@@ -147,3 +147,78 @@ having blocked on it earlier.
 - `npm run build` must pass with no TypeScript errors after each item;
   `dist/` is committed (tracked despite `.gitignore`, per CLAUDE.md) and
   must be rebuilt in the same commit as any `src/index.ts` change.
+
+## Addendum (post-implementation): Item 2 reverted — design premise did not survive benchmarking
+
+Item 2 was implemented exactly as specified above, built cleanly, and passed
+its stated hard gate (`bench-sync-latency.ts`, 3x, zero convergence
+timeouts). It was reverted anyway — no code shipped, HEAD unaffected — after
+two further findings, escalated separately as they were found rather than
+smoothed into one write-up:
+
+1. **`bench-corruption-storm.ts`, accepted as a narrow trade-off (this
+   finding alone would NOT have blocked the item):** at the single most
+   extreme corruption tier the script tests (50%, framed by its own header
+   as boundary-search rather than a realistic rate) and only at the smallest
+   peer counts (N=2/N=5, not N=10), 3 after-runs showed
+   `RESULT: at least one run failed to converge`, with `convergeMs` landing
+   at 15003-15020ms against the script's 15000ms settle window — i.e.
+   converging tens of milliseconds late relative to an arbitrary test
+   timeout, not never. Two baseline reruns of the same cells ruled out
+   pre-existing flakiness (both converged cleanly, 60-4996ms). This alone was
+   ruled acceptable: `_requestResync()`'s backoff has no attempt cap (keeps
+   retrying indefinitely, capped at 5s per attempt), and the benchmark
+   deliberately disables the default periodic-sync backstop to isolate
+   resync-trigger behavior in isolation — real deployments keep it.
+
+2. **`bench-packet-loss.ts`, NOT accepted — this is what killed the item:**
+   the "Fan-out under packet loss" scenario degraded badly starting at
+   **1% packet loss** — the very first nonzero rate the script tests, and
+   explicitly the realistic scenario it exists to validate per its own
+   header comment, not a stress-test boundary. Two after-runs (WebSocket
+   profile) showed reproducible full 30-second convergence timeouts
+   (`converged 2/3` at a different (dropRate, N) cell each run — general
+   instability, not one flaky cell) where baseline was 3/3 clean everywhere
+   (confirmed stable across 3 baseline runs total). Message counts also rose
+   sharply in slow cells instead of falling — e.g. 3% drop, N=50: 12,626
+   (baseline) → 28,453-46,713 (after), roughly 2-4x — directly contradicting
+   the item's own purpose in the scenario ("network problems") this whole
+   plan exists to serve.
+
+**Root cause (confirmed mechanistically, not just observed):** push+pull
+gave a resync trigger two *independent* recovery paths — the pushed
+full-state update surviving on its own (needs exactly 1 message to survive),
+or the SyncStep1→SyncStep2 round trip surviving (needs 2 independent
+messages, in sequence). Pull-only removes the first path entirely. Under
+loss specifically (as opposed to corruption, which at least produces a
+detectable-and-rejected signal), a dropped SyncStep2 reply produces *no*
+signal to retry against until the next exponential-backoff tick, so chains
+of independently-dropped messages compound into multi-second-to-full-timeout
+stalls — and the resulting extra backoff retries are exactly what drove
+message counts up rather than down. This invalidates this document's own
+Item 2 reasoning above ("the pull half alone is adequate") under realistic
+packet loss specifically; it remains true only in a loss-free or
+near-loss-free environment, which is not the condition this plan's own goal
+statement (peers going online/offline, "network problems") targets.
+
+**Disposition:** reverted, not shipped with a caveat, unlike Item 1's
+`bench-corruption-storm.ts` finding — because it fails at a realistic rate
+(not an extreme one), degrades by multiple seconds (not milliseconds), and
+makes the thing this whole plan optimizes for (message count) worse, not
+better, in the scenario ("network problems") the plan's own goal statement
+names first. See `test/dummy/bench-packet-loss.ts` and
+`test/dummy/bench-corruption-storm.ts` for the scripts; the numbers above are
+recorded in the (unshipped) task's investigation report, not in any commit,
+since no commit for this item exists.
+
+**If revisited:** any future redesign of this specific optimization needs to
+preserve at least one single-message-survival recovery path (i.e. something
+functionally equivalent to the old unconditional push) for the packet-loss
+case specifically — a pull-only round trip does not have an equivalent
+reliability profile under independent per-message loss, regardless of
+retry/backoff tuning. This is the same category of lesson as the 2026-07-26
+doc's own Task 2 finding (expected 5-10x, measured 1.3x, real bottleneck
+elsewhere) — reasoning about redundant-seeming traffic without benchmarking
+it under the specific failure mode the traffic exists to survive is
+unreliable here specifically because resync/error-recovery paths are, by
+definition, exercised only when something is already going wrong.

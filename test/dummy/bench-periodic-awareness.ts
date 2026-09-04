@@ -31,16 +31,35 @@ const SYNC_INTERVAL_MS = 300
 const TICKS_TO_OBSERVE = 4
 const LATENCY = 10
 
-function classify(wrapped: Uint8Array): 'awareness' | 'syncStep1' | 'other' {
-  if (wrapped.length < 5) return 'other'
-  const decoder = decoding.createDecoder(wrapped.subarray(4))
+const MESSAGE_BATCH = 4
+
+/**
+ * Classify one already-unwrapped-of-its-CRC32 message. Recurses into
+ * MESSAGE_BATCH envelopes (see src/index.ts's _sendBatch()/_dispatchMessage())
+ * so a periodic tick's SyncStep1+awareness now traveling as ONE wire
+ * message still gets counted as one of each logical message, not lost into
+ * an unclassified "batch" bucket.
+ */
+function classifyOne(msg: Uint8Array, out: { awareness: number; syncStep1: number }): void {
+  const decoder = decoding.createDecoder(msg)
   const msgType = decoding.readVarUint(decoder)
-  if (msgType === 1) return 'awareness'
-  if (msgType === 0) {
+  if (msgType === 1) {
+    out.awareness++
+  } else if (msgType === 0) {
     const subType = decoding.readVarUint(decoder)
-    if (subType === 0) return 'syncStep1'
+    if (subType === 0) out.syncStep1++
+  } else if (msgType === MESSAGE_BATCH) {
+    while (decoding.hasContent(decoder)) {
+      classifyOne(decoding.readVarUint8Array(decoder), out)
+    }
   }
-  return 'other'
+}
+
+function classify(wrapped: Uint8Array): { awareness: number; syncStep1: number } {
+  const out = { awareness: 0, syncStep1: 0 }
+  if (wrapped.length < 5) return out
+  classifyOne(wrapped.subarray(4), out)
+  return out
 }
 
 function withSendClassification(counts: {
@@ -50,8 +69,8 @@ function withSendClassification(counts: {
   const original = DummyTransport.prototype.send
   DummyTransport.prototype.send = function (data: Uint8Array) {
     const label = classify(data)
-    if (label === 'awareness') counts.awareness++
-    else if (label === 'syncStep1') counts.syncStep1++
+    counts.awareness += label.awareness
+    counts.syncStep1 += label.syncStep1
     return original.call(this, data)
   }
   return () => {

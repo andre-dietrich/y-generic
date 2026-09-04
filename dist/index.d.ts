@@ -305,6 +305,19 @@ export declare class GenericProvider extends Observable<string> {
      * `syncNow()` so `_requestResync()`'s scheduled retry (see below) can tell
      * the difference between "sent" and "silently skipped" and react to it,
      * instead of assuming a resync always succeeds once it fires.
+     *
+     * @param push - whether to also broadcast full local document state.
+     * `_requestResync()`'s retry passes `false` (pull-only is enough for a
+     * resync trigger - see its call site).
+     * @param buildExtra - optional callback, invoked ONLY once a rate-limit
+     * slot is actually reserved (so it never runs, and never mutates
+     * whatever state it touches, on a call that ends up rate-limited),
+     * returning additional already-encoded sub-messages to fold into the SAME
+     * batched wire send as the push/pull messages below - e.g. an awareness
+     * update that's ready to go out "now" anyway (see
+     * `_tryImmediateAwarenessMessage()`). Pure wire-framing: whether a caller
+     * passes this never changes whether/when the push+pull half itself sends,
+     * only how many separate `transport.send()`/`bc.publish()` calls it costs.
      */
     private _trySyncPushPull;
     /**
@@ -377,6 +390,18 @@ export declare class GenericProvider extends Observable<string> {
      * implementation, unchanged.
      */
     private _processWrappedMessage;
+    /**
+     * Decode and act on one already-integrity-verified, already-decompressed
+     * message. Split out of `_processWrappedMessage()` so `MESSAGE_BATCH`
+     * (see `_sendBatch()`) can recurse into this for each sub-message it
+     * unwraps, running the EXACT SAME per-message-type logic used for a
+     * top-level message rather than a parallel reimplementation. A thrown
+     * error partway through a batch's sub-messages aborts the REST of that
+     * batch (propagates up to `_processWrappedMessage()`'s catch) - same as
+     * a logic error aborting a single top-level message today, just now
+     * scoped to "the rest of this batch" instead of "this one message".
+     */
+    private _dispatchMessage;
     /**
      * Max random delay (ms) before replying to a SyncStep1 request, scaled by
      * a room-size signal already available (`this.awareness.getStates().size`
@@ -481,18 +506,41 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _tryReserveSyncSlot;
     /**
-     * Encode and send a SyncStep1 message requesting missing updates.
-     * Does not check the rate limiter itself - callers must reserve a slot
-     * via `_tryReserveSyncSlot()` first.
+     * Encode a SyncStep1 message requesting missing updates, without sending
+     * it. Extracted from the old `_writeSyncStep1()` so callers that want to
+     * fold this into a larger batch (see `_sendBatch()`) can get the raw
+     * encoded bytes; `_sendSyncStep1()` below is the send-immediately form
+     * most callers still want.
      */
-    private _writeSyncStep1;
+    private _encodeSyncStep1;
     /**
      * Send SyncStep1 message to request missing updates.
      * This is sent when first connecting to sync with remote peers.
      * Note: SyncStep1 is just a request and doesn't include hash verification.
-     * Rate limited to prevent spam.
+     * Rate limited to prevent spam. Returns whether it actually sent (false
+     * means rate-limited).
+     *
+     * @param extra - optional already-encoded sub-messages (e.g. an awareness
+     * update ready to send "now" - see `_tryImmediateAwarenessMessage()`) to
+     * fold into the same batched wire send as the SyncStep1 message, instead
+     * of each going out as its own separate message. Only ever included when
+     * this actually sends (i.e. not rate-limited) - a caller passing `extra`
+     * must handle the `false`-return/not-sent case itself (see call site in
+     * `connect()`'s periodic-sync tick).
      */
     private _sendSyncStep1;
+    /**
+     * Encode a document update, without sending it. Extracted from the old
+     * `_sendUpdate()` so `_trySyncPushPull()` can fold the push half into a
+     * batched wire send (see `_sendBatch()`); `_sendUpdate()` below is the
+     * send-immediately form still used by every other update-emitting path
+     * (the doc-update handler, batch-flush, disconnect/destroy flush) since
+     * those aren't part of this batching effort's scope.
+     *
+     * NOTE: has a side effect (`_localSeqNum++`) - call exactly once per
+     * logical update, same as before.
+     */
+    private _encodeUpdate;
     /**
      * Send a document update to the transport.
      * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
@@ -514,9 +562,38 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _broadcastAwareness;
     /**
+     * Encode an awareness update, without sending it. Extracted from the old
+     * `_sendAwarenessNow()` so `_tryImmediateAwarenessMessage()` can fold it
+     * into a batched wire send instead of always sending it as its own
+     * message.
+     */
+    private _encodeAwareness;
+    /**
      * Send awareness update immediately without throttling.
      */
     private _sendAwarenessNow;
+    /**
+     * Attempt to build an awareness broadcast message for immediate
+     * inclusion in the same wire send as a sync message a caller is about to
+     * send anyway (see `_trySyncPushPull`/`_sendSyncStep1`'s `extra`/
+     * `buildExtra` parameters), instead of going through
+     * `_broadcastAwareness()`'s independent debounce.
+     *
+     * Only returns non-null when the throttle would have let an immediate
+     * send through anyway - i.e. no debounced broadcast is already pending
+     * AND (throttling is disabled, or at least `_awarenessInterval` ms have
+     * passed since the last broadcast) - so this never changes awareness
+     * throttle semantics, only whether the resulting message travels as its
+     * own wire send or bundled with a sync message that happens to be going
+     * out "now" too.
+     *
+     * Mutates the same state `_broadcastAwareness()`'s own immediate-send
+     * branches mutate (`_pendingAwarenessClients`, `_lastAwarenessTime`) -
+     * once this returns non-null, the state is already committed as "sent
+     * now", so the caller MUST actually send the returned message (bundled
+     * or standalone) rather than discarding it.
+     */
+    private _tryImmediateAwarenessMessage;
     /**
      * Setup BroadcastChannel for cross-tab communication.
      * Automatically disabled in non-browser environments.
@@ -526,6 +603,45 @@ export declare class GenericProvider extends Observable<string> {
      * Disconnect from BroadcastChannel and mark local client as offline.
      */
     private _disconnectBroadcastChannel;
+    /**
+     * Send N already-encoded, already-typed sub-messages as ONE wire message
+     * instead of N separate `transport.send()`/`bc.publish()` calls, when
+     * there's more than one to send. Used at trigger points that
+     * conceptually produce a single event but historically sent multiple
+     * independent messages for it (sync push, sync pull, awareness) - see
+     * `_trySyncPushPull()`, `_sendSyncStep1()`'s `extra` parameter, and
+     * `connect()`'s periodic-sync tick.
+     *
+     * Design (see the task's framing requirements):
+     * - Each sub-message is length-prefixed with `writeVarUint8Array`,
+     *   consistent with how this codebase already frames variable-length
+     *   payloads elsewhere (e.g. MESSAGE_AWARENESS). On receipt,
+     *   `_dispatchMessage()`'s `MESSAGE_BATCH` case unwraps and re-dispatches
+     *   each one through the EXACT SAME per-message-type logic used for a
+     *   top-level message - no parallel reimplementation.
+     * - Sub-messages are NOT individually CRC32-wrapped here - the whole
+     *   batch envelope goes through the normal, single `_send()` pipeline
+     *   below, which wraps the WHOLE envelope in exactly one CRC32 checksum
+     *   (and, if `compressionThresholdBytes` is configured, one compression
+     *   pass) - built and computed exactly like any other outgoing message,
+     *   so this composes with the existing compression pipeline for free
+     *   rather than fighting it with a second, nested wrap/compress step.
+     *   The tradeoff: a single corrupted bit anywhere in a batched wire
+     *   message now invalidates every sub-message it carried, not just one -
+     *   per-sub-message CRC32s would avoid that, at the cost of ~4 extra
+     *   bytes per sub-message for a benefit that only matters under active
+     *   corruption. This tradeoff is exactly what
+     *   test/dummy/bench-corruption-storm.ts and bench-packet-loss.ts exist
+     *   to measure empirically, per this task's validation requirements,
+     *   rather than deciding it by design argument alone.
+     * - BroadcastChannel (cross-tab) traffic is NOT specially batched beyond
+     *   whatever `_send()` already does per call - same-tab-group cross-tab
+     *   traffic is local/cheap, and `_send()` already only issues one
+     *   `bc.publish()` per call regardless, so a batch of N sub-messages
+     *   already becomes exactly one `bc.publish()` call for free once routed
+     *   through here - no separate BC-specific batching logic needed.
+     */
+    private _sendBatch;
     /**
      * Send data through both BroadcastChannel (if connected) and transport.
      * All messages are wrapped with CRC32 checksum for integrity verification.

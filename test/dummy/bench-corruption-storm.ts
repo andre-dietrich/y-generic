@@ -44,6 +44,7 @@
  */
 
 import * as Y from 'yjs'
+import * as decoding from 'lib0/decoding'
 import { GenericProvider } from '../../src/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
 import { sleep, instrumentHub } from './bench-user-scaling'
@@ -115,28 +116,7 @@ function withCorruption(
   }
 }
 
-/**
- * Classify an outgoing (never-corrupted, sender-side) wire message by type
- * for fanout analysis: is a resync's request (SyncStep1) answered by ~1
- * reply (SyncStep2) regardless of N (suppression working), or does the
- * reply count scale with N (suppression not engaging / not enough)?
- * Wire format: [4-byte CRC][varUint msgType][varUint syncSubType?]. Types
- * 0-3 and sync subtypes 0-2 all fit a single-byte varUint.
- */
-function classify(data: Uint8Array): string {
-  if (data.length < 5) return 'other'
-  const msgType = data[4]
-  if (msgType === 0 || msgType === 3) {
-    const subType = data.length > 5 ? data[5] : -1
-    if (subType === 0) return 'syncStep1'
-    if (subType === 1) return 'syncStep2'
-    if (subType === 2) return 'update'
-    return 'sync-other'
-  }
-  if (msgType === 1) return 'awareness'
-  if (msgType === 2) return 'pubsub'
-  return 'other'
-}
+const MESSAGE_BATCH = 4
 
 interface TypeCounts {
   syncStep1: number
@@ -149,15 +129,39 @@ function newTypeCounts(): TypeCounts {
   return { syncStep1: 0, syncStep2: 0, update: 0, awareness: 0 }
 }
 
+/**
+ * Classify an outgoing (never-corrupted, sender-side) wire message by type
+ * for fanout analysis: is a resync's request (SyncStep1) answered by ~1
+ * reply (SyncStep2) regardless of N (suppression working), or does the
+ * reply count scale with N (suppression not engaging / not enough)?
+ * Recurses into MESSAGE_BATCH envelopes (see src/index.ts's _sendBatch()/
+ * _dispatchMessage()) - a batched push+pull now travels as ONE wire
+ * message, but must still be counted as one syncStep1 + one update (etc)
+ * for this ratio analysis to stay meaningful, not silently disappear into
+ * an unclassified bucket.
+ */
+function classifyOne(msg: Uint8Array, counts: TypeCounts): void {
+  const decoder = decoding.createDecoder(msg)
+  const msgType = decoding.readVarUint(decoder)
+  if (msgType === 0 || msgType === 3) {
+    const subType = decoding.readVarUint(decoder)
+    if (subType === 0) counts.syncStep1++
+    else if (subType === 1) counts.syncStep2++
+    else if (subType === 2) counts.update++
+  } else if (msgType === 1) {
+    counts.awareness++
+  } else if (msgType === MESSAGE_BATCH) {
+    while (decoding.hasContent(decoder)) {
+      classifyOne(decoding.readVarUint8Array(decoder), counts)
+    }
+  }
+}
+
 /** Shadow DummyTransport.prototype.send globally to classify+count sends. */
 function withSendClassification(counts: TypeCounts): () => void {
   const original = DummyTransport.prototype.send
   DummyTransport.prototype.send = function (data: Uint8Array) {
-    const label = classify(data)
-    if (label === 'syncStep1') counts.syncStep1++
-    else if (label === 'syncStep2') counts.syncStep2++
-    else if (label === 'update') counts.update++
-    else if (label === 'awareness') counts.awareness++
+    if (data.length >= 5) classifyOne(data.subarray(4), counts)
     return original.call(this, data)
   }
   return () => {

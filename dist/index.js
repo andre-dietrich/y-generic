@@ -10,6 +10,7 @@ const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
 const MESSAGE_PUBSUB = 2;
 const MESSAGE_SYNC_VERIFIED = 3; // Sync message with hash verification
+const MESSAGE_BATCH = 4; // Envelope for N independently-typed sub-messages sent as one wire message
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -388,7 +389,6 @@ export class GenericProvider extends Observable {
                 const scheduleNextPeriodicSync = () => {
                     this._syncIntervalId = setTimeout(() => {
                         if (this.transport.isConnected && !this._destroying) {
-                            this._sendSyncStep1();
                             // Also re-announce awareness - but only on transports WITHOUT
                             // onPeerConnect (e.g. WebSocket, PubNub, Trystero strategies
                             // that don't support it), which never otherwise re-broadcast
@@ -402,7 +402,31 @@ export class GenericProvider extends Observable {
                             // connected lifetime of every such peer, answering a gap that's
                             // already covered by a different mechanism.
                             if (!this.transport.onPeerConnect) {
-                                this._broadcastAwareness([this.doc.clientID]);
+                                // Fold the awareness re-announce into the SAME wire message
+                                // as the SyncStep1 pull below when possible (see
+                                // _tryImmediateAwarenessMessage's doc) - this is the
+                                // steady-state periodic path, the single largest source of
+                                // background traffic in a long-lived room, so it's the
+                                // biggest win for this batching. Falls back to the normal
+                                // independent throttled broadcast exactly as before when
+                                // the immediate path isn't available right now.
+                                const msg = this._tryImmediateAwarenessMessage([
+                                    this.doc.clientID,
+                                ]);
+                                const sent = this._sendSyncStep1(msg ? [msg] : undefined);
+                                if (msg && !sent) {
+                                    // SyncStep1 was rate-limited so the batch above never
+                                    // went out, but the awareness throttle already committed
+                                    // to sending now (pending clients cleared, timestamp
+                                    // updated) - send it on its own rather than losing it.
+                                    this._send(msg);
+                                }
+                                else if (!msg) {
+                                    this._broadcastAwareness([this.doc.clientID]);
+                                }
+                            }
+                            else {
+                                this._sendSyncStep1();
                             }
                         }
                         if (!this._destroying)
@@ -582,8 +606,21 @@ export class GenericProvider extends Observable {
      * `syncNow()` so `_requestResync()`'s scheduled retry (see below) can tell
      * the difference between "sent" and "silently skipped" and react to it,
      * instead of assuming a resync always succeeds once it fires.
+     *
+     * @param push - whether to also broadcast full local document state.
+     * `_requestResync()`'s retry passes `false` (pull-only is enough for a
+     * resync trigger - see its call site).
+     * @param buildExtra - optional callback, invoked ONLY once a rate-limit
+     * slot is actually reserved (so it never runs, and never mutates
+     * whatever state it touches, on a call that ends up rate-limited),
+     * returning additional already-encoded sub-messages to fold into the SAME
+     * batched wire send as the push/pull messages below - e.g. an awareness
+     * update that's ready to go out "now" anyway (see
+     * `_tryImmediateAwarenessMessage()`). Pure wire-framing: whether a caller
+     * passes this never changes whether/when the push+pull half itself sends,
+     * only how many separate `transport.send()`/`bc.publish()` calls it costs.
      */
-    _trySyncPushPull() {
+    _trySyncPushPull(push = true, buildExtra) {
         // Push (full document state) and pull (SyncStep1 request) share a
         // single rate-limit reservation. syncNow() is called from several
         // triggers that can all fire in a short window when many peers are
@@ -597,14 +634,23 @@ export class GenericProvider extends Observable {
         // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md.
         if (!this._tryReserveSyncSlot())
             return false;
+        const messages = [];
         // Send our current document state to all peers
         // This ensures any changes made while offline are transmitted
-        const update = Y.encodeStateAsUpdate(this.doc);
-        if (update.length > 0) {
-            this._sendUpdate(update);
+        if (push) {
+            const update = Y.encodeStateAsUpdate(this.doc);
+            if (update.length > 0) {
+                messages.push(this._encodeUpdate(update));
+            }
         }
         // Send sync request to get updates from others
-        this._writeSyncStep1();
+        messages.push(this._encodeSyncStep1());
+        if (buildExtra) {
+            messages.push(...buildExtra());
+        }
+        // Batched into one wire message (MESSAGE_BATCH) instead of one
+        // transport.send()/bc.publish() call per sub-message - see _sendBatch().
+        this._sendBatch(messages);
         return true;
     }
     /**
@@ -616,11 +662,31 @@ export class GenericProvider extends Observable {
             console.warn('Cannot sync: transport not connected');
             return;
         }
-        this._trySyncPushPull();
-        // Broadcast current awareness state - independently throttled and much
-        // cheaper than a full document push, so it isn't gated by the sync
-        // rate limiter above even when the sync half is skipped.
-        this._broadcastAwareness([this.doc.clientID]);
+        // Try to fold the awareness broadcast into the same wire send as the
+        // sync push+pull below. _tryImmediateAwarenessMessage() only returns
+        // non-null (and only mutates awareness-throttle state) when the
+        // throttle would have let an immediate send through anyway - so this
+        // never changes awareness throttle semantics, only whether it travels
+        // as its own message or bundled with the sync message going out "now"
+        // too. Built inside buildExtra so it's only even attempted once a sync
+        // rate-limit slot is confirmed reserved (see _trySyncPushPull's doc).
+        let awarenessBatched = false;
+        const sent = this._trySyncPushPull(true, () => {
+            const msg = this._tryImmediateAwarenessMessage([this.doc.clientID]);
+            if (msg) {
+                awarenessBatched = true;
+                return [msg];
+            }
+            return [];
+        });
+        // Awareness broadcasting is independently throttled and explicitly NOT
+        // gated by the sync rate limiter above - preserve that exactly: it
+        // always ends up broadcast one way or another (batched above, or via
+        // its own throttled path here), regardless of whether the sync half
+        // above was rate-limited.
+        if (!sent || !awarenessBatched) {
+            this._broadcastAwareness([this.doc.clientID]);
+        }
     }
     /**
      * Compute the next periodic-sync delay, jittered by ~+/-20% around
@@ -791,7 +857,14 @@ export class GenericProvider extends Observable {
         // Verify message integrity with CRC32 checksum
         const message = unwrapAndVerifyMessage(data);
         if (message === null) {
-            // Message is corrupted - reject it immediately
+            // Message is corrupted - reject it immediately. Note: if this was a
+            // MESSAGE_BATCH envelope, the CRC32 wrap covers the WHOLE batch, so a
+            // single corrupted bit here loses every sub-message it contained, not
+            // just one - a deliberate tradeoff of batching multiple logical
+            // messages behind one wire message/one checksum. See _sendBatch()'s
+            // doc comment for why this was chosen over per-sub-message checksums,
+            // and this project's benchmark suite (bench-corruption-storm.ts,
+            // bench-packet-loss.ts) for how that tradeoff was measured.
             console.warn(`[GenericProvider] 💥 Corrupted message rejected: CRC32 checksum mismatch. ` +
                 `This is expected if data corruption simulation is enabled.`);
             // Request re-sync to recover any lost data - routed through the
@@ -802,153 +875,178 @@ export class GenericProvider extends Observable {
         }
         // Message integrity verified - safe to decode
         try {
-            const decoder = decoding.createDecoder(message);
-            const messageType = decoding.readVarUint(decoder);
-            switch (messageType) {
-                case MESSAGE_SYNC: {
-                    const encoder = encoding.createEncoder();
-                    encoding.writeVarUint(encoder, MESSAGE_SYNC);
-                    const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
-                    if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-                        // If we received SyncStep2, we're synced
-                        if (!this._synced) {
-                            this._synced = true;
-                            this.emit('synced', [true]);
-                        }
-                        // Someone else's SyncStep2 reply just arrived - our own pending
-                        // reply (if any) is now most likely redundant.
-                        this._cancelPendingSyncReply();
-                    }
-                    // Send reply if needed. Suppression only engages with genuine
-                    // redundancy (>=2 other known peers via awareness) - below that,
-                    // there's no "someone else" to rely on, so reply immediately
-                    // (still rate-limited via _sendSyncReply() as a hard backstop).
-                    if (encoding.length(encoder) > 1) {
-                        if (this.awareness.getStates().size >= 3) {
-                            this._scheduleSyncReply(encoding.toUint8Array(encoder));
-                        }
-                        else {
-                            this._sendSyncReply(encoding.toUint8Array(encoder));
-                        }
-                    }
-                    break;
-                }
-                case MESSAGE_AWARENESS: {
-                    awarenessProtocol.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(decoder), this);
-                    break;
-                }
-                case MESSAGE_PUBSUB: {
-                    // Read topic
-                    const topic = decoding.readVarString(decoder);
-                    // Read message payload
-                    const payloadBytes = decoding.readVarUint8Array(decoder);
-                    try {
-                        // Decode JSON payload
-                        const decoder = new TextDecoder();
-                        const payloadStr = decoder.decode(payloadBytes);
-                        const message = JSON.parse(payloadStr);
-                        // Emit to pubsub channel
-                        this.pubsub._handleMessage(topic, message);
-                    }
-                    catch (error) {
-                        console.error('Error decoding pub/sub message:', error);
-                    }
-                    break;
-                }
-                case MESSAGE_SYNC_VERIFIED: {
-                    // Sync message with sequence number and hash verification
-                    // Read sequence number and clientID first
-                    const seqNum = decoding.readVarUint(decoder);
-                    const senderClientID = decoding.readVarUint(decoder);
-                    // Track for gap detection only — does NOT gate whether we apply
-                    // the update below (see _trackRemoteSeq() for why).
-                    this._trackRemoteSeq(senderClientID, seqNum);
-                    // Always apply the update. Yjs updates are idempotent/commutative,
-                    // so re-applying an already-seen update is a harmless no-op.
-                    // Under reordering, a merely-late (not actually duplicate) update
-                    // must still be applied here — the old "skip if seqNum <= last
-                    // seen" logic silently dropped such updates forever whenever a
-                    // later-numbered message happened to arrive first.
-                    const encoder = encoding.createEncoder();
-                    encoding.writeVarUint(encoder, MESSAGE_SYNC);
-                    const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
-                    // Someone else's SyncStep2 reply just arrived - our own pending
-                    // reply (if any) is now most likely redundant. Mirrors the
-                    // MESSAGE_SYNC case: the reply encoded above is always a plain
-                    // MESSAGE_SYNC-typed message regardless of which message type
-                    // triggered it, so the same suppression scheme applies here too.
-                    if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-                        this._cancelPendingSyncReply();
-                    }
-                    // Read the expected hash from sender (signed integer)
-                    const expectedHash = decoding.readVarInt(decoder);
-                    // Compute our local hash after applying the update
-                    const localHash = computeDocHash(this.doc);
-                    // Verify hash match
-                    if (localHash !== expectedHash) {
-                        // If we already know this sender has a suspected reordering gap
-                        // (see _trackRemoteSeq()/_scheduleGapCheck()), a hash mismatch
-                        // right now is the *expected* transient state — we're missing a
-                        // piece that's very likely still in flight, not actually
-                        // diverged. Let the pending gap-check grace period resolve it
-                        // instead of also escalating the hash-mismatch backoff: under
-                        // heavy reordering this previously caused a burst of mismatches
-                        // to rack up the exponential backoff to its 10s cap within a
-                        // single edit burst, purely from timing, not real divergence.
-                        // A hash mismatch with NO pending gap (in-order, but still
-                        // wrong) is not explained by reordering and still escalates
-                        // normally below.
-                        const reorderingSuspected = this._gapCheckTimers.has(senderClientID);
-                        if (!reorderingSuspected) {
-                            // Push our full state AND request theirs (syncNow() does
-                            // both). A hash mismatch means the two peers have diverged -
-                            // one side may have edits the other lacks. Routed through the
-                            // shared coordinator so this doesn't stack an independent
-                            // timer on top of any corrupted-message/gap-confirmed resync
-                            // already pending.
-                            this._requestResync();
-                            // Logged with the shared attempt counter (kept as "#N" for
-                            // compatibility with existing tooling/benchmarks that grep
-                            // for this exact "Hash mismatch #" pattern) - it now reflects
-                            // the unified resync-attempt count rather than a
-                            // hash-mismatch-specific one, since the two escalation
-                            // counters were merged.
-                            console.warn(`[GenericProvider] Hash mismatch #${this._resyncAttemptCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
-                        }
-                    }
-                    // If we received SyncStep2, we're synced (unless hash mismatched)
-                    if (syncMessageType === syncProtocol.messageYjsSyncStep2 &&
-                        !this._synced &&
-                        localHash === expectedHash) {
-                        this._synced = true;
-                        this.emit('synced', [true]);
-                    }
-                    // Send reply if needed (as standard MESSAGE_SYNC). Suppression
-                    // only engages with genuine redundancy (>=2 other known peers via
-                    // awareness) - below that, reply immediately (still rate-limited
-                    // via _sendSyncReply() as a hard backstop). Matches the
-                    // MESSAGE_SYNC case's gate exactly; without this, a hash-mismatch
-                    // resync burst under packet loss bypassed suppression entirely,
-                    // since every peer answering a post-mismatch SyncStep1 replied
-                    // immediately via this path.
-                    if (encoding.length(encoder) > 1) {
-                        if (this.awareness.getStates().size >= 3) {
-                            this._scheduleSyncReply(encoding.toUint8Array(encoder));
-                        }
-                        else {
-                            this._sendSyncReply(encoding.toUint8Array(encoder));
-                        }
-                    }
-                    break;
-                }
-                default:
-                    console.warn('Unknown message type:', messageType);
-            }
+            this._dispatchMessage(message);
         }
         catch (error) {
             // This should only happen for logic errors, not corruption
             // (corruption is caught by CRC32 check above)
             console.error('[GenericProvider] Error handling message:', error);
+        }
+    }
+    /**
+     * Decode and act on one already-integrity-verified, already-decompressed
+     * message. Split out of `_processWrappedMessage()` so `MESSAGE_BATCH`
+     * (see `_sendBatch()`) can recurse into this for each sub-message it
+     * unwraps, running the EXACT SAME per-message-type logic used for a
+     * top-level message rather than a parallel reimplementation. A thrown
+     * error partway through a batch's sub-messages aborts the REST of that
+     * batch (propagates up to `_processWrappedMessage()`'s catch) - same as
+     * a logic error aborting a single top-level message today, just now
+     * scoped to "the rest of this batch" instead of "this one message".
+     */
+    _dispatchMessage(message) {
+        const decoder = decoding.createDecoder(message);
+        const messageType = decoding.readVarUint(decoder);
+        switch (messageType) {
+            case MESSAGE_BATCH: {
+                // Payload is N length-prefixed sub-messages (writeVarUint8Array
+                // per sub-message, mirroring MESSAGE_AWARENESS's own framing).
+                // Each was NOT individually CRC32-wrapped - see _sendBatch()'s doc
+                // comment - so just decode and dispatch each one directly.
+                while (decoding.hasContent(decoder)) {
+                    const subMessage = decoding.readVarUint8Array(decoder);
+                    this._dispatchMessage(subMessage);
+                }
+                break;
+            }
+            case MESSAGE_SYNC: {
+                const encoder = encoding.createEncoder();
+                encoding.writeVarUint(encoder, MESSAGE_SYNC);
+                const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
+                if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+                    // If we received SyncStep2, we're synced
+                    if (!this._synced) {
+                        this._synced = true;
+                        this.emit('synced', [true]);
+                    }
+                    // Someone else's SyncStep2 reply just arrived - our own pending
+                    // reply (if any) is now most likely redundant.
+                    this._cancelPendingSyncReply();
+                }
+                // Send reply if needed. Suppression only engages with genuine
+                // redundancy (>=2 other known peers via awareness) - below that,
+                // there's no "someone else" to rely on, so reply immediately
+                // (still rate-limited via _sendSyncReply() as a hard backstop).
+                if (encoding.length(encoder) > 1) {
+                    if (this.awareness.getStates().size >= 3) {
+                        this._scheduleSyncReply(encoding.toUint8Array(encoder));
+                    }
+                    else {
+                        this._sendSyncReply(encoding.toUint8Array(encoder));
+                    }
+                }
+                break;
+            }
+            case MESSAGE_AWARENESS: {
+                awarenessProtocol.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(decoder), this);
+                break;
+            }
+            case MESSAGE_PUBSUB: {
+                // Read topic
+                const topic = decoding.readVarString(decoder);
+                // Read message payload
+                const payloadBytes = decoding.readVarUint8Array(decoder);
+                try {
+                    // Decode JSON payload
+                    const decoder = new TextDecoder();
+                    const payloadStr = decoder.decode(payloadBytes);
+                    const message = JSON.parse(payloadStr);
+                    // Emit to pubsub channel
+                    this.pubsub._handleMessage(topic, message);
+                }
+                catch (error) {
+                    console.error('Error decoding pub/sub message:', error);
+                }
+                break;
+            }
+            case MESSAGE_SYNC_VERIFIED: {
+                // Sync message with sequence number and hash verification
+                // Read sequence number and clientID first
+                const seqNum = decoding.readVarUint(decoder);
+                const senderClientID = decoding.readVarUint(decoder);
+                // Track for gap detection only — does NOT gate whether we apply
+                // the update below (see _trackRemoteSeq() for why).
+                this._trackRemoteSeq(senderClientID, seqNum);
+                // Always apply the update. Yjs updates are idempotent/commutative,
+                // so re-applying an already-seen update is a harmless no-op.
+                // Under reordering, a merely-late (not actually duplicate) update
+                // must still be applied here — the old "skip if seqNum <= last
+                // seen" logic silently dropped such updates forever whenever a
+                // later-numbered message happened to arrive first.
+                const encoder = encoding.createEncoder();
+                encoding.writeVarUint(encoder, MESSAGE_SYNC);
+                const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
+                // Someone else's SyncStep2 reply just arrived - our own pending
+                // reply (if any) is now most likely redundant. Mirrors the
+                // MESSAGE_SYNC case: the reply encoded above is always a plain
+                // MESSAGE_SYNC-typed message regardless of which message type
+                // triggered it, so the same suppression scheme applies here too.
+                if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+                    this._cancelPendingSyncReply();
+                }
+                // Read the expected hash from sender (signed integer)
+                const expectedHash = decoding.readVarInt(decoder);
+                // Compute our local hash after applying the update
+                const localHash = computeDocHash(this.doc);
+                // Verify hash match
+                if (localHash !== expectedHash) {
+                    // If we already know this sender has a suspected reordering gap
+                    // (see _trackRemoteSeq()/_scheduleGapCheck()), a hash mismatch
+                    // right now is the *expected* transient state — we're missing a
+                    // piece that's very likely still in flight, not actually
+                    // diverged. Let the pending gap-check grace period resolve it
+                    // instead of also escalating the hash-mismatch backoff: under
+                    // heavy reordering this previously caused a burst of mismatches
+                    // to rack up the exponential backoff to its 10s cap within a
+                    // single edit burst, purely from timing, not real divergence.
+                    // A hash mismatch with NO pending gap (in-order, but still
+                    // wrong) is not explained by reordering and still escalates
+                    // normally below.
+                    const reorderingSuspected = this._gapCheckTimers.has(senderClientID);
+                    if (!reorderingSuspected) {
+                        // Push our full state AND request theirs (syncNow() does
+                        // both). A hash mismatch means the two peers have diverged -
+                        // one side may have edits the other lacks. Routed through the
+                        // shared coordinator so this doesn't stack an independent
+                        // timer on top of any corrupted-message/gap-confirmed resync
+                        // already pending.
+                        this._requestResync();
+                        // Logged with the shared attempt counter (kept as "#N" for
+                        // compatibility with existing tooling/benchmarks that grep
+                        // for this exact "Hash mismatch #" pattern) - it now reflects
+                        // the unified resync-attempt count rather than a
+                        // hash-mismatch-specific one, since the two escalation
+                        // counters were merged.
+                        console.warn(`[GenericProvider] Hash mismatch #${this._resyncAttemptCount} detected! Local: ${localHash}, Expected: ${expectedHash}`);
+                    }
+                }
+                // If we received SyncStep2, we're synced (unless hash mismatched)
+                if (syncMessageType === syncProtocol.messageYjsSyncStep2 &&
+                    !this._synced &&
+                    localHash === expectedHash) {
+                    this._synced = true;
+                    this.emit('synced', [true]);
+                }
+                // Send reply if needed (as standard MESSAGE_SYNC). Suppression
+                // only engages with genuine redundancy (>=2 other known peers via
+                // awareness) - below that, reply immediately (still rate-limited
+                // via _sendSyncReply() as a hard backstop). Matches the
+                // MESSAGE_SYNC case's gate exactly; without this, a hash-mismatch
+                // resync burst under packet loss bypassed suppression entirely,
+                // since every peer answering a post-mismatch SyncStep1 replied
+                // immediately via this path.
+                if (encoding.length(encoder) > 1) {
+                    if (this.awareness.getStates().size >= 3) {
+                        this._scheduleSyncReply(encoding.toUint8Array(encoder));
+                    }
+                    else {
+                        this._sendSyncReply(encoding.toUint8Array(encoder));
+                    }
+                }
+                break;
+            }
+            default:
+                console.warn('Unknown message type:', messageType);
         }
     }
     /**
@@ -1165,8 +1263,26 @@ export class GenericProvider extends Observable {
             // in the first place. Re-arm through the same coordinator instead -
             // the budget is a rolling window, so this keeps retrying (still
             // backed off, still capped at 5s) until it eventually gets a slot.
-            if (this._trySyncPushPull()) {
-                this._broadcastAwareness([this.doc.clientID]);
+            //
+            // As in syncNow(), fold the awareness broadcast into the same wire
+            // send as the push/pull messages when the awareness throttle would
+            // let it through immediately anyway (buildExtra only runs once a
+            // slot is confirmed reserved) - preserves the exact "only broadcast
+            // awareness when the sync half actually sent" semantics this retry
+            // has always had (unlike syncNow(), which broadcasts unconditionally).
+            let awarenessBatched = false;
+            const sent = this._trySyncPushPull(true, () => {
+                const msg = this._tryImmediateAwarenessMessage([this.doc.clientID]);
+                if (msg) {
+                    awarenessBatched = true;
+                    return [msg];
+                }
+                return [];
+            });
+            if (sent) {
+                if (!awarenessBatched) {
+                    this._broadcastAwareness([this.doc.clientID]);
+                }
             }
             else {
                 this._requestResync();
@@ -1192,36 +1308,58 @@ export class GenericProvider extends Observable {
         return true;
     }
     /**
-     * Encode and send a SyncStep1 message requesting missing updates.
-     * Does not check the rate limiter itself - callers must reserve a slot
-     * via `_tryReserveSyncSlot()` first.
+     * Encode a SyncStep1 message requesting missing updates, without sending
+     * it. Extracted from the old `_writeSyncStep1()` so callers that want to
+     * fold this into a larger batch (see `_sendBatch()`) can get the raw
+     * encoded bytes; `_sendSyncStep1()` below is the send-immediately form
+     * most callers still want.
      */
-    _writeSyncStep1() {
+    _encodeSyncStep1() {
         const encoder = encoding.createEncoder();
         // SyncStep1 is always sent as standard MESSAGE_SYNC (no verification)
         // It's just a request, not an assertion of state
         encoding.writeVarUint(encoder, MESSAGE_SYNC);
         syncProtocol.writeSyncStep1(encoder, this.doc);
-        this._send(encoding.toUint8Array(encoder));
+        return encoding.toUint8Array(encoder);
     }
     /**
      * Send SyncStep1 message to request missing updates.
      * This is sent when first connecting to sync with remote peers.
      * Note: SyncStep1 is just a request and doesn't include hash verification.
-     * Rate limited to prevent spam.
+     * Rate limited to prevent spam. Returns whether it actually sent (false
+     * means rate-limited).
+     *
+     * @param extra - optional already-encoded sub-messages (e.g. an awareness
+     * update ready to send "now" - see `_tryImmediateAwarenessMessage()`) to
+     * fold into the same batched wire send as the SyncStep1 message, instead
+     * of each going out as its own separate message. Only ever included when
+     * this actually sends (i.e. not rate-limited) - a caller passing `extra`
+     * must handle the `false`-return/not-sent case itself (see call site in
+     * `connect()`'s periodic-sync tick).
      */
-    _sendSyncStep1() {
+    _sendSyncStep1(extra) {
         if (!this._tryReserveSyncSlot()) {
             console.warn(`[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`);
-            return; // Drop the request
+            return false; // Drop the request
         }
-        this._writeSyncStep1();
+        const messages = [this._encodeSyncStep1()];
+        if (extra)
+            messages.push(...extra);
+        this._sendBatch(messages);
+        return true;
     }
     /**
-     * Send a document update to the transport.
-     * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
+     * Encode a document update, without sending it. Extracted from the old
+     * `_sendUpdate()` so `_trySyncPushPull()` can fold the push half into a
+     * batched wire send (see `_sendBatch()`); `_sendUpdate()` below is the
+     * send-immediately form still used by every other update-emitting path
+     * (the doc-update handler, batch-flush, disconnect/destroy flush) since
+     * those aren't part of this batching effort's scope.
+     *
+     * NOTE: has a side effect (`_localSeqNum++`) - call exactly once per
+     * logical update, same as before.
      */
-    _sendUpdate(update) {
+    _encodeUpdate(update) {
         const encoder = encoding.createEncoder();
         if (this._verifyUpdates) {
             // Use verified sync protocol with sequence number and hash
@@ -1239,7 +1377,14 @@ export class GenericProvider extends Observable {
             encoding.writeVarUint(encoder, MESSAGE_SYNC);
             syncProtocol.writeUpdate(encoder, update);
         }
-        this._send(encoding.toUint8Array(encoder));
+        return encoding.toUint8Array(encoder);
+    }
+    /**
+     * Send a document update to the transport.
+     * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
+     */
+    _sendUpdate(update) {
+        this._send(this._encodeUpdate(update));
     }
     /**
      * Send awareness update to the transport.
@@ -1315,13 +1460,69 @@ export class GenericProvider extends Observable {
         }, delay);
     }
     /**
-     * Send awareness update immediately without throttling.
+     * Encode an awareness update, without sending it. Extracted from the old
+     * `_sendAwarenessNow()` so `_tryImmediateAwarenessMessage()` can fold it
+     * into a batched wire send instead of always sending it as its own
+     * message.
      */
-    _sendAwarenessNow(clients) {
+    _encodeAwareness(clients) {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, clients));
-        this._send(encoding.toUint8Array(encoder));
+        return encoding.toUint8Array(encoder);
+    }
+    /**
+     * Send awareness update immediately without throttling.
+     */
+    _sendAwarenessNow(clients) {
+        this._send(this._encodeAwareness(clients));
+    }
+    /**
+     * Attempt to build an awareness broadcast message for immediate
+     * inclusion in the same wire send as a sync message a caller is about to
+     * send anyway (see `_trySyncPushPull`/`_sendSyncStep1`'s `extra`/
+     * `buildExtra` parameters), instead of going through
+     * `_broadcastAwareness()`'s independent debounce.
+     *
+     * Only returns non-null when the throttle would have let an immediate
+     * send through anyway - i.e. no debounced broadcast is already pending
+     * AND (throttling is disabled, or at least `_awarenessInterval` ms have
+     * passed since the last broadcast) - so this never changes awareness
+     * throttle semantics, only whether the resulting message travels as its
+     * own wire send or bundled with a sync message that happens to be going
+     * out "now" too.
+     *
+     * Mutates the same state `_broadcastAwareness()`'s own immediate-send
+     * branches mutate (`_pendingAwarenessClients`, `_lastAwarenessTime`) -
+     * once this returns non-null, the state is already committed as "sent
+     * now", so the caller MUST actually send the returned message (bundled
+     * or standalone) rather than discarding it.
+     */
+    _tryImmediateAwarenessMessage(clients) {
+        if (clients.length === 0)
+            return null;
+        // A debounced broadcast is already scheduled - let it handle these
+        // clients via the normal pending-set path below, don't race it with an
+        // immediate send here.
+        if (this._awarenessTimeoutId !== undefined)
+            return null;
+        if (this._awarenessInterval > 0) {
+            const timeSinceLastBroadcast = Date.now() - this._lastAwarenessTime;
+            if (timeSinceLastBroadcast < this._awarenessInterval)
+                return null;
+        }
+        // Merge with anything already pending (normally empty here since no
+        // timer is scheduled, but merge for safety) and commit to sending now -
+        // mirrors exactly what _broadcastAwareness()'s own immediate
+        // (_awarenessInterval <= 0) and debounced-timer-fired branches do.
+        for (const c of clients)
+            this._pendingAwarenessClients.add(c);
+        const clientsToSend = Array.from(this._pendingAwarenessClients);
+        this._pendingAwarenessClients.clear();
+        if (clientsToSend.length === 0)
+            return null;
+        this._lastAwarenessTime = Date.now();
+        return this._encodeAwareness(clientsToSend);
     }
     /**
      * Setup BroadcastChannel for cross-tab communication.
@@ -1387,6 +1588,58 @@ export class GenericProvider extends Observable {
         bc.unsubscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = false;
         this._bcSubscriber = undefined;
+    }
+    /**
+     * Send N already-encoded, already-typed sub-messages as ONE wire message
+     * instead of N separate `transport.send()`/`bc.publish()` calls, when
+     * there's more than one to send. Used at trigger points that
+     * conceptually produce a single event but historically sent multiple
+     * independent messages for it (sync push, sync pull, awareness) - see
+     * `_trySyncPushPull()`, `_sendSyncStep1()`'s `extra` parameter, and
+     * `connect()`'s periodic-sync tick.
+     *
+     * Design (see the task's framing requirements):
+     * - Each sub-message is length-prefixed with `writeVarUint8Array`,
+     *   consistent with how this codebase already frames variable-length
+     *   payloads elsewhere (e.g. MESSAGE_AWARENESS). On receipt,
+     *   `_dispatchMessage()`'s `MESSAGE_BATCH` case unwraps and re-dispatches
+     *   each one through the EXACT SAME per-message-type logic used for a
+     *   top-level message - no parallel reimplementation.
+     * - Sub-messages are NOT individually CRC32-wrapped here - the whole
+     *   batch envelope goes through the normal, single `_send()` pipeline
+     *   below, which wraps the WHOLE envelope in exactly one CRC32 checksum
+     *   (and, if `compressionThresholdBytes` is configured, one compression
+     *   pass) - built and computed exactly like any other outgoing message,
+     *   so this composes with the existing compression pipeline for free
+     *   rather than fighting it with a second, nested wrap/compress step.
+     *   The tradeoff: a single corrupted bit anywhere in a batched wire
+     *   message now invalidates every sub-message it carried, not just one -
+     *   per-sub-message CRC32s would avoid that, at the cost of ~4 extra
+     *   bytes per sub-message for a benefit that only matters under active
+     *   corruption. This tradeoff is exactly what
+     *   test/dummy/bench-corruption-storm.ts and bench-packet-loss.ts exist
+     *   to measure empirically, per this task's validation requirements,
+     *   rather than deciding it by design argument alone.
+     * - BroadcastChannel (cross-tab) traffic is NOT specially batched beyond
+     *   whatever `_send()` already does per call - same-tab-group cross-tab
+     *   traffic is local/cheap, and `_send()` already only issues one
+     *   `bc.publish()` per call regardless, so a batch of N sub-messages
+     *   already becomes exactly one `bc.publish()` call for free once routed
+     *   through here - no separate BC-specific batching logic needed.
+     */
+    _sendBatch(messages) {
+        if (messages.length === 0)
+            return;
+        if (messages.length === 1) {
+            this._send(messages[0]);
+            return;
+        }
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, MESSAGE_BATCH);
+        for (const message of messages) {
+            encoding.writeVarUint8Array(encoder, message);
+        }
+        this._send(encoding.toUint8Array(encoder));
     }
     /**
      * Send data through both BroadcastChannel (if connected) and transport.

@@ -313,6 +313,28 @@ export class DummyTransport implements Transport {
   private _peerConnectCallback?: (peerId: string) => void
 
   /**
+   * Register callback for peer-connect notifications. Test-only simulation
+   * of what a real mesh transport (peerjs, simple-peer) does when a new
+   * data channel opens - see DummyHub.registerPeerConnect(). Assigned
+   * conditionally in the constructor (NOT a class method - see there for
+   * why): present only when `simulatePeerConnect` is on, so this property
+   * is genuinely absent (`undefined`), not merely a no-op function, on a
+   * plain DummyTransport. GenericProvider feature-detects onPeerConnect via
+   * `if (this.transport.onPeerConnect)` (matching the optional method on
+   * the `Transport` interface) - a class method satisfying that interface
+   * is ALWAYS present on every instance regardless of any constructor
+   * option, which previously defeated this feature-detection for every
+   * DummyTransport consumer (even non-mesh ones), silently registering an
+   * inert onPeerConnect subscription and, since GenericProvider gained
+   * onPeerConnect-conditional behavior elsewhere in its periodic-sync path,
+   * silently suppressing periodic awareness re-announce for plain
+   * DummyTransport usage too - a real bug, not just untidiness.
+   */
+  readonly onPeerConnect?: (
+    callback: (peerId: string) => void,
+  ) => () => void
+
+  /**
    * Create a new DummyTransport.
    *
    * @param options - Optional behavior simulation settings
@@ -344,6 +366,23 @@ export class DummyTransport implements Transport {
       jitter: options.jitter ?? 0,
       autoConnect: options.autoConnect ?? false,
       simulatePeerConnect: options.simulatePeerConnect ?? false,
+    }
+
+    if (this.options.simulatePeerConnect) {
+      this.onPeerConnect = (callback: (peerId: string) => void) => {
+        this._peerConnectCallback = callback
+
+        if (this._connected && this._room && this.hub) {
+          this.hub.registerPeerConnect(this._room, this, callback)
+        }
+
+        return () => {
+          this._peerConnectCallback = undefined
+          if (this.hub) {
+            this.hub.unregisterPeerConnect(this._room, this)
+          }
+        }
+      }
     }
   }
 
@@ -433,32 +472,6 @@ export class DummyTransport implements Transport {
     // Return unsubscribe function
     return () => {
       this._callback = undefined
-    }
-  }
-
-  /**
-   * Register callback for peer-connect notifications. Test-only simulation
-   * of what a real mesh transport (peerjs, simple-peer) does when a new
-   * data channel opens - see DummyHub.registerPeerConnect(). Off by default
-   * (see DummyTransportOptions.simulatePeerConnect) - GenericProvider
-   * feature-detects onPeerConnect, so leaving this unconditionally active
-   * would silently move every DummyTransport consumer onto the mesh code
-   * path, even though DummyTransport otherwise models a broadcast relay.
-   */
-  onPeerConnect(callback: (peerId: string) => void): () => void {
-    if (!this.options.simulatePeerConnect) return () => {}
-
-    this._peerConnectCallback = callback
-
-    if (this._connected && this._room && this.hub) {
-      this.hub.registerPeerConnect(this._room, this, callback)
-    }
-
-    return () => {
-      this._peerConnectCallback = undefined
-      if (this.hub) {
-        this.hub.unregisterPeerConnect(this._room, this)
-      }
     }
   }
 

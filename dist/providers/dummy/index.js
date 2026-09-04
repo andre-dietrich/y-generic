@@ -240,6 +240,20 @@ export class DummyTransport {
             autoConnect: options.autoConnect ?? false,
             simulatePeerConnect: options.simulatePeerConnect ?? false,
         };
+        if (this.options.simulatePeerConnect) {
+            this.onPeerConnect = (callback) => {
+                this._peerConnectCallback = callback;
+                if (this._connected && this._room && this.hub) {
+                    this.hub.registerPeerConnect(this._room, this, callback);
+                }
+                return () => {
+                    this._peerConnectCallback = undefined;
+                    if (this.hub) {
+                        this.hub.unregisterPeerConnect(this._room, this);
+                    }
+                };
+            };
+        }
     }
     /**
      * Connect to a room on the hub.
@@ -315,29 +329,6 @@ export class DummyTransport {
         // Return unsubscribe function
         return () => {
             this._callback = undefined;
-        };
-    }
-    /**
-     * Register callback for peer-connect notifications. Test-only simulation
-     * of what a real mesh transport (peerjs, simple-peer) does when a new
-     * data channel opens - see DummyHub.registerPeerConnect(). Off by default
-     * (see DummyTransportOptions.simulatePeerConnect) - GenericProvider
-     * feature-detects onPeerConnect, so leaving this unconditionally active
-     * would silently move every DummyTransport consumer onto the mesh code
-     * path, even though DummyTransport otherwise models a broadcast relay.
-     */
-    onPeerConnect(callback) {
-        if (!this.options.simulatePeerConnect)
-            return () => { };
-        this._peerConnectCallback = callback;
-        if (this._connected && this._room && this.hub) {
-            this.hub.registerPeerConnect(this._room, this, callback);
-        }
-        return () => {
-            this._peerConnectCallback = undefined;
-            if (this.hub) {
-                this.hub.unregisterPeerConnect(this._room, this);
-            }
         };
     }
     /**

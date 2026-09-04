@@ -77,6 +77,63 @@ function unwrapAndVerifyMessage(wrapped) {
     return message;
 }
 /**
+ * Whether this runtime has the Compression Streams API (Node 18+, all
+ * evergreen browsers). Checked once at module load; compressionThresholdBytes
+ * falls back to sending uncompressed (still flag-byte-prefixed, flag=0) if
+ * this is false, rather than throwing.
+ */
+const COMPRESSION_AVAILABLE = typeof CompressionStream !== 'undefined' &&
+    typeof DecompressionStream !== 'undefined';
+/** Drain a ReadableStream<Uint8Array> into a single concatenated Uint8Array. */
+async function _readAllChunks(readable) {
+    const chunks = [];
+    const reader = readable.getReader();
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done)
+            break;
+        chunks.push(value);
+    }
+    const total = chunks.reduce((sum, c) => sum + c.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
+}
+/**
+ * Compress with deflate-raw (no gzip header/trailer - see
+ * compressionThresholdBytes's doc comment for why deflate-raw over gzip).
+ */
+async function compressDeflateRaw(data) {
+    const cs = new CompressionStream('deflate-raw');
+    const writer = cs.writable.getWriter();
+    writer.write(data);
+    writer.close();
+    return _readAllChunks(cs.readable);
+}
+/** Inverse of compressDeflateRaw(). */
+async function decompressDeflateRaw(data) {
+    const ds = new DecompressionStream('deflate-raw');
+    const writer = ds.writable.getWriter();
+    writer.write(data);
+    writer.close();
+    return _readAllChunks(ds.readable);
+}
+/**
+ * Prepend a 1-byte compressed(1)/uncompressed(0) flag. Only used when
+ * compressionThresholdBytes is configured - see that option's doc comment
+ * for why this is a deliberate, opt-in wire-format change.
+ */
+function prefixCompressionFlag(flag, data) {
+    const out = new Uint8Array(1 + data.length);
+    out[0] = flag;
+    out.set(data, 1);
+    return out;
+}
+/**
  * Compute a cheap hash of document state for verification.
  *
  * Hashes the state VECTOR (each client's clock), not the full document
@@ -256,6 +313,7 @@ export class GenericProvider extends Observable {
         this._peerConnectDebounceMs = options.peerConnectDebounceMs ?? 50;
         this._gapGraceMs = options.gapGraceMs ?? 300;
         this._seqWindowSize = options.seqWindowSize ?? 64;
+        this._compressionThresholdBytes = options.compressionThresholdBytes || undefined;
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -673,11 +731,63 @@ export class GenericProvider extends Observable {
         }
     }
     /**
-     * Handle incoming messages from the transport.
-     * Verifies message integrity with CRC32 before processing.
-     * Corrupt messages are rejected immediately without attempting to decode.
+     * Handle incoming messages from the transport (or BroadcastChannel).
+     *
+     * When compressionThresholdBytes is disabled (the default), this is a
+     * fully synchronous fast path, byte-for-byte the same behavior as before
+     * that option existed: straight into _processWrappedMessage().
+     *
+     * When enabled, every message - from the network transport AND from
+     * BroadcastChannel (see _send()) - carries a leading compressed(1)/
+     * uncompressed(0) flag byte ahead of the usual CRC32 wrapper. Reading
+     * that flag and, if set, decompressing is inherently async (the
+     * Compression Streams API has no synchronous form), so this method
+     * dispatches to a promise chain instead of processing inline in that
+     * case. This means a large (compressed) message and a small (uncompressed
+     * or below-threshold) message that arrive back-to-back can finish
+     * processing out of arrival order - acceptable here because Yjs updates
+     * are idempotent/commutative (see MESSAGE_SYNC_VERIFIED's handling below)
+     * and because the compression threshold keeps this path almost entirely
+     * to large, full-state syncs, not the per-keystroke incremental updates
+     * that per-sender gap detection actually relies on ordering-sensitive
+     * heuristics for.
      */
     _handleIncomingMessage(data) {
+        if (!this._compressionThresholdBytes) {
+            this._processWrappedMessage(data);
+            return;
+        }
+        if (data.length < 1) {
+            console.warn('[GenericProvider] Dropping empty message (missing compression flag byte)');
+            return;
+        }
+        const flag = data[0];
+        const rest = data.subarray(1);
+        if (flag === 0) {
+            this._processWrappedMessage(rest);
+            return;
+        }
+        if (!COMPRESSION_AVAILABLE) {
+            console.warn('[GenericProvider] Received a compressed message but this runtime has no DecompressionStream - dropping it.');
+            return;
+        }
+        decompressDeflateRaw(rest)
+            .then((wrapped) => this._processWrappedMessage(wrapped))
+            .catch((error) => {
+            // Treat decompression failure the same as a CRC32 mismatch on the
+            // uncompressed path: request a resync rather than silently dropping.
+            console.warn('[GenericProvider] Failed to decompress incoming message, treating as corrupted:', error);
+            this._requestResync();
+        });
+    }
+    /**
+     * Verify message integrity with CRC32 and decode. Corrupt messages are
+     * rejected immediately without attempting to decode. Operates on bytes
+     * that have already had any compression flag/decompression handled by
+     * _handleIncomingMessage() - this is the pre-compression-feature
+     * implementation, unchanged.
+     */
+    _processWrappedMessage(data) {
         // Verify message integrity with CRC32 checksum
         const message = unwrapAndVerifyMessage(data);
         if (message === null) {
@@ -1286,16 +1396,53 @@ export class GenericProvider extends Observable {
     _send(data) {
         // Wrap message with CRC32 checksum
         const wrappedData = wrapMessageWithChecksum(data);
-        // Send via BroadcastChannel to other tabs first
+        // Send via BroadcastChannel to other tabs first. BroadcastChannel is
+        // same-process (other tabs in this browser) - never worth compressing.
+        // When compressionThresholdBytes is enabled, every message still needs
+        // the same leading flag byte _handleIncomingMessage() expects
+        // regardless of source, so this always sends flag=0 (uncompressed) in
+        // that case rather than skipping the flag - see that option's doc
+        // comment.
         if (this._bcConnected) {
-            bc.publish(this._bcChannel, wrappedData, this);
+            bc.publish(this._bcChannel, this._compressionThresholdBytes
+                ? prefixCompressionFlag(0, wrappedData)
+                : wrappedData, this);
         }
         // Send via network transport
         if (!this.transport.isConnected) {
             return;
         }
+        this._sendToTransport(wrappedData);
+    }
+    /**
+     * Send already-CRC32-wrapped bytes to the network transport, compressing
+     * first if compressionThresholdBytes is configured and this payload
+     * clears it. See that option's doc comment for the size threshold
+     * reasoning and the wire-format compatibility tradeoff of enabling it.
+     */
+    _sendToTransport(wrappedData) {
+        const threshold = this._compressionThresholdBytes;
+        if (!threshold) {
+            this._dispatchToTransport(wrappedData);
+            return;
+        }
+        if (!COMPRESSION_AVAILABLE || wrappedData.length < threshold) {
+            this._dispatchToTransport(prefixCompressionFlag(0, wrappedData));
+            return;
+        }
+        compressDeflateRaw(wrappedData)
+            .then((compressed) => {
+            this._dispatchToTransport(prefixCompressionFlag(1, compressed));
+        })
+            .catch((error) => {
+            console.error('[GenericProvider] Compression failed, sending uncompressed:', error);
+            this._dispatchToTransport(prefixCompressionFlag(0, wrappedData));
+        });
+    }
+    /** Hand fully-framed bytes to transport.send(), tolerating a sync or async send(). */
+    _dispatchToTransport(data) {
         try {
-            const result = this.transport.send(wrappedData);
+            const result = this.transport.send(data);
             // Handle async send
             if (result instanceof Promise) {
                 result.catch((error) => {

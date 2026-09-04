@@ -98,6 +98,7 @@ export declare class GenericProvider extends Observable<string> {
     private _syncReplySuppressionMs;
     private _peerConnectDebounceMs;
     private _pendingPeerConnectSyncTimeoutId?;
+    private _compressionThresholdBytes?;
     private _localSeqNum;
     private _remoteSeqInfo;
     private _gapCheckTimers;
@@ -217,6 +218,53 @@ export declare class GenericProvider extends Observable<string> {
          * @default 64
          */
         seqWindowSize?: number;
+        /**
+         * Minimum payload size (bytes, measured on the CRC32-wrapped bytes
+         * about to be sent) above which a message is compressed
+         * (`deflate-raw`, via the standard CompressionStream/
+         * DecompressionStream Web API) before being handed to the network
+         * transport. Below this size, messages are sent byte-for-byte as they
+         * are today.
+         *
+         * Measured on synthetic Yjs docs (test/dummy/bench-compression-ratio.ts):
+         * a single-keystroke update (~20 bytes) actually gets BIGGER under
+         * gzip (fixed ~18-byte header/trailer) and is break-even at best under
+         * deflate-raw - not worth the async round trip through the
+         * Compression Streams API for a handful of bytes saved. A clean
+         * ~3.3KB doc compresses ~17x; a ~45KB doc with heavy edit-history
+         * churn (tombstones from insert/delete cycles) still compresses ~8x.
+         * 2048 is chosen so ordinary typing traffic (tens to a few hundred
+         * bytes per update - the majority of real-world traffic per this
+         * project's prior benchmark rounds) NEVER crosses it and is completely
+         * unaffected, while a full-document push/reply large enough to matter
+         * (and, on chunking transports like PubNub/Ably, large enough to
+         * multiply into several wire messages) reliably compresses down well
+         * below its own pre-compression size.
+         *
+         * `deflate-raw` (not `gzip`) is used deliberately: gzip's fixed
+         * header/trailer overhead makes it a net loss for anything under
+         * roughly 200 bytes (measured), while deflate-raw has ~0 fixed
+         * overhead and compresses at least as well for every size measured.
+         *
+         * IMPORTANT - wire-format compatibility: this project has no
+         * versioned wire-protocol negotiation. Enabling this (any truthy
+         * value) changes the wire format for EVERY message this instance
+         * sends: a 1-byte compressed/uncompressed flag is prepended ahead of
+         * the existing CRC32 wrapper on every message, compressed or not, so
+         * the receiving side can unambiguously tell them apart. A peer NOT
+         * running this option (or running an older version of this library)
+         * will misinterpret that leading flag byte as the start of the CRC32
+         * wrapper and reject every message as corrupted. All peers in a room
+         * must set this the same way (all enabled, or all disabled) for the
+         * room to function. This is a real, deliberate tradeoff - not a
+         * detail - which is why this defaults to fully disabled rather than
+         * auto-enabling above some size unconditionally.
+         *
+         * `0` or `undefined` disables compression entirely and keeps the wire
+         * format byte-for-byte identical to before this option existed.
+         * @default undefined (compression disabled, wire format unchanged)
+         */
+        compressionThresholdBytes?: number;
     });
     /**
      * Connect to the backend and start syncing.
@@ -299,11 +347,36 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _setupAwarenessSync;
     /**
-     * Handle incoming messages from the transport.
-     * Verifies message integrity with CRC32 before processing.
-     * Corrupt messages are rejected immediately without attempting to decode.
+     * Handle incoming messages from the transport (or BroadcastChannel).
+     *
+     * When compressionThresholdBytes is disabled (the default), this is a
+     * fully synchronous fast path, byte-for-byte the same behavior as before
+     * that option existed: straight into _processWrappedMessage().
+     *
+     * When enabled, every message - from the network transport AND from
+     * BroadcastChannel (see _send()) - carries a leading compressed(1)/
+     * uncompressed(0) flag byte ahead of the usual CRC32 wrapper. Reading
+     * that flag and, if set, decompressing is inherently async (the
+     * Compression Streams API has no synchronous form), so this method
+     * dispatches to a promise chain instead of processing inline in that
+     * case. This means a large (compressed) message and a small (uncompressed
+     * or below-threshold) message that arrive back-to-back can finish
+     * processing out of arrival order - acceptable here because Yjs updates
+     * are idempotent/commutative (see MESSAGE_SYNC_VERIFIED's handling below)
+     * and because the compression threshold keeps this path almost entirely
+     * to large, full-state syncs, not the per-keystroke incremental updates
+     * that per-sender gap detection actually relies on ordering-sensitive
+     * heuristics for.
      */
     private _handleIncomingMessage;
+    /**
+     * Verify message integrity with CRC32 and decode. Corrupt messages are
+     * rejected immediately without attempting to decode. Operates on bytes
+     * that have already had any compression flag/decompression handled by
+     * _handleIncomingMessage() - this is the pre-compression-feature
+     * implementation, unchanged.
+     */
+    private _processWrappedMessage;
     /**
      * Max random delay (ms) before replying to a SyncStep1 request, scaled by
      * a room-size signal already available (`this.awareness.getStates().size`
@@ -459,6 +532,15 @@ export declare class GenericProvider extends Observable<string> {
      * This ensures updates reach both local tabs and remote peers with corruption detection.
      */
     private _send;
+    /**
+     * Send already-CRC32-wrapped bytes to the network transport, compressing
+     * first if compressionThresholdBytes is configured and this payload
+     * clears it. See that option's doc comment for the size threshold
+     * reasoning and the wire-format compatibility tradeoff of enabling it.
+     */
+    private _sendToTransport;
+    /** Hand fully-framed bytes to transport.send(), tolerating a sync or async send(). */
+    private _dispatchToTransport;
     /**
      * Update connection status and emit event.
      */

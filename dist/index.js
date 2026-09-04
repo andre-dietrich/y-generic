@@ -317,27 +317,41 @@ export class GenericProvider extends Observable {
             // Just request sync without sending full state (avoid redundant broadcasts)
             // _sendSyncStep1() already checks the shared rate limiter internally
             // and silently drops the request if it's exceeded.
+            //
+            // Uses a recursive setTimeout (re-jittered by ~20% each tick) rather
+            // than a plain setInterval so peers that connect() within a short
+            // window of each other - the common case: everyone joining a room
+            // near session start, or reconnecting together after a shared network
+            // blip - don't end up with near-synchronized periodic timers that all
+            // fire in the same few milliseconds every syncInterval. This doesn't
+            // reduce total periodic-sync traffic, only spreads it out so a room's
+            // background traffic is smooth instead of bursty.
             if (this._syncInterval > 0) {
-                this._syncIntervalId = setInterval(() => {
-                    if (this.transport.isConnected && !this._destroying) {
-                        this._sendSyncStep1();
-                        // Also re-announce awareness - but only on transports WITHOUT
-                        // onPeerConnect (e.g. WebSocket, PubNub, Trystero strategies
-                        // that don't support it), which never otherwise re-broadcast
-                        // presence to peers that joined after our last broadcast; this
-                        // bounds that gap to one interval instead of leaving it
-                        // unbounded. On transports WITH onPeerConnect (peerjs,
-                        // simple-peer, trystero mesh - see CLAUDE.md), every new peer
-                        // already triggers _schedulePeerConnectSync() -> syncNow() on
-                        // join, which broadcasts awareness itself - so this periodic
-                        // re-announce would be pure redundant traffic for the entire
-                        // connected lifetime of every such peer, answering a gap that's
-                        // already covered by a different mechanism.
-                        if (!this.transport.onPeerConnect) {
-                            this._broadcastAwareness([this.doc.clientID]);
+                const scheduleNextPeriodicSync = () => {
+                    this._syncIntervalId = setTimeout(() => {
+                        if (this.transport.isConnected && !this._destroying) {
+                            this._sendSyncStep1();
+                            // Also re-announce awareness - but only on transports WITHOUT
+                            // onPeerConnect (e.g. WebSocket, PubNub, Trystero strategies
+                            // that don't support it), which never otherwise re-broadcast
+                            // presence to peers that joined after our last broadcast; this
+                            // bounds that gap to one interval instead of leaving it
+                            // unbounded. On transports WITH onPeerConnect (peerjs,
+                            // simple-peer, trystero mesh - see CLAUDE.md), every new peer
+                            // already triggers _schedulePeerConnectSync() -> syncNow() on
+                            // join, which broadcasts awareness itself - so this periodic
+                            // re-announce would be pure redundant traffic for the entire
+                            // connected lifetime of every such peer, answering a gap that's
+                            // already covered by a different mechanism.
+                            if (!this.transport.onPeerConnect) {
+                                this._broadcastAwareness([this.doc.clientID]);
+                            }
                         }
-                    }
-                }, this._syncInterval);
+                        if (!this._destroying)
+                            scheduleNextPeriodicSync();
+                    }, this._jitteredSyncInterval());
+                };
+                scheduleNextPeriodicSync();
             }
         }
         catch (error) {
@@ -355,7 +369,7 @@ export class GenericProvider extends Observable {
     disconnect() {
         // Stop periodic sync
         if (this._syncIntervalId !== undefined) {
-            clearInterval(this._syncIntervalId);
+            clearTimeout(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
         // Reset resync escalation tracking
@@ -439,7 +453,7 @@ export class GenericProvider extends Observable {
         this._destroying = true;
         // Stop periodic sync (disconnect() will also do this, but be explicit)
         if (this._syncIntervalId !== undefined) {
-            clearInterval(this._syncIntervalId);
+            clearTimeout(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
         // Stop any pending gap-check timers
@@ -549,6 +563,18 @@ export class GenericProvider extends Observable {
         // cheaper than a full document push, so it isn't gated by the sync
         // rate limiter above even when the sync half is skipped.
         this._broadcastAwareness([this.doc.clientID]);
+    }
+    /**
+     * Compute the next periodic-sync delay, jittered by ~+/-20% around
+     * `_syncInterval`. Re-jittered fresh each tick (not computed once per
+     * connect()) so a room's peers - which commonly all connect() within a
+     * short window of each other - drift apart over time instead of staying
+     * loosely synchronized. Extracted to its own method purely so benchmarks
+     * can shadow it to compare against the unjittered baseline.
+     */
+    _jitteredSyncInterval() {
+        const jitter = 1 + (Math.random() * 2 - 1) * 0.2; // +/-20%
+        return this._syncInterval * jitter;
     }
     /**
      * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect

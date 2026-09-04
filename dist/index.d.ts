@@ -265,6 +265,15 @@ export declare class GenericProvider extends Observable<string> {
      */
     syncNow(): void;
     /**
+     * Compute the next periodic-sync delay, jittered by ~+/-20% around
+     * `_syncInterval`. Re-jittered fresh each tick (not computed once per
+     * connect()) so a room's peers - which commonly all connect() within a
+     * short window of each other - drift apart over time instead of staying
+     * loosely synchronized. Extracted to its own method purely so benchmarks
+     * can shadow it to compare against the unjittered baseline.
+     */
+    private _jitteredSyncInterval;
+    /**
      * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
      * events within `_peerConnectDebounceMs` collapses into one call instead
      * of one per event - without this, N peers joining a mesh in a short

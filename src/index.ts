@@ -508,13 +508,21 @@ export class GenericProvider extends Observable<string> {
         this._syncIntervalId = setInterval(() => {
           if (this.transport.isConnected && !this._destroying) {
             this._sendSyncStep1()
-            // Also re-announce awareness. Transports without onPeerConnect
-            // (e.g. WebSocket, PubNub, Trystero strategies that don't
-            // support it) never otherwise re-broadcast presence to peers
-            // that joined after our last broadcast — this bounds that gap
-            // to one interval instead of leaving it unbounded. Cheap: same
-            // throttled path as any other awareness change.
-            this._broadcastAwareness([this.doc.clientID])
+            // Also re-announce awareness - but only on transports WITHOUT
+            // onPeerConnect (e.g. WebSocket, PubNub, Trystero strategies
+            // that don't support it), which never otherwise re-broadcast
+            // presence to peers that joined after our last broadcast; this
+            // bounds that gap to one interval instead of leaving it
+            // unbounded. On transports WITH onPeerConnect (peerjs,
+            // simple-peer, trystero mesh - see CLAUDE.md), every new peer
+            // already triggers _schedulePeerConnectSync() -> syncNow() on
+            // join, which broadcasts awareness itself - so this periodic
+            // re-announce would be pure redundant traffic for the entire
+            // connected lifetime of every such peer, answering a gap that's
+            // already covered by a different mechanism.
+            if (!this.transport.onPeerConnect) {
+              this._broadcastAwareness([this.doc.clientID])
+            }
           }
         }, this._syncInterval)
       }

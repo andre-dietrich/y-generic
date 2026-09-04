@@ -34,22 +34,29 @@ import { sleep, instrumentHub } from './bench-user-scaling'
 const GAP_GRACE_MS = 300
 const CYCLES = 20
 
-/** Drop exactly the (1-indexed) Nth message delivered to this transport's callback. */
-function withNthMessageDropped(
-  transport: DummyTransport,
-  n: number,
-): () => void {
+/** Install a drop switch on transport, returning setters to control when drops occur. */
+function withDropSwitch(transport: DummyTransport): {
+  restore: () => void
+  setDropNext: (v: boolean) => void
+} {
+  let dropNext = false
   const originalOnMessage = transport.onMessage.bind(transport)
-  let count = 0
   transport.onMessage = (callback: (data: Uint8Array) => void) => {
     return originalOnMessage((data: Uint8Array) => {
-      count++
-      if (count === n) return // drop it
+      if (dropNext) {
+        dropNext = false
+        return // drop it
+      }
       callback(data)
     })
   }
-  return () => {
-    transport.onMessage = originalOnMessage
+  return {
+    restore: () => {
+      transport.onMessage = originalOnMessage
+    },
+    setDropNext: (v: boolean) => {
+      dropNext = v
+    },
   }
 }
 
@@ -72,7 +79,7 @@ async function withWarnCount(
 
 async function runCycle(): Promise<{
   spuriousGapWarnings: number
-  extraMessages: number
+  messagesAfterGraceWait: number
 }> {
   const room = `bench-reconnect-${Math.random().toString(36).slice(2)}`
   const hub = new DummyHub()
@@ -90,6 +97,7 @@ async function runCycle(): Promise<{
 
   const docB = new Y.Doc()
   const transportB = new DummyTransport({ hub, latency: 5 })
+  const dropSwitch = withDropSwitch(transportB)
   const providerB = new GenericProvider(docB, transportB, {
     batchUpdates: 0,
     verifyUpdates: true,
@@ -106,16 +114,15 @@ async function runCycle(): Promise<{
 
   const textA = docA.getText('content')
 
-  // Drop the 2nd MESSAGE_SYNC_VERIFIED update B receives from A, to open a
-  // real sequence gap (A's seq 0 arrives, seq 1 is dropped, seq 2 arrives).
-  const restore = withNthMessageDropped(transportB, 2)
+  // Drop one message from A to B to open a real sequence gap (seq 0 arrives,
+  // seq 1 is dropped, seq 2 arrives, triggering gap detection).
   docA.transact(() => textA.insert(0, 'x')) // seq 0 - delivered
   await sleep(20)
-  docA.transact(() => textA.insert(0, 'y')) // seq 1 - dropped
+  dropSwitch.setDropNext(true)
+  docA.transact(() => textA.insert(0, 'y')) // seq 1 - dropped (flag auto-resets)
   await sleep(20)
   docA.transact(() => textA.insert(0, 'z')) // seq 2 - delivered, gap detected
   await sleep(20)
-  restore()
 
   // Gap check is now scheduled on B with GAP_GRACE_MS grace. Disconnect and
   // immediately reconnect B well before that grace period elapses.
@@ -123,7 +130,7 @@ async function runCycle(): Promise<{
   await providerB.connect({ room })
 
   await sleep(50) // let the reconnect's own syncNow() traffic land
-  const baseline = { messages: stats.messages }
+  const beforeGraceWait = stats.messages
 
   const spuriousGapWarnings = await withWarnCount(
     'Sequence gap confirmed',
@@ -133,30 +140,29 @@ async function runCycle(): Promise<{
     },
   )
 
-  const extraMessages = stats.messages - baseline.messages
+  const messagesAfterGraceWait = stats.messages - beforeGraceWait
 
+  dropSwitch.restore()
   providerA.destroy()
   providerB.destroy()
   hub.clear()
 
-  return { spuriousGapWarnings, extraMessages }
+  return { spuriousGapWarnings, messagesAfterGraceWait }
 }
 
 async function main() {
   let totalSpurious = 0
-  let totalExtraMessages = 0
+  let totalMessages = 0
   for (let i = 0; i < CYCLES; i++) {
-    const { spuriousGapWarnings, extraMessages } = await runCycle()
+    const { spuriousGapWarnings, messagesAfterGraceWait } = await runCycle()
     totalSpurious += spuriousGapWarnings
-    totalExtraMessages += extraMessages
+    totalMessages += messagesAfterGraceWait
   }
   console.log(
     `Over ${CYCLES} disconnect/reconnect cycles racing a pending gap check:`,
   )
   console.log(`  spurious "Sequence gap confirmed" warnings: ${totalSpurious}`)
-  console.log(
-    `  extra messages attributable to stale gap timers: ${totalExtraMessages}`,
-  )
+  console.log(`  total messages during grace-period wait: ${totalMessages}`)
   console.log(
     totalSpurious > 0
       ? 'RESULT: stale gap-check timer fired after reconnect - bug reproduced.'

@@ -153,6 +153,27 @@ export interface DummyTransportOptions {
      * @default false
      */
     simulatePeerConnect?: boolean;
+    /**
+     * Simulate a chunking transport's hard per-message size limit (bytes),
+     * mirroring how PubNub (`src/providers/pubnub/index.ts`, ~30KB) and Ably
+     * (`src/providers/ably/index.ts`) split any `send()` payload larger than
+     * their wire limit into multiple messages, reassembled on the receiving
+     * side. DummyTransport otherwise has no size limit at all, so this
+     * scenario (a large sync payload silently becoming N wire messages) is
+     * completely unbenchmarkable without it - see
+     * docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
+     * item 1. Off by default (`undefined`) so every existing bench script's
+     * message counts are unaffected.
+     *
+     * When set, EVERY `send()` call is wrapped in a small chunk header
+     * (chunk id + index + total), even payloads that fit in a single chunk -
+     * this keeps the wire format unambiguous instead of guessing whether an
+     * incoming message is chunked. Both sides of a room must set this
+     * consistently (this is a same-process test simulation, not a real
+     * negotiated protocol).
+     * @default undefined (no chunking)
+     */
+    chunkSizeLimit?: number;
 }
 /**
  * Dummy transport implementation for testing and development.
@@ -169,6 +190,8 @@ export declare class DummyTransport implements Transport {
     private _room;
     private _callback?;
     private _peerConnectCallback?;
+    /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
+    private _chunkBuffers;
     /**
      * Register callback for peer-connect notifications. Test-only simulation
      * of what a real mesh transport (peerjs, simple-peer) does when a new
@@ -224,6 +247,22 @@ export declare class DummyTransport implements Transport {
      * Send data to all other clients in the room.
      */
     send(data: Uint8Array): void;
+    /**
+     * Split `data` into one or more hub-delivered chunks, each carrying a
+     * small [chunkId][index][total] header - mirrors (in spirit, not byte
+     * format) how PubNub/Ably split an oversized payload into multiple wire
+     * messages. Always chunks (even a payload that fits in one chunk, as a
+     * single total=1 "chunk") so the receiving side's framing is unambiguous
+     * regardless of payload size - see chunkSizeLimit's doc comment.
+     */
+    private _sendChunked;
+    /**
+     * Reassemble a chunked message. Returns the complete payload once every
+     * chunk for its chunkId has arrived, or `undefined` while still waiting
+     * on more chunks (including the single-chunk total=1 case reassembling
+     * immediately).
+     */
+    private _reassembleChunk;
     /**
      * Register callback for incoming messages.
      */

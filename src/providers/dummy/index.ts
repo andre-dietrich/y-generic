@@ -293,7 +293,32 @@ export interface DummyTransportOptions {
    * @default false
    */
   simulatePeerConnect?: boolean
+
+  /**
+   * Simulate a chunking transport's hard per-message size limit (bytes),
+   * mirroring how PubNub (`src/providers/pubnub/index.ts`, ~30KB) and Ably
+   * (`src/providers/ably/index.ts`) split any `send()` payload larger than
+   * their wire limit into multiple messages, reassembled on the receiving
+   * side. DummyTransport otherwise has no size limit at all, so this
+   * scenario (a large sync payload silently becoming N wire messages) is
+   * completely unbenchmarkable without it - see
+   * docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
+   * item 1. Off by default (`undefined`) so every existing bench script's
+   * message counts are unaffected.
+   *
+   * When set, EVERY `send()` call is wrapped in a small chunk header
+   * (chunk id + index + total), even payloads that fit in a single chunk -
+   * this keeps the wire format unambiguous instead of guessing whether an
+   * incoming message is chunked. Both sides of a room must set this
+   * consistently (this is a same-process test simulation, not a real
+   * negotiated protocol).
+   * @default undefined (no chunking)
+   */
+  chunkSizeLimit?: number
 }
+
+/** Chunk header: [chunkId: uint32][index: uint16][total: uint16]. */
+const CHUNK_HEADER_SIZE = 8
 
 /**
  * Dummy transport implementation for testing and development.
@@ -311,6 +336,8 @@ export class DummyTransport implements Transport {
   private _room: string = ''
   private _callback?: (data: Uint8Array) => void
   private _peerConnectCallback?: (peerId: string) => void
+  /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
+  private _chunkBuffers: Map<number, Map<number, Uint8Array>> = new Map()
 
   /**
    * Register callback for peer-connect notifications. Test-only simulation
@@ -366,6 +393,7 @@ export class DummyTransport implements Transport {
       jitter: options.jitter ?? 0,
       autoConnect: options.autoConnect ?? false,
       simulatePeerConnect: options.simulatePeerConnect ?? false,
+      chunkSizeLimit: options.chunkSizeLimit,
     }
 
     if (this.options.simulatePeerConnect) {
@@ -450,6 +478,12 @@ export class DummyTransport implements Transport {
       return
     }
 
+    const limit = this.options.chunkSizeLimit
+    if (limit) {
+      this._sendChunked(data, limit)
+      return
+    }
+
     // Broadcast through hub
     this.hub.broadcast(this._room, data, this, {
       latency: this.options.latency,
@@ -459,14 +493,97 @@ export class DummyTransport implements Transport {
   }
 
   /**
+   * Split `data` into one or more hub-delivered chunks, each carrying a
+   * small [chunkId][index][total] header - mirrors (in spirit, not byte
+   * format) how PubNub/Ably split an oversized payload into multiple wire
+   * messages. Always chunks (even a payload that fits in one chunk, as a
+   * single total=1 "chunk") so the receiving side's framing is unambiguous
+   * regardless of payload size - see chunkSizeLimit's doc comment.
+   */
+  private _sendChunked(data: Uint8Array, limit: number): void {
+    const payloadSize = Math.max(1, limit - CHUNK_HEADER_SIZE)
+    const total = Math.max(1, Math.ceil(data.length / payloadSize))
+    const chunkId = Math.floor(Math.random() * 0xffffffff)
+
+    for (let i = 0; i < total; i++) {
+      const slice = data.subarray(i * payloadSize, (i + 1) * payloadSize)
+      const packed = new Uint8Array(CHUNK_HEADER_SIZE + slice.length)
+      const view = new DataView(packed.buffer)
+      view.setUint32(0, chunkId)
+      view.setUint16(4, i)
+      view.setUint16(6, total)
+      packed.set(slice, CHUNK_HEADER_SIZE)
+
+      this.hub!.broadcast(this._room, packed, this, {
+        latency: this.options.latency,
+        dropRate: this.options.dropRate,
+        jitter: this.options.jitter,
+      })
+    }
+  }
+
+  /**
+   * Reassemble a chunked message. Returns the complete payload once every
+   * chunk for its chunkId has arrived, or `undefined` while still waiting
+   * on more chunks (including the single-chunk total=1 case reassembling
+   * immediately).
+   */
+  private _reassembleChunk(packed: Uint8Array): Uint8Array | undefined {
+    const view = new DataView(
+      packed.buffer,
+      packed.byteOffset,
+      packed.byteLength,
+    )
+    const chunkId = view.getUint32(0)
+    const index = view.getUint16(4)
+    const total = view.getUint16(6)
+    const payload = packed.subarray(CHUNK_HEADER_SIZE)
+
+    if (total === 1) {
+      return payload
+    }
+
+    let buf = this._chunkBuffers.get(chunkId)
+    if (!buf) {
+      buf = new Map()
+      this._chunkBuffers.set(chunkId, buf)
+    }
+    buf.set(index, payload)
+    if (buf.size < total) {
+      return undefined
+    }
+
+    this._chunkBuffers.delete(chunkId)
+    const totalLength = Array.from(buf.values()).reduce(
+      (sum, c) => sum + c.length,
+      0,
+    )
+    const combined = new Uint8Array(totalLength)
+    let offset = 0
+    for (let i = 0; i < total; i++) {
+      const part = buf.get(i)!
+      combined.set(part, offset)
+      offset += part.length
+    }
+    return combined
+  }
+
+  /**
    * Register callback for incoming messages.
    */
   onMessage(callback: (data: Uint8Array) => void): () => void {
-    this._callback = callback
+    const limit = this.options.chunkSizeLimit
+    const wrappedCallback = limit
+      ? (packed: Uint8Array) => {
+          const reassembled = this._reassembleChunk(packed)
+          if (reassembled) callback(reassembled)
+        }
+      : callback
+    this._callback = wrappedCallback
 
     // If already connected, register with hub now
     if (this._connected && this._room && this.hub) {
-      this.hub.join(this._room, this, callback)
+      this.hub.join(this._room, this, wrappedCallback)
     }
 
     // Return unsubscribe function

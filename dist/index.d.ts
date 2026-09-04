@@ -96,6 +96,8 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingSyncReply;
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
+    private _peerConnectDebounceMs;
+    private _pendingPeerConnectSyncTimeoutId?;
     private _localSeqNum;
     private _remoteSeqInfo;
     private _gapCheckTimers;
@@ -184,6 +186,17 @@ export declare class GenericProvider extends Observable<string> {
          */
         syncReplySuppressionMs?: number;
         /**
+         * Debounce window (ms) for coalescing onPeerConnect-triggered
+         * syncNow() calls. Mesh transports (peerjs, simple-peer) fire
+         * onPeerConnect once per newly-connected remote peer; without
+         * coalescing, N peers joining within a short window each
+         * independently trigger a full-state broadcast to everyone already
+         * connected - an O(N^2) burst. A burst of onPeerConnect events within
+         * this window collapses into a single syncNow() call.
+         * @default 50
+         */
+        peerConnectDebounceMs?: number;
+        /**
          * Grace period (ms) after detecting a suspected sequence-number gap
          * before requesting a resync. Tolerates mere network reordering
          * without treating it as loss; lower it to detect genuine packet loss
@@ -246,6 +259,15 @@ export declare class GenericProvider extends Observable<string> {
      * Useful after network interruptions or to manually trigger re-sync.
      */
     syncNow(): void;
+    /**
+     * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
+     * events within `_peerConnectDebounceMs` collapses into one call instead
+     * of one per event - without this, N peers joining a mesh in a short
+     * window each independently broadcast full state to everyone already
+     * connected (O(N^2) traffic), since onPeerConnect fires once per
+     * newly-opened peer connection with no coalescing of its own.
+     */
+    private _schedulePeerConnectSync;
     /**
      * Setup automatic document synchronization.
      * Listens to document updates and sends them to the transport.

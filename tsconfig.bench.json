@@ -22,6 +22,7 @@
     "test/dummy/repro-gun-batch-corruption.ts",
     "test/dummy/bench-corruption-storm.ts",
     "test/dummy/bench-reconnect-cycling.ts",
+    "test/dummy/bench-mesh-join-burst.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

@@ -59,6 +59,23 @@ export declare class DummyHub {
      * Unregister a transport from a room.
      */
     leave(room: string, transport: DummyTransport): void;
+    private peerConnectSubs;
+    /**
+     * Register a transport's onPeerConnect callback and simulate the
+     * peer-discovery notifications a real mesh transport (peerjs,
+     * simple-peer) would fire: every OTHER already-registered transport in
+     * the room is notified about this new one, and this new transport is
+     * notified about every other one already registered - mirrors each side
+     * of a newly-opened data channel firing its own onPeerConnect. Test-only
+     * simulation: DummyTransport has no real peer-to-peer channels, this
+     * exists purely so GenericProvider's onPeerConnect handling (mesh-join
+     * burst coalescing) is exercisable via DummyTransport in benchmarks.
+     */
+    registerPeerConnect(room: string, transport: DummyTransport, callback: (peerId: string) => void): void;
+    /**
+     * Unregister a transport's onPeerConnect subscription from a room.
+     */
+    unregisterPeerConnect(room: string, transport: DummyTransport): void;
     /**
      * Broadcast a message to all clients in a room except the sender.
      */
@@ -130,12 +147,16 @@ export interface DummyTransportOptions {
  * Routes messages through a DummyHub instance.
  */
 export declare class DummyTransport implements Transport {
+    private static _idCounter;
+    /** Unique id for this transport instance, used by the onPeerConnect simulation. */
+    readonly id: string;
     private hub?;
     private explicitHub;
     private options;
     private _connected;
     private _room;
     private _callback?;
+    private _peerConnectCallback?;
     /**
      * Create a new DummyTransport.
      *
@@ -176,6 +197,12 @@ export declare class DummyTransport implements Transport {
      * Register callback for incoming messages.
      */
     onMessage(callback: (data: Uint8Array) => void): () => void;
+    /**
+     * Register callback for peer-connect notifications. Test-only simulation
+     * of what a real mesh transport (peerjs, simple-peer) does when a new
+     * data channel opens - see DummyHub.registerPeerConnect().
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
      * Check if connected.
      */

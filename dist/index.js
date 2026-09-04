@@ -253,6 +253,7 @@ export class GenericProvider extends Observable {
         this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20;
         this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000;
         this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30;
+        this._peerConnectDebounceMs = options.peerConnectDebounceMs ?? 50;
         this._gapGraceMs = options.gapGraceMs ?? 300;
         this._seqWindowSize = options.seqWindowSize ?? 64;
         this._setupDocumentSync();
@@ -294,7 +295,7 @@ export class GenericProvider extends Observable {
             if (this.transport.onPeerConnect) {
                 const unsubPeer = this.transport.onPeerConnect((_peerId) => {
                     if (!this._destroying)
-                        this.syncNow();
+                        this._schedulePeerConnectSync();
                 });
                 const originalUnsub = this._unsubscribeTransport;
                 this._unsubscribeTransport = () => {
@@ -371,6 +372,13 @@ export class GenericProvider extends Observable {
         }
         this._gapCheckTimers.clear();
         this._remoteSeqInfo.clear();
+        // Cancel any pending debounced onPeerConnect sync - a reconnect gets a
+        // fresh burst of onPeerConnect events (if the transport supports it) and
+        // shouldn't fire a stale one left over from before this disconnect.
+        if (this._pendingPeerConnectSyncTimeoutId !== undefined) {
+            clearTimeout(this._pendingPeerConnectSyncTimeoutId);
+            this._pendingPeerConnectSyncTimeoutId = undefined;
+        }
         // Reset the sync rate-limit budget. Without this, a reconnect inherits
         // whatever budget was left over from before the disconnect - and since
         // syncNow()'s full-state push now shares this same limiter (see
@@ -533,6 +541,23 @@ export class GenericProvider extends Observable {
         // cheaper than a full document push, so it isn't gated by the sync
         // rate limiter above even when the sync half is skipped.
         this._broadcastAwareness([this.doc.clientID]);
+    }
+    /**
+     * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
+     * events within `_peerConnectDebounceMs` collapses into one call instead
+     * of one per event - without this, N peers joining a mesh in a short
+     * window each independently broadcast full state to everyone already
+     * connected (O(N^2) traffic), since onPeerConnect fires once per
+     * newly-opened peer connection with no coalescing of its own.
+     */
+    _schedulePeerConnectSync() {
+        if (this._pendingPeerConnectSyncTimeoutId !== undefined)
+            return;
+        this._pendingPeerConnectSyncTimeoutId = setTimeout(() => {
+            this._pendingPeerConnectSyncTimeoutId = undefined;
+            if (!this._destroying)
+                this.syncNow();
+        }, this._peerConnectDebounceMs);
     }
     /**
      * Setup automatic document synchronization.

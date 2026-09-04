@@ -92,6 +92,55 @@ export class DummyHub {
     }
   }
 
+  private peerConnectSubs: Map<
+    string,
+    Set<{ transport: DummyTransport; callback: (peerId: string) => void }>
+  > = new Map()
+
+  /**
+   * Register a transport's onPeerConnect callback and simulate the
+   * peer-discovery notifications a real mesh transport (peerjs,
+   * simple-peer) would fire: every OTHER already-registered transport in
+   * the room is notified about this new one, and this new transport is
+   * notified about every other one already registered - mirrors each side
+   * of a newly-opened data channel firing its own onPeerConnect. Test-only
+   * simulation: DummyTransport has no real peer-to-peer channels, this
+   * exists purely so GenericProvider's onPeerConnect handling (mesh-join
+   * burst coalescing) is exercisable via DummyTransport in benchmarks.
+   */
+  registerPeerConnect(
+    room: string,
+    transport: DummyTransport,
+    callback: (peerId: string) => void,
+  ): void {
+    if (!this.peerConnectSubs.has(room)) {
+      this.peerConnectSubs.set(room, new Set())
+    }
+    const subs = this.peerConnectSubs.get(room)!
+    const entry = { transport, callback }
+    subs.add(entry)
+
+    for (const other of subs) {
+      if (other.transport === transport) continue
+      other.callback(transport.id)
+      callback(other.transport.id)
+    }
+  }
+
+  /**
+   * Unregister a transport's onPeerConnect subscription from a room.
+   */
+  unregisterPeerConnect(room: string, transport: DummyTransport): void {
+    const subs = this.peerConnectSubs.get(room)
+    if (!subs) return
+    for (const entry of subs) {
+      if (entry.transport === transport) {
+        subs.delete(entry)
+        break
+      }
+    }
+  }
+
   /**
    * Broadcast a message to all clients in a room except the sender.
    */
@@ -238,12 +287,17 @@ export interface DummyTransportOptions {
  * Routes messages through a DummyHub instance.
  */
 export class DummyTransport implements Transport {
+  private static _idCounter = 0
+  /** Unique id for this transport instance, used by the onPeerConnect simulation. */
+  public readonly id: string = `dummy-${DummyTransport._idCounter++}`
+
   private hub?: DummyHub
   private explicitHub: boolean
   private options: DummyTransportOptions
   private _connected: boolean = false
   private _room: string = ''
   private _callback?: (data: Uint8Array) => void
+  private _peerConnectCallback?: (peerId: string) => void
 
   /**
    * Create a new DummyTransport.
@@ -303,6 +357,12 @@ export class DummyTransport implements Transport {
     }
     // Otherwise, will join when onMessage() is called
 
+    // Same deal for onPeerConnect - register with the hub now that the room
+    // is known, if a caller already subscribed before connect() resolved.
+    if (this._peerConnectCallback) {
+      this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback)
+    }
+
     this._connected = true
   }
 
@@ -314,6 +374,7 @@ export class DummyTransport implements Transport {
 
     if (this.hub) {
       this.hub.leave(this._room, this)
+      this.hub.unregisterPeerConnect(this._room, this)
     }
     this._connected = false
   }
@@ -352,6 +413,26 @@ export class DummyTransport implements Transport {
     // Return unsubscribe function
     return () => {
       this._callback = undefined
+    }
+  }
+
+  /**
+   * Register callback for peer-connect notifications. Test-only simulation
+   * of what a real mesh transport (peerjs, simple-peer) does when a new
+   * data channel opens - see DummyHub.registerPeerConnect().
+   */
+  onPeerConnect(callback: (peerId: string) => void): () => void {
+    this._peerConnectCallback = callback
+
+    if (this._connected && this._room && this.hub) {
+      this.hub.registerPeerConnect(this._room, this, callback)
+    }
+
+    return () => {
+      this._peerConnectCallback = undefined
+      if (this.hub) {
+        this.hub.unregisterPeerConnect(this._room, this)
+      }
     }
   }
 

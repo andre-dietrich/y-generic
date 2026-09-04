@@ -51,6 +51,7 @@
 export class DummyHub {
     constructor() {
         this.rooms = new Map();
+        this.peerConnectSubs = new Map();
     }
     /**
      * Register a transport in a room.
@@ -75,6 +76,45 @@ export class DummyHub {
             }
             if (clients.size === 0) {
                 this.rooms.delete(room);
+            }
+        }
+    }
+    /**
+     * Register a transport's onPeerConnect callback and simulate the
+     * peer-discovery notifications a real mesh transport (peerjs,
+     * simple-peer) would fire: every OTHER already-registered transport in
+     * the room is notified about this new one, and this new transport is
+     * notified about every other one already registered - mirrors each side
+     * of a newly-opened data channel firing its own onPeerConnect. Test-only
+     * simulation: DummyTransport has no real peer-to-peer channels, this
+     * exists purely so GenericProvider's onPeerConnect handling (mesh-join
+     * burst coalescing) is exercisable via DummyTransport in benchmarks.
+     */
+    registerPeerConnect(room, transport, callback) {
+        if (!this.peerConnectSubs.has(room)) {
+            this.peerConnectSubs.set(room, new Set());
+        }
+        const subs = this.peerConnectSubs.get(room);
+        const entry = { transport, callback };
+        subs.add(entry);
+        for (const other of subs) {
+            if (other.transport === transport)
+                continue;
+            other.callback(transport.id);
+            callback(other.transport.id);
+        }
+    }
+    /**
+     * Unregister a transport's onPeerConnect subscription from a room.
+     */
+    unregisterPeerConnect(room, transport) {
+        const subs = this.peerConnectSubs.get(room);
+        if (!subs)
+            return;
+        for (const entry of subs) {
+            if (entry.transport === transport) {
+                subs.delete(entry);
+                break;
             }
         }
     }
@@ -187,6 +227,8 @@ export class DummyTransport {
      * ```
      */
     constructor(options = {}) {
+        /** Unique id for this transport instance, used by the onPeerConnect simulation. */
+        this.id = `dummy-${DummyTransport._idCounter++}`;
         this._connected = false;
         this._room = '';
         this.hub = options.hub;
@@ -217,6 +259,11 @@ export class DummyTransport {
             this.hub.join(this._room, this, this._callback);
         }
         // Otherwise, will join when onMessage() is called
+        // Same deal for onPeerConnect - register with the hub now that the room
+        // is known, if a caller already subscribed before connect() resolved.
+        if (this._peerConnectCallback) {
+            this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback);
+        }
         this._connected = true;
     }
     /**
@@ -227,6 +274,7 @@ export class DummyTransport {
             return;
         if (this.hub) {
             this.hub.leave(this._room, this);
+            this.hub.unregisterPeerConnect(this._room, this);
         }
         this._connected = false;
     }
@@ -263,6 +311,23 @@ export class DummyTransport {
         };
     }
     /**
+     * Register callback for peer-connect notifications. Test-only simulation
+     * of what a real mesh transport (peerjs, simple-peer) does when a new
+     * data channel opens - see DummyHub.registerPeerConnect().
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        if (this._connected && this._room && this.hub) {
+            this.hub.registerPeerConnect(this._room, this, callback);
+        }
+        return () => {
+            this._peerConnectCallback = undefined;
+            if (this.hub) {
+                this.hub.unregisterPeerConnect(this._room, this);
+            }
+        };
+    }
+    /**
      * Check if connected.
      */
     get isConnected() {
@@ -281,6 +346,7 @@ export class DummyTransport {
         return this.hub;
     }
 }
+DummyTransport._idCounter = 0;
 /**
  * Utility functions for debugging and testing.
  */

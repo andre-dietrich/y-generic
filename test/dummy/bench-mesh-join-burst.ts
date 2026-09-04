@@ -39,6 +39,29 @@
  * comparing raw message counts across variants with very different call
  * frequencies.
  *
+ * Pass/fail: for every (M,K) row, asserts `debounceMs: 50` messages are
+ * strictly lower than the `uncoalesced` baseline's, and that the
+ * `debounceMs: 50` variant itself fully converges (allSynced true).
+ * debounceMs:0 stays an informational/diagnostic row only - per this
+ * benchmark's own investigation history, both 0 and 50 partially coalesce
+ * (0 via same-event-loop-tick batching, both via the shared rate limiter
+ * saturating at higher peer counts), so 0-vs-50 is not a reliable gate on
+ * its own; uncoalesced-vs-50 is what actually demonstrates the fix.
+ *
+ * The gate deliberately does NOT require the `uncoalesced` baseline itself
+ * to converge: at M=20,K=10 it reliably does NOT (messages kept climbing
+ * past 26000 even with a 60s timeout in manual investigation, vs. ~15s for
+ * the fixed variants) - the true pre-fix burst overwhelms the sync
+ * rate-limit budget badly enough (~94% of syncNow() attempts silently
+ * dropped) that it can fail to converge at all within a reasonable window,
+ * which is itself evidence for why this fix matters, not a benchmark bug.
+ *
+ * DummyTransport.onPeerConnect is a no-op unless
+ * `simulatePeerConnect: true` is passed - off by default so plain
+ * DummyTransport usage elsewhere doesn't silently take the mesh code path.
+ * This benchmark passes it explicitly since it's the one script that wants
+ * the simulation.
+ *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/dummy/bench-mesh-join-burst.js
  */
 
@@ -108,7 +131,12 @@ function makeMeshProvider(
   peerConnectDebounceMs: number,
 ): { doc: Y.Doc; provider: GenericProvider } {
   const doc = new Y.Doc()
-  const transport = new DummyTransport({ hub, latency: 10, jitter: 0.1 })
+  const transport = new DummyTransport({
+    hub,
+    latency: 10,
+    jitter: 0.1,
+    simulatePeerConnect: true,
+  })
   const provider = new GenericProvider(doc, transport, {
     batchUpdates: 0,
     verifyUpdates: true,
@@ -178,19 +206,46 @@ async function main() {
   console.log(
     '   M |    K |      variant | messages | allSynced | slot drops/attempts',
   )
+  let failures = 0
   for (const { M, K } of SCENARIOS) {
+    const results: Partial<Record<Variant, { messages: number; allSynced: boolean }>> = {}
     for (const variant of ['uncoalesced', 0, 50] as const) {
       const { messages, allSynced, slotStats } = await runScenario(
         M,
         K,
         variant,
       )
+      results[variant] = { messages, allSynced }
       console.log(
         `${String(M).padStart(4)} | ${String(K).padStart(4)} | ${String(variant).padStart(13)} | ${String(messages).padStart(8)} | ${String(allSynced).padStart(9)} | ${slotStats.drops}/${slotStats.attempts}`,
       )
     }
+
+    // Pass/fail gate: the shipped default (debounceMs: 50) must fully
+    // converge and must send fewer messages than the true uncoalesced
+    // baseline. The uncoalesced baseline itself is NOT required to converge
+    // - at higher (M,K) it reliably doesn't (see header comment), which is
+    // evidence for the fix, not a benchmark bug. debounceMs:0 is
+    // informational only.
+    const uncoalesced = results['uncoalesced']!
+    const debounced = results[50]!
+    if (!debounced.allSynced) {
+      console.log(`  FAIL (M=${M},K=${K}): debounceMs:50 did not fully converge`)
+      failures++
+    }
+    if (debounced.messages >= uncoalesced.messages) {
+      console.log(
+        `  FAIL (M=${M},K=${K}): debounced (${debounced.messages}) not lower than uncoalesced (${uncoalesced.messages})`,
+      )
+      failures++
+    }
   }
-  process.exit(0)
+  console.log(
+    failures === 0
+      ? 'RESULT: debounce reduces messages vs. the uncoalesced baseline in every scenario, allSynced held everywhere.'
+      : `RESULT: ${failures} assertion(s) failed.`,
+  )
+  process.exit(failures === 0 ? 0 : 1)
 }
 
 main().catch((err) => {

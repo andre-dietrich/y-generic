@@ -777,7 +777,8 @@ export class GenericProvider extends Observable<string> {
     if (this._pendingPeerConnectSyncTimeoutId !== undefined) return
     this._pendingPeerConnectSyncTimeoutId = setTimeout(() => {
       this._pendingPeerConnectSyncTimeoutId = undefined
-      if (!this._destroying) this.syncNow()
+      if (!this.transport.isConnected || this._destroying) return
+      this.syncNow()
     }, this._peerConnectDebounceMs)
   }
 

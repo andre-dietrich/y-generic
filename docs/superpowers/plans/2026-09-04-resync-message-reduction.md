@@ -10,6 +10,15 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-04-resync-message-reduction-design.md`
 
+> **Post-implementation note:** Task 2 (below) was reverted, not shipped — benchmarking found
+> its approach regressed convergence and message counts under realistic packet loss; see the
+> design doc's addendum for the full story. Task 3 shipped, but its actual acceptance criterion
+> ended up being "uncoalesced vs. 50ms debounced" rather than this plan's original "0ms vs.
+> 50ms" — 0ms debounce turned out not to be a true zero-coalescing baseline (same-event-loop-tick
+> onPeerConnect bursts still coalesce onto one pending timer even at a 0ms window), so the
+> shipped `test/dummy/bench-mesh-join-burst.ts` compares against a genuine uncoalesced baseline
+> instead.
+
 ## Global Constraints
 
 - No automated test suite (no jest/mocha/vitest) — every task's verification is a `test/dummy/bench-*.ts` script, compiled via `npx tsc -p tsconfig.bench.json` and run with `node bench-dist/test/dummy/<script>.js`. A new bench script must be added to `tsconfig.bench.json`'s `include` array or it will not compile.

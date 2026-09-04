@@ -280,6 +280,19 @@ export interface DummyTransportOptions {
    * @default false
    */
   autoConnect?: boolean
+
+  /**
+   * Simulate onPeerConnect notifications (mesh-style peer-discovery, as a
+   * real peerjs/simple-peer/trystero transport would fire). DummyTransport
+   * otherwise models a broadcast relay (like websocket/pubnub/gun/matrix,
+   * none of which implement onPeerConnect) - off by default so plain
+   * multi-peer benchmarks/usage aren't silently shifted onto the mesh code
+   * path in GenericProvider.connect(). Enable only when a test specifically
+   * wants to exercise onPeerConnect-triggered behavior (e.g.
+   * test/dummy/bench-mesh-join-burst.ts).
+   * @default false
+   */
+  simulatePeerConnect?: boolean
 }
 
 /**
@@ -330,6 +343,7 @@ export class DummyTransport implements Transport {
       dropRate: options.dropRate ?? 0,
       jitter: options.jitter ?? 0,
       autoConnect: options.autoConnect ?? false,
+      simulatePeerConnect: options.simulatePeerConnect ?? false,
     }
   }
 
@@ -357,13 +371,19 @@ export class DummyTransport implements Transport {
     }
     // Otherwise, will join when onMessage() is called
 
+    // Mark connected before registering onPeerConnect: registerPeerConnect()
+    // synchronously fires callbacks (including this transport's own, about
+    // peers already in the room), and a real mesh transport only fires
+    // onPeerConnect once it considers its own channel open - so any
+    // consumer reacting to that notification (e.g. GenericProvider calling
+    // syncNow()) should see isConnected as true, matching real transports.
+    this._connected = true
+
     // Same deal for onPeerConnect - register with the hub now that the room
     // is known, if a caller already subscribed before connect() resolved.
     if (this._peerConnectCallback) {
       this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback)
     }
-
-    this._connected = true
   }
 
   /**
@@ -419,9 +439,15 @@ export class DummyTransport implements Transport {
   /**
    * Register callback for peer-connect notifications. Test-only simulation
    * of what a real mesh transport (peerjs, simple-peer) does when a new
-   * data channel opens - see DummyHub.registerPeerConnect().
+   * data channel opens - see DummyHub.registerPeerConnect(). Off by default
+   * (see DummyTransportOptions.simulatePeerConnect) - GenericProvider
+   * feature-detects onPeerConnect, so leaving this unconditionally active
+   * would silently move every DummyTransport consumer onto the mesh code
+   * path, even though DummyTransport otherwise models a broadcast relay.
    */
   onPeerConnect(callback: (peerId: string) => void): () => void {
+    if (!this.options.simulatePeerConnect) return () => {}
+
     this._peerConnectCallback = callback
 
     if (this._connected && this._room && this.hub) {

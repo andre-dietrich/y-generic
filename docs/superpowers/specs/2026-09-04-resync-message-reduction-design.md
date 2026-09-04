@@ -207,9 +207,9 @@ statement (peers going online/offline, "network problems") targets.
 makes the thing this whole plan optimizes for (message count) worse, not
 better, in the scenario ("network problems") the plan's own goal statement
 names first. See `test/dummy/bench-packet-loss.ts` and
-`test/dummy/bench-corruption-storm.ts` for the scripts; the numbers above are
-recorded in the (unshipped) task's investigation report, not in any commit,
-since no commit for this item exists.
+`test/dummy/bench-corruption-storm.ts` for the scripts; the full run logs and
+additional detail are in the (unshipped) task's investigation report - no
+commit for this item exists, since it was reverted before shipping.
 
 **If revisited:** any future redesign of this specific optimization needs to
 preserve at least one single-message-survival recovery path (i.e. something

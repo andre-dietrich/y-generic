@@ -238,6 +238,7 @@ export class DummyTransport {
             dropRate: options.dropRate ?? 0,
             jitter: options.jitter ?? 0,
             autoConnect: options.autoConnect ?? false,
+            simulatePeerConnect: options.simulatePeerConnect ?? false,
         };
     }
     /**
@@ -259,12 +260,18 @@ export class DummyTransport {
             this.hub.join(this._room, this, this._callback);
         }
         // Otherwise, will join when onMessage() is called
+        // Mark connected before registering onPeerConnect: registerPeerConnect()
+        // synchronously fires callbacks (including this transport's own, about
+        // peers already in the room), and a real mesh transport only fires
+        // onPeerConnect once it considers its own channel open - so any
+        // consumer reacting to that notification (e.g. GenericProvider calling
+        // syncNow()) should see isConnected as true, matching real transports.
+        this._connected = true;
         // Same deal for onPeerConnect - register with the hub now that the room
         // is known, if a caller already subscribed before connect() resolved.
         if (this._peerConnectCallback) {
             this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback);
         }
-        this._connected = true;
     }
     /**
      * Disconnect from the hub.
@@ -313,9 +320,15 @@ export class DummyTransport {
     /**
      * Register callback for peer-connect notifications. Test-only simulation
      * of what a real mesh transport (peerjs, simple-peer) does when a new
-     * data channel opens - see DummyHub.registerPeerConnect().
+     * data channel opens - see DummyHub.registerPeerConnect(). Off by default
+     * (see DummyTransportOptions.simulatePeerConnect) - GenericProvider
+     * feature-detects onPeerConnect, so leaving this unconditionally active
+     * would silently move every DummyTransport consumer onto the mesh code
+     * path, even though DummyTransport otherwise models a broadcast relay.
      */
     onPeerConnect(callback) {
+        if (!this.options.simulatePeerConnect)
+            return () => { };
         this._peerConnectCallback = callback;
         if (this._connected && this._room && this.hub) {
             this.hub.registerPeerConnect(this._room, this, callback);

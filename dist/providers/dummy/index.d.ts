@@ -141,6 +141,18 @@ export interface DummyTransportOptions {
      * @default false
      */
     autoConnect?: boolean;
+    /**
+     * Simulate onPeerConnect notifications (mesh-style peer-discovery, as a
+     * real peerjs/simple-peer/trystero transport would fire). DummyTransport
+     * otherwise models a broadcast relay (like websocket/pubnub/gun/matrix,
+     * none of which implement onPeerConnect) - off by default so plain
+     * multi-peer benchmarks/usage aren't silently shifted onto the mesh code
+     * path in GenericProvider.connect(). Enable only when a test specifically
+     * wants to exercise onPeerConnect-triggered behavior (e.g.
+     * test/dummy/bench-mesh-join-burst.ts).
+     * @default false
+     */
+    simulatePeerConnect?: boolean;
 }
 /**
  * Dummy transport implementation for testing and development.
@@ -200,7 +212,11 @@ export declare class DummyTransport implements Transport {
     /**
      * Register callback for peer-connect notifications. Test-only simulation
      * of what a real mesh transport (peerjs, simple-peer) does when a new
-     * data channel opens - see DummyHub.registerPeerConnect().
+     * data channel opens - see DummyHub.registerPeerConnect(). Off by default
+     * (see DummyTransportOptions.simulatePeerConnect) - GenericProvider
+     * feature-detects onPeerConnect, so leaving this unconditionally active
+     * would silently move every DummyTransport consumer onto the mesh code
+     * path, even though DummyTransport otherwise models a broadcast relay.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
     /**

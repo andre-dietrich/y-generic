@@ -177,11 +177,16 @@ export declare class GenericProvider extends Observable<string> {
          */
         syncRequestWindowMs?: number;
         /**
-         * Max random delay (ms) before replying to a SyncStep1 request, used
-         * to let other peers' replies pre-empt a redundant one (NACK-style
-         * suppression). Only engages once at least 2 other peers are known via
-         * awareness. Larger values suppress more redundant traffic in large
-         * rooms at the cost of higher requester-perceived latency.
+         * Base max random delay (ms) before replying to a SyncStep1 request,
+         * used to let other peers' replies pre-empt a redundant one
+         * (NACK-style suppression). Only engages once at least 2 other peers
+         * are known via awareness. The actual max delay scales up from this
+         * base with room size (see `_replySuppressionMaxDelay()`) - a larger
+         * room has more repliers racing within the same window, so it's given
+         * more time for the "someone already answered" signal to be overheard
+         * before more repliers commit. This option is the small-room baseline
+         * and the growth-rate multiplier's unit, not a hard cap (see the
+         * `200`ms cap in `_replySuppressionMaxDelay()`).
          * @default 30
          */
         syncReplySuppressionMs?: number;
@@ -290,6 +295,28 @@ export declare class GenericProvider extends Observable<string> {
      * Corrupt messages are rejected immediately without attempting to decode.
      */
     private _handleIncomingMessage;
+    /**
+     * Max random delay (ms) before replying to a SyncStep1 request, scaled by
+     * a room-size signal already available (`this.awareness.getStates().size`
+     * - the same signal read at the `>= 3` suppression gate). A fixed window
+     * (the pre-fix behavior: always `_syncReplySuppressionMs`) doesn't scale
+     * with room size, so a larger room has more independent repliers racing
+     * to answer the same request within the same window - more of them lose
+     * the race and get silently dropped by the `_sendSyncReply()` rate-limit
+     * backstop instead of never sending in the first place. Measured in
+     * test/dummy/bench-corruption-storm.ts: the SyncStep2/SyncStep1 ratio (
+     * ideally ~1 if suppression alone were sufficient) grew from ~1.1-1.3 at
+     * N=2 to ~4.5-5.9 at N=10 with the fixed 30ms window.
+     *
+     * `min(cap, base * log2(peerCount))` - log2 growth spreads replies over a
+     * wider window as the room grows without the delay exploding at very high
+     * N. Capped at 200ms: the slowest-profile round trip this project
+     * benchmarks against (Matrix, ~350ms one-way) already tolerates hundreds
+     * of ms of latency, so 200ms of extra requester-perceived delay stays
+     * well inside that budget while still giving a 100-peer room roughly
+     * 6-7x the base window instead of an unbounded one.
+     */
+    private _replySuppressionMaxDelay;
     /**
      * Schedule a SyncStep2 reply after a short random delay instead of
      * sending immediately. If another peer's reply is overheard in the

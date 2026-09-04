@@ -233,6 +233,15 @@ export declare class GenericProvider extends Observable<string> {
      */
     get synced(): boolean;
     /**
+     * Push local state + request remote state, gated by the shared rate
+     * limiter. Returns whether it actually reserved a slot and sent anything
+     * - `false` means the caller was rate-limited right now. Extracted out of
+     * `syncNow()` so `_requestResync()`'s scheduled retry (see below) can tell
+     * the difference between "sent" and "silently skipped" and react to it,
+     * instead of assuming a resync always succeeds once it fires.
+     */
+    private _trySyncPushPull;
+    /**
      * Force an immediate sync with remote peers.
      * Useful after network interruptions or to manually trigger re-sync.
      */

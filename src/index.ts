@@ -674,15 +674,14 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Force an immediate sync with remote peers.
-   * Useful after network interruptions or to manually trigger re-sync.
+   * Push local state + request remote state, gated by the shared rate
+   * limiter. Returns whether it actually reserved a slot and sent anything
+   * - `false` means the caller was rate-limited right now. Extracted out of
+   * `syncNow()` so `_requestResync()`'s scheduled retry (see below) can tell
+   * the difference between "sent" and "silently skipped" and react to it,
+   * instead of assuming a resync always succeeds once it fires.
    */
-  syncNow(): void {
-    if (!this.transport.isConnected) {
-      console.warn('Cannot sync: transport not connected')
-      return
-    }
-
+  private _trySyncPushPull(): boolean {
     // Push (full document state) and pull (SyncStep1 request) share a
     // single rate-limit reservation. syncNow() is called from several
     // triggers that can all fire in a short window when many peers are
@@ -694,17 +693,31 @@ export class GenericProvider extends Observable<string> {
     // test/dummy/bench-user-scaling.ts: at 100 simulated users this drove
     // message counts to 20-200x the theoretical linear cost. See
     // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md.
-    if (this._tryReserveSyncSlot()) {
-      // Send our current document state to all peers
-      // This ensures any changes made while offline are transmitted
-      const update = Y.encodeStateAsUpdate(this.doc)
-      if (update.length > 0) {
-        this._sendUpdate(update)
-      }
+    if (!this._tryReserveSyncSlot()) return false
 
-      // Send sync request to get updates from others
-      this._writeSyncStep1()
+    // Send our current document state to all peers
+    // This ensures any changes made while offline are transmitted
+    const update = Y.encodeStateAsUpdate(this.doc)
+    if (update.length > 0) {
+      this._sendUpdate(update)
     }
+
+    // Send sync request to get updates from others
+    this._writeSyncStep1()
+    return true
+  }
+
+  /**
+   * Force an immediate sync with remote peers.
+   * Useful after network interruptions or to manually trigger re-sync.
+   */
+  syncNow(): void {
+    if (!this.transport.isConnected) {
+      console.warn('Cannot sync: transport not connected')
+      return
+    }
+
+    this._trySyncPushPull()
 
     // Broadcast current awareness state - independently throttled and much
     // cheaper than a full document push, so it isn't gated by the sync
@@ -1224,8 +1237,23 @@ export class GenericProvider extends Observable<string> {
     )
     this._pendingResyncTimeoutId = setTimeout(() => {
       this._pendingResyncTimeoutId = undefined
-      if (this.transport.isConnected && !this._destroying) {
-        this.syncNow()
+      if (!this.transport.isConnected || this._destroying) return
+
+      // Use the push/pull half directly (not syncNow()) so we can tell
+      // whether it actually sent anything. If the shared rate-limit budget
+      // is still exhausted right now (e.g. this peer has been busy
+      // answering/replying to plenty of other room traffic), silently
+      // treating that as "resync complete" would permanently strand this
+      // peer: nothing else re-triggers _requestResync() unless a new
+      // incoming message happens to mismatch again, which may never
+      // happen if this peer never received anything to mismatch against
+      // in the first place. Re-arm through the same coordinator instead -
+      // the budget is a rolling window, so this keeps retrying (still
+      // backed off, still capped at 5s) until it eventually gets a slot.
+      if (this._trySyncPushPull()) {
+        this._broadcastAwareness([this.doc.clientID])
+      } else {
+        this._requestResync()
       }
     }, delay)
   }

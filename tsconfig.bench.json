@@ -18,6 +18,7 @@
     "test/dummy/bench-asymmetric-join.ts",
     "test/dummy/bench-packet-loss.ts",
     "test/dummy/bench-late-join.ts",
+    "test/dummy/bench-rejoin-blank-doc.ts",
     "test/dummy/repro-gun-batch-corruption.ts",
     "test/dummy/bench-corruption-storm.ts",
     "test/ably/repro-liveobjects-persist.ts"

@@ -84,6 +84,11 @@ export declare class GenericProvider extends Observable<string> {
     private _syncIntervalId?;
     private _verifyUpdates;
     private _disableBc;
+    private _idleBackoffEnabled;
+    private _idleBackoffMaxMs;
+    private _currentSyncIntervalMs;
+    private _lastActivityTime;
+    private _lastPeriodicTickTime;
     private _bcChannel;
     private _bcConnected;
     private _bcSubscriber?;
@@ -265,6 +270,54 @@ export declare class GenericProvider extends Observable<string> {
          * @default undefined (compression disabled, wire format unchanged)
          */
         compressionThresholdBytes?: number;
+        /**
+         * Back off the periodic-sync interval (see `syncInterval`) when the
+         * room is idle, instead of ticking at a fixed cadence forever. After
+         * each periodic tick that saw no activity since the previous tick -
+         * no local or remote document change, no local or remote awareness
+         * change, no corrupted/rejected wire message - the interval DOUBLES
+         * (capped at `idleBackoffMaxMs`) for the next tick. Any activity
+         * resets it immediately back to `syncInterval`. Deliberately does NOT
+         * count the periodic tick's own routine SyncStep1/SyncStep2 exchange
+         * as activity (see `_markActivity()`'s doc comment for why treating
+         * that as activity would make this option a no-op - an earlier draft
+         * of this feature made exactly that mistake, caught by this option's
+         * own bench script). Still composes with the existing +/-20% jitter
+         * (`_jitteredSyncInterval()`) at whatever the current backed-off value
+         * is.
+         *
+         * TRADEOFF - read before enabling: periodic sync exists as a
+         * loss-recovery backstop (catch a message that was silently dropped).
+         * Backing it off during idle periods directly trades away worst-case
+         * recovery latency for exactly the scenario it exists to cover: a
+         * message dropped right after the room goes quiet won't be caught by
+         * periodic sync until the NEXT tick, which by then may be up to
+         * `idleBackoffMaxMs` away instead of `syncInterval` away. Measured in
+         * test/dummy/bench-idle-backoff.ts: with default settings (5s base,
+         * 60s cap), a loss injected early in an idle stretch can take on the
+         * order of the current backed-off interval (up to ~60s) to recover,
+         * vs. one `syncInterval` (~5s) with this off - see that bench's own
+         * output/header for the exact run's numbers. This is a real
+         * bandwidth-vs-recovery-latency tradeoff, not a free win, which is why
+         * this defaults to OFF.
+         * @default false (no backoff - identical behavior to before this
+         * option existed)
+         */
+        idleBackoffEnabled?: boolean;
+        /**
+         * Ceiling (ms) for the backed-off periodic-sync interval when
+         * `idleBackoffEnabled` is true. Doubling from a 5000ms base reaches
+         * this in 4 idle ticks (5s/10s/20s/40s/60s). 60000 is chosen so the
+         * worst-case loss-recovery latency this trades away stays the same
+         * order of magnitude as `y-protocols/awareness`'s own built-in
+         * peer-removal timeout (30s, halved from its 60s+ `_checkInterval`
+         * sweep window) rather than growing unbounded - a room silent long
+         * enough to be fully backed off is, on this timescale, already close
+         * to "everyone's gone idle/timed out" territory anyway. Ignored when
+         * `idleBackoffEnabled` is false.
+         * @default 60000
+         */
+        idleBackoffMaxMs?: number;
     });
     /**
      * Connect to the backend and start syncing.
@@ -327,13 +380,49 @@ export declare class GenericProvider extends Observable<string> {
     syncNow(): void;
     /**
      * Compute the next periodic-sync delay, jittered by ~+/-20% around
-     * `_syncInterval`. Re-jittered fresh each tick (not computed once per
-     * connect()) so a room's peers - which commonly all connect() within a
-     * short window of each other - drift apart over time instead of staying
-     * loosely synchronized. Extracted to its own method purely so benchmarks
-     * can shadow it to compare against the unjittered baseline.
+     * `_currentSyncIntervalMs` (== `_syncInterval` unless `idleBackoffEnabled`
+     * has backed it off - see that option's doc comment). Re-jittered fresh
+     * each tick (not computed once per connect()) so a room's peers - which
+     * commonly all connect() within a short window of each other - drift
+     * apart over time instead of staying loosely synchronized. Extracted to
+     * its own method purely so benchmarks can shadow it to compare against
+     * the unjittered baseline.
      */
     private _jitteredSyncInterval;
+    /**
+     * Record that "activity" happened right now, for `idleBackoffEnabled`'s
+     * benefit. Cheap (one timestamp write) and called unconditionally
+     * regardless of whether idle backoff is enabled, so there's no behavioral
+     * branch to keep in sync - the backoff decision in connect()'s periodic
+     * tick is the only place that actually reads this.
+     *
+     * Call sites are deliberately NOT "any inbound wire message" - an earlier
+     * version of this hooked `_handleIncomingMessage()` unconditionally, which
+     * made the periodic tick's OWN SyncStep1 request and the SyncStep2 reply
+     * answering it (empty payload - nothing to sync) each count as "activity",
+     * permanently resetting the backoff on every single tick and making the
+     * whole feature a no-op (caught by this bench script's own first run: ON
+     * and OFF produced statistically indistinguishable message counts). Both
+     * Yjs's `doc.emit('update', ...)` and y-protocols' `awareness.emit('update', ...)`
+     * already only fire when something with actual content changed
+     * (`hasContent`/non-empty added+updated+removed - confirmed by reading
+     * yjs's `Transaction.js` and y-protocols' `awareness.js` directly), so
+     * hooking THOSE instead is exactly "local or remote document/awareness
+     * change" with no extra filtering needed - a no-op SyncStep2 reply or a
+     * duplicate/no-change awareness re-announce (e.g. this same periodic
+     * tick's own presence re-broadcast on transports without
+     * `onPeerConnect`) never reaches these handlers. A corrupted (CRC32
+     * mismatch) message is real evidence of wire activity that neither
+     * handler would ever see (it's rejected before decoding) - see the
+     * explicit call in `_processWrappedMessage()`'s corruption branch.
+     *
+     * Call sites: `_setupDocumentSync()`'s update handler (local or remote
+     * document content change), `_setupAwarenessSync()`'s update handler
+     * (local or remote awareness content change), and
+     * `_processWrappedMessage()`'s corrupted-message branch (wire noise, not
+     * silence).
+     */
+    private _markActivity;
     /**
      * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
      * events within `_peerConnectDebounceMs` collapses into one call instead

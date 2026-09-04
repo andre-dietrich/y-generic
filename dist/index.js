@@ -253,6 +253,8 @@ export class GenericProvider extends Observable {
         this._status = { state: 'disconnected' };
         this._synced = false;
         this._destroying = false;
+        this._lastActivityTime = Date.now();
+        this._lastPeriodicTickTime = Date.now();
         // BroadcastChannel state for cross-tab sync
         this._bcChannel = '';
         this._bcConnected = false;
@@ -315,6 +317,9 @@ export class GenericProvider extends Observable {
         this._gapGraceMs = options.gapGraceMs ?? 300;
         this._seqWindowSize = options.seqWindowSize ?? 64;
         this._compressionThresholdBytes = options.compressionThresholdBytes || undefined;
+        this._idleBackoffEnabled = options.idleBackoffEnabled ?? false;
+        this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000;
+        this._currentSyncIntervalMs = this._syncInterval;
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -386,8 +391,28 @@ export class GenericProvider extends Observable {
             // reduce total periodic-sync traffic, only spreads it out so a room's
             // background traffic is smooth instead of bursty.
             if (this._syncInterval > 0) {
+                // Reset idle-backoff state on every (re)connect so a reconnect
+                // always starts its first tick at the base interval, never
+                // inheriting a backed-off value left over from a previous session.
+                this._currentSyncIntervalMs = this._syncInterval;
+                this._lastActivityTime = Date.now();
+                this._lastPeriodicTickTime = Date.now();
                 const scheduleNextPeriodicSync = () => {
                     this._syncIntervalId = setTimeout(() => {
+                        const tickTime = Date.now();
+                        if (this._idleBackoffEnabled) {
+                            // "Activity" = anything _markActivity() call sites observed
+                            // (incoming message via transport or BroadcastChannel, local
+                            // or remote doc change, local or remote awareness change)
+                            // since the LAST tick fired - not since backoff started, so a
+                            // single quiet tick after a burst of activity still resets to
+                            // base rather than needing a full quiet cycle to catch up.
+                            const hadActivitySinceLastTick = this._lastActivityTime > this._lastPeriodicTickTime;
+                            this._currentSyncIntervalMs = hadActivitySinceLastTick
+                                ? this._syncInterval
+                                : Math.min(this._idleBackoffMaxMs, this._currentSyncIntervalMs * 2);
+                        }
+                        this._lastPeriodicTickTime = tickTime;
                         if (this.transport.isConnected && !this._destroying) {
                             // Also re-announce awareness - but only on transports WITHOUT
                             // onPeerConnect (e.g. WebSocket, PubNub, Trystero strategies
@@ -690,15 +715,53 @@ export class GenericProvider extends Observable {
     }
     /**
      * Compute the next periodic-sync delay, jittered by ~+/-20% around
-     * `_syncInterval`. Re-jittered fresh each tick (not computed once per
-     * connect()) so a room's peers - which commonly all connect() within a
-     * short window of each other - drift apart over time instead of staying
-     * loosely synchronized. Extracted to its own method purely so benchmarks
-     * can shadow it to compare against the unjittered baseline.
+     * `_currentSyncIntervalMs` (== `_syncInterval` unless `idleBackoffEnabled`
+     * has backed it off - see that option's doc comment). Re-jittered fresh
+     * each tick (not computed once per connect()) so a room's peers - which
+     * commonly all connect() within a short window of each other - drift
+     * apart over time instead of staying loosely synchronized. Extracted to
+     * its own method purely so benchmarks can shadow it to compare against
+     * the unjittered baseline.
      */
     _jitteredSyncInterval() {
         const jitter = 1 + (Math.random() * 2 - 1) * 0.2; // +/-20%
-        return this._syncInterval * jitter;
+        return this._currentSyncIntervalMs * jitter;
+    }
+    /**
+     * Record that "activity" happened right now, for `idleBackoffEnabled`'s
+     * benefit. Cheap (one timestamp write) and called unconditionally
+     * regardless of whether idle backoff is enabled, so there's no behavioral
+     * branch to keep in sync - the backoff decision in connect()'s periodic
+     * tick is the only place that actually reads this.
+     *
+     * Call sites are deliberately NOT "any inbound wire message" - an earlier
+     * version of this hooked `_handleIncomingMessage()` unconditionally, which
+     * made the periodic tick's OWN SyncStep1 request and the SyncStep2 reply
+     * answering it (empty payload - nothing to sync) each count as "activity",
+     * permanently resetting the backoff on every single tick and making the
+     * whole feature a no-op (caught by this bench script's own first run: ON
+     * and OFF produced statistically indistinguishable message counts). Both
+     * Yjs's `doc.emit('update', ...)` and y-protocols' `awareness.emit('update', ...)`
+     * already only fire when something with actual content changed
+     * (`hasContent`/non-empty added+updated+removed - confirmed by reading
+     * yjs's `Transaction.js` and y-protocols' `awareness.js` directly), so
+     * hooking THOSE instead is exactly "local or remote document/awareness
+     * change" with no extra filtering needed - a no-op SyncStep2 reply or a
+     * duplicate/no-change awareness re-announce (e.g. this same periodic
+     * tick's own presence re-broadcast on transports without
+     * `onPeerConnect`) never reaches these handlers. A corrupted (CRC32
+     * mismatch) message is real evidence of wire activity that neither
+     * handler would ever see (it's rejected before decoding) - see the
+     * explicit call in `_processWrappedMessage()`'s corruption branch.
+     *
+     * Call sites: `_setupDocumentSync()`'s update handler (local or remote
+     * document content change), `_setupAwarenessSync()`'s update handler
+     * (local or remote awareness content change), and
+     * `_processWrappedMessage()`'s corrupted-message branch (wire noise, not
+     * silence).
+     */
+    _markActivity() {
+        this._lastActivityTime = Date.now();
     }
     /**
      * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
@@ -725,6 +788,11 @@ export class GenericProvider extends Observable {
      */
     _setupDocumentSync() {
         this._updateHandler = (update, origin) => {
+            // Fires for BOTH local edits and remotely-applied updates (the latter
+            // go through doc.transact with origin=this) - see _markActivity()'s
+            // doc comment for why this single hook covers "local or remote
+            // document change" for idleBackoffEnabled.
+            this._markActivity();
             // Don't send updates that originated from this provider
             // This prevents infinite loops when receiving updates
             if (origin !== this) {
@@ -781,6 +849,9 @@ export class GenericProvider extends Observable {
      */
     _setupAwarenessSync() {
         this._awarenessUpdateHandler = ({ added, updated, removed, }, origin) => {
+            // Fires for both local and remote-applied awareness changes - see
+            // _markActivity()'s doc comment.
+            this._markActivity();
             // Broadcast awareness changes (unless they came from remote)
             const changedClients = added.concat(updated).concat(removed);
             this._broadcastAwareness(changedClients);
@@ -867,6 +938,11 @@ export class GenericProvider extends Observable {
             // bench-packet-loss.ts) for how that tradeoff was measured.
             console.warn(`[GenericProvider] 💥 Corrupted message rejected: CRC32 checksum mismatch. ` +
                 `This is expected if data corruption simulation is enabled.`);
+            // Wire noise, not silence - counts as activity for idleBackoffEnabled
+            // even though nothing here reaches the doc/awareness update handlers
+            // (the message is rejected before decoding). See _markActivity()'s
+            // doc comment.
+            this._markActivity();
             // Request re-sync to recover any lost data - routed through the
             // shared coordinator so this doesn't stack an independent timer on
             // top of any hash-mismatch/gap-confirmed resync already pending.

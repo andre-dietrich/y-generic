@@ -27,6 +27,7 @@
     "test/dummy/bench-periodic-jitter.ts",
     "test/dummy/bench-compression-ratio.ts",
     "test/dummy/bench-chunking-compression.ts",
+    "test/dummy/bench-idle-backoff.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

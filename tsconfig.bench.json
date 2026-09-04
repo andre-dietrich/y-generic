@@ -21,6 +21,7 @@
     "test/dummy/bench-rejoin-blank-doc.ts",
     "test/dummy/repro-gun-batch-corruption.ts",
     "test/dummy/bench-corruption-storm.ts",
+    "test/dummy/bench-reconnect-cycling.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

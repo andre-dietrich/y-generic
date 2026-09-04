@@ -359,6 +359,18 @@ export class GenericProvider extends Observable {
             clearTimeout(this._pendingResyncTimeoutId);
             this._pendingResyncTimeoutId = undefined;
         }
+        // Stop any pending gap-check timers and forget per-sender sequence
+        // tracking. Without this, a gap-check timer armed before this
+        // disconnect() keeps running in the background and can fire
+        // _requestResync() after reconnect using sequence-number bookkeeping
+        // from the PREVIOUS connection - a spurious resync race disconnected
+        // from anything actually missing in the new session. Mirrors the
+        // equivalent cleanup in destroy().
+        for (const timer of this._gapCheckTimers.values()) {
+            clearTimeout(timer);
+        }
+        this._gapCheckTimers.clear();
+        this._remoteSeqInfo.clear();
         // Reset the sync rate-limit budget. Without this, a reconnect inherits
         // whatever budget was left over from before the disconnect - and since
         // syncNow()'s full-state push now shares this same limiter (see

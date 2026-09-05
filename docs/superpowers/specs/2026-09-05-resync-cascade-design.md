@@ -196,3 +196,49 @@ had already fast-forwarded the receiver — Task 2's late-update guard.
 The per-task bench set for Task 1 (late-join, packet-loss both regimes,
 user-scaling both regimes with tail) was still running when this was
 committed; recorded with Task 2.
+
+### After Task 2 — resync sends a beacon; mismatch triggers filtered (design 1b)
+
+Three changes, the third found by measuring the first two:
+
+1. `_requestResync()`'s action is a beacon plus response wait (retry with
+   a plain beacon after 1 s / 2 s / 4 s), no document push.
+2. A hash mismatch on an update that added nothing (every client it
+   touches ends at a clock we were already past — `Y.parseUpdateMeta` vs.
+   our state vector) is not a trigger: it is a keystroke that arrived after
+   a resync reply had fast-forwarded us.
+3. A hash mismatch on an update Yjs could not fully integrate
+   (`doc.store.pendingStructs` / `pendingDs` non-null) gets the gap grace
+   (`gapGraceMs`, 300 ms) and a beacon only if still pending afterwards.
+   Measuring 1 + 2 alone left the mismatch count where Task 1 had it
+   (343 vs 353) and the cascade at the ceiling: since the connect push no
+   longer carries a sequence number, a peer's first keystroke can be the
+   first numbered message a receiver sees from it, so a reordered first
+   burst had no earlier number to open a sequence gap against, and the
+   pre-existing "reordering suspected" guard never engaged. Yjs's own
+   pending store is the exact signal (research doc item 4, dropped from
+   phase 1 as speculative — it stopped being speculative here).
+
+**Fan-out Gun N=100, fresh budget (probe with tail), the phase's headline:**
+
+| | deliveries until quiet | hash mismatches | resyncs |
+|---|---|---|---|
+| baseline (end of phase 1) | 198,990 | 6,899 | 210 |
+| Task 1 | 198,990 | 353 | 105 |
+| Task 2, changes 1+2 | 198,990 | 343 | 144 |
+| **Task 2, final** | **990** (the 10 keystrokes × 99, nothing else) | **0** | **0** |
+
+The probe's window also catches the y-protocols 15 s awareness renewal
+(9,900 deliveries) once the settle plus tail exceed 15 s; it is not part
+of the cascade and is listed separately.
+
+`bench-join-after-burst`: WebSocket in-budget 7,989 / 225 ms, fresh
+3,971 / 52 ms; Matrix in-budget 15,437 / 524 ms, fresh 14,653 / 529 ms —
+the in-budget WebSocket row varies run to run (3,873-7,989 across Task 1
+and 2 runs; its SyncStep2 count swings between 245 and 4,557), a
+single-run number; the per-task set below is the record. Two fresh peers
+and a 3-peer simultaneous join still reach `synced` (probe).
+
+The full per-task set for Task 2 (user-scaling both regimes with tail,
+late-join, packet-loss both regimes, corruption-storm, idle census,
+periodic-awareness) is recorded below once the queued run completes.

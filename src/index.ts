@@ -441,6 +441,8 @@ export class GenericProvider extends Observable<string> {
   private _responseWaitTimer?: ReturnType<typeof setTimeout>
   private _responseWaitAttempts: number = 0
   private _responseSeen: boolean = false
+  private _responseWaitFlags: number = 0 // flags for the retry beacon: CONFIRM after a JOIN, 0 after a resync
+  private _pendingCheckTimer?: ReturnType<typeof setTimeout> // see _schedulePendingCheck()
 
   // Same NACK-style suppression as _pendingSyncReply above, applied to
   // awareness updates that are a pure timeout-triggered removal (see
@@ -921,6 +923,10 @@ export class GenericProvider extends Observable<string> {
       clearTimeout(this._responseWaitTimer)
       this._responseWaitTimer = undefined
     }
+    if (this._pendingCheckTimer !== undefined) {
+      clearTimeout(this._pendingCheckTimer)
+      this._pendingCheckTimer = undefined
+    }
     this._responseWaitAttempts = 0
     this._responseSeen = false
 
@@ -1137,7 +1143,7 @@ export class GenericProvider extends Observable<string> {
     // Batched into one wire message (MESSAGE_BATCH) instead of one
     // transport.send()/bc.publish() call per sub-message - see _sendBatch().
     this._sendBatch(messages)
-    if (flags & DIGEST_FLAG_JOIN) this._armResponseWait()
+    if (flags & DIGEST_FLAG_JOIN) this._armResponseWait(DIGEST_FLAG_CONFIRM)
     return true
   }
 
@@ -1687,6 +1693,12 @@ export class GenericProvider extends Observable<string> {
         // must still be applied here — the old "skip if seqNum <= last
         // seen" logic silently dropped such updates forever whenever a
         // later-numbered message happened to arrive first.
+        // Peek at the sync sub-message's payload (SyncStep2/Update carry
+        // an update as a varUint8Array right after the sub-type) without
+        // consuming the decoder - _isLateUpdate() needs the bytes after
+        // readSyncMessage() has applied them.
+        const updateBytes = this._peekSyncUpdate(decoder)
+
         const encoder = encoding.createEncoder()
         encoding.writeVarUint(encoder, MESSAGE_SYNC)
 
@@ -1731,7 +1743,34 @@ export class GenericProvider extends Observable<string> {
             senderClientID,
           )
 
-          if (!reorderingSuspected) {
+          // A late update - one whose content we had already been past
+          // when it arrived (its sender's clock in the update is below
+          // ours, because a SyncStep2 or a reordered later update got here
+          // first) - carries a hash of a state we have legitimately moved
+          // beyond. Its mismatch says nothing about anything we lack; it
+          // was the other half of the item-13 cascade (a resync's reply
+          // fast-forwards a peer, then every in-flight keystroke behind it
+          // mismatches). Cheap to detect from the update's own metadata.
+          const lateUpdate = this._isLateUpdate(updateBytes)
+
+          // Yjs's own verdict: if the update could not be fully integrated
+          // because a causal dependency is missing, the struct store holds
+          // it as pending. That is the ONE mismatch that is evidence of a
+          // gap - and under jitter it is usually a reordering that the
+          // next few ms resolve, so it gets the same grace a sequence gap
+          // gets before a beacon goes out (_schedulePendingCheck). It also
+          // covers the case the sequence anchor no longer does: since the
+          // connect push carries no sequence number (MESSAGE_SYNC_PUSH), a
+          // peer's first keystroke can be the first numbered message we see
+          // from it, and a reordered first burst has no earlier number to
+          // open a gap against.
+          const pending =
+            this.doc.store.pendingStructs !== null ||
+            this.doc.store.pendingDs !== null
+
+          if (pending) {
+            this._schedulePendingCheck()
+          } else if (!reorderingSuspected && !lateUpdate) {
             // Push our full state AND request theirs (syncNow() does
             // both). A hash mismatch means the two peers have diverged -
             // one side may have edits the other lacks. Routed through the
@@ -1998,6 +2037,66 @@ export class GenericProvider extends Observable<string> {
     }
   }
 
+  /**
+   * Re-check Yjs's pending-struct store after the gap grace period and
+   * request a resync (a beacon, see _requestResync) only if something is
+   * still missing. One timer; a check scheduled while one is pending is
+   * absorbed. Cleared on disconnect/destroy.
+   */
+  private _schedulePendingCheck(): void {
+    if (this._pendingCheckTimer !== undefined) return
+    this._pendingCheckTimer = setTimeout(() => {
+      this._pendingCheckTimer = undefined
+      if (this._destroying || !this.transport.isConnected) return
+      if (
+        this.doc.store.pendingStructs !== null ||
+        this.doc.store.pendingDs !== null
+      ) {
+        this._requestResync()
+      }
+    }, this._gapGraceMs)
+  }
+
+  /**
+   * Return the update payload of a SyncStep2/Update sync sub-message
+   * without advancing `decoder` (null for SyncStep1 or malformed input).
+   * y-protocols frames both as [subType varUint][update varUint8Array].
+   */
+  private _peekSyncUpdate(decoder: decoding.Decoder): Uint8Array | null {
+    const peek = decoding.clone(decoder)
+    try {
+      const subType = decoding.readVarUint(peek)
+      if (subType === syncProtocol.messageYjsSyncStep1) return null
+      return decoding.readVarUint8Array(peek)
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Whether an update we just applied was already superseded here: every
+   * client it touches ends at a clock we were at or beyond BEFORE this
+   * update (i.e. it added nothing). Uses the update's own metadata
+   * (`Y.parseUpdateMeta`), O(clients in the update).
+   */
+  private _isLateUpdate(updateBytes: Uint8Array | null): boolean {
+    if (!updateBytes) return false
+    try {
+      const { to } = Y.parseUpdateMeta(updateBytes)
+      if (to.size === 0) return false
+      const local = Y.decodeStateVector(Y.encodeStateVector(this.doc))
+      for (const [client, clock] of to) {
+        // `to` is the exclusive end clock of the update's range for that
+        // client; our state vector is exclusive too. Equal means the update
+        // brought us exactly here (not late); greater means we were past it.
+        if ((local.get(client) ?? 0) <= clock) return false
+      }
+      return true
+    } catch {
+      return false
+    }
+  }
+
   /** Flip `synced` once and emit; idempotent. */
   private _markSynced(): void {
     if (!this._synced) {
@@ -2007,16 +2106,20 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Wait for a response to the JOIN beacon we just sent. If neither a
-   * SyncStep2 nor an equal ack/beacon arrives within 1s (then 2s, 4s), ask
-   * again with a CONFIRM beacon, three times at most - after that the
+   * Wait for a response to the JOIN or resync beacon we just sent. If
+   * neither a SyncStep2 nor an equal ack/beacon arrives within 1s (then
+   * 2s, 4s), ask again - with a CONFIRM beacon after a JOIN (so an equal
+   * room acks), with a plain beacon after a resync (only peers ahead of us
+   * need to answer; an equal room's silence is the correct answer and its
+   * periodic beacons end the wait) - three times at most; after that the
    * periodic beacon is the fallback, as before. Requester-side retry is how the protocol
    * stays loss-tolerant now that reply suppression leaves ~1 reply per
    * request; N-fold redundant replies were the old (accidental) way.
    */
-  private _armResponseWait(): void {
+  private _armResponseWait(retryFlags: number): void {
     if (this._responseWaitTimer !== undefined) return
     this._responseSeen = false
+    this._responseWaitFlags = retryFlags
     const delay = 1000 * Math.pow(2, this._responseWaitAttempts)
     this._responseWaitTimer = setTimeout(() => {
       this._responseWaitTimer = undefined
@@ -2030,8 +2133,8 @@ export class GenericProvider extends Observable<string> {
         return
       }
       this._responseWaitAttempts++
-      this._sendSyncStep1(DIGEST_FLAG_CONFIRM) // rate-limited; a dropped attempt is simply retried next round
-      this._armResponseWait()
+      this._sendSyncStep1(this._responseWaitFlags) // rate-limited; a dropped attempt is simply retried next round
+      this._armResponseWait(this._responseWaitFlags)
     }, delay)
   }
 
@@ -2308,40 +2411,22 @@ export class GenericProvider extends Observable<string> {
       this._pendingResyncTimeoutId = undefined
       if (!this.transport.isConnected || this._destroying) return
 
-      // Use the push/pull half directly (not syncNow()) so we can tell
-      // whether it actually sent anything. If the shared rate-limit budget
-      // is still exhausted right now (e.g. this peer has been busy
-      // answering/replying to plenty of other room traffic), silently
-      // treating that as "resync complete" would permanently strand this
-      // peer: nothing else re-triggers _requestResync() unless a new
-      // incoming message happens to mismatch again, which may never
-      // happen if this peer never received anything to mismatch against
-      // in the first place. Re-arm through the same coordinator instead -
-      // the budget is a rolling window, so this keeps retrying (still
-      // backed off, still capped at 5s) until it eventually gets a slot.
-      //
-      // As in syncNow(), fold the awareness broadcast into the same wire
-      // send as the push/pull messages when the awareness throttle would
-      // let it through immediately anyway (buildExtra only runs once a
-      // slot is confirmed reserved) - preserves the exact "only broadcast
-      // awareness when the sync half actually sent" semantics this retry
-      // has always had (unlike syncNow(), which broadcasts unconditionally).
-      let awarenessBatched = false
-      const sent = this._trySyncPushPull(
-        true,
-        () => {
-          const msg = this._tryImmediateAwarenessMessage([this.doc.clientID])
-          if (msg) {
-            awarenessBatched = true
-            return [msg]
-          }
-          return []
-        },
-      )
-      if (sent) {
-        if (!awarenessBatched) {
-          this._broadcastAwareness([this.doc.clientID])
-        }
+      // A resync trigger means "I may be missing something" - never "the
+      // room is missing my data" (my updates travel on their own, and the
+      // connect-time push covers offline edits). So: ask with a 12-byte
+      // beacon; the peers ahead of me reply with exactly the diff (a
+      // SyncStep2 against my state vector, suppressed as any reply), the
+      // rest stay silent. Until phase 1b this pushed the WHOLE document to
+      // the room on every trigger, and that push - a hashed update of my
+      // state - failed the hash check at every peer ahead of me, which
+      // scheduled a resync of its own: the cascade of research doc item 13
+      // (198,990 deliveries for 10 keystrokes at N=100 on the Gun profile,
+      // the rate limiter's ceiling). If the beacon or its reply is lost,
+      // _armResponseWait() re-beacons (1s/2s/4s); the periodic beacon is
+      // the fallback after that. A rate-limited attempt re-arms through
+      // this same coordinator so a stranded peer keeps retrying.
+      if (this._sendSyncStep1(0)) {
+        this._armResponseWait(0)
       } else {
         this._requestResync()
       }

@@ -126,6 +126,8 @@ export declare class GenericProvider extends Observable<string> {
     private _responseWaitTimer?;
     private _responseWaitAttempts;
     private _responseSeen;
+    private _responseWaitFlags;
+    private _pendingCheckTimer?;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
@@ -615,12 +617,35 @@ export declare class GenericProvider extends Observable<string> {
      * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
      */
     private _replyToSyncRequest;
+    /**
+     * Re-check Yjs's pending-struct store after the gap grace period and
+     * request a resync (a beacon, see _requestResync) only if something is
+     * still missing. One timer; a check scheduled while one is pending is
+     * absorbed. Cleared on disconnect/destroy.
+     */
+    private _schedulePendingCheck;
+    /**
+     * Return the update payload of a SyncStep2/Update sync sub-message
+     * without advancing `decoder` (null for SyncStep1 or malformed input).
+     * y-protocols frames both as [subType varUint][update varUint8Array].
+     */
+    private _peekSyncUpdate;
+    /**
+     * Whether an update we just applied was already superseded here: every
+     * client it touches ends at a clock we were at or beyond BEFORE this
+     * update (i.e. it added nothing). Uses the update's own metadata
+     * (`Y.parseUpdateMeta`), O(clients in the update).
+     */
+    private _isLateUpdate;
     /** Flip `synced` once and emit; idempotent. */
     private _markSynced;
     /**
-     * Wait for a response to the JOIN beacon we just sent. If neither a
-     * SyncStep2 nor an equal ack/beacon arrives within 1s (then 2s, 4s), ask
-     * again with a CONFIRM beacon, three times at most - after that the
+     * Wait for a response to the JOIN or resync beacon we just sent. If
+     * neither a SyncStep2 nor an equal ack/beacon arrives within 1s (then
+     * 2s, 4s), ask again - with a CONFIRM beacon after a JOIN (so an equal
+     * room acks), with a plain beacon after a resync (only peers ahead of us
+     * need to answer; an equal room's silence is the correct answer and its
+     * periodic beacons end the wait) - three times at most; after that the
      * periodic beacon is the fallback, as before. Requester-side retry is how the protocol
      * stays loss-tolerant now that reply suppression leaves ~1 reply per
      * request; N-fold redundant replies were the old (accidental) way.

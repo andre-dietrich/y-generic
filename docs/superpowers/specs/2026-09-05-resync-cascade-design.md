@@ -126,6 +126,19 @@ passes; `bench-corruption-storm` still converges at every corruption rate
 (the mismatch → beacon path is also the corruption-recovery path);
 `bench-idle-room` (b) still heals a lost delete.
 
+**Bench change during the phase:** `bench-packet-loss` now runs its peers
+with `syncInterval: 2000` (`SYNC_INTERVAL_MS` override; was 0 via
+`makeProviders`). Reason, found after Task 2: a lost *last* keystroke has,
+by design, no trigger but the periodic beacon (no later update opens a
+sequence gap or a pending dependency, no hash to mismatch). The pre-phase
+builds recovered it anyway, because every other lost message's resync
+pushed the whole document to the room and carried it along; with the
+cascade gone the N=5 / 10 % fan-out cell timed out in 1 of 3 samples on an
+intermediate build. Measuring loss recovery without the mechanism the
+README prescribes for lossy links (~2 s) was measuring the storm. Baseline
+and final are both re-measured with the new setting; the phase-1 numbers
+for this bench are not comparable to the phase-1b ones.
+
 ## Work items, in order (one commit each)
 
 1. 1a push type + baseline numbers recorded
@@ -199,7 +212,12 @@ had already fast-forwarded the receiver — Task 2's late-update guard.
 
 The per-task bench set for Task 1 (late-join, packet-loss both regimes,
 user-scaling both regimes with tail) was still running when this was
-committed; recorded with Task 2.
+committed. **Its late-join and packet-loss logs are not Task 1 numbers:**
+that set ran from `bench-dist/`, which was rebuilt for Tasks 2-3 while
+the set was still going, so those two benches loaded intermediate builds.
+They are excluded from the record. From Task 2 on, every per-task set
+runs from a per-task snapshot (`bench-dist-tN/`), and the loss/join
+gates are run once, 3 × 3, on the final build (see "Final gates").
 
 ### After Task 2 — resync sends a beacon; mismatch triggers filtered (design 1b)
 

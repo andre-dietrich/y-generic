@@ -105,6 +105,7 @@ export function makeProviders(
   profile: Profile,
   N: number,
   dropRate: number = 0,
+  syncInterval: number = 0,
 ): { docs: Y.Doc[]; providers: GenericProvider[] } {
   const docs: Y.Doc[] = []
   const providers: GenericProvider[] = []
@@ -119,7 +120,10 @@ export function makeProviders(
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
       verifyUpdates: true,
-      syncInterval: 0,
+      // 0 (default) isolates join/resync mechanics from the periodic beacon;
+      // bench-packet-loss passes a real interval, because recovery from a
+      // lost LAST update has no trigger but the periodic beacon by design.
+      syncInterval,
     })
     // Bump local awareness state past the library's genesis clock (0) -
     // every real consumer app does this for presence/cursors, and it's a

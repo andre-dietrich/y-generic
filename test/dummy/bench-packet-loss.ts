@@ -48,6 +48,14 @@ import {
 const TEST_PROFILES: Profile[] = PROFILES.filter(
   (p) => p.name.startsWith('WebSocket') || p.name.startsWith('Matrix'),
 )
+// Periodic beacon interval for the peers under test. Phase 1b: the pre-phase
+// builds recovered a lost LAST keystroke only through the resync storms
+// that other lost messages happened to trigger (every resync pushed the
+// whole document); with those gone, a lost last update in a room without a
+// periodic beacon has - by design - nothing to recover it, and the N=5 /
+// 10 % cell timed out in 1 of 3 samples. The README recommends ~2 s for
+// lossy links; that is what this bench uses now (override: SYNC_INTERVAL_MS).
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)
 const DROP_RATES = [0, 0.01, 0.03, 0.05, 0.1]
 const N_VALUES = [5, 10, 25, 50]
 const SAMPLES = 3
@@ -106,7 +114,7 @@ async function runFanOut(
     const room = `bench-pl-fanout-${Math.random().toString(36).slice(2)}`
     const hub = new DummyHub()
     const stats = instrumentHub(hub)
-    const { docs, providers } = makeProviders(hub, profile, N, dropRate)
+    const { docs, providers } = makeProviders(hub, profile, N, dropRate, SYNC_INTERVAL_MS)
 
     await Promise.all(providers.map((p) => p.connect({ room })))
     // Default: edit right after the join burst, i.e. while every peer's
@@ -164,7 +172,7 @@ async function runJoinBurst(
     const room = `bench-pl-join-${Math.random().toString(36).slice(2)}`
     const hub = new DummyHub()
     const stats = instrumentHub(hub)
-    const { providers } = makeProviders(hub, profile, N, dropRate)
+    const { providers } = makeProviders(hub, profile, N, dropRate, SYNC_INTERVAL_MS)
 
     const start = Date.now()
     await Promise.all(providers.map((p) => p.connect({ room })))

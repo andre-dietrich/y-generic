@@ -444,6 +444,18 @@ export class GenericProvider extends Observable<string> {
   private _responseWaitFlags: number = 0 // flags for the retry beacon: CONFIRM after a JOIN, 0 after a resync
   private _pendingCheckTimer?: ReturnType<typeof setTimeout> // see _schedulePendingCheck()
 
+  // Round-trip estimate from our own requests (JOIN/resync beacon -> first
+  // SyncStep2 or ack): the minimum of the last 8 samples, because a sample
+  // includes the responder's random suppression delay and the fastest
+  // reply had the least of it. Drives _replySuppressionMaxDelay() (a
+  // suppression window shorter than the one-way latency suppresses
+  // nothing: at 250-350 ms latency every peer ahead of a requester replied
+  // before any reply could be overheard, ~20 replies per request at N=100)
+  // and _armResponseWait()'s first delay (a fixed 1 s fired premature
+  // retries on the Matrix profile). See the phase-1b design doc, 1c.
+  private _rttSamples: number[] = []
+  private _requestSentAt: number = 0
+
   // Same NACK-style suppression as _pendingSyncReply above, applied to
   // awareness updates that are a pure timeout-triggered removal (see
   // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
@@ -929,6 +941,8 @@ export class GenericProvider extends Observable<string> {
     }
     this._responseWaitAttempts = 0
     this._responseSeen = false
+    this._rttSamples = []
+    this._requestSentAt = 0
 
     // Drop any pending suppressed sync reply - safe to simply discard (not
     // flush/send like batched updates/awareness below), since a suppressed
@@ -1609,7 +1623,7 @@ export class GenericProvider extends Observable<string> {
 
         if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
           // If we received SyncStep2, we're synced
-          this._noteResponse()
+          this._noteResponse(true)
           this._markSynced()
 
           // Someone else's SyncStep2 reply just arrived - our own pending
@@ -1716,7 +1730,7 @@ export class GenericProvider extends Observable<string> {
         // triggered it, so the same suppression scheme applies here too.
         if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
           this._cancelPendingSyncReply()
-          this._noteResponse()
+          this._noteResponse(true)
         }
 
         // Read the expected hash from sender (signed integer)
@@ -1870,7 +1884,7 @@ export class GenericProvider extends Observable<string> {
       // ours, we're synced; if we were about to confirm the same state, we
       // no longer need to. Never a request: no reply, no presence.
       if (equal) {
-        this._noteResponse()
+        this._noteResponse(true)
         this._markSynced()
         this._cancelPendingAck()
       }
@@ -1888,7 +1902,7 @@ export class GenericProvider extends Observable<string> {
     if (equal && !(flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM))) {
       // A settled peer's periodic beacon in our state: it confirms us (and
       // whoever we were about to ack) as well as any ack would.
-      this._noteResponse()
+      this._noteResponse(false)
       this._cancelPendingAck()
     }
 
@@ -1936,10 +1950,17 @@ export class GenericProvider extends Observable<string> {
    */
   private _replySuppressionMaxDelay(): number {
     const peerCount = this.awareness.getStates().size
-    return Math.min(
+    const byRoomSize = Math.min(
       200,
       this._syncReplySuppressionMs * Math.log2(Math.max(2, peerCount)),
     )
+    // Phase 1b: the window must exceed the one-way latency or nobody
+    // overhears anybody in time (see _rttSamples). 1.5x the smallest
+    // observed round trip, capped at 2 s - on a 350 ms profile that is
+    // ~1 s of extra requester-perceived delay in exchange for ~1 reply
+    // instead of ~20.
+    const rtt = this._rttMinMs()
+    return rtt === null ? byRoomSize : Math.min(2000, Math.max(byRoomSize, 1.5 * rtt))
   }
 
   /**
@@ -2120,7 +2141,11 @@ export class GenericProvider extends Observable<string> {
     if (this._responseWaitTimer !== undefined) return
     this._responseSeen = false
     this._responseWaitFlags = retryFlags
-    const delay = 1000 * Math.pow(2, this._responseWaitAttempts)
+    this._requestSentAt = Date.now()
+    const rtt = this._rttMinMs()
+    const delay =
+      Math.max(1000, rtt === null ? 0 : 4 * rtt) *
+      Math.pow(2, this._responseWaitAttempts)
     this._responseWaitTimer = setTimeout(() => {
       this._responseWaitTimer = undefined
       if (
@@ -2138,14 +2163,29 @@ export class GenericProvider extends Observable<string> {
     }, delay)
   }
 
-  /** A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is answered. */
-  private _noteResponse(): void {
+  /**
+   * A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is
+   * answered. `sample` = it was a direct reply (SyncStep2/ack), so its
+   * timing is a round-trip sample; an equal periodic beacon from a settled
+   * peer also ends the wait but says nothing about latency.
+   */
+  private _noteResponse(sample: boolean): void {
+    if (sample && this._requestSentAt > 0) {
+      this._rttSamples.push(Date.now() - this._requestSentAt)
+      if (this._rttSamples.length > 8) this._rttSamples.shift()
+    }
+    this._requestSentAt = 0
     this._responseSeen = true
     this._responseWaitAttempts = 0
     if (this._responseWaitTimer !== undefined) {
       clearTimeout(this._responseWaitTimer)
       this._responseWaitTimer = undefined
     }
+  }
+
+  /** Minimum of the recent round-trip samples, or null before the first reply. */
+  private _rttMinMs(): number | null {
+    return this._rttSamples.length === 0 ? null : Math.min(...this._rttSamples)
   }
 
   /**

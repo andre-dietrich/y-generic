@@ -128,6 +128,8 @@ export declare class GenericProvider extends Observable<string> {
     private _responseSeen;
     private _responseWaitFlags;
     private _pendingCheckTimer?;
+    private _rttSamples;
+    private _requestSentAt;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
@@ -651,8 +653,15 @@ export declare class GenericProvider extends Observable<string> {
      * request; N-fold redundant replies were the old (accidental) way.
      */
     private _armResponseWait;
-    /** A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is answered. */
+    /**
+     * A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is
+     * answered. `sample` = it was a direct reply (SyncStep2/ack), so its
+     * timing is a round-trip sample; an equal periodic beacon from a settled
+     * peer also ends the wait but says nothing about latency.
+     */
     private _noteResponse;
+    /** Minimum of the recent round-trip samples, or null before the first reply. */
+    private _rttMinMs;
     /**
      * Delay a pure timeout-removal awareness broadcast and drop it if
      * another peer's broadcast of the SAME removal is overheard first (see

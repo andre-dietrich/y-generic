@@ -242,3 +242,30 @@ and a 3-peer simultaneous join still reach `synced` (probe).
 The full per-task set for Task 2 (user-scaling both regimes with tail,
 late-join, packet-loss both regimes, corruption-storm, idle census,
 periodic-awareness) is recorded below once the queued run completes.
+
+### After Task 3 — RTT-driven suppression window and response wait (design 1c)
+
+The estimate is the **minimum** of the last 8 round trips (JOIN/resync
+beacon → first SyncStep2 or ack), not an EWMA: a sample includes the
+responder's random suppression delay, so a mean would feed the window
+back into itself (a wider window → slower replies → wider window, up to
+the cap); the fastest reply carries the least delay and tracks the real
+latency. Equal periodic beacons end a response wait but are not samples.
+Window = `min(2000, max(room-size formula, 1.5 · minRTT))`; first
+response-wait delay = `max(1000, 4 · minRTT)`.
+
+`bench-join-after-burst` (single run; the queued set is the record):
+
+| profile | variant | Task 2 | Task 3 |
+|---|---|---|---|
+| WebSocket | in budget window | 7,989 / 225 ms (SyncStep2 4,557) | 5,392 / 50 ms (SyncStep2 **147**) |
+| WebSocket | fresh budget | 3,971 / 52 ms (SyncStep2 392) | 5,735 / 42 ms (SyncStep2 **147**) |
+| Matrix | in budget window | 15,437 / 524 ms (SyncStep2 4,655) | **11,811** / 604 ms (SyncStep2 **784**) |
+| Matrix | fresh budget | 14,653 / 529 ms (SyncStep2 4,067) | **11,713** / 608 ms (SyncStep2 **784**) |
+
+Replies to the K=10 joiners on Matrix: ~46 per joiner → ~8; the ~80 ms
+of extra convergence time is the wider window doing its job. WebSocket
+totals in this bench are dominated by the presence responses now (4,116 /
+4,361 of ~5,500), as are Matrix's (~9,200 of ~11,800) — Task 6. Concurrent
+late-join probe on Matrix (M=40, K=10, 10 keystrokes): 11,860 deliveries,
+SyncStep2 1,029 (phase 1 end: 18,181 / 5,586), zero warnings.

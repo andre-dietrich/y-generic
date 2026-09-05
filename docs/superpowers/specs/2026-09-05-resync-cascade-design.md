@@ -135,3 +135,64 @@ passes; `bench-corruption-storm` still converges at every corruption rate
 ## Results
 
 Appended per step as measured, baseline first.
+
+### Baseline (`main` @ `55d36f7`, end of phase 1; `bench-dist-baseline/`)
+
+Default-timing gate logs are the phase-1 "Task 3c final" set (see the
+digest-beacon design doc). New for this phase:
+
+**`bench-user-scaling` fan-out with tail counting** (deliveries until the
+room is quiet for 1 s; `atConv` = at the moment every doc converged, the
+old metric). One editor, 10 keystrokes, no loss:
+
+| profile | N | default timing: until quiet / atConv | fresh budget (`SETTLE_MS=12000`): until quiet / atConv |
+|---|---|---|---|
+| WebSocket | 50 | 1,813 / 490 | 2,450 / 490 |
+| WebSocket | 100 | 8,910 / 990 | 9,009 / 990 |
+| WebRTC | 100 | 7,623 / 990 | 7,920 / 990 |
+| Gun | 50 | 38,808 / 2,793 | **49,490** / 2,352 |
+| Gun | 100 | 160,974 / 9,801 | **198,990** / 9,603 |
+| Matrix | 50 | 36,799 / 2,450 | **49,490** / 2,744 |
+| Matrix | 100 | 149,985 / 10,395 | **198,990** / 10,197 |
+
+Every doc has the content within one latency; what follows is the
+cascade. 49,490 and 198,990 are the limiter ceilings for N=50 and N=100.
+Even WebSocket at N=100 carries a 9x tail behind its linear 990.
+
+`bench-join-after-burst`: WebSocket in-budget 5,049 / 96 ms, fresh 7,205 /
+64 ms; Matrix in-budget 33,365 / 341 ms, fresh 19,161 / 539 ms. Idle
+census N=50: default 18,081, 15 s settle 24,402. Join burst N=50 (probe):
+5,194 / 185 ms.
+
+### After Task 1 — `MESSAGE_SYNC_PUSH` (design 1a)
+
+Item 12 is gone: `bench-idle-room` (b)'s setup phase shows `setupWarns=none`
+in every sample (was one hash mismatch + one resync per sample);
+`bench-join-after-burst` pushes are exactly the K joiners' (445) with no
+resync pushes behind them:
+
+| profile | variant | baseline | Task 1 |
+|---|---|---|---|
+| WebSocket | in budget window | 5,049 / 96 ms (SyncStep2 490) | **3,873 / 56 ms** (SyncStep2 245) |
+| WebSocket | fresh budget | 7,205 / 64 ms (SyncStep2 392) | **5,343 / 42 ms** (SyncStep2 245) |
+| Matrix | in budget window | 33,365 / 341 ms (SyncStep2 20,618) | **15,241 / 500 ms** (SyncStep2 4,263) |
+| Matrix | fresh budget | 19,161 / 539 ms (SyncStep2 4,361) | **15,486 / 519 ms** (SyncStep2 4,557) |
+
+Join burst N=50: 5,684 / 173 ms (pushes now 5 bytes each: 4.8 KB for
+1,225 deliveries vs 14.3 KB). Idle census N=50 default settle 19,502
+(18,081): the post-join retry storm is smaller, not gone — the cascade's
+other half is still there:
+
+Fan-out Gun N=100, fresh budget (probe with tail): **198,990** — unchanged
+— but hash mismatches 6,899 → **353** and resyncs 210 → **105**. What
+remains: each of the ~105 resyncs still pushes the document and beacons,
+and each beacon collects ~20 SyncStep2 replies (the 200 ms suppression
+window is shorter than the 250 ms one-way latency), until the *reply*
+budgets are spent (189,189 SyncStep2 deliveries ≈ 99 peers × 20 slots ×
+99 recipients). Tasks 2 and 3 address exactly those two factors. The
+remaining 353 mismatches are late keystrokes arriving after a resync reply
+had already fast-forwarded the receiver — Task 2's late-update guard.
+
+The per-task bench set for Task 1 (late-join, packet-loss both regimes,
+user-scaling both regimes with tail) was still running when this was
+committed; recorded with Task 2.

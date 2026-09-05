@@ -44,6 +44,8 @@ interface RunResult {
   cpuMs: number
   messages: number
   bytes: number
+  /** fan-out only: deliveries counted at the moment every doc converged (the pre-phase-1b metric) */
+  atConvergence?: number
 }
 
 export function sleep(ms: number): Promise<void> {
@@ -172,12 +174,34 @@ async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
     const totalMs = Date.now() - start
     const cpuAfter = process.cpuUsage(cpuBefore)
     const cpuMs = (cpuAfter.user + cpuAfter.system) / 1000
+    const atConvergence = stats.messages - preExisting.messages
+
+    // Keep counting until the room has been quiet for QUIET_MS (cap
+    // TAIL_CAP_MS): the hash-mismatch/resync cascade under jitter runs on
+    // for seconds AFTER every doc has the content (research doc item 13) -
+    // counting only to convergence hid ~95% of it on the Gun/Matrix
+    // profiles at N=100 (9,405 at convergence vs ~199,000 until quiet).
+    const QUIET_MS = 1000
+    const TAIL_CAP_MS = 10000
+    const tailStart = Date.now()
+    let lastCount = stats.messages
+    let quietSince = Date.now()
+    while (Date.now() - tailStart < TAIL_CAP_MS) {
+      await sleep(50)
+      if (stats.messages !== lastCount) {
+        lastCount = stats.messages
+        quietSince = Date.now()
+      } else if (Date.now() - quietSince >= QUIET_MS) {
+        break
+      }
+    }
 
     const result: RunResult = {
       totalMs,
       cpuMs,
       messages: stats.messages - preExisting.messages,
       bytes: stats.bytes - preExisting.bytes,
+      atConvergence,
     }
 
     for (const p of providers) p.destroy()
@@ -228,16 +252,18 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
 }
 
 function printRow(N: number, r: RunResult): void {
+  const tail = r.atConvergence === undefined ? '' : ` | ${String(r.atConvergence).padStart(8)}`
   console.log(
-    `${String(N).padStart(5)} | ${String(r.totalMs).padStart(7)} | ${r.cpuMs.toFixed(1).padStart(6)} | ${String(r.messages).padStart(8)} | ${String(r.bytes).padStart(9)}`,
+    `${String(N).padStart(5)} | ${String(r.totalMs).padStart(7)} | ${r.cpuMs.toFixed(1).padStart(6)} | ${String(r.messages).padStart(8)} | ${String(r.bytes).padStart(9)}${tail}`,
   )
 }
 
 async function main() {
   console.log('=== Fan-out cost (steady-state broadcast of a 10-edit burst) ===')
+  console.log('"messages"/"bytes" = deliveries until the room is quiet for 1s (cap 10s); "atConv" = deliveries at the moment every doc converged.')
   for (const profile of PROFILES) {
     console.log(`\n-- Profile: ${profile.name} (latency=${profile.latency}ms, jitter=${profile.jitter}) --`)
-    console.log('users | totalMs |  cpuMs | messages |     bytes')
+    console.log('users | totalMs |  cpuMs | messages |     bytes |   atConv')
     for (const N of USER_COUNTS) {
       const r = await runFanOut(N, profile)
       printRow(N, r)

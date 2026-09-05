@@ -722,7 +722,11 @@ budget (12 s settle):
 
 198,990 is the limiter ceiling for N=100 (100 peers × 20 slots × 99
 recipients plus the burst). Identical for baseline and 3c: this phase
-neither caused nor touched it. What happens: 30 % jitter reorders the
+neither caused nor touched it. (Correction from phase 1b: the bench's
+~9.4k numbers are not a spent-budget effect but a counting one — every doc
+converges after ~330 ms and 9,405 deliveries, and the bench stopped
+counting there while the cascade ran on for seconds; the probe's numbers
+include a tail. `bench-user-scaling` now counts until the room is quiet.) What happens: 30 % jitter reorders the
 editor's 10 updates at many receivers; a reordered update mismatches the
 hash *after* the sender's gap-check grace has expired for some of them,
 each mismatch schedules a full-state push + request; every push is itself

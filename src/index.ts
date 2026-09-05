@@ -49,6 +49,15 @@ const DIGEST_FLAG_ACK = 2
 // an equal room every peer would answer, and at high latency the
 // suppression window cannot thin those replies (measured 4-5x more acks).
 const DIGEST_FLAG_CONFIRM = 4
+// Full-state push (connect()/syncNow()): the whole document as one update,
+// no hash, no sequence number, applied and nothing else. Before this type a
+// push was a MESSAGE_SYNC_VERIFIED update whose hash was the PUSHER's state
+// - every peer holding more data read that as divergence and scheduled a
+// resync of its own (research doc item 12), the seed of the cascade in item
+// 13. Not a SyncStep2 either: receiving one must not flip `synced` (an
+// empty joiner's push says nothing about the room's content). See
+// docs/superpowers/specs/2026-09-05-resync-cascade-design.md.
+const MESSAGE_SYNC_PUSH = 6
 
 /**
  * CRC32 lookup table for fast computation.
@@ -1114,7 +1123,7 @@ export class GenericProvider extends Observable<string> {
     if (push) {
       const update = Y.encodeStateAsUpdate(this.doc)
       if (update.length > 0) {
-        messages.push(this._encodeUpdate(update))
+        messages.push(this._encodePush(update))
       }
     }
 
@@ -1571,6 +1580,13 @@ export class GenericProvider extends Observable<string> {
 
       case MESSAGE_SYNC_DIGEST: {
         this._handleDigest(decoder)
+        break
+      }
+
+      case MESSAGE_SYNC_PUSH: {
+        // Somebody's whole document: apply it, nothing else (see the
+        // constant's comment for why no hash check and no synced flip).
+        Y.applyUpdate(this.doc, decoding.readVarUint8Array(decoder), this)
         break
       }
 
@@ -2437,6 +2453,18 @@ export class GenericProvider extends Observable<string> {
       syncProtocol.writeUpdate(encoder, update)
     }
 
+    return encoding.toUint8Array(encoder)
+  }
+
+  /**
+   * Encode a full-state push (see MESSAGE_SYNC_PUSH): the document as one
+   * update, deliberately without the hash and sequence number that
+   * `_encodeUpdate()` adds to incremental updates.
+   */
+  private _encodePush(update: Uint8Array): Uint8Array {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC_PUSH)
+    encoding.writeVarUint8Array(encoder, update)
     return encoding.toUint8Array(encoder)
   }
 

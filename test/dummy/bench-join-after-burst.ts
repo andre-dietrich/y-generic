@@ -73,6 +73,8 @@ function classifyOne(msg: Uint8Array, census: Census, mult: number): void {
     decoding.readVarUint(d) // version
     const flags = decoding.readVarUint(d)
     cls = flags & 2 ? 'ack' : flags & 1 ? 'requestJoin' : 'request'
+  } else if (t === 6) {
+    cls = 'push' // MESSAGE_SYNC_PUSH: connect-time full state (phase 1b)
   } else if (t === 1) {
     cls = 'awareness'
   }

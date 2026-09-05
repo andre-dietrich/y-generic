@@ -5,3 +5,4 @@ demos/
 examples/
 bench-dist/
 bench-dist-baseline/
+bench-dist-*/

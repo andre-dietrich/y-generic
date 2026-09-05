@@ -153,6 +153,8 @@ function classifyOne(msg: Uint8Array, counts: TypeCounts): void {
     // class, replaces SyncStep1 on the wire; counted as syncStep1 so the
     // SyncStep2/SyncStep1 ratio stays comparable across the change.
     counts.syncStep1++
+  } else if (msgType === 6) {
+    counts.update++ // MESSAGE_SYNC_PUSH: connect-time full state (phase 1b)
   } else if (msgType === 1) {
     counts.awareness++
   } else if (msgType === MESSAGE_BATCH) {

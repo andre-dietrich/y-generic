@@ -767,6 +767,12 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _encodeUpdate;
     /**
+     * Encode a full-state push (see MESSAGE_SYNC_PUSH): the document as one
+     * update, deliberately without the hash and sequence number that
+     * `_encodeUpdate()` adds to incremental updates.
+     */
+    private _encodePush;
+    /**
      * Send a document update to the transport.
      * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
      */

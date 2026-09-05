@@ -80,6 +80,8 @@ function classifyOne(msg: Uint8Array, census: Census, mult: number): void {
     cls = sub === 0 ? 'request' : sub === 1 ? 'syncStep2' : 'update'
   } else if (msgType === MESSAGE_SYNC_DIGEST) {
     cls = 'request'
+  } else if (msgType === 6) {
+    cls = 'update' // MESSAGE_SYNC_PUSH: connect-time full state (phase 1b)
   } else if (msgType === MESSAGE_AWARENESS) {
     cls = 'awareness'
   }

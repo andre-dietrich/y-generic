@@ -781,16 +781,21 @@ beacon's JOIN path is exactly where this fires.
 
 ### 13. The resync cascade is only bounded by the rate limiter, and every bench that edits soon after a join burst has been measuring a spent budget
 
-**Finding (measured, 2026-09-05, phase 1 Task 3c).** `bench-user-scaling`
-fan-out at N=100, one editor, 10 keystrokes, no loss, Gun profile (250 ms
-± 30 %): with a fresh 20-per-10 s budget on every peer, **both** the
-pre-phase-1 baseline and the digest-beacon build deliver exactly 198,990
-messages — the limiter ceiling (100 × 20 × 99 + the burst) — with ~6,900
-hash-mismatch warnings and ~210-280 scheduled resyncs. With the bench's
-default timing (edit 850 ms after the join burst) the baseline shows
-22,968 and the beacon build 162,261; the difference is entirely how much
-budget the join burst left, not protocol efficiency. WebSocket/WebRTC
-profiles stay at the linear 990 in all cases.
+**Finding (measured, 2026-09-05, phase 1 Task 3c; corrected in phase 1b).**
+Fan-out at N=100, one editor, 10 keystrokes, no loss, Gun profile (250 ms
+± 30 %): every doc has the content after ~330 ms and 9,405 deliveries —
+and then the cascade runs on for seconds. Counted until the room is quiet,
+with a fresh 20-per-10 s budget on every peer, **both** the pre-phase-1
+baseline and the digest-beacon build reach 198,990 deliveries — the
+limiter ceiling (100 × 20 × 99 + the burst) — with ~6,900 hash-mismatch
+warnings and ~210-280 scheduled resyncs, and the count is still creeping
+up three seconds later. `bench-user-scaling` counted only to convergence
+and therefore reported 9,405 in every build; it now also counts the tail
+until 1 s of silence. With the bench's default timing (edit 850 ms after
+the join burst) the tail is smaller (23k baseline / 162k beacon build)
+because the join burst had already spent most of the budget the cascade
+runs on. WebSocket/WebRTC profiles stay at the linear 990 in all cases,
+tail included.
 
 **Mechanism.** Jitter reorders one editor's updates → a late update fails
 the hash after the sender's gap-check grace (300 ms) has run out →

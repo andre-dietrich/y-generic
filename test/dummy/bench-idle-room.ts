@@ -28,7 +28,7 @@
 
 import * as Y from 'yjs'
 import * as decoding from 'lib0/decoding'
-import { GenericProvider } from '../../src/index'
+import { GenericProvider, computeDeleteSetHash } from '../../src/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
 import { sleep, silenced } from './bench-user-scaling'
 
@@ -287,7 +287,50 @@ async function runLostDelete(sample: number): Promise<boolean> {
   return result.ok
 }
 
+/**
+ * (c) Delete-set hash properties, no network. Two docs that reach the same
+ * logical state through different struct splits (B receives A's inserts as
+ * one update, A built them keystroke by keystroke) must hash equal; docs
+ * that differ only in a deletion must hash differently; the hash must be
+ * stable across independently built replicas; a doc with no deletions
+ * hashes like an empty doc.
+ */
+function runHashProperties(): boolean {
+  const a = new Y.Doc()
+  const ta = a.getText('t')
+  for (const ch of 'hello world') ta.insert(ta.length, ch)
+  const b = new Y.Doc()
+  Y.applyUpdate(b, Y.encodeStateAsUpdate(a))
+  const noDeletes = computeDeleteSetHash(a) === computeDeleteSetHash(new Y.Doc())
+
+  ta.delete(0, 6) // A deletes 'hello ' - B does not get it
+  const differs = computeDeleteSetHash(a) !== computeDeleteSetHash(b)
+
+  Y.applyUpdate(b, Y.encodeStateAsUpdate(a, Y.encodeStateVector(b)))
+  const equalAfterSync = computeDeleteSetHash(a) === computeDeleteSetHash(b)
+
+  // Two more replicas built from different sources (b's merged state, a's
+  // full state) must agree with a: same logical delete set regardless of
+  // how the structs were split on arrival.
+  const c = new Y.Doc()
+  Y.applyUpdate(c, Y.encodeStateAsUpdate(b))
+  const e = new Y.Doc()
+  Y.applyUpdate(e, Y.encodeStateAsUpdate(a))
+  const stable =
+    computeDeleteSetHash(e) === computeDeleteSetHash(a) &&
+    computeDeleteSetHash(c) === computeDeleteSetHash(a)
+
+  const ok = noDeletes && differs && equalAfterSync && stable
+  console.log(
+    `HASHPROPS noDeletes=${noDeletes} differs=${differs} equalAfterSync=${equalAfterSync} stable=${stable} => ${ok ? 'PASS' : 'FAIL'}`,
+  )
+  return ok
+}
+
 async function main() {
+  console.log('(c) delete-set hash properties:\n')
+  const hashOk = runHashProperties()
+  if (!hashOk) process.exitCode = 1
 
   console.log(
     `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms\n`,
@@ -299,7 +342,7 @@ async function main() {
     if (!(await runLostDelete(i))) allOk = false
   }
   console.log(allOk ? '\nLOSTDELETE RESULT: PASS (all samples converged)' : '\nLOSTDELETE RESULT: FAIL')
-  process.exit(allOk ? 0 : 1)
+  process.exit(allOk && hashOk ? 0 : 1)
 }
 
 main().catch((err) => {

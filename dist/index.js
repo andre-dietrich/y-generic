@@ -157,6 +157,39 @@ function computeDocHash(doc) {
     return hash;
 }
 /**
+ * Cheap, peer-deterministic hash of the document's delete set - the half of
+ * a Yjs document's identity that the state vector does NOT cover (yjs
+ * INTERNALS.md: "deletions are tracked in the DeleteSet, and do not update
+ * the state vector"). Two docs that differ only by a lost delete-only
+ * update have identical state vectors, so `computeDocHash` can never
+ * detect that divergence; this hash can, at heartbeat granularity (see
+ * `_encodeSyncStep1()` / `_handleDigest()`).
+ *
+ * Cost: `Y.createDeleteSetFromStructStore` walks every struct (Yjs keeps no
+ * incremental delete set), so this is O(items) - fine once per heartbeat
+ * (every empty SyncStep2 already did this exact walk inside
+ * `encodeStateAsUpdate`), NOT fine per update; hence the cache in
+ * `_deleteSetHash()`. Per-client runs come out already sorted and merged;
+ * the only per-peer non-determinism is `Map` insertion order, fixed by
+ * sorting client IDs before hashing.
+ *
+ * Exported for the property check in test/dummy/bench-idle-room.ts.
+ * @internal
+ */
+export function computeDeleteSetHash(doc) {
+    const ds = Y.createDeleteSetFromStructStore(doc.store);
+    const encoder = encoding.createEncoder();
+    const clients = Array.from(ds.clients.keys()).sort((x, y) => x - y);
+    for (const client of clients) {
+        encoding.writeVarUint(encoder, client);
+        for (const item of ds.clients.get(client)) {
+            encoding.writeVarUint(encoder, item.clock);
+            encoding.writeVarUint(encoder, item.len);
+        }
+    }
+    return computeCRC32(encoding.toUint8Array(encoder));
+}
+/**
  * PubSub channel for real-time messaging alongside Yjs.
  * Allows sending ephemeral messages that don't need CRDT properties.
  */
@@ -293,6 +326,11 @@ export class GenericProvider extends Observable {
         // this. See docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
         // item 7 and test/dummy/bench-awareness-removal-burst.ts.
         this._pendingAwarenessRemoval = null;
+        // Cached computeDeleteSetHash(doc); null = stale. Invalidated on every
+        // doc 'update' (deletes are content changes, so this is exact; inserts
+        // invalidate needlessly but cheaply). See computeDeleteSetHash's doc for
+        // why this must not be recomputed per update.
+        this._dsHashCache = null;
         // Sequence numbers for causal ordering
         this._localSeqNum = 0; // Our sequence number counter
         // Per-sender sequence tracking for reordering-tolerant gap detection.
@@ -781,6 +819,13 @@ export class GenericProvider extends Observable {
     _markActivity() {
         this._lastActivityTime = Date.now();
     }
+    /** Cached delete-set hash - see computeDeleteSetHash(). */
+    _deleteSetHash() {
+        if (this._dsHashCache === null) {
+            this._dsHashCache = computeDeleteSetHash(this.doc);
+        }
+        return this._dsHashCache;
+    }
     /**
      * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
      * events within `_peerConnectDebounceMs` collapses into one call instead
@@ -806,6 +851,7 @@ export class GenericProvider extends Observable {
      */
     _setupDocumentSync() {
         this._updateHandler = (update, origin) => {
+            this._dsHashCache = null;
             // Fires for BOTH local edits and remotely-applied updates (the latter
             // go through doc.transact with origin=this) - see _markActivity()'s
             // doc comment for why this single hook covers "local or remote

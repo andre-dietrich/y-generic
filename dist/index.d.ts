@@ -3,6 +3,27 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import { Observable } from 'lib0/observable';
 import type { Transport, ConnectionConfig, ConnectionStatus } from './transport';
 /**
+ * Cheap, peer-deterministic hash of the document's delete set - the half of
+ * a Yjs document's identity that the state vector does NOT cover (yjs
+ * INTERNALS.md: "deletions are tracked in the DeleteSet, and do not update
+ * the state vector"). Two docs that differ only by a lost delete-only
+ * update have identical state vectors, so `computeDocHash` can never
+ * detect that divergence; this hash can, at heartbeat granularity (see
+ * `_encodeSyncStep1()` / `_handleDigest()`).
+ *
+ * Cost: `Y.createDeleteSetFromStructStore` walks every struct (Yjs keeps no
+ * incremental delete set), so this is O(items) - fine once per heartbeat
+ * (every empty SyncStep2 already did this exact walk inside
+ * `encodeStateAsUpdate`), NOT fine per update; hence the cache in
+ * `_deleteSetHash()`. Per-client runs come out already sorted and merged;
+ * the only per-peer non-determinism is `Map` insertion order, fixed by
+ * sorting client IDs before hashing.
+ *
+ * Exported for the property check in test/dummy/bench-idle-room.ts.
+ * @internal
+ */
+export declare function computeDeleteSetHash(doc: Y.Doc): number;
+/**
  * PubSub channel for real-time messaging alongside Yjs.
  * Allows sending ephemeral messages that don't need CRDT properties.
  */
@@ -106,6 +127,7 @@ export declare class GenericProvider extends Observable<string> {
     private _peerConnectDebounceMs;
     private _pendingPeerConnectSyncTimeoutId?;
     private _compressionThresholdBytes?;
+    private _dsHashCache;
     private _localSeqNum;
     private _remoteSeqInfo;
     private _gapCheckTimers;
@@ -425,6 +447,8 @@ export declare class GenericProvider extends Observable<string> {
      * silence).
      */
     private _markActivity;
+    /** Cached delete-set hash - see computeDeleteSetHash(). */
+    private _deleteSetHash;
     /**
      * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
      * events within `_peerConnectDebounceMs` collapses into one call instead

@@ -124,6 +124,7 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
     private _pendingSyncReplyIsAck;
+    private _pendingSyncReplyTargetSv;
     private _responseWaitTimer?;
     private _responseWaitAttempts;
     private _responseSeen;

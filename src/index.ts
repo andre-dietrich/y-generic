@@ -441,6 +441,16 @@ export class GenericProvider extends Observable<string> {
   // signal. Measured in test/dummy/bench-user-scaling.ts: without this, acks
   // were ~94% of a 50-peer join burst's messages (Task 3b in the design doc).
   private _pendingSyncReplyIsAck: boolean = false
+  // The requester's state vector the pending SyncStep2 answers (null for
+  // acks and for replies to plain SyncStep1s). A later request with the
+  // same state vector is the same question: the pending reply's bytes are
+  // refreshed to the current document and the timer kept, instead of the
+  // old reply being flushed as "a different request" - measured: with one
+  // peer typing while K empty peers join, keystroke and JOIN-beacon
+  // arrivals interleave at random, every keystroke in between changed the
+  // reply bytes, and each settled peer flushed up to K replies (Task 7 in
+  // the phase-1b design doc).
+  private _pendingSyncReplyTargetSv: Uint8Array | null = null
 
   // Response-wait for our own JOIN/CONFIRM/resync beacons - see
   // DIGEST_FLAG_CONFIRM and _armResponseWait(). A SyncStep2 or an equal
@@ -1941,7 +1951,7 @@ export class GenericProvider extends Observable<string> {
       const encoder = encoding.createEncoder()
       encoding.writeVarUint(encoder, MESSAGE_SYNC)
       syncProtocol.writeSyncStep2(encoder, this.doc, remoteSv)
-      this._replyToSyncRequest(encoding.toUint8Array(encoder))
+      this._replyToSyncRequest(encoding.toUint8Array(encoder), false, remoteSv)
     } else if (flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM)) {
       this._replyToSyncRequest(this._encodeAck(remoteSv, remoteDsHash), true)
     }
@@ -2046,13 +2056,25 @@ export class GenericProvider extends Observable<string> {
    * suppression) and drop the new one. Measured in
    * test/dummy/bench-join-after-burst.ts.
    */
-  private _scheduleSyncReply(reply: Uint8Array, isAck: boolean = false): void {
-    if (
-      this._pendingSyncReplyTimeoutId !== undefined &&
-      this._pendingSyncReply !== null &&
-      bytesEqual(this._pendingSyncReply, reply)
-    ) {
-      return
+  private _scheduleSyncReply(
+    reply: Uint8Array,
+    isAck: boolean = false,
+    targetSv: Uint8Array | null = null,
+  ): void {
+    if (this._pendingSyncReplyTimeoutId !== undefined && this._pendingSyncReply !== null) {
+      if (bytesEqual(this._pendingSyncReply, reply)) {
+        return // identical answer already scheduled
+      }
+      if (
+        targetSv !== null &&
+        this._pendingSyncReplyTargetSv !== null &&
+        bytesEqual(this._pendingSyncReplyTargetSv, targetSv)
+      ) {
+        // Same question (same requester state), newer document: refresh
+        // the answer, keep the timer. See _pendingSyncReplyTargetSv.
+        this._pendingSyncReply = reply
+        return
+      }
     }
 
     if (this._pendingSyncReplyTimeoutId !== undefined) {
@@ -2065,12 +2087,14 @@ export class GenericProvider extends Observable<string> {
 
     this._pendingSyncReply = reply
     this._pendingSyncReplyIsAck = isAck
+    this._pendingSyncReplyTargetSv = targetSv
     const delay = Math.random() * this._replySuppressionMaxDelay()
     this._pendingSyncReplyTimeoutId = setTimeout(() => {
       this._pendingSyncReplyTimeoutId = undefined
       if (this._pendingSyncReply) {
         this._sendSyncReply(this._pendingSyncReply)
         this._pendingSyncReply = null
+        this._pendingSyncReplyTargetSv = null
       }
     }, delay)
   }
@@ -2083,6 +2107,7 @@ export class GenericProvider extends Observable<string> {
     }
     this._pendingSyncReply = null
     this._pendingSyncReplyIsAck = false
+    this._pendingSyncReplyTargetSv = null
   }
 
   /**
@@ -2103,7 +2128,11 @@ export class GenericProvider extends Observable<string> {
    * immediately. Both paths are rate-limited by `_sendSyncReply()`. Shared
    * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
    */
-  private _replyToSyncRequest(reply: Uint8Array, isAck: boolean = false): void {
+  private _replyToSyncRequest(
+    reply: Uint8Array,
+    isAck: boolean = false,
+    targetSv: Uint8Array | null = null,
+  ): void {
     // Acks ALWAYS take the delayed/suppressible path: they carry no data,
     // so the only cost of delaying one is a few ms on the joiner's `synced`
     // flip (measured before this rule: 37,240 of a 50-peer join burst's
@@ -2111,7 +2140,7 @@ export class GenericProvider extends Observable<string> {
     // suppression once there is someone else who could answer - counted
     // from beacon/update senders as well as awareness, see _peerCount().
     if (isAck || this._peerCount() >= 3) {
-      this._scheduleSyncReply(reply, isAck)
+      this._scheduleSyncReply(reply, isAck, targetSv)
     } else {
       this._sendSyncReply(reply)
     }

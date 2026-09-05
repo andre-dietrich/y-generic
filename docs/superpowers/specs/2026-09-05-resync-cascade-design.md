@@ -337,3 +337,20 @@ requester, the byte-identical dedupe misses, and the pending reply is
 flushed as "a different request" — up to ten flushed replies per settled
 peer instead of one. Fixed next (Task 7): dedupe by the requested state
 vector and refresh the pending reply's bytes instead of flushing.
+
+### After Task 7 — replies deduplicated by requested state vector
+
+`_scheduleSyncReply()` now also remembers the requester's state vector a
+pending SyncStep2 answers; a later request with the same state vector
+refreshes the pending reply's bytes to the current document and keeps the
+timer, instead of flushing the old reply. Byte-identical dedupe stays for
+the cases it covers; acks and replies to plain SyncStep1s (no target
+known) keep the flush behaviour.
+
+Concurrent late-join probe, WebSocket, three runs: 4,461 / 5,147 / 5,000
+deliveries with 8 / 20 / 17 SyncStep2 messages from the settled peers
+(before: 4,363 or 9,606 with 7 or 119). `bench-join-after-burst`, two
+runs: WebSocket in-budget **4,706 / 5,343** (SyncStep2 539 / 1,176;
+before: 9,802-9,998 with ~6,100), fresh 4,559 / 4,461; Matrix in-budget
+6,283 / 6,205, fresh 5,539 / 5,784. All variants PASS; two fresh peers and
+a 3-peer simultaneous join reach `synced`.

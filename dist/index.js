@@ -284,6 +284,15 @@ export class GenericProvider extends Observable {
         // peers there's no "someone else" to rely on, so replies go out
         // immediately as before.
         this._pendingSyncReply = null;
+        // Same NACK-style suppression as _pendingSyncReply above, applied to
+        // awareness updates that are a pure timeout-triggered removal (see
+        // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
+        // independent 30s outdatedTimeout sweep (y-protocols/awareness.js), so
+        // one peer going silent (crash/dirty drop, not a clean disconnect())
+        // causes an O(N) simultaneous "peer X is gone" broadcast burst without
+        // this. See docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
+        // item 7 and test/dummy/bench-awareness-removal-burst.ts.
+        this._pendingAwarenessRemoval = null;
         // Sequence numbers for causal ordering
         this._localSeqNum = 0; // Our sequence number counter
         // Per-sender sequence tracking for reordering-tolerant gap detection.
@@ -518,6 +527,12 @@ export class GenericProvider extends Observable {
         // flush/send like batched updates/awareness below), since a suppressed
         // reply is by design redundant with whatever the room already has.
         this._cancelPendingSyncReply();
+        // Same reasoning for a pending suppressed awareness-removal broadcast -
+        // every other surviving peer is independently running the same
+        // suppression for the same departure, so dropping ours on disconnect
+        // (rather than flushing it through a transport that's about to go
+        // down) is safe.
+        this._cancelPendingAwarenessRemoval();
         // Flush any pending batched updates before disconnecting
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
@@ -571,6 +586,9 @@ export class GenericProvider extends Observable {
         // Drop any pending suppressed sync reply (disconnect() will also do
         // this, but be explicit)
         this._cancelPendingSyncReply();
+        // Same, for a pending suppressed awareness-removal broadcast
+        // (disconnect() will also do this, but be explicit)
+        this._cancelPendingAwarenessRemoval();
         // Flush any pending batched updates before destroying
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
@@ -877,10 +895,37 @@ export class GenericProvider extends Observable {
             // case must still be broadcast so the room's stale belief that we're
             // gone gets corrected promptly, instead of only self-healing on our
             // next unrelated state change/renewal (up to ~15s later).
-            if (origin === this && !removed.includes(this.awareness.clientID)) {
-                return;
+            if (origin === this) {
+                // An incoming removal might be the SAME departure we have a
+                // suppressed broadcast queued for (see _scheduleAwarenessRemoval())
+                // - someone else already told the room, drop ours.
+                if (removed.length > 0) {
+                    this._cancelPendingAwarenessRemovalIfOverlaps(removed);
+                }
+                if (!removed.includes(this.awareness.clientID)) {
+                    return;
+                }
             }
             const changedClients = added.concat(updated).concat(removed);
+            // A pure timeout-triggered removal ('timeout' is the exact origin
+            // string y-protocols/awareness.js's own _checkInterval passes to
+            // removeAwarenessStates()) is redundant across the whole room: every
+            // OTHER connected peer runs the identical 30s-timeout sweep
+            // independently, so all of them detect and would broadcast the SAME
+            // departure within the same ~3s tick - measured as O(N-1) broadcasts
+            // / O((N-1)(N-2)) deliveries for ONE departure in
+            // test/dummy/bench-awareness-removal-burst.ts (e.g. N=50: 2352
+            // deliveries). Delay + drop-if-overheard, exactly mirroring
+            // _scheduleSyncReply()/_cancelPendingSyncReply()'s suppression of
+            // redundant SyncStep2 replies. Deliberately NOT applied to
+            // 'disconnect'/'window unload' removals (a single broadcaster, not
+            // redundant) or to added/updated clients (every sender's
+            // cursor/presence data is meaningfully different and must never be
+            // suppressed).
+            if (origin === 'timeout') {
+                this._scheduleAwarenessRemoval(changedClients);
+                return;
+            }
             this._broadcastAwareness(changedClients);
         };
         this.awareness.on('update', this._awarenessUpdateHandler);
@@ -1041,7 +1086,26 @@ export class GenericProvider extends Observable {
                 break;
             }
             case MESSAGE_AWARENESS: {
-                awarenessProtocol.applyAwarenessUpdate(this.awareness, decoding.readVarUint8Array(decoder), this);
+                const payload = decoding.readVarUint8Array(decoder);
+                // Someone else's removal broadcast just arrived - cancel our own
+                // suppressed removal for the same clientID(s), if pending (see
+                // _scheduleAwarenessRemoval()). This MUST be checked here, at the
+                // wire-message level, before calling applyAwarenessUpdate() below -
+                // by the time this arrives we've very likely already independently
+                // detected and applied the SAME removal ourselves (every peer's
+                // 30s outdatedTimeout sweep fires near-simultaneously, well before
+                // this message's network delay elapses - see
+                // test/dummy/bench-awareness-removal-burst.ts), so
+                // applyAwarenessUpdate() below will see a clock it already knows
+                // and emit no 'update' event at all - mirrors exactly how the
+                // MESSAGE_SYNC/MESSAGE_SYNC_VERIFIED case above cancels
+                // _pendingSyncReply on seeing a SyncStep2 message TYPE arrive, not
+                // on whether it changed anything locally.
+                const removedIds = this._extractRemovedClientIds(payload);
+                if (removedIds.length > 0) {
+                    this._cancelPendingAwarenessRemovalIfOverlaps(removedIds);
+                }
+                awarenessProtocol.applyAwarenessUpdate(this.awareness, payload, this);
                 break;
             }
             case MESSAGE_PUBSUB: {
@@ -1215,6 +1279,103 @@ export class GenericProvider extends Observable {
             this._pendingSyncReplyTimeoutId = undefined;
         }
         this._pendingSyncReply = null;
+    }
+    /**
+     * Delay a pure timeout-removal awareness broadcast and drop it if
+     * another peer's broadcast of the SAME removal is overheard first (see
+     * the `origin === this` branch in `_setupAwarenessSync()`'s handler,
+     * which calls `_cancelPendingAwarenessRemovalIfOverlaps()`) - the exact
+     * same NACK-style suppression `_scheduleSyncReply()` already applies to
+     * SyncStep2 replies, reusing the same room-size-scaled delay
+     * (`_replySuppressionMaxDelay()`).
+     *
+     * A pending removal already queued when this is called is for a
+     * DIFFERENT departure (two peers timing out within the same suppression
+     * window) - flush it immediately rather than silently overwrite it, then
+     * queue the new one fresh. If it turns out to cover more than one
+     * clientID and only some overlap with a later-overheard broadcast,
+     * `_cancelPendingAwarenessRemovalIfOverlaps()` drops the whole pending
+     * set on ANY overlap rather than partially trimming it - simpler, and
+     * the dropped-but-not-actually-covered client(s) are still safe: every
+     * OTHER surviving peer is independently running this same suppression
+     * for them too.
+     */
+    _scheduleAwarenessRemoval(clients) {
+        if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
+            if (this._pendingAwarenessRemoval) {
+                this._broadcastAwareness(this._pendingAwarenessRemoval);
+            }
+            clearTimeout(this._pendingAwarenessRemovalTimeoutId);
+            this._pendingAwarenessRemovalTimeoutId = undefined;
+        }
+        this._pendingAwarenessRemoval = clients;
+        const delay = Math.random() * this._replySuppressionMaxDelay();
+        this._pendingAwarenessRemovalTimeoutId = setTimeout(() => {
+            this._pendingAwarenessRemovalTimeoutId = undefined;
+            if (this._pendingAwarenessRemoval) {
+                this._broadcastAwareness(this._pendingAwarenessRemoval);
+                this._pendingAwarenessRemoval = null;
+            }
+        }, delay);
+    }
+    /**
+     * Peek at an awareness-update payload (still in
+     * `awarenessProtocol.encodeAwarenessUpdate()`'s wire encoding) for
+     * clientIDs whose state is `null` (a removal), without applying it.
+     * y-protocols/awareness.js doesn't export a standalone decoder for this,
+     * only `applyAwarenessUpdate()` (which also mutates state) and
+     * `modifyAwarenessUpdate()` (which re-encodes) - so this mirrors the
+     * format by hand: varUint length, then per entry
+     * [varUint clientID][varUint clock][varString JSON state]. Used to cancel
+     * a pending suppressed removal (see `_scheduleAwarenessRemoval()`) at the
+     * wire-message level, before `applyAwarenessUpdate()` runs - see the
+     * `MESSAGE_AWARENESS` case's comment for why timing matters here.
+     */
+    _extractRemovedClientIds(payload) {
+        try {
+            const d = decoding.createDecoder(payload);
+            const len = decoding.readVarUint(d);
+            const removed = [];
+            for (let i = 0; i < len; i++) {
+                const clientID = decoding.readVarUint(d);
+                decoding.readVarUint(d); // clock, unused here
+                const state = JSON.parse(decoding.readVarString(d));
+                if (state === null)
+                    removed.push(clientID);
+            }
+            return removed;
+        }
+        catch {
+            // Malformed payload - let applyAwarenessUpdate() below be the one
+            // that deals with it (or throws); suppression is a pure optimization,
+            // never worth failing the actual message handling over.
+            return [];
+        }
+    }
+    /**
+     * Drop a pending suppressed removal broadcast if it overlaps
+     * `removedClientIds` - someone else already broadcast (at least part of)
+     * the same departure, so ours is redundant.
+     */
+    _cancelPendingAwarenessRemovalIfOverlaps(removedClientIds) {
+        if (!this._pendingAwarenessRemoval)
+            return;
+        if (!this._pendingAwarenessRemoval.some((id) => removedClientIds.includes(id))) {
+            return;
+        }
+        if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
+            clearTimeout(this._pendingAwarenessRemovalTimeoutId);
+            this._pendingAwarenessRemovalTimeoutId = undefined;
+        }
+        this._pendingAwarenessRemoval = null;
+    }
+    /** Cancel a pending suppressed awareness-removal broadcast, if any. */
+    _cancelPendingAwarenessRemoval() {
+        if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
+            clearTimeout(this._pendingAwarenessRemovalTimeoutId);
+            this._pendingAwarenessRemovalTimeoutId = undefined;
+        }
+        this._pendingAwarenessRemoval = null;
     }
     /**
      * Send a SyncStep2 reply, gated by the same shared per-peer budget as

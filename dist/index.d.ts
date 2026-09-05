@@ -101,6 +101,8 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingSyncReply;
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
+    private _pendingAwarenessRemoval;
+    private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
     private _pendingPeerConnectSyncTimeoutId?;
     private _compressionThresholdBytes?;
@@ -529,6 +531,49 @@ export declare class GenericProvider extends Observable<string> {
     private _scheduleSyncReply;
     /** Cancel a pending suppressed reply, if any. */
     private _cancelPendingSyncReply;
+    /**
+     * Delay a pure timeout-removal awareness broadcast and drop it if
+     * another peer's broadcast of the SAME removal is overheard first (see
+     * the `origin === this` branch in `_setupAwarenessSync()`'s handler,
+     * which calls `_cancelPendingAwarenessRemovalIfOverlaps()`) - the exact
+     * same NACK-style suppression `_scheduleSyncReply()` already applies to
+     * SyncStep2 replies, reusing the same room-size-scaled delay
+     * (`_replySuppressionMaxDelay()`).
+     *
+     * A pending removal already queued when this is called is for a
+     * DIFFERENT departure (two peers timing out within the same suppression
+     * window) - flush it immediately rather than silently overwrite it, then
+     * queue the new one fresh. If it turns out to cover more than one
+     * clientID and only some overlap with a later-overheard broadcast,
+     * `_cancelPendingAwarenessRemovalIfOverlaps()` drops the whole pending
+     * set on ANY overlap rather than partially trimming it - simpler, and
+     * the dropped-but-not-actually-covered client(s) are still safe: every
+     * OTHER surviving peer is independently running this same suppression
+     * for them too.
+     */
+    private _scheduleAwarenessRemoval;
+    /**
+     * Peek at an awareness-update payload (still in
+     * `awarenessProtocol.encodeAwarenessUpdate()`'s wire encoding) for
+     * clientIDs whose state is `null` (a removal), without applying it.
+     * y-protocols/awareness.js doesn't export a standalone decoder for this,
+     * only `applyAwarenessUpdate()` (which also mutates state) and
+     * `modifyAwarenessUpdate()` (which re-encodes) - so this mirrors the
+     * format by hand: varUint length, then per entry
+     * [varUint clientID][varUint clock][varString JSON state]. Used to cancel
+     * a pending suppressed removal (see `_scheduleAwarenessRemoval()`) at the
+     * wire-message level, before `applyAwarenessUpdate()` runs - see the
+     * `MESSAGE_AWARENESS` case's comment for why timing matters here.
+     */
+    private _extractRemovedClientIds;
+    /**
+     * Drop a pending suppressed removal broadcast if it overlaps
+     * `removedClientIds` - someone else already broadcast (at least part of)
+     * the same departure, so ours is redundant.
+     */
+    private _cancelPendingAwarenessRemovalIfOverlaps;
+    /** Cancel a pending suppressed awareness-removal broadcast, if any. */
+    private _cancelPendingAwarenessRemoval;
     /**
      * Send a SyncStep2 reply, gated by the same shared per-peer budget as
      * SyncStep1 requests/syncNow() pushes (`_tryReserveSyncSlot()`).

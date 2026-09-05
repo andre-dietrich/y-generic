@@ -3,3 +3,5 @@ version/
 .parcel-cache/
 demos/
 examples/
+bench-dist/
+bench-dist-baseline/

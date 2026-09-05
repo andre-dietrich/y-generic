@@ -716,3 +716,51 @@ process.exit(0)
 [lb-subdocs]: https://liveblocks.io/docs/guides/how-to-use-yjs-subdocuments
 [hocus-sub]: https://tiptap.dev/docs/hocuspocus/guides/multi-subdocuments
 [anikd]: https://anikd.com/blog/optimizing-yjs-first-load/
+
+## Addendum (2026-09-05, found while building the phase-1 baseline bench)
+
+### 12. False-positive hash mismatch on every join into a room with content
+
+**Finding (measured, deterministic).** `test/dummy/bench-idle-room.ts` part
+(b) tallies provider warnings for a 2-peer room with zero loss and zero
+reordering during setup: every sample shows exactly one `Hash mismatch` and
+one `Resync scheduled` before the experiment even starts. Mechanism:
+`connect()` → `syncNow()` pushes the joiner's full state as a
+`MESSAGE_SYNC_VERIFIED` update whose trailing hash is `computeDocHash` of
+the *joiner's* state vector. Any receiver that already holds more data
+applies the (no-op) update, hashes its *own* state vector, sees a
+different value and — since no sequence gap is pending — calls
+`_requestResync()`. The receiver then pushes its full state and pulls
+(SyncStep1 → SyncStep2 replies from everyone) ~100 ms later. "Sender is
+behind me" is indistinguishable from "we diverged" with a single hash.
+
+**Why it matters.** In a room of N peers with content, every join
+deterministically triggers N-1 resyncs: N-1 full-document broadcasts
+((N-1)² deliveries) plus N-1 SyncStep1 pulls each answered by ~k peers.
+The round-1 design doc attributed the join-burst blow-up (509,850 messages
+at N=100) to "hash mismatches [being] common (reordering across many
+concurrent senders)"; this addendum shows a mismatch that needs no
+reordering at all. It is very likely the dominant term of the join-burst
+cost that the rate limiter bounds today — a hypothesis for
+`bench-late-join.ts` / `bench-user-scaling.ts` to confirm by counting
+`Hash mismatch` warnings during a join with zero loss.
+
+**Fix candidates (measure, don't pick by argument):**
+- (a) Send the connect-time push as a plain `MESSAGE_SYNC` SyncStep2
+  (`writeSyncStep2(encoder, doc)` with no target vector = full state)
+  instead of a hashed `VERIFIED` update. Receivers apply it and never
+  hash-compare it. Keeps the single-message-survival property round 2
+  requires; loses the push's sequence number (a lost push is caught by
+  the digest-beacon exchange within one interval anyway).
+- (b) Keep the hash but add a cheap monotone scalar (sum of all clocks in
+  the sender's state vector, one varuint) to `VERIFIED` updates: on
+  mismatch, `senderSum < mySum` → sender behind, do nothing (their beacon
+  fetches the rest); `senderSum > mySum` → I am behind, pull only;
+  equal → genuine divergence, resync as today.
+- (c) With the digest beacon shipped, drop the hash-mismatch trigger's
+  push half for the join case only — rejected on the round-2 evidence
+  unless (a) or (b) turns out insufficient.
+
+Not part of phase 1 (out of its design doc's scope); proposed as the first
+item of phase 1b, sequenced right after the digest beacon because the
+beacon's JOIN path is exactly where this fires.

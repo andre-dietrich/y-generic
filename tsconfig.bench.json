@@ -30,6 +30,7 @@
     "test/dummy/bench-idle-backoff.ts",
     "test/dummy/bench-awareness-echo.ts",
     "test/dummy/bench-awareness-removal-burst.ts",
+    "test/dummy/bench-idle-room.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

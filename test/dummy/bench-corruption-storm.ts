@@ -148,6 +148,11 @@ function classifyOne(msg: Uint8Array, counts: TypeCounts): void {
     if (subType === 0) counts.syncStep1++
     else if (subType === 1) counts.syncStep2++
     else if (subType === 2) counts.update++
+  } else if (msgType === 5) {
+    // MESSAGE_SYNC_DIGEST (digest-beacon plan, 2026-09-05) - the request
+    // class, replaces SyncStep1 on the wire; counted as syncStep1 so the
+    // SyncStep2/SyncStep1 ratio stays comparable across the change.
+    counts.syncStep1++
   } else if (msgType === 1) {
     counts.awareness++
   } else if (msgType === MESSAGE_BATCH) {

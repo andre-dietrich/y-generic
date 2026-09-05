@@ -209,3 +209,52 @@ Gates for the whole phase (run after the last step, on the branch tip):
 
 Appended per step as measured (baseline first). Nothing in this document
 above this line is to be read as a measured result.
+
+### Baseline (branch `round-4-phase-1`, `src/` unchanged from `main` @ `e2cf824`)
+
+Machine-local numbers; compare within this document only. Every `bench-*`
+below was run from a snapshot of the compiled baseline
+(`bench-dist-baseline/`), so later `src/` changes cannot leak into it.
+
+**`bench-idle-room` (a) — idle census**, 10 s window, `syncInterval` 1000 ms,
+latency 20 ms ±25 %. "request" = SyncStep1 (or, after Task 3, the digest
+beacon); floors are the protocol minimum for the window (one request per
+peer per interval; one awareness renewal per peer per 15 s):
+
+| N | deliveries | /s | /s/peer | request | syncStep2 | update | awareness | request floor | awareness floor |
+|---|---|---|---|---|---|---|---|---|---|
+| 5 | 388 | 39 | 7.8 | 120 | 188 | 0 | 200 | 200 | 13 |
+| 20 | 10,127 | 1,013 | 50.6 | 988 | 6,289 | 0 | 3,838 | 3,800 | 253 |
+| 50 | 69,874 | 6,987 | 139.7 | 3,577 | 45,031 | 0 | 24,843 | 24,500 | 1,633 |
+
+Two things the census shows beyond the research doc's probe: (1) requests
+land *below* their floor at N ≥ 20 (3,577 vs 24,500 at N=50) because the
+shared rate limiter (20 per 10 s) throttles the periodic tick itself once
+SyncStep2 replies eat the budget — the replies crowd out the requests they
+answer; (2) SyncStep2 : request = 12.6 : 1 at N=50, i.e. reply suppression
+is far from the ~1 it targets at this latency, and every one of those
+replies is empty (219.9 KB / 45,031 ≈ 5 bytes).
+
+**`bench-idle-room` (b) — lost delete**, 2 peers, 5 samples: all converged,
+heal latency 131-832 ms (uniform over one interval, as expected from the
+random tick phase), always via one request + one SyncStep2 (the reply's
+full delete set), zero warnings in the heal window. Setup phase of every
+sample: exactly one `Hash mismatch` + one `Resync scheduled` — the
+pre-existing join artifact recorded as item 12 in the research doc's
+addendum (the joiner's full-state push carries a hash of *its* state; a
+peer holding more data reads that as divergence). Not caused by this
+phase; visible here because the bench tallies warnings.
+
+**`bench-sync-latency`**, 3 runs, no convergence timeouts. `msgCount` is
+identical across runs for every cell (30 for `batchUpdates: 0`, 31 where a
+join-artifact resync adds a message, 1 for `batchUpdates: 150`). `totalMs`
+for the `batchUpdates: 0, verifyUpdates: true` row, empty doc: WebSocket
+29-51, WebRTC 27-37, Gun 326-329, Matrix 473-491; 195 KB preloaded doc:
+WebSocket 26-42, WebRTC 26-40, Gun 331-350, Matrix 474-497. `Hash mismatch`
+warnings per run: 9 / 21 / 19 — all in 2-client runs with zero loss and
+zero reordering, i.e. item 12 again.
+
+Remaining baseline gates (`bench-late-join` ×3, `bench-corruption-storm`,
+`bench-user-scaling`, `bench-packet-loss` ×3) were still running from the
+same `bench-dist-baseline/` snapshot when Task 1 was committed; their
+numbers are appended below in the commit that records them.

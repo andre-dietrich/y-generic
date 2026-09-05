@@ -40,10 +40,10 @@ Three facts checked against `node_modules` that shape the design:
 ```
 writeVarUint(5)                       // MESSAGE_SYNC_DIGEST
 writeVarUint(1)                       // DIGEST_VERSION, append-only
-writeVarUint(flags)                   // bit 0: DIGEST_FLAG_JOIN
+writeVarUint(flags)                   // bit 0: DIGEST_FLAG_JOIN, bit 1: DIGEST_FLAG_ACK, bit 2: DIGEST_FLAG_CONFIRM (Task 3c)
 writeVarUint(doc.clientID)            // sender
-writeVarUint8Array(encodeStateVector) // as SyncStep1 today
-writeVarUint(dsHash)                  // CRC32 of the normalized delete set
+writeVarUint8Array(encodeStateVector) // as SyncStep1 today; for an ACK: the JOINER's vector, echoed
+writeVarUint(dsHash)                  // CRC32 of the normalized delete set; for an ACK: the joiner's, echoed
 ```
 
 Emitted from the one place that encodes SyncStep1 today
@@ -106,6 +106,22 @@ if flags & JOIN && awareness.getLocalState() !== null → _broadcastAwareness([c
   digest equals ours cancels a pending *ack* (never a pending SyncStep2),
   and acks always take the delayed/suppressible path regardless of the
   awareness-based peer-count gate.
+- **Amended in Task 3c (see Results): an ack is not a beacon.** ~~reply our
+  own beacon (flags = 0) as an ack~~ → reply a `DIGEST_FLAG_ACK` message that
+  echoes the *joiner's* state vector and delete-set hash. Receivers of an
+  ACK never reply and never re-announce presence; a receiver whose own
+  state equals the echoed digest marks itself synced and drops any pending
+  ack for that digest. Reason: an ack that carried the acker's own state
+  was read as a request by every peer ahead of the acker — a joiner acking
+  another joiner, or an ack landing after an edit burst had started,
+  collected a SyncStep2 from each of them. Also in 3c: a pending reply
+  whose bytes equal a newly required reply is kept instead of flushed (K
+  identical requests, one answer), and an equal JOIN beacon does not
+  cancel a pending ack (the pending ack echoes that same state and answers
+  it too). A `DIGEST_FLAG_CONFIRM` beacon (bit 2) is a JOIN without the
+  presence request: answered with an ack when states are equal, sent only
+  by a joiner whose JOIN got no response within 1 s / 2 s / 4 s (three
+  attempts, then the periodic beacon takes over).
 
 ### 4. `synced`
 
@@ -583,15 +599,181 @@ WebSocket, +140 % Matrix) and bench-packet-loss fan-out under the default
 timing. The first is addressed by Task 3c; the second is the baseline's
 starvation, not this phase's cost.
 
-### Task 3c — identical replies coalesced (planned, own before/after)
+### Task 3c — identical replies coalesced, acks are not requests
 
-`_scheduleSyncReply()` flushes a pending reply immediately whenever a
-reply for a *different* request arrives, on the (previously correct)
-assumption that two requests need two answers. K empty joiners produce K
-byte-identical SyncStep2s per settled peer. Change: if the new reply's
-bytes equal the pending reply's bytes, keep the pending one (same delay,
-same suppression) and drop the new one. Measured with the new
-`test/dummy/bench-join-after-burst.ts` (the probe above as a bench, two
-variants: joiners 600 ms after the settled peers connected, and after
-12 s), plus the usual gates. Expected: the "join during edit burst" rows
-drop below baseline; no effect anywhere else.
+Three changes, arrived at in that order because each measurement exposed
+the next problem:
+
+1. **Identical replies coalesced.** `_scheduleSyncReply()` flushed a
+   pending reply immediately whenever a reply for a *different* request
+   arrived, assuming two requests need two answers. K empty joiners
+   produce K byte-identical SyncStep2s per settled peer, each burning a
+   rate-limit slot. Now: if the new reply's bytes equal the pending
+   reply's bytes, the pending one is kept (same delay, same suppression)
+   and the new one dropped. This alone turned the Matrix in-budget
+   variant of the new bench from 12,895 ms (FAIL) to 316 ms.
+2. **Equal JOIN beacons keep a pending ack** instead of cancel + re-arm:
+   the pending ack answers the new joiner too. Originally motivated by a
+   suspected 3b side-effect in `bench-user-scaling` fan-out at N=100 on
+   the Gun and Matrix profiles (2,871 / 3,168 → ~9,500 messages), read at
+   the time as acks landing after the edit burst had started. That reading
+   was wrong — see "Fan-out at high latency" below: the increase is the
+   budget artifact again. The change itself is still correct (one ack
+   answers K identical joiners), but measured on its own it *moved* a
+   real problem: acks now fired early, from joiners that were themselves
+   behind the room, and as beacons they collected SyncStep2s from all
+   settled peers (WebSocket in-budget SyncStep2 196 → 4,459). A first
+   attempt to gate acks on "own join confirmed" made the last joiner of a
+   simultaneous burst never reach `synced` (its predecessors' JOIN beacons
+   were sent before it joined; with nobody acking, only a periodic beacon
+   would have confirmed it). Reverted in favour of 3.
+3. **`DIGEST_FLAG_ACK`.** The root cause of both: an ack was the acker's
+   own beacon, i.e. a request. Now an ack echoes the *joiner's* digest
+   (state vector + delete-set hash) under a distinct flag; receivers never
+   reply to it or re-announce presence for it; a receiver whose state
+   equals the echoed digest marks itself synced (the joiner, and anyone
+   else in that state) and drops a pending ack for it. Every peer may ack.
+   Wire: same framing, bit 1 of `flags`, echoed fields — no version bump
+   (append-only rule untouched).
+4. **Requester-side response wait** (`DIGEST_FLAG_CONFIRM`, bit 2). The
+   first full gate run of 3c had one `bench-packet-loss` run with two N=5
+   cells at 2/3 (fan-out 3 %, join-burst 10 %). An instrumented repro (600
+   simultaneous 5-peer joins at 10 % loss, `syncInterval: 0`) found the
+   join case twice: the *last* peer to join never receives the others'
+   JOIN beacons (they were broadcast before it was in the room), so its
+   `synced` depends entirely on the acks to its own beacon — which
+   suppression thins to 1-3 — and when those are dropped nothing retries
+   (the baseline survived the same runs 200/200 because it answered every
+   request from every peer, i.e. by accident of redundancy). Fix in the
+   spirit of the design: the *requester* retries. After a JOIN beacon, if
+   neither a SyncStep2 nor an equal ack/beacon arrives within 1 s (then
+   2 s, 4 s; three attempts), the joiner sends a CONFIRM beacon — "ack me
+   if equal", without the presence request — and the periodic beacon
+   remains the fallback after that. 0/600 failures afterwards. Deliberately
+   *not* applied to resync beacons: asking every equal peer for an ack on
+   each resync produced 4-5x more acks at Matrix latency in
+   `bench-join-after-burst` (the suppression window is shorter than the
+   one-way latency there); the resync path keeps its periodic-beacon
+   fallback. The fan-out 3 % N=5 cell did not reproduce in 200 + 200
+   repetitions on either build and is recorded as unexplained.
+
+**Measured (final 3c build).** `bench-join-after-burst` (new; M=40 with
+2 KB, K=10 empty joiners, 10 keystrokes during the join; PASS = converged
+within 2 s):
+
+| profile | variant | Task 3b | Task 3c (final, incl. change 4) |
+|---|---|---|---|
+| WebSocket | in budget window (600 ms) | 20,288 / 424 ms (SyncStep2 15,386) | **5,049 / 96 ms** (SyncStep2 490, acks 392) |
+| WebSocket | fresh budget (12 s) | 24,012 / 384 ms (SyncStep2 17,640) | **7,205 / 64 ms** (SyncStep2 392, acks 392) |
+| Matrix | in budget window | 16,048 / **12,895 ms FAIL** (SyncStep2 1,014) | 33,365 / **341 ms** (SyncStep2 20,618, acks 98) |
+| Matrix | fresh budget | 33,028 / 490 ms (SyncStep2 19,698) | **19,161 / 539 ms** (SyncStep2 4,361, acks 1,274) |
+
+The Matrix in-budget row converges 40x faster and carries more
+deliveries, because replies are now delivered instead of silently
+dropped by an exhausted budget; its ~20k SyncStep2s are the high-latency
+suppression problem (200 ms window vs. 350 ms one-way, so every settled
+peer's reply fires before any other's is overheard), the same mechanism
+as the Matrix late-join rows and a phase-1b item. Presence responses
+(~11k on Matrix) are the other phase-1b item noted under Task 3.
+
+Join burst N=50 (probe, WebSocket): 5,194 deliveries, all `synced` after
+185 ms (Task 3b: 5,096 / 195 ms; the acks are now 25-byte echoes that
+buy `synced` for the last joiner of a burst without waiting for a
+periodic beacon, and a lost one is retried by that joiner). Unchanged:
+`bench-idle-room` (a) N=50 default 18,081, 15 s settle 24,402 (floor
+24,500); (b) 5/5; (c) PASS; `bench-periodic-awareness` 4/4 PASS (presence
+36 ms, `synced` 41 ms);
+fresh-budget packet-loss fan-out N=50 (probe): 1 % 7,317, 3 % 12,397,
+10 % 42,205 — within the 3b/3c run-to-run spread (5,374-6,876 /
+12,397-19,584 / 40,196-42,205), the 10 % cell at the limiter ceiling as
+before.
+
+**Gate verdict for Task 3c (final build):** all gates pass — `bench-packet-
+loss`, `bench-late-join`, `bench-sync-latency` 3 × 3 runs with every cell
+3/3 (the first 3c gate run's two N=5 cells at 2/3 are what change 4
+addressed; 0/600 in the targeted repro afterwards), corruption-storm both
+RESULT lines, periodic-awareness 4/4, join-after-burst 4/4, idle-room
+(b)/(c). `bench-user-scaling` final: fan-out WebSocket/WebRTC exactly 990
+at N=100; Gun/Matrix 9,207 / 9,702 (the budget artifact below); join-burst
+WebSocket 5,243 (N=50) / 21,384 (N=100), Matrix 20,188 / 83,358. The
+Matrix N=100 join burst is above 3b's 58,707: at 350 ms ± 40 % one-way the
+ack round trip plus suppression delay can exceed the 1 s response wait, so
+some joiners send a CONFIRM retry that every equal peer answers, and at
+that latency suppression cannot thin the answers. Still −53 % against the
+baseline's 178,200; the right fix is a latency-aware wait, which is
+phase-1b item (c) (latency estimate from the beacon round trip) rather
+than a constant tuned to one profile.
+
+**Fan-out at high latency — the finding that matters most for phase 1b.**
+`bench-user-scaling` fan-out at N=100 (one editor, 10 keystrokes, *no*
+loss) on the 250 ms/30 % jitter Gun profile and the 350 ms/40 % Matrix
+profile: baseline 2,871 / 3,168, Task 3 2,475 / 2,772, **Task 3b 9,504 /
+9,405, Task 3c 9,306 / 9,801**. WebSocket and WebRTC stay at the exact
+linear 990 in every build. A per-class probe of the Gun cell with the
+bench's own timing (edit 850 ms after the join burst) versus a fresh
+budget (12 s settle):
+
+| build | timing | deliveries | SyncStep2 | hash mismatches | resyncs |
+|---|---|---|---|---|---|
+| baseline | 850 ms after join | 22,968 | 19,998 | 1,688 | 278 |
+| Task 3c | 850 ms after join | 162,261 | 152,460 | 5,862 | 213 |
+| baseline | fresh budget | **198,990** | 188,793 | 6,961 | 277 |
+| Task 3c | fresh budget | **198,990** | 189,684 | 6,899 | 210 |
+
+198,990 is the limiter ceiling for N=100 (100 peers × 20 slots × 99
+recipients plus the burst). Identical for baseline and 3c: this phase
+neither caused nor touched it. What happens: 30 % jitter reorders the
+editor's 10 updates at many receivers; a reordered update mismatches the
+hash *after* the sender's gap-check grace has expired for some of them,
+each mismatch schedules a full-state push + request; every push is itself
+a `MESSAGE_SYNC_VERIFIED` update whose hash mismatches at every peer that
+is ahead of the pusher (research doc item 12), which schedules more
+pushes; every request collects a SyncStep2 from every peer ahead of the
+requester, and at 250-350 ms one-way the 200 ms suppression window is
+over before any reply is overheard — ~17-20 SyncStep2 per request. The
+cascade runs until every peer has spent its 20 slots. It is the storm
+round 1 bounded with the rate limiter, still there in full, and the
+baseline numbers in every bench that edits within 10 s of a join burst
+were low only because the join burst had already spent the budget. The
+digest beacon made the budget available again (that is what a −64 %
+steady state and a 40x faster late join *mean*), so those benches now show
+the storm at its true size. Three concrete phase-1b changes follow from
+the mechanism, in order: (a) item 12 — a full-state push must not carry
+a hash that peers ahead of the pusher will fail; (b) a hash mismatch on an
+incremental update should request (a beacon, 12 bytes) rather than push
+the whole document, now that the beacon exists; (c) the reply-suppression
+window must exceed the one-way latency, which needs a latency estimate
+(the beacon → first-reply round trip gives one for free).
+
+**Measured.** `bench-join-after-burst` (M=40 with 2 KB, K=10 empty joiners,
+10 keystrokes during the join; deliveries from the joiners' `connect()`
+to convergence; PASS = converged within 2 s):
+
+| profile | variant | Task 3b | Task 3c |
+|---|---|---|---|
+| WebSocket | in budget window (600 ms) | 20,288 / 424 ms (SyncStep2 15,386) | **3,922 / 122 ms** (SyncStep2 196) |
+| WebSocket | fresh budget (12 s) | 24,012 / 384 ms (SyncStep2 17,640) | **7,842 / 45 ms** (SyncStep2 686) |
+| Matrix | in budget window | 16,048 / **12,895 ms FAIL** (SyncStep2 1,014) | 23,896 / **316 ms** (SyncStep2 10,570) |
+| Matrix | fresh budget | 33,028 / 490 ms (SyncStep2 19,698) | **20,974 / 521 ms** (SyncStep2 5,880) |
+
+The Matrix in-budget row is the Task 3 starvation defect again, one layer
+down: Task 3b removed the ack drain, but the K byte-identical SyncStep2s
+per settled peer still emptied the budget at 350 ms latency, so the
+joiners were served by item-12 resync pushes seconds later. With 3c the
+settled peers answer the burst with one SyncStep2 each and the joiners
+converge in 316 ms; deliveries in that row go *up* because replies are now
+delivered instead of silently dropped. Per-class probe of the same
+scenario, WebSocket: baseline 4,265 (2,940 SyncStep2, converged 276 ms) →
+Task 3 7,450 (13,174 ms) → Task 3b 18,475 (14,308 SyncStep2, 397 ms) →
+**Task 3c 4,951 (539 SyncStep2, 254 ms)**; Matrix: baseline 10,880 →
+Task 3 11,958 (9,502 ms) → Task 3b 17,348 → **Task 3c 18,181 (1,302 ms)**,
+of which 10,588 are presence responses — the Matrix-latency
+presence-coalescing issue noted under Task 3, unchanged by 3c and still
+the phase-1b candidate it was.
+
+Unchanged by 3c, as expected: `bench-idle-room` (a) default settle N=50
+17,395, 15 s settle 24,941 (floor 24,500); (b) 5/5; (c) PASS;
+`bench-periodic-awareness` 4/4 PASS (presence 36 ms, `synced` 36 ms);
+fresh-budget packet-loss fan-out N=50 (probe): 1 % 5,292, 3 % 15,762,
+10 % 28,224 (Task 3b: 5,374 / 14,243 / 41,846 — within run-to-run
+spread, the 10 % cell sits below the limiter ceiling this time).

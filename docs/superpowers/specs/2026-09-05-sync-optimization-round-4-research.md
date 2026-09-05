@@ -778,3 +778,42 @@ cost that the rate limiter bounds today — a hypothesis for
 Not part of phase 1 (out of its design doc's scope); proposed as the first
 item of phase 1b, sequenced right after the digest beacon because the
 beacon's JOIN path is exactly where this fires.
+
+### 13. The resync cascade is only bounded by the rate limiter, and every bench that edits soon after a join burst has been measuring a spent budget
+
+**Finding (measured, 2026-09-05, phase 1 Task 3c).** `bench-user-scaling`
+fan-out at N=100, one editor, 10 keystrokes, no loss, Gun profile (250 ms
+± 30 %): with a fresh 20-per-10 s budget on every peer, **both** the
+pre-phase-1 baseline and the digest-beacon build deliver exactly 198,990
+messages — the limiter ceiling (100 × 20 × 99 + the burst) — with ~6,900
+hash-mismatch warnings and ~210-280 scheduled resyncs. With the bench's
+default timing (edit 850 ms after the join burst) the baseline shows
+22,968 and the beacon build 162,261; the difference is entirely how much
+budget the join burst left, not protocol efficiency. WebSocket/WebRTC
+profiles stay at the linear 990 in all cases.
+
+**Mechanism.** Jitter reorders one editor's updates → a late update fails
+the hash after the sender's gap-check grace (300 ms) has run out →
+`_requestResync()` pushes the full document + a request → the push is a
+hashed update that fails at every peer *ahead* of the pusher (item 12) →
+more resyncs → every request collects a SyncStep2 from every peer ahead of
+the requester, and at 250-350 ms one-way the 200 ms suppression window
+closes before any reply is overheard (~17-20 replies per request). The
+cascade stops when the budgets are spent. This is the round-1 storm; the
+rate limiter bounds it, nothing removes it.
+
+**Consequences for phase 1b (ordered):**
+- (a) item 12: full-state pushes must not carry a hash that peers ahead of
+  the pusher fail (send them as plain SyncStep2, or add the clock-sum
+  discriminator);
+- (b) a hash mismatch on an *incremental* update should send a beacon (12
+  bytes; the peers ahead answer with exactly the diff) instead of pushing
+  the whole document — the round-2 objection to pull-only recovery was
+  measured with `syncInterval: 0`, i.e. without the periodic beacon that
+  now exists as the retry signal, and needs re-measuring on that basis;
+- (c) the reply-suppression window must exceed the one-way latency; the
+  beacon → first-SyncStep2 round trip is a free latency estimate;
+- (d) every bench that edits within 10 s of a join burst should run in
+  both regimes (`SETTLE_MS` overrides now exist in `bench-idle-room`,
+  `bench-packet-loss`; `bench-user-scaling` needs the same) — a
+  spent-budget number is a statement about the limiter, not the protocol.

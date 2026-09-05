@@ -140,7 +140,12 @@ async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
     const { docs, providers } = makeProviders(hub, profile, N)
 
     await Promise.all(providers.map((p) => p.connect({ room })))
-    await sleep(profile.latency * 3 + 100)
+    // Default: edit right after the join burst, while every peer's
+    // 20-per-10s sync budget is still mostly spent on join replies. Override
+    // with SETTLE_MS=<ms> (e.g. 12000) for a fresh budget - on the
+    // high-latency profiles the two regimes differ by ~20x at N=100, see
+    // docs/superpowers/specs/2026-09-05-digest-beacon-design.md (Task 3c).
+    await sleep(Number(process.env.SETTLE_MS ?? profile.latency * 3 + 100))
 
     // Reset counters - only count messages caused by the edit burst below.
     const preExisting = { messages: stats.messages, bytes: stats.bytes }

@@ -25,6 +25,30 @@ const MESSAGE_BATCH = 4 // Envelope for N independently-typed sub-messages sent 
 const MESSAGE_SYNC_DIGEST = 5
 const DIGEST_VERSION = 1
 const DIGEST_FLAG_JOIN = 1 // bit 0: "I just joined - send me your presence and confirm my state"
+// bit 1: this message is an ACK, not a request. It echoes the state vector
+// and delete-set hash of the JOIN beacon it answers ("I hold exactly this
+// state too"), never the sender's own state - so it is never read as a
+// request and never collects a SyncStep2 from anyone. Receivers whose state
+// equals the echoed digest mark themselves synced (the joiner it was for,
+// and everyone else in that state); receivers holding a pending ack for the
+// same digest drop it. See _handleDigest(). Before this flag existed the ack
+// was the acker's own beacon; an acker that was itself behind the room (a
+// joiner acking another joiner) made every peer ahead of it reply with a
+// SyncStep2, and acks landing after an edit burst had started did the same
+// (Task 3c in the design doc).
+const DIGEST_FLAG_ACK = 2
+// bit 2: "ack me if our states are equal" WITHOUT the presence request of
+// DIGEST_FLAG_JOIN. Sent only by the response-wait retry
+// (_armResponseWait): a joiner that gets neither a SyncStep2 nor an ack
+// within the wait has lost one message or the other and asks again - reply
+// suppression deliberately leaves ~1 reply per request, so a single lost
+// reply would otherwise strand the joiner's `synced` until the next
+// periodic beacon (never, with syncInterval 0). Measured: the last joiner
+// of a simultaneous 5-peer burst at 10% loss failed to reach `synced` in 1
+// of 600 runs before this existed. Resync beacons do NOT request acks: in
+// an equal room every peer would answer, and at high latency the
+// suppression window cannot thin those replies (measured 4-5x more acks).
+const DIGEST_FLAG_CONFIRM = 4
 
 /**
  * CRC32 lookup table for fast computation.
@@ -103,6 +127,15 @@ function unwrapAndVerifyMessage(wrapped: Uint8Array): Uint8Array | null {
   }
 
   return message
+}
+
+/** Byte-wise equality of two Uint8Arrays. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
 }
 
 /**
@@ -392,6 +425,13 @@ export class GenericProvider extends Observable<string> {
   // signal. Measured in test/dummy/bench-user-scaling.ts: without this, acks
   // were ~94% of a 50-peer join burst's messages (Task 3b in the design doc).
   private _pendingSyncReplyIsAck: boolean = false
+
+  // Response-wait for our own JOIN/CONFIRM/resync beacons - see
+  // DIGEST_FLAG_CONFIRM and _armResponseWait(). A SyncStep2 or an equal
+  // ack/beacon counts as a response.
+  private _responseWaitTimer?: ReturnType<typeof setTimeout>
+  private _responseWaitAttempts: number = 0
+  private _responseSeen: boolean = false
 
   // Same NACK-style suppression as _pendingSyncReply above, applied to
   // awareness updates that are a pure timeout-triggered removal (see
@@ -867,6 +907,14 @@ export class GenericProvider extends Observable<string> {
     // the very push that delivers edits made while offline.
     this._syncRequestTimes = []
 
+    // A pending response-wait belongs to a request on the old connection.
+    if (this._responseWaitTimer !== undefined) {
+      clearTimeout(this._responseWaitTimer)
+      this._responseWaitTimer = undefined
+    }
+    this._responseWaitAttempts = 0
+    this._responseSeen = false
+
     // Drop any pending suppressed sync reply - safe to simply discard (not
     // flush/send like batched updates/awareness below), since a suppressed
     // reply is by design redundant with whatever the room already has.
@@ -1080,6 +1128,7 @@ export class GenericProvider extends Observable<string> {
     // Batched into one wire message (MESSAGE_BATCH) instead of one
     // transport.send()/bc.publish() call per sub-message - see _sendBatch().
     this._sendBatch(messages)
+    if (flags & DIGEST_FLAG_JOIN) this._armResponseWait()
     return true
   }
 
@@ -1538,6 +1587,7 @@ export class GenericProvider extends Observable<string> {
 
         if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
           // If we received SyncStep2, we're synced
+          this._noteResponse()
           this._markSynced()
 
           // Someone else's SyncStep2 reply just arrived - our own pending
@@ -1638,6 +1688,7 @@ export class GenericProvider extends Observable<string> {
         // triggered it, so the same suppression scheme applies here too.
         if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
           this._cancelPendingSyncReply()
+          this._noteResponse()
         }
 
         // Read the expected hash from sender (signed integer)
@@ -1759,13 +1810,30 @@ export class GenericProvider extends Observable<string> {
     const dsEqual = remoteDsHash === this._deleteSetHash()
     const equal = !senderBehind && !weBehind && dsEqual
 
-    // An equal-digest beacon from anyone - a periodic tick, another
-    // peer's ack, or another joiner's JOIN beacon in a join burst - has
-    // just told the room (including whoever our pending ack was for) that
-    // this state is confirmed. Our ack would say the same thing again.
-    // Task 3b in the design doc: without this, acks were ~94% of a 50-peer
-    // join burst's messages, throttled only by the rate limiter.
-    if (equal) {
+    if (flags & DIGEST_FLAG_ACK) {
+      // Somebody confirmed the echoed state (see DIGEST_FLAG_ACK). If it is
+      // ours, we're synced; if we were about to confirm the same state, we
+      // no longer need to. Never a request: no reply, no presence.
+      if (equal) {
+        this._noteResponse()
+        this._markSynced()
+        this._cancelPendingAck()
+      }
+      return
+    }
+
+    // An equal-digest beacon from a settled peer's periodic tick has just
+    // told the room (including whoever our pending ack was for) that this
+    // state is confirmed. Our ack would say the same thing again. Task 3b
+    // in the design doc: without this, acks were ~94% of a 50-peer join
+    // burst's messages, throttled only by the rate limiter. An equal JOIN
+    // beacon (another joiner in the same burst) asks for an ack too; our
+    // pending ack - identical bytes, since it echoes that same state -
+    // answers it as well, and _scheduleSyncReply() dedupes it below.
+    if (equal && !(flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM))) {
+      // A settled peer's periodic beacon in our state: it confirms us (and
+      // whoever we were about to ack) as well as any ack would.
+      this._noteResponse()
       this._cancelPendingAck()
     }
 
@@ -1774,8 +1842,8 @@ export class GenericProvider extends Observable<string> {
       encoding.writeVarUint(encoder, MESSAGE_SYNC)
       syncProtocol.writeSyncStep2(encoder, this.doc, remoteSv)
       this._replyToSyncRequest(encoding.toUint8Array(encoder))
-    } else if (flags & DIGEST_FLAG_JOIN) {
-      this._replyToSyncRequest(this._encodeSyncStep1(0), true)
+    } else if (flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM)) {
+      this._replyToSyncRequest(this._encodeAck(remoteSv, remoteDsHash), true)
     }
 
     if (!weBehind && dsEqual) {
@@ -1826,13 +1894,31 @@ export class GenericProvider extends Observable<string> {
    * redundant - the requester likely already got what it needed.
    *
    * A reply that is already pending when this is called answers a
-   * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
-   * later by peer B's) - it must not be silently overwritten by the new
-   * one. Flush it immediately, then schedule the new reply fresh. The only
-   * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
-   * because we overheard someone else's SyncStep2 for the SAME request.
+   * *different* request (e.g. peer A's request, followed 5ms later by
+   * peer B's) - it must not be silently overwritten by the new one. Flush
+   * it immediately, then schedule the new reply fresh. The only sanctioned
+   * ways a reply gets dropped are `_cancelPendingSyncReply()` (we overheard
+   * someone else's SyncStep2 for the SAME request), `_cancelPendingAck()`,
+   * and the identical-bytes case below.
+   *
+   * Identical-bytes case (Task 3c in the design doc): K peers with the same
+   * state asking at once (K empty joiners in a burst) get K byte-identical
+   * SyncStep2s from us - the same full document K times, one flushed
+   * immediately per arriving request, each burning a rate-limit slot. If
+   * the new reply's bytes equal the pending reply's bytes, the pending one
+   * already answers this request too: keep it (same delay, same
+   * suppression) and drop the new one. Measured in
+   * test/dummy/bench-join-after-burst.ts.
    */
   private _scheduleSyncReply(reply: Uint8Array, isAck: boolean = false): void {
+    if (
+      this._pendingSyncReplyTimeoutId !== undefined &&
+      this._pendingSyncReply !== null &&
+      bytesEqual(this._pendingSyncReply, reply)
+    ) {
+      return
+    }
+
     if (this._pendingSyncReplyTimeoutId !== undefined) {
       if (this._pendingSyncReply) {
         this._sendSyncReply(this._pendingSyncReply)
@@ -1901,6 +1987,45 @@ export class GenericProvider extends Observable<string> {
     if (!this._synced) {
       this._synced = true
       this.emit('synced', [true])
+    }
+  }
+
+  /**
+   * Wait for a response to the JOIN beacon we just sent. If neither a
+   * SyncStep2 nor an equal ack/beacon arrives within 1s (then 2s, 4s), ask
+   * again with a CONFIRM beacon, three times at most - after that the
+   * periodic beacon is the fallback, as before. Requester-side retry is how the protocol
+   * stays loss-tolerant now that reply suppression leaves ~1 reply per
+   * request; N-fold redundant replies were the old (accidental) way.
+   */
+  private _armResponseWait(): void {
+    if (this._responseWaitTimer !== undefined) return
+    this._responseSeen = false
+    const delay = 1000 * Math.pow(2, this._responseWaitAttempts)
+    this._responseWaitTimer = setTimeout(() => {
+      this._responseWaitTimer = undefined
+      if (
+        this._responseSeen ||
+        this._responseWaitAttempts >= 3 ||
+        !this.transport.isConnected ||
+        this._destroying
+      ) {
+        this._responseWaitAttempts = 0
+        return
+      }
+      this._responseWaitAttempts++
+      this._sendSyncStep1(DIGEST_FLAG_CONFIRM) // rate-limited; a dropped attempt is simply retried next round
+      this._armResponseWait()
+    }, delay)
+  }
+
+  /** A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is answered. */
+  private _noteResponse(): void {
+    this._responseSeen = true
+    this._responseWaitAttempts = 0
+    if (this._responseWaitTimer !== undefined) {
+      clearTimeout(this._responseWaitTimer)
+      this._responseWaitTimer = undefined
     }
   }
 
@@ -2186,14 +2311,17 @@ export class GenericProvider extends Observable<string> {
       // awareness when the sync half actually sent" semantics this retry
       // has always had (unlike syncNow(), which broadcasts unconditionally).
       let awarenessBatched = false
-      const sent = this._trySyncPushPull(true, () => {
-        const msg = this._tryImmediateAwarenessMessage([this.doc.clientID])
-        if (msg) {
-          awarenessBatched = true
-          return [msg]
-        }
-        return []
-      })
+      const sent = this._trySyncPushPull(
+        true,
+        () => {
+          const msg = this._tryImmediateAwarenessMessage([this.doc.clientID])
+          if (msg) {
+            awarenessBatched = true
+            return [msg]
+          }
+          return []
+        },
+      )
       if (sent) {
         if (!awarenessBatched) {
           this._broadcastAwareness([this.doc.clientID])
@@ -2246,17 +2374,33 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
+   * Encode an ack for a JOIN beacon: same framing as a beacon, DIGEST_FLAG_ACK
+   * set, and the JOINER's state vector + delete-set hash echoed back instead
+   * of ours (see DIGEST_FLAG_ACK for why it must never carry our own state).
+   */
+  private _encodeAck(ackedSv: Uint8Array, ackedDsHash: number): Uint8Array {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST)
+    encoding.writeVarUint(encoder, DIGEST_VERSION)
+    encoding.writeVarUint(encoder, DIGEST_FLAG_ACK)
+    encoding.writeVarUint(encoder, this.doc.clientID)
+    encoding.writeVarUint8Array(encoder, ackedSv)
+    encoding.writeVarUint(encoder, ackedDsHash)
+    return encoding.toUint8Array(encoder)
+  }
+
+  /**
    * Send the periodic digest beacon. Rate limited to prevent spam. Returns
    * whether it actually sent (false means rate-limited).
    */
-  private _sendSyncStep1(): boolean {
+  private _sendSyncStep1(flags: number = 0): boolean {
     if (!this._tryReserveSyncSlot()) {
       console.warn(
         `[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`,
       )
       return false // Drop the request
     }
-    this._send(this._encodeSyncStep1())
+    this._send(this._encodeSyncStep1(flags))
     return true
   }
 

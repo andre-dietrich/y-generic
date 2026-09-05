@@ -123,6 +123,9 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
     private _pendingSyncReplyIsAck;
+    private _responseWaitTimer?;
+    private _responseWaitAttempts;
+    private _responseSeen;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
@@ -579,11 +582,21 @@ export declare class GenericProvider extends Observable<string> {
      * redundant - the requester likely already got what it needed.
      *
      * A reply that is already pending when this is called answers a
-     * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
-     * later by peer B's) - it must not be silently overwritten by the new
-     * one. Flush it immediately, then schedule the new reply fresh. The only
-     * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
-     * because we overheard someone else's SyncStep2 for the SAME request.
+     * *different* request (e.g. peer A's request, followed 5ms later by
+     * peer B's) - it must not be silently overwritten by the new one. Flush
+     * it immediately, then schedule the new reply fresh. The only sanctioned
+     * ways a reply gets dropped are `_cancelPendingSyncReply()` (we overheard
+     * someone else's SyncStep2 for the SAME request), `_cancelPendingAck()`,
+     * and the identical-bytes case below.
+     *
+     * Identical-bytes case (Task 3c in the design doc): K peers with the same
+     * state asking at once (K empty joiners in a burst) get K byte-identical
+     * SyncStep2s from us - the same full document K times, one flushed
+     * immediately per arriving request, each burning a rate-limit slot. If
+     * the new reply's bytes equal the pending reply's bytes, the pending one
+     * already answers this request too: keep it (same delay, same
+     * suppression) and drop the new one. Measured in
+     * test/dummy/bench-join-after-burst.ts.
      */
     private _scheduleSyncReply;
     /** Cancel a pending suppressed reply, if any. */
@@ -604,6 +617,17 @@ export declare class GenericProvider extends Observable<string> {
     private _replyToSyncRequest;
     /** Flip `synced` once and emit; idempotent. */
     private _markSynced;
+    /**
+     * Wait for a response to the JOIN beacon we just sent. If neither a
+     * SyncStep2 nor an equal ack/beacon arrives within 1s (then 2s, 4s), ask
+     * again with a CONFIRM beacon, three times at most - after that the
+     * periodic beacon is the fallback, as before. Requester-side retry is how the protocol
+     * stays loss-tolerant now that reply suppression leaves ~1 reply per
+     * request; N-fold redundant replies were the old (accidental) way.
+     */
+    private _armResponseWait;
+    /** A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is answered. */
+    private _noteResponse;
     /**
      * Delay a pure timeout-removal awareness broadcast and drop it if
      * another peer's broadcast of the SAME removal is overheard first (see
@@ -719,6 +743,12 @@ export declare class GenericProvider extends Observable<string> {
      * _requestResync()'s retry), so they all switched together.
      */
     private _encodeSyncStep1;
+    /**
+     * Encode an ack for a JOIN beacon: same framing as a beacon, DIGEST_FLAG_ACK
+     * set, and the JOINER's state vector + delete-set hash echoed back instead
+     * of ours (see DIGEST_FLAG_ACK for why it must never carry our own state).
+     */
+    private _encodeAck;
     /**
      * Send the periodic digest beacon. Rate limited to prevent spam. Returns
      * whether it actually sent (false means rate-limited).

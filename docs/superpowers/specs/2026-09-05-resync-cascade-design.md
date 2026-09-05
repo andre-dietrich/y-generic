@@ -280,3 +280,30 @@ request budget. N=20: 3,895 (floor 3,800). (b) 5/5. `bench-join-after-
 burst` single run: WebSocket in-budget 4,020 / 106 ms, Matrix in-budget
 11,713 / 622 ms — within the Task 3 spread; the in-budget variant is what
 this change is for, and its per-task set is the record.
+
+### After Task 5 — peer count from beacon and update senders (design item 3)
+
+`_knownPeers` (beacon senders, verified-update senders) backs
+`_peerCount()`, used by the suppression gate and the window formula; the
+awareness-only count stays as a floor. Also folded in here, found while
+checking this task: the pending-struct check (Task 2, change 3) now defers
+to an outstanding request of ours — a joiner that receives keystrokes
+before its content has a JOIN response wait running, and firing a second
+beacon at 300 ms only raced the settled peers' suppression window.
+
+`bench-join-after-burst`, three consecutive runs on this build — the
+WebSocket "in budget window" row is the one cell of this bench that
+swings: 5,147 / 9,606 / 4,020 deliveries (SyncStep2 392 / 6,272 / 588),
+converging in 56-260 ms; all other rows are stable (WebSocket fresh
+3,726-5,882 with SyncStep2 245-392; Matrix in-budget 11,419-11,909 with
+SyncStep2 735-1,029, ~600 ms; Matrix fresh 11,909-12,007). Mechanism of
+the swing, from the class counts: one settled peer is typing while the ten
+empty joiners arrive, so the byte-identical-reply dedupe misses whenever a
+keystroke lands between two JOIN beacons (the SyncStep2 for an empty
+requester changes bytes), and a joiner that has already received the
+content answers later joiners' JOIN beacons itself (it *is* ahead of them)
+— both correct, both redundant with the settled peers' replies, both
+racing suppression at 15 ms latency. Deduping by requested state vector
+instead of reply bytes would remove the first; noted for a later phase,
+not done here. Join burst N=50 (probe): 5,880 / 174 ms. Two fresh peers and
+a 3-peer simultaneous join reach `synced`.

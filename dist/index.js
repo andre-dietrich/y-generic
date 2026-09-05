@@ -400,6 +400,13 @@ export class GenericProvider extends Observable {
         // retries on the Matrix profile). See the phase-1b design doc, 1c.
         this._rttSamples = [];
         this._requestSentAt = 0;
+        // ClientIDs we have heard from directly (beacon and verified-update
+        // senders). The reply-suppression gate ("is there someone else who could
+        // answer?") used awareness alone, and in a join burst the awareness
+        // messages trail the beacons - so the gate was still closed exactly when
+        // 49 requests arrived at once, and every one got an immediate reply
+        // (phase-1b design, item 3). Cleared on disconnect.
+        this._knownPeers = new Set();
         // Same NACK-style suppression as _pendingSyncReply above, applied to
         // awareness updates that are a pure timeout-triggered removal (see
         // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
@@ -616,6 +623,7 @@ export class GenericProvider extends Observable {
         // the very push that delivers edits made while offline.
         this._syncRequestTimes = [];
         this._syncReplyTimes = [];
+        this._knownPeers.clear();
         // A pending response-wait belongs to a request on the old connection.
         if (this._responseWaitTimer !== undefined) {
             clearTimeout(this._responseWaitTimer);
@@ -1266,6 +1274,7 @@ export class GenericProvider extends Observable {
                 // Track for gap detection only — does NOT gate whether we apply
                 // the update below (see _trackRemoteSeq() for why).
                 this._trackRemoteSeq(senderClientID, seqNum);
+                this._knownPeers.add(senderClientID);
                 // Always apply the update. Yjs updates are idempotent/commutative,
                 // so re-applying an already-seen update is a harmless no-op.
                 // Under reordering, a merely-late (not actually duplicate) update
@@ -1395,7 +1404,7 @@ export class GenericProvider extends Observable {
     _handleDigest(decoder) {
         decoding.readVarUint(decoder); // DIGEST_VERSION - append-only, nothing to branch on yet
         const flags = decoding.readVarUint(decoder);
-        decoding.readVarUint(decoder); // sender clientID - reserved for unicast replies (round-4 research item 6)
+        this._knownPeers.add(decoding.readVarUint(decoder)); // sender clientID
         const remoteSv = decoding.readVarUint8Array(decoder);
         const remoteDsHash = decoding.readVarUint(decoder);
         // Any trailing bytes belong to a newer version; ignored by design.
@@ -1482,8 +1491,16 @@ export class GenericProvider extends Observable {
      * well inside that budget while still giving a 100-peer room roughly
      * 6-7x the base window instead of an unbounded one.
      */
+    /**
+     * How many peers we believe are in the room: awareness states (includes
+     * ourselves) or, if larger, the distinct beacon/update senders we have
+     * heard plus ourselves. See `_knownPeers`.
+     */
+    _peerCount() {
+        return Math.max(this.awareness.getStates().size, this._knownPeers.size + 1);
+    }
     _replySuppressionMaxDelay() {
-        const peerCount = this.awareness.getStates().size;
+        const peerCount = this._peerCount();
         const byRoomSize = Math.min(200, this._syncReplySuppressionMs * Math.log2(Math.max(2, peerCount)));
         // Phase 1b: the window must exceed the one-way latency or nobody
         // overhears anybody in time (see _rttSamples). 1.5x the smallest
@@ -1569,12 +1586,11 @@ export class GenericProvider extends Observable {
     _replyToSyncRequest(reply, isAck = false) {
         // Acks ALWAYS take the delayed/suppressible path: they carry no data,
         // so the only cost of delaying one is a few ms on the joiner's `synced`
-        // flip, and in a join burst the JOIN beacons arrive BEFORE any
-        // awareness state does - the `>= 3` gate below (awareness as a proxy
-        // for "known peers") is still closed, and without this every one of
-        // the 49 acks went out immediately, throttled only by the rate limiter
-        // (measured: 37,240 of a 50-peer join burst's 40,915 deliveries).
-        if (isAck || this.awareness.getStates().size >= 3) {
+        // flip (measured before this rule: 37,240 of a 50-peer join burst's
+        // 40,915 deliveries were immediate acks). Everything else goes through
+        // suppression once there is someone else who could answer - counted
+        // from beacon/update senders as well as awareness, see _peerCount().
+        if (isAck || this._peerCount() >= 3) {
             this._scheduleSyncReply(reply, isAck);
         }
         else {
@@ -1593,6 +1609,16 @@ export class GenericProvider extends Observable {
         this._pendingCheckTimer = setTimeout(() => {
             this._pendingCheckTimer = undefined;
             if (this._destroying || !this.transport.isConnected)
+                return;
+            // A request of ours is already outstanding (JOIN or resync beacon
+            // with its response wait running): whatever is pending is what that
+            // request is fetching, and the response wait retries if it is lost.
+            // Asking again here just raced the responders' suppression window
+            // (measured: a joiner's keystrokes-before-content check fired at
+            // 300 ms while the settled peers' replies were still delayed by a
+            // window of up to ~300 ms, and every such re-beacon collected
+            // another round of replies).
+            if (this._responseWaitTimer !== undefined)
                 return;
             if (this.doc.store.pendingStructs !== null ||
                 this.doc.store.pendingDs !== null) {

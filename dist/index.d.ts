@@ -131,6 +131,7 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingCheckTimer?;
     private _rttSamples;
     private _requestSentAt;
+    private _knownPeers;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
@@ -581,6 +582,12 @@ export declare class GenericProvider extends Observable<string> {
      * well inside that budget while still giving a 100-peer room roughly
      * 6-7x the base window instead of an unbounded one.
      */
+    /**
+     * How many peers we believe are in the room: awareness states (includes
+     * ourselves) or, if larger, the distinct beacon/update senders we have
+     * heard plus ourselves. See `_knownPeers`.
+     */
+    private _peerCount;
     private _replySuppressionMaxDelay;
     /**
      * Schedule a SyncStep2 reply after a short random delay instead of

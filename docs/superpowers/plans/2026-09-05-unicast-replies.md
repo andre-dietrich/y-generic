@@ -50,3 +50,11 @@
 ### Task 5: final gates, results, README
 
 - [ ] Full gate list on the final build in both dummy modes; Results section; README transport-author notes (`from`, `sendTo`, `expectedRttMs`); commit `Phase 1c results and README`.
+
+### Task 6: overlapping SyncStep2 requests share one pending reply (design D; added after the Task 5 gates)
+
+**Files:** `src/index.ts` (`_scheduleSyncReply`: new branch after the same-`targetSv` refresh; module-level `minStateVector(a, b)` next to `bytesEqual`).
+
+- [ ] Implement: when a pending reply exists, `!isAck && !this._pendingSyncReplyIsAck && targetSv !== null && this._pendingSyncReplyTargetSv !== null` → `merged = minStateVector(pendingTargetSv, targetSv)`; re-encode `MESSAGE_SYNC` + `syncProtocol.writeSyncStep2(encoder, this.doc, merged)` into `_pendingSyncReply`, set `_pendingSyncReplyTargetSv = merged`, return (timer untouched). `minStateVector`: decode both with `Y.decodeStateVector`, per client `Math.min(a, b ?? 0)`, omit zeros, `Y.encodeStateVector(map)`.
+- [ ] Measure before/after with the fan-out-under-loss probe (Matrix, N=50, 1/3/5/10 %, fresh and default regime) and the per-task set; then the full final gate list on the new build in both dummy modes.
+- [ ] `npm run build`; commit `Overlapping SyncStep2 requests share one pending reply instead of flushing it`.

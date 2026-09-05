@@ -157,6 +157,22 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
 }
 
 /**
+ * Componentwise minimum of two encoded state vectors: the state a
+ * SyncStep2 must start from to serve both requesters. Clients missing from
+ * one side count as clock 0 and are omitted (omitted = 0 on the wire).
+ */
+function minStateVector(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const ma = Y.decodeStateVector(a)
+  const mb = Y.decodeStateVector(b)
+  const out = new Map<number, number>()
+  for (const [client, clock] of ma) {
+    const m = Math.min(clock, mb.get(client) ?? 0)
+    if (m > 0) out.set(client, m)
+  }
+  return Y.encodeStateVector(out)
+}
+
+/**
  * Whether this runtime has the Compression Streams API (Node 18+, all
  * evergreen browsers). Checked once at module load; compressionThresholdBytes
  * falls back to sending uncompressed (still flag-byte-prefixed, flag=0) if
@@ -2137,6 +2153,29 @@ export class GenericProvider extends Observable<string> {
         // Same question (same requester state), newer document: refresh
         // the answer, keep the timer. See _pendingSyncReplyTargetSv.
         this._pendingSyncReply = reply
+        return
+      }
+      if (
+        !isAck &&
+        !this._pendingSyncReplyIsAck &&
+        targetSv !== null &&
+        this._pendingSyncReplyTargetSv !== null
+      ) {
+        // Two requesters, both behind, different states: one SyncStep2
+        // from the componentwise minimum of both state vectors contains
+        // everything either of them lacks. Keep the pending reply's timer
+        // and widen its content instead of flushing it. The flush (the
+        // rule below, kept for acks and legacy SyncStep1s) sent an
+        // unsuppressed broadcast for every second request that arrived
+        // inside the suppression window; with the window at 1.5x RTT on a
+        // 350 ms link and several peers behind after a lossy edit burst
+        // that was ~4-5 broadcast replies per beacon (phase-1c results).
+        const merged = minStateVector(this._pendingSyncReplyTargetSv, targetSv)
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, MESSAGE_SYNC)
+        syncProtocol.writeSyncStep2(encoder, this.doc, merged)
+        this._pendingSyncReply = encoding.toUint8Array(encoder)
+        this._pendingSyncReplyTargetSv = merged
         return
       }
     }

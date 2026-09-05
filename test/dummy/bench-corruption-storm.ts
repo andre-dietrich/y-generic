@@ -92,26 +92,38 @@ async function withWarnCounts<T>(
  * clean) copy, i.e. corruption shared across the whole room per message
  * rather than independent per wire link. Real network corruption happens
  * per physical link, so each recipient must get its own independent coin
- * flip. Returns a restore function.
+ * flip. Returns a restore function that really stops the corruption.
+ *
+ * "Really": the corrupting closure is what the provider subscribed with at
+ * connect() and stays registered for the transport's lifetime, so the
+ * restore must flip a flag that closure reads - restoring the `onMessage`
+ * method alone only affects future subscriptions. Until 2026-09-06 it did
+ * only the latter, so the "converged once corruption stopped" column was
+ * measured under continued corruption: at 50 % it was a coin flip per
+ * reply, and the N=2 / 50 % cell stalled in 3 of 5 runs of one evening
+ * with a perfectly healthy protocol (each stall: one peer behind, its 5 s
+ * resync retry answered, the answer corrupted again).
  */
 function withCorruption(
   transport: DummyTransport,
   corruptionRate: number,
 ): () => void {
+  let active = true
   const originalOnMessage = transport.onMessage.bind(transport)
-  transport.onMessage = (callback: (data: Uint8Array) => void) => {
-    return originalOnMessage((data: Uint8Array) => {
-      if (corruptionRate > 0 && Math.random() < corruptionRate) {
+  transport.onMessage = (callback: (data: Uint8Array, from?: string) => void) => {
+    return originalOnMessage((data: Uint8Array, from?: string) => {
+      if (active && corruptionRate > 0 && Math.random() < corruptionRate) {
         const corrupted = new Uint8Array(data)
         const idx = Math.floor(Math.random() * corrupted.length)
         corrupted[idx] ^= 0xff
-        callback(corrupted)
+        callback(corrupted, from)
       } else {
-        callback(data)
+        callback(data, from)
       }
     })
   }
   return () => {
+    active = false
     transport.onMessage = originalOnMessage
   }
 }
@@ -187,7 +199,14 @@ function makeProviders(
   const restoreFns: Array<() => void> = []
   for (let i = 0; i < N; i++) {
     const doc = new Y.Doc()
-    const transport = new DummyTransport({ hub, latency: 15, jitter: 0.2 })
+    const transport = new DummyTransport({
+      hub,
+      latency: 15,
+      jitter: 0.2,
+      // DUMMY_UNICAST=1 models a mesh transport with Transport.sendTo (phase
+      // 1c): replies to a corrupted peer's beacon then travel as unicasts.
+      unicast: process.env.DUMMY_UNICAST === '1',
+    })
     restoreFns.push(withCorruption(transport, corruptionRate))
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,

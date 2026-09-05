@@ -181,6 +181,12 @@ export interface DummyTransportOptions {
  */
 export declare class DummyTransport implements Transport {
     private static _idCounter;
+    /**
+     * Transport.expectedRttMs: a simulated transport that knows its latency
+     * class - twice the configured one-way latency, or undefined when no
+     * latency is simulated (matching push transports that leave it unset).
+     */
+    get expectedRttMs(): number | undefined;
     /** Unique id for this transport instance, used by the onPeerConnect simulation. */
     readonly id: string;
     private hub?;

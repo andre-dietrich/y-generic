@@ -34,6 +34,8 @@ export class MatrixTransport {
          * batching. Recommends GenericProvider debounce rapid edits by default.
          */
         this.preferredBatchMs = 150;
+        // HTTP PUT to send, long-poll to receive: several hundred ms one way.
+        this.expectedRttMs = 700;
         this.config = null;
         this._isConnected = false;
         this.debug = false;

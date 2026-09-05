@@ -274,6 +274,8 @@ export class NostrTransport implements Transport {
    * round trips.
    */
   readonly preferredBatchMs = 150
+  // Relay round trip incl. signature verification: a few hundred ms.
+  readonly expectedRttMs = 600
 
   private readonly opts: NostrTransportOptions
   private _connected = false

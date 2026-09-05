@@ -62,6 +62,20 @@ export interface Transport {
    * without reducing round trips that were already cheap.
    */
   readonly preferredBatchMs?: number
+
+  /**
+   * Optional hint: the round-trip time class (ms) this transport expects -
+   * e.g. ~700 for a Matrix homeserver long-poll, ~500 for a Gun relay
+   * mesh, undefined for low-latency push transports. GenericProvider uses
+   * it to seed its round-trip estimate before the first measured sample
+   * arrives, so the first response wait after a join and the first reply
+   * suppression window already fit the transport instead of the
+   * low-latency defaults (measured before this hint: on a 350 ms profile a
+   * 100-peer join burst spent most of its traffic on retries fired before
+   * the first replies could have arrived). Replaced by measured samples as
+   * soon as they exist.
+   */
+  readonly expectedRttMs?: number
 }
 
 /**

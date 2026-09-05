@@ -197,6 +197,8 @@ export interface GunConnectionConfig extends ConnectionConfig {
  * would just stack a second debounce in front of this one for no benefit.
  */
 export class GunTransport implements Transport {
+  // Relay mesh with its own debounce/throttle: a few hundred ms round trip.
+  readonly expectedRttMs = 500
   private options: Required<Omit<GunTransportOptions, 'password' | 'sea'>> & {
     password?: string
     sea?: any

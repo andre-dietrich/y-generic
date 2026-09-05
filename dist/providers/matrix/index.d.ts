@@ -49,6 +49,7 @@ export declare class MatrixTransport implements Transport {
      * batching. Recommends GenericProvider debounce rapid edits by default.
      */
     readonly preferredBatchMs = 150;
+    readonly expectedRttMs = 700;
     private config;
     private messageCallback?;
     private _isConnected;

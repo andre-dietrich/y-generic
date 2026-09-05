@@ -147,6 +147,8 @@ export class NostrTransport {
          * round trips.
          */
         this.preferredBatchMs = 150;
+        // Relay round trip incl. signature verification: a few hundred ms.
+        this.expectedRttMs = 600;
         this._connected = false;
         this._buffer = [];
         this.pool = null;

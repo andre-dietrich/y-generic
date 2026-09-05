@@ -91,6 +91,8 @@ export class GunTransport {
      * @param options - Configuration options (must include gun constructor)
      */
     constructor(options) {
+        // Relay mesh with its own debounce/throttle: a few hundred ms round trip.
+        this.expectedRttMs = 500;
         this._connected = false;
         this._room = '';
         this.gun = null;

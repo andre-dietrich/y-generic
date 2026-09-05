@@ -850,6 +850,13 @@ export class GenericProvider extends Observable<string> {
 
       this._setStatus({ state: 'connected' })
 
+      // Seed the round-trip estimate from the transport's hint (see
+      // Transport.expectedRttMs); the minimum-of-8 rule lets real samples
+      // take over as soon as they arrive.
+      if (this.transport.expectedRttMs) {
+        this._rttSamples = [this.transport.expectedRttMs]
+      }
+
       // Send initial sync pushing our local state plus requesting remote state.
       // syncNow() is used instead of _sendSyncStep1() so that any offline edits
       // made before this connect() call are pushed to currently-connected peers

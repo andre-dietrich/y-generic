@@ -206,6 +206,15 @@ const CHUNK_HEADER_SIZE = 8;
  */
 export class DummyTransport {
     /**
+     * Transport.expectedRttMs: a simulated transport that knows its latency
+     * class - twice the configured one-way latency, or undefined when no
+     * latency is simulated (matching push transports that leave it unset).
+     */
+    get expectedRttMs() {
+        const latency = this.options.latency ?? 0;
+        return latency > 0 ? 2 * latency : undefined;
+    }
+    /**
      * Create a new DummyTransport.
      *
      * @param options - Optional behavior simulation settings

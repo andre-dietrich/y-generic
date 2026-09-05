@@ -326,6 +326,16 @@ const CHUNK_HEADER_SIZE = 8
  */
 export class DummyTransport implements Transport {
   private static _idCounter = 0
+  /**
+   * Transport.expectedRttMs: a simulated transport that knows its latency
+   * class - twice the configured one-way latency, or undefined when no
+   * latency is simulated (matching push transports that leave it unset).
+   */
+  get expectedRttMs(): number | undefined {
+    const latency = this.options.latency ?? 0
+    return latency > 0 ? 2 * latency : undefined
+  }
+
   /** Unique id for this transport instance, used by the onPeerConnect simulation. */
   public readonly id: string = `dummy-${DummyTransport._idCounter++}`
 

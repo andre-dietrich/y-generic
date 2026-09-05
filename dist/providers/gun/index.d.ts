@@ -144,6 +144,7 @@ export interface GunConnectionConfig extends ConnectionConfig {
  * would just stack a second debounce in front of this one for no benefit.
  */
 export declare class GunTransport implements Transport {
+    readonly expectedRttMs = 500;
     private options;
     private _connected;
     private _room;

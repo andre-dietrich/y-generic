@@ -51,6 +51,8 @@ export class MatrixTransport implements Transport {
    * batching. Recommends GenericProvider debounce rapid edits by default.
    */
   readonly preferredBatchMs = 150
+  // HTTP PUT to send, long-poll to receive: several hundred ms one way.
+  readonly expectedRttMs = 700
 
   private config: MatrixConfig | null = null
   private messageCallback?: (data: Uint8Array) => void

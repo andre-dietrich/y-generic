@@ -734,6 +734,20 @@ different value and — since no sequence gap is pending — calls
 (SyncStep1 → SyncStep2 replies from everyone) ~100 ms later. "Sender is
 behind me" is indistinguishable from "we diverged" with a single hash.
 
+**Quantified (2026-09-05, after the digest beacon shipped).** A per-phase
+warning tally on a 50-peer `DummyHub` room where one peer edits right
+after everyone connects (probe sharing the bench build's Yjs instance —
+an earlier version of this probe loaded a second Yjs copy, which inflated
+its numbers; the corrected run is the one quoted): 531 `Hash mismatch`
+warnings and 71 scheduled resyncs during the join, then 47 + 168 "rate
+limit exceeded" hits and 16 + 16 further resync attempts during the
+following 12.5 s of *complete idleness* — the retries re-arm on every
+rate-limited attempt and compete with the periodic beacons for the same
+20-per-10 s budget, so the periodic beacons of that window came out at
+roughly a third of their expected rate. This is the dominant
+cost in every join scenario the bench suite has, and it also throttles
+the digest beacon's own steady state for ~10 s after a burst.
+
 **Why it matters.** In a room of N peers with content, every join
 deterministically triggers N-1 resyncs: N-1 full-document broadcasts
 ((N-1)² deliveries) plus N-1 SyncStep1 pulls each answered by ~k peers.

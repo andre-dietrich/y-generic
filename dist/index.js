@@ -328,6 +328,14 @@ export class GenericProvider extends Observable {
         // peers there's no "someone else" to rely on, so replies go out
         // immediately as before.
         this._pendingSyncReply = null;
+        // Whether _pendingSyncReply is a digest-beacon ack (see _handleDigest())
+        // rather than a SyncStep2. An overheard beacon with a digest equal to ours
+        // makes a pending ACK redundant (the joiner it was for has received that
+        // same beacon and is synced by it) but says nothing about a pending
+        // SyncStep2, which carries data - so only acks are cancelled on that
+        // signal. Measured in test/dummy/bench-user-scaling.ts: without this, acks
+        // were ~94% of a 50-peer join burst's messages (Task 3b in the design doc).
+        this._pendingSyncReplyIsAck = false;
         // Same NACK-style suppression as _pendingSyncReply above, applied to
         // awareness updates that are a pure timeout-triggered removal (see
         // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
@@ -1290,6 +1298,16 @@ export class GenericProvider extends Observable {
             }
         }
         const dsEqual = remoteDsHash === this._deleteSetHash();
+        const equal = !senderBehind && !weBehind && dsEqual;
+        // An equal-digest beacon from anyone - a periodic tick, another
+        // peer's ack, or another joiner's JOIN beacon in a join burst - has
+        // just told the room (including whoever our pending ack was for) that
+        // this state is confirmed. Our ack would say the same thing again.
+        // Task 3b in the design doc: without this, acks were ~94% of a 50-peer
+        // join burst's messages, throttled only by the rate limiter.
+        if (equal) {
+            this._cancelPendingAck();
+        }
         if (senderBehind || !dsEqual) {
             const encoder = encoding.createEncoder();
             encoding.writeVarUint(encoder, MESSAGE_SYNC);
@@ -1297,7 +1315,7 @@ export class GenericProvider extends Observable {
             this._replyToSyncRequest(encoding.toUint8Array(encoder));
         }
         else if (flags & DIGEST_FLAG_JOIN) {
-            this._replyToSyncRequest(this._encodeSyncStep1(0));
+            this._replyToSyncRequest(this._encodeSyncStep1(0), true);
         }
         if (!weBehind && dsEqual) {
             this._markSynced();
@@ -1347,7 +1365,7 @@ export class GenericProvider extends Observable {
      * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
      * because we overheard someone else's SyncStep2 for the SAME request.
      */
-    _scheduleSyncReply(reply) {
+    _scheduleSyncReply(reply, isAck = false) {
         if (this._pendingSyncReplyTimeoutId !== undefined) {
             if (this._pendingSyncReply) {
                 this._sendSyncReply(this._pendingSyncReply);
@@ -1356,6 +1374,7 @@ export class GenericProvider extends Observable {
             this._pendingSyncReplyTimeoutId = undefined;
         }
         this._pendingSyncReply = reply;
+        this._pendingSyncReplyIsAck = isAck;
         const delay = Math.random() * this._replySuppressionMaxDelay();
         this._pendingSyncReplyTimeoutId = setTimeout(() => {
             this._pendingSyncReplyTimeoutId = undefined;
@@ -1372,6 +1391,17 @@ export class GenericProvider extends Observable {
             this._pendingSyncReplyTimeoutId = undefined;
         }
         this._pendingSyncReply = null;
+        this._pendingSyncReplyIsAck = false;
+    }
+    /**
+     * Cancel a pending reply only if it is a digest ack - see
+     * `_pendingSyncReplyIsAck`. Called from `_handleDigest()` on every
+     * overheard beacon whose digest equals ours.
+     */
+    _cancelPendingAck() {
+        if (this._pendingSyncReplyIsAck) {
+            this._cancelPendingSyncReply();
+        }
     }
     /**
      * Route a SyncStep2 (or digest-ack) reply through the redundancy
@@ -1380,9 +1410,16 @@ export class GenericProvider extends Observable {
      * immediately. Both paths are rate-limited by `_sendSyncReply()`. Shared
      * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
      */
-    _replyToSyncRequest(reply) {
-        if (this.awareness.getStates().size >= 3) {
-            this._scheduleSyncReply(reply);
+    _replyToSyncRequest(reply, isAck = false) {
+        // Acks ALWAYS take the delayed/suppressible path: they carry no data,
+        // so the only cost of delaying one is a few ms on the joiner's `synced`
+        // flip, and in a join burst the JOIN beacons arrive BEFORE any
+        // awareness state does - the `>= 3` gate below (awareness as a proxy
+        // for "known peers") is still closed, and without this every one of
+        // the 49 acks went out immediately, throttled only by the rate limiter
+        // (measured: 37,240 of a 50-peer join burst's 40,915 deliveries).
+        if (isAck || this.awareness.getStates().size >= 3) {
+            this._scheduleSyncReply(reply, isAck);
         }
         else {
             this._sendSyncReply(reply);

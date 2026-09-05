@@ -35,7 +35,10 @@ import { sleep, silenced } from './bench-user-scaling'
 const SYNC_INTERVAL_MS = 1000
 const LATENCY = 20
 const JITTER = 0.25
-const SETTLE_MS = 2500
+// Override with SETTLE_MS=<ms> to measure a room that has been quiet longer
+// than the 10s sync rate-limit window (the default 2500 sits inside the
+// post-join resync-retry storm described in the design doc's Results).
+const SETTLE_MS = Number(process.env.SETTLE_MS ?? 2500)
 const OBSERVE_MS = 10000
 const N_VALUES = [5, 20, 50]
 const LOST_DELETE_CAP_MS = 5000

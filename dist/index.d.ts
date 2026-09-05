@@ -122,6 +122,7 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingSyncReply;
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
+    private _pendingSyncReplyIsAck;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
@@ -587,6 +588,12 @@ export declare class GenericProvider extends Observable<string> {
     private _scheduleSyncReply;
     /** Cancel a pending suppressed reply, if any. */
     private _cancelPendingSyncReply;
+    /**
+     * Cancel a pending reply only if it is a digest ack - see
+     * `_pendingSyncReplyIsAck`. Called from `_handleDigest()` on every
+     * overheard beacon whose digest equals ours.
+     */
+    private _cancelPendingAck;
     /**
      * Route a SyncStep2 (or digest-ack) reply through the redundancy
      * suppression when there's genuine redundancy (>= 2 other known peers via

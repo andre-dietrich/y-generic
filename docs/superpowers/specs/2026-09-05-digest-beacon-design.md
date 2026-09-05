@@ -101,8 +101,11 @@ if flags & JOIN && awareness.getLocalState() !== null → _broadcastAwareness([c
   This is the round-2 lesson respected: no recovery path is removed, only
   replies that carry no information.
 - `_cancelPendingSyncReply()` semantics unchanged: an overheard SyncStep2
-  cancels a pending reply (SyncStep2 or ack). An overheard beacon cancels
-  nothing.
+  cancels a pending reply (SyncStep2 or ack). ~~An overheard beacon cancels
+  nothing.~~ **Amended in Task 3b (see Results):** an overheard beacon whose
+  digest equals ours cancels a pending *ack* (never a pending SyncStep2),
+  and acks always take the delayed/suppressible path regardless of the
+  awareness-based peer-count gate.
 
 ### 4. `synced`
 
@@ -299,12 +302,23 @@ counts are unaffected by that, wall-clock columns are noisier than usual.
 | 50 | 70,854 → 7,497 | **−89 %** | 2,891 → 7,497 | 46,109 → **0** | 24,745 → **0** |
 
 An idle room now carries beacons and nothing else. Requests went *up*
-because the rate limiter is no longer drained by replies (still below the
-24,500 floor at N=50: the join-time ack burst spends most of each peer's
-20-per-10 s budget, so ticks in the first ~10 s after a 50-peer join are
-throttled — see the follow-up below). Awareness is 0 in the window because
-the y-protocols 15 s renewal falls outside the 10 s observation; the
-per-tick re-announce is gone on every transport.
+because the rate limiter is no longer drained by replies, but they are
+still far below the 24,500 floor at N=50. A follow-up probe (per-phase
+warning tally, same setup) found the cause, and it is not this phase's
+code: the bench connects 50 peers and lets one of them edit immediately,
+so every peer that already holds that edit reads the other 48 joiners'
+*empty* full-state pushes as a hash mismatch (research doc item 12) —
+531 mismatches, 71 resyncs at join (corrected probe; see the research
+doc's item 12 for the probe fix). The resync retries then sit in the
+20-per-10 s rate limiter for the next ~10 s (`_requestResync()` re-arms on
+a rate-limited attempt), crowding out the periodic beacons: 168
+"rate limit exceeded" hits during the 10 s "idle" window, in which only
+about a third of the expected beacons went out. The −89 % is measured
+*during* that retry storm; a room that has been quiet longer than the
+limiter window pays exactly N·(N-1) beacon deliveries per interval and
+nothing else. Awareness is 0 in the window because the y-protocols 15 s
+renewal falls outside the 10 s observation; the per-tick re-announce is
+gone on every transport.
 
 **`bench-idle-room` (b)** — lost delete: 5/5 converged, heal latency
 127-1,019 ms, always via one beacon + one SyncStep2 (the `dsHash`
@@ -405,3 +419,179 @@ join-burst messages at N=50 drop from ~40.9k toward the ~2.5k connect
 batches plus a handful of surviving acks; `bench-idle-room` requests
 recover toward their floor because the budget is no longer spent on acks.
 Measured in the Task 3b section below.
+
+### Task 3b — redundant acks cancelled (branch tip after the Task 3b commit)
+
+Two changes, both in `_handleDigest()` / `_replyToSyncRequest()`:
+
+1. A received beacon whose digest equals ours (`!senderBehind && !weBehind
+   && dsEqual`) cancels a pending ack (`_pendingSyncReplyIsAck`), never a
+   pending SyncStep2.
+2. Acks always go through `_scheduleSyncReply()`. The first cut of 3b had
+   only change 1 and measured **no effect at all** (join-burst still
+   40,915): a per-class breakdown of the burst (probe, same parameters as
+   `bench-user-scaling`) showed 37,240 of the 40,915 deliveries were acks
+   sent through the *immediate* path — in a join burst every JOIN beacon
+   arrives before any awareness state does, so the `awareness.getStates()
+   .size >= 3` gate that decides "is there someone else to rely on" is
+   still closed, exactly when it matters most. The same gate lets a
+   baseline room answer 49 SyncStep1s with 49 immediate SyncStep2s
+   (37,240 in the baseline breakdown) — that half is a phase-1b item: use
+   the beacon's `senderClientID` as the peer-count signal instead of
+   awareness.
+
+**Join burst, N=50, per class** (probe; deliveries):
+
+| class | baseline | Task 3 | Task 3b |
+|---|---|---|---|
+| connect batch: push (V-Update) | 1,225 | 1,225 | 1,225 |
+| connect batch: request | 1,225 (SyncStep1) | 1,225 (JOIN beacon) | 1,225 |
+| awareness | 2,450 | 2,450 | 2,450 |
+| replies | 37,240 (empty SyncStep2) | 37,240 (acks) | **1,421** (acks) |
+| **total** | **40,915** | **40,915** | **5,096** |
+| all peers `synced` after | 380 ms | 286 ms | 195 ms |
+
+**`bench-idle-room` (a)**, default 2.5 s settle (inside the post-join
+resync-retry storm, see the Task 3 note): N=50 requests 7,497 → 17,346;
+the budget freed from acks goes to periodic beacons. With
+`SETTLE_MS=15000` (room quiet longer than the 10 s limiter window —
+override added to the bench for this, baseline measured from a worktree at
+the Task 1 commit with the same override):
+
+| N | baseline (15 s settle) | Task 3b (15 s settle) | floor |
+|---|---|---|---|
+| 5 | 396 (136 req / 196 SyncStep2 / 200 awareness) | 200 (200 req) | 200 |
+| 20 | 10,070 (1,292 / 6,251 / 3,800) | 3,857 (3,838 req + 19 awareness renewal) | 3,800 |
+| 50 | 68,894 (4,263 / 44,737 / 24,157) | 24,794 (24,745 req + 49 awareness renewal) | 24,500 |
+
+A quiet room now sits exactly on the protocol floor: one beacon per peer
+per interval, nothing else. The honest steady-state figure for this phase
+is therefore **−64 % of deliveries at N=50 with every remaining message
+carrying information** — the −89 % of the default-settle census overstates
+it because the baseline was also busy with the item-12 retry storm during
+that window. What remains is O(N²) beacons per interval; that is the
+lever `idleBackoffEnabled` (shipped off in round 3) now pulls without the
+recovery-latency cost it had when every beacon collected N-1 replies.
+
+**`bench-idle-room` (b)**: 5/5 converged, 156-912 ms, `dsHash` path, no
+heal-window warnings. **(c)**: PASS. **`bench-periodic-awareness`**: 4/4
+PASS, joiner presence 34 ms, `synced` 31 ms.
+
+**`bench-user-scaling`**, join-burst, all four profiles (messages):
+
+| N | profile | baseline | Task 3 | Task 3b |
+|---|---|---|---|---|
+| 50 | WebSocket | 40,915 | 40,915 | **5,096** |
+| 100 | WebSocket | 184,140 | 184,140 | **20,592** |
+| 50 | Matrix | 37,730 | 47,628 | **15,729** |
+| 100 | Matrix | 178,200 | 212,652 | **58,707** |
+
+Fan-out unchanged (exactly linear, 990 at N=100).
+
+**`bench-late-join`**, 3 runs, every cell converged:
+
+| scenario | profile | M | K | baseline | Task 3 | Task 3b |
+|---|---|---|---|---|---|---|
+| idle late join | WebSocket | 10 | 5 | 811-821 | 1,199-1,213 | **401-419** |
+| idle late join | WebSocket | 40 | 10 | 8,546-9,412 | 13,708-13,871 | **4,675-5,149** |
+| idle late join | Matrix | 40 | 10 | 10,245-10,555 | 18,461-18,608 | **13,185-13,283** |
+| join during edit burst | WebSocket | 40 | 10 | 15,029-15,502 | 19,586-20,027 | 23,522-24,159 |
+| join during edit burst | Matrix | 40 | 10 | 18,112-19,191 | 22,474-23,346 | 44,113-46,256 |
+
+Idle late join is now well below baseline. The join-during-edit-burst
+rows went the other way, and a per-class probe of exactly that scenario
+(M=40 settled with 2 KB of content, one of them typing 10 chars while
+K=10 empty peers join, WebSocket) explains both directions:
+
+| build | deliveries | converged after | SyncStep2 | acks | awareness | full-state pushes |
+|---|---|---|---|---|---|---|
+| baseline | 4,265 | 276 ms | 2,940 | — | 490 | 0 |
+| Task 3 | 7,450 | **13,174 ms** | **0** | 4,165 | 4,410 | 1,960 |
+| Task 3b | 18,475 | 397 ms | 14,308 | 882 | 3,283 | 833 |
+
+Task 3 had a latent defect that none of the gate benches covered: the
+settled peers' 20-per-10 s sync budgets were still exhausted by the
+unsuppressed acks of *their own* join burst 0.6 s earlier, so their
+SyncStep2 replies to the joiners were dropped silently by
+`_sendSyncReply()`'s rate gate, and the joiners got the document only
+from item-12 resync pushes seconds later — 13 s to converge. Task 3b
+restores the budget (acks suppressed) and the joiners are served in
+397 ms. The baseline converged fast for the *same* budget reason in
+reverse: its replies to the initial burst were suppressible SyncStep2s,
+so budget was left for the joiners — its low count is partly silent
+rate-limit drops, not efficiency. With budget available, 3b now answers
+each of the K joiners with its own SyncStep2 per settled peer
+(`_scheduleSyncReply()` flushes a pending reply whenever a *different*
+request arrives, even when the new reply would be byte-identical), which
+is where the 14,308 come from. That is the next redundancy to remove
+(Task 3c below), and the reason the bench-late-join "during edit burst"
+rows are above baseline. Both bench-late-join scenarios settle for
+longer than 10 s before the joiners arrive, so they never saw Task 3's
+starvation; the probe is being turned into a bench (`bench-join-after-
+burst.ts`, Task 3c) so this regime stays covered.
+
+**`bench-corruption-storm`**, N=10: 5 % → 909 / 2.00 (Task 3: 747 / 1.18;
+baseline 1,170 / 3.24); 20 % → 1,053 / 2.22 (1,413 / 3.90; 1,422 / 4.21);
+50 % → 1,035 / 1.95 (1,179 / 2.60; 1,341 / 3.50). Both RESULT lines pass.
+
+**`bench-sync-latency`**, 3 runs: `msgCount` identical to baseline in every
+cell, `totalMs` within the baseline spread.
+
+**`bench-packet-loss`**, 3 runs, every cell converged. Fan-out at N=50,
+WebSocket, mean messages per run — and this looked like a regression:
+
+| loss | baseline | Task 3 | Task 3b |
+|---|---|---|---|
+| 1 % | 3,936 / 4,688 / 6,435 | 1,437 / 1,160 / 1,111 | 4,965 / 3,332 / 2,646 |
+| 3 % | 7,513 / 5,521 / 6,615 | 2,777 / 3,691 / 1,895 | 9,490 / 7,268 / 11,303 |
+| 10 % | 4,737 / 7,219 / 6,158 | 5,602 / 4,704 / 5,063 | 30,315 / 24,549 / 27,032 |
+
+It is not one. The bench starts the edit burst `latency·3 + 200` ms after
+a 50-peer join burst — inside the 10 s window in which every peer's
+20-slot sync budget is still spent on that burst's replies. Baseline and
+Task 3 both recovered from loss with a nearly empty budget (silently
+dropped resync attempts, `_requestResync()` re-arming, convergence
+anyway because 10 keystrokes mostly arrive); Task 3b's suppressed acks
+leave the budget intact, so the recovery machinery runs at full rate.
+Controlled re-measurement with a **fresh budget** (`SETTLE_MS=12000`
+override added to the bench for this; probe with the same
+`makeProviders`/`instrumentHub` helpers, N=50, WebSocket, 3 samples each,
+all builds converged):
+
+| loss | baseline | Task 3 | Task 3b |
+|---|---|---|---|
+| 1 % | 48,608 (46,844-49,490) | 6,876 (1,911-11,662) | **5,374** (3,332-7,546) |
+| 3 % | 49,490 (49,490-49,490) | 19,584 (7,889-31,654) | **14,243** (8,330-21,756) |
+| 10 % | 45,358 (37,289-49,490) | 40,196 (35,231-49,245) | 41,846 (29,547-49,392) |
+
+49,490 is the rate limiter's ceiling (50 peers × 20 slots × 49
+recipients plus the burst itself): the baseline saturates it at *every*
+loss rate once it has budget to spend, because each resync trigger pushes
+the full document to the whole room and every SyncStep1 collects a reply
+from everyone. The digest beacon cuts that to a ninth at 1 % and a third
+at 3 %; at 10 % all three builds hit the ceiling — the resync design
+(full-state push per trigger) is the binding constraint there, which is
+what round-4 item 5 (targeted NACK + replay) is for. Both regimes are now
+measurable: the default bench timing shows recovery under a spent budget,
+`SETTLE_MS` shows it under a fresh one.
+
+**Gate verdict for Task 3b:** all gates pass (3 × 3 loss/join/latency runs
+without a timeout, corruption-storm and periodic-awareness PASS). Reported
+regressions vs. baseline, both attributable to budget that the baseline
+did not have available: bench-late-join "join during edit burst" (+55 %
+WebSocket, +140 % Matrix) and bench-packet-loss fan-out under the default
+timing. The first is addressed by Task 3c; the second is the baseline's
+starvation, not this phase's cost.
+
+### Task 3c — identical replies coalesced (planned, own before/after)
+
+`_scheduleSyncReply()` flushes a pending reply immediately whenever a
+reply for a *different* request arrives, on the (previously correct)
+assumption that two requests need two answers. K empty joiners produce K
+byte-identical SyncStep2s per settled peer. Change: if the new reply's
+bytes equal the pending reply's bytes, keep the pending one (same delay,
+same suppression) and drop the new one. Measured with the new
+`test/dummy/bench-join-after-burst.ts` (the probe above as a bench, two
+variants: joiners 600 ms after the settled peers connected, and after
+12 s), plus the usual gates. Expected: the "join during edit burst" rows
+drop below baseline; no effect anywhere else.

@@ -373,6 +373,44 @@ before: 9,802-9,998 with ~6,100), fresh 4,559 / 4,461; Matrix in-budget
 6,283 / 6,205, fresh 5,539 / 5,784. All variants PASS; two fresh peers and
 a 3-peer simultaneous join reach `synced`.
 
+### Per-task fast sets (each from that task's frozen build, `bench-dist-tN/`)
+
+`bench-user-scaling` **fan-out N=100, deliveries until quiet** (default
+timing / fresh budget):
+
+| build | WebSocket | WebRTC | Gun | Matrix |
+|---|---|---|---|---|
+| baseline | 8,910 / 9,009 | 7,623 / 7,920 | 160,974 / 198,990 | 149,985 / 198,990 |
+| Task 1 | 9,702 / 9,009 | 8,217 / 8,415 | 161,469 / 198,990 | 150,084 / 198,990 |
+| Task 2 | **990 / 990** | 990 / 990 | **990 / 990** | **990 / 990** |
+| Tasks 3-5 | 990 / 990 | 990 / 990 | 990 / 990 | 990 / 990 |
+| Tasks 6-7 | 10,791* / 990 | 10,791* / 990 | 990 / 990 | 990 / 990 |
+
+\* Not fan-out traffic: in the default-timing variant the edits start
+145 ms after the 100-peer join, and Task 6 moved the join's coalesced
+presence responses from ≤ 100 ms to ~130-150 ms after the first JOIN
+beacon (2 × RTT), so exactly one presence broadcast per peer (99 × 99 =
+9,801) now falls inside the counting window. The fresh-budget column and
+the Gun/Matrix rows (settle ≥ 850 ms) show the fan-out itself: 990.
+
+`bench-user-scaling` **join-burst N=100** (default / fresh): baseline
+WebSocket 18,018 / 19,602, Matrix 84,150 / 84,447 → Task 7 16,335 /
+18,612 and **69,201 / 69,300**; Gun 59,400 → 50,985. Matrix remains the
+expensive profile: with no RTT sample yet, a joiner's first response wait
+is the 1 s floor, shorter than the Matrix round trip plus suppression, so
+many joiners send a CONFIRM retry that collects acks — a transport-provided
+latency hint for the first wait is the obvious phase-1c item.
+
+`bench-join-after-burst` (deliveries; WebSocket in-budget / fresh, Matrix
+in-budget / fresh): baseline 5,049 / 7,205 / 33,365 / 19,161 → Task 7
+**4,804 / 4,167 / 6,009 / 6,078**, all converging in ≤ 600 ms. Idle census
+N=50 default settle: 18,081 → 24,598 (floor 24,500) from Task 4 on.
+`bench-corruption-storm` N=10 at 5 % corruption: 774 → 756-873 messages
+(ratio 1.06 → 1.07-1.5), both RESULT lines pass on every build.
+`bench-periodic-awareness`: 4/4 PASS on every build; joiner presence 33-37
+ms through Task 5, 133-138 ms from Task 6 (the coalescing delay), `synced`
+24-58 ms.
+
 ### After Task 8 — a joiner's wait ends only with data or a confirmed peer's word
 
 Found by the final gate: `bench-late-join` run 1, "join during edit burst",
@@ -405,3 +443,80 @@ presence) before bootstrapping — join burst N=50 in an empty room (probe):
 5,880 → 7,203 deliveries. Rooms with a settled peer pay nothing: its acks
 carry the bit. Task 8 replaces Task 5's "defer" rule and is the last code
 change of the phase; the final gates below ran on this build.
+
+### Final gates (Task 8 build, `bench-dist-t8/`; baseline = end of phase 1 with the same bench scripts)
+
+**Every gate passes:** `bench-sync-latency`, `bench-late-join`,
+`bench-packet-loss` 3 × 3 runs with every cell 3/3, `bench-packet-loss`
+fresh budget 1 run all cells, `bench-corruption-storm` both RESULT lines,
+`bench-idle-room` (b)/(c), `bench-join-after-burst` 4/4,
+`bench-periodic-awareness` 4/4. `bench-sync-latency` `Hash mismatch`
+warnings: **0 / 0 / 0** (phase 1 end: 9-21 per run); `msgCount` 30-32 per
+cell (30-31 before — the +1 is a joiner's CONFIRM retry in a fresh 2-peer
+room).
+
+**The headline** — `bench-user-scaling` fan-out N=100 with a fresh budget,
+deliveries until the room is quiet:
+
+| profile | end of phase 1 | phase 1b |
+|---|---|---|
+| WebSocket | 9,009 | **990** |
+| WebRTC | 7,920 | **990** |
+| Gun | 198,990 | **990** |
+| Matrix | 198,990 | **990** |
+
+Ten keystrokes reach 99 peers as ten updates each, and nothing else
+happens. The default-timing fan-out rows on this build (WebSocket 23,760,
+Gun 43,560, Matrix 30,492) are not fan-out traffic: the edits start
+145-1,150 ms after a 100-peer join into an *empty* room, and that window
+now contains the join's coalesced presence responses (Task 6) and the
+first JOIN retries of peers that are not yet confirmed (Task 8); the
+fresh-budget column and the Gun/Matrix rows of every earlier task show
+the cascade itself is gone.
+
+**`bench-late-join`** (M=40, K=10, `syncInterval: 2000` in both builds):
+
+| scenario | profile | end of phase 1 | phase 1b (3 runs) | mismatch column |
+|---|---|---|---|---|
+| idle late join | WebSocket | 5,067 | 4,137-5,135 | 0 → 0 |
+| idle late join | Matrix | 13,585 | 14,803-15,416 | 0 → 0 |
+| join during edit burst | WebSocket | 7,760 | **5,263-5,361** | 1,436 → **0** |
+| join during edit burst | Matrix | 41,370 | **16,332-19,636** | 6,040 → **0** |
+
+**`bench-packet-loss`** (N=50, `syncInterval: 2000` in both builds; mean
+messages to convergence, then mean ms):
+
+| profile | loss | end of phase 1 | phase 1b, 3 runs | ms: before → after |
+|---|---|---|---|---|
+| WebSocket | 1 % | 3,724 | 1,584 / 14,226 / 1,584 | 168 → 570-860 |
+| WebSocket | 3 % | 7,677 | 6,860 / 7,677 / 7,873 | 157 → 690-780 |
+| WebSocket | 5 % | 8,542 | 9,473 / 8,003 / 10,094 | 154 → 600-1,030 |
+| WebSocket | 10 % | 25,578 | 12,381 / 15,353 / 9,326 | 256 → 670-770 |
+| Matrix | 1 % | 8,167 | 7,187 / 7,285 / 7,383 | 574 → 491-564 |
+| Matrix | 10 % | 20,972 | 10,192 / 8,542 / 7,791 | 630 → 610-660 |
+
+Fresh budget (1 run each): WebSocket 1/3/5/10 % 2,107 / 3,610 / 2,205 /
+8,412 → 1,323 / 4,426 / 2,466 / 2,581; Matrix 9,424 / 8,477 / 9,996 /
+11,809 → 3,528 / 5,259 / 3,430 / 4,149. Message counts are flat across
+loss rates now where they used to grow with loss; **recovery latency on
+WebSocket went up** from ~0.2 s to ~0.6-1.0 s at N=50: a lost keystroke
+is now healed by one gap-grace period (300 ms) plus a beacon round trip,
+where before it was healed — along with the rest of the storm — by the
+first of many full-document pushes. That is the intended trade; the grace
+period is an existing option (`gapGraceMs`) for deployments that prefer
+the other side of it.
+
+**Everything else on the final build:** join burst N=50/100 WebSocket
+5,978 / 17,721 (18,018 before), Matrix 19,747 / 81,774 (84,150 before —
+Task 8's fresh-room retries gave back most of Task 6's Matrix gain, see
+the phase-1c note); `bench-join-after-burst` WebSocket 4,461 / 4,363,
+Matrix 5,774 / 5,735 (baseline 5,049 / 7,205 / 33,365 / 19,161); idle
+census N=50 24,598 default and 15 s (floor 24,500); corruption-storm N=10
+at 5 %: 900 messages (774), ratio 1.05; late joiner presence 136 ms,
+`synced` 34 ms.
+
+**What this phase did not do (phase 1c candidates, in order):** a
+transport-provided latency hint to seed the first response wait (the
+Matrix join burst still pays CONFIRM retries); dedupe of the `synced`
+semantics against `_confirmed`; `Transport.sendTo`; the idle-backoff
+default; the orphaned subdoc work.

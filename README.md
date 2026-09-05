@@ -432,9 +432,11 @@ For most production scenarios, the default 5-second interval provides good resil
 
 > **Wire compatibility.** All peers in a room must run the same version of
 > this library. Sync requests travel as a private digest message (state
-> vector + delete-set hash), and several messages are batched into one
-> envelope; an older peer drops both unread. This has been the case since
-> message batching landed and is not new to the digest format.
+> vector + delete-set hash, with join/ack/confirm flags), the connect-time
+> full-state push has its own message type, and several messages are
+> batched into one envelope; an older peer drops all of them unread. This
+> has been the case since message batching landed and is not new to the
+> digest format.
 
 ### Update Batching (Debouncing)
 

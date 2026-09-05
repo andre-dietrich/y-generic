@@ -822,3 +822,12 @@ rate limiter bounds it, nothing removes it.
   both regimes (`SETTLE_MS` overrides now exist in `bench-idle-room`,
   `bench-packet-loss`; `bench-user-scaling` needs the same) — a
   spent-budget number is a statement about the limiter, not the protocol.
+
+**Status (2026-09-05, evening): items 12 and 13 fixed in phase 1b** — see
+`2026-09-05-resync-cascade-design.md`. Fan-out N=100 on the Gun profile
+with a fresh budget: 198,990 → 990 deliveries (the ten keystrokes × 99,
+nothing else); `bench-sync-latency` hash-mismatch warnings 9-21 per run →
+0. The remaining phase-1c candidates, in order: a transport-provided
+latency hint for the first response wait (Matrix join bursts still pay
+CONFIRM retries), `Transport.sendTo` (item 6), idle backoff re-decision,
+and the orphaned subdoc work.

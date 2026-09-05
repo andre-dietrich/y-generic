@@ -287,6 +287,12 @@ See `examples.ts` for complete implementations of:
 - **PubNubTransport**: Pub/sub messaging
 - **IndexedDBTransport**: Local persistence (acts as a "transport")
 
+When you combine a persistence provider with a network provider on the
+same `Y.Doc`, connect the persistence provider first and wait for its
+`synced` event before calling `connect()` on the network provider. The
+network provider's first request then carries your real state vector and
+the reply is only the tail you are missing, instead of the whole document.
+
 ## How It Works
 
 ```
@@ -417,9 +423,18 @@ const provider = new GenericProvider(doc, transport, {
 - Yjs requires multi-step handshakes (SyncStep1 → SyncStep2 → Updates)
 - If any message is lost due to packet loss, sync stalls
 - Periodic retries ensure eventual consistency even on unreliable networks
-- Performance impact is minimal (only sends if there are changes)
+- Performance impact is minimal: each tick sends one small digest beacon
+  (state vector plus a hash of the delete set), and peers answer only when
+  the sender is actually missing something. A fully synced room exchanges
+  beacons and nothing else.
 
 For most production scenarios, the default 5-second interval provides good resilience without excessive traffic. For testing with simulated packet loss, use a shorter interval (e.g., 2 seconds).
+
+> **Wire compatibility.** All peers in a room must run the same version of
+> this library. Sync requests travel as a private digest message (state
+> vector + delete-set hash), and several messages are batched into one
+> envelope; an older peer drops both unread. This has been the case since
+> message batching landed and is not new to the digest format.
 
 ### Update Batching (Debouncing)
 

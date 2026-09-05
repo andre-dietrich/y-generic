@@ -112,8 +112,10 @@ current behavior.
 
 ## Package structure notes
 
-- `main`/`types` point at `./dist/lib.js` / `./dist/lib.d.ts` (built output only — `dist/` is
-  gitignored, always run `npm run build` before relying on it locally).
+- `main`/`types` point at `./dist/lib.js` / `./dist/lib.d.ts`. `dist/` is **tracked and
+  committed** (not gitignored): every commit that touches `src/` rebuilds it with `npm run build`
+  and includes the result, as the git history shows. `bench-dist/` (the `tsconfig.bench.json`
+  output) is gitignored.
 - Each transport is also its own `exports` subpath (e.g. `./providers/gun`) mapping to its own
   compiled file under `dist/providers/<name>/`, so consumers only pull in the transport they
   actually import.

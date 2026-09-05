@@ -11,6 +11,17 @@ const MESSAGE_AWARENESS = 1;
 const MESSAGE_PUBSUB = 2;
 const MESSAGE_SYNC_VERIFIED = 3; // Sync message with hash verification
 const MESSAGE_BATCH = 4; // Envelope for N independently-typed sub-messages sent as one wire message
+// Digest beacon: replaces SyncStep1 on the wire. [version][flags][sender
+// clientID][state vector][delete-set hash]. Receivers reply only when the
+// sender is behind them or the delete-set hashes differ (SyncStep2, as
+// before), or - on a JOIN-flagged beacon with equal state - with their own
+// beacon as an ack; otherwise not at all. See
+// docs/superpowers/specs/2026-09-05-digest-beacon-design.md and
+// _handleDigest(). Versions are append-only: receivers read the fields
+// they know and ignore trailing bytes.
+const MESSAGE_SYNC_DIGEST = 5;
+const DIGEST_VERSION = 1;
+const DIGEST_FLAG_JOIN = 1; // bit 0: "I just joined - send me your presence and confirm my state"
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -422,8 +433,9 @@ export class GenericProvider extends Observable {
             // made before this connect() call are pushed to currently-connected peers
             // (e.g. same-browser tabs via BroadcastChannel).
             this.syncNow();
-            // Broadcast local awareness state
-            this._broadcastAwareness([this.doc.clientID]);
+            // (Local awareness goes out inside syncNow()'s batch, or via its
+            // throttled fallback - a second broadcast here was a duplicate 100ms
+            // later.)
             // Start periodic sync to handle packet loss
             // Just request sync without sending full state (avoid redundant broadcasts)
             // _sendSyncStep1() already checks the shared rate limiter internally
@@ -461,45 +473,15 @@ export class GenericProvider extends Observable {
                         }
                         this._lastPeriodicTickTime = tickTime;
                         if (this.transport.isConnected && !this._destroying) {
-                            // Also re-announce awareness - but only on transports WITHOUT
-                            // onPeerConnect (e.g. WebSocket, PubNub, Trystero strategies
-                            // that don't support it), which never otherwise re-broadcast
-                            // presence to peers that joined after our last broadcast; this
-                            // bounds that gap to one interval instead of leaving it
-                            // unbounded. On transports WITH onPeerConnect (peerjs,
-                            // simple-peer, trystero mesh - see CLAUDE.md), every new peer
-                            // already triggers _schedulePeerConnectSync() -> syncNow() on
-                            // join, which broadcasts awareness itself - so this periodic
-                            // re-announce would be pure redundant traffic for the entire
-                            // connected lifetime of every such peer, answering a gap that's
-                            // already covered by a different mechanism.
-                            if (!this.transport.onPeerConnect) {
-                                // Fold the awareness re-announce into the SAME wire message
-                                // as the SyncStep1 pull below when possible (see
-                                // _tryImmediateAwarenessMessage's doc) - this is the
-                                // steady-state periodic path, the single largest source of
-                                // background traffic in a long-lived room, so it's the
-                                // biggest win for this batching. Falls back to the normal
-                                // independent throttled broadcast exactly as before when
-                                // the immediate path isn't available right now.
-                                const msg = this._tryImmediateAwarenessMessage([
-                                    this.doc.clientID,
-                                ]);
-                                const sent = this._sendSyncStep1(msg ? [msg] : undefined);
-                                if (msg && !sent) {
-                                    // SyncStep1 was rate-limited so the batch above never
-                                    // went out, but the awareness throttle already committed
-                                    // to sending now (pending clients cleared, timestamp
-                                    // updated) - send it on its own rather than losing it.
-                                    this._send(msg);
-                                }
-                                else if (!msg) {
-                                    this._broadcastAwareness([this.doc.clientID]);
-                                }
-                            }
-                            else {
-                                this._sendSyncStep1();
-                            }
+                            // Beacon only. Presence is no longer re-announced per tick on
+                            // any transport: a joiner requests it via DIGEST_FLAG_JOIN
+                            // (see _handleDigest()), and y-protocols/awareness renews the
+                            // local state itself every outdatedTimeout/2 = 15s
+                            // (awareness.js _checkInterval), which the awareness update
+                            // handler broadcasts. Measured in
+                            // test/dummy/bench-idle-room.ts: the per-tick re-announce was
+                            // ~40% of an idle room's deliveries.
+                            this._sendSyncStep1();
                         }
                         if (!this._destroying)
                             scheduleNextPeriodicSync();
@@ -700,8 +682,10 @@ export class GenericProvider extends Observable {
      * `_tryImmediateAwarenessMessage()`). Pure wire-framing: whether a caller
      * passes this never changes whether/when the push+pull half itself sends,
      * only how many separate `transport.send()`/`bc.publish()` calls it costs.
+     * @param flags - digest beacon flags: DIGEST_FLAG_JOIN from syncNow(), 0
+     * from the peer-connect debounce and the resync retry (see _syncNow()).
      */
-    _trySyncPushPull(push = true, buildExtra) {
+    _trySyncPushPull(push = true, buildExtra, flags = 0) {
         // Push (full document state) and pull (SyncStep1 request) share a
         // single rate-limit reservation. syncNow() is called from several
         // triggers that can all fire in a short window when many peers are
@@ -725,7 +709,7 @@ export class GenericProvider extends Observable {
             }
         }
         // Send sync request to get updates from others
-        messages.push(this._encodeSyncStep1());
+        messages.push(this._encodeSyncStep1(flags));
         if (buildExtra) {
             messages.push(...buildExtra());
         }
@@ -737,8 +721,19 @@ export class GenericProvider extends Observable {
     /**
      * Force an immediate sync with remote peers.
      * Useful after network interruptions or to manually trigger re-sync.
+     * Sends the beacon with DIGEST_FLAG_JOIN: peers answer with their
+     * presence and, if our state already matches theirs, with an ack beacon
+     * so `synced` flips without a data round trip.
      */
     syncNow() {
+        this._syncNow(DIGEST_FLAG_JOIN);
+    }
+    /**
+     * syncNow() body. `flags` = 0 for callers that must NOT request presence:
+     * `_schedulePeerConnectSync()` (mesh transports already re-broadcast
+     * presence to a newcomer via their own onPeerConnect -> syncNow()).
+     */
+    _syncNow(flags) {
         if (!this.transport.isConnected) {
             console.warn('Cannot sync: transport not connected');
             return;
@@ -759,7 +754,7 @@ export class GenericProvider extends Observable {
                 return [msg];
             }
             return [];
-        });
+        }, flags);
         // Awareness broadcasting is independently throttled and explicitly NOT
         // gated by the sync rate limiter above - preserve that exactly: it
         // always ends up broadcast one way or another (batched above, or via
@@ -802,10 +797,10 @@ export class GenericProvider extends Observable {
      * (`hasContent`/non-empty added+updated+removed - confirmed by reading
      * yjs's `Transaction.js` and y-protocols' `awareness.js` directly), so
      * hooking THOSE instead is exactly "local or remote document/awareness
-     * change" with no extra filtering needed - a no-op SyncStep2 reply or a
-     * duplicate/no-change awareness re-announce (e.g. this same periodic
-     * tick's own presence re-broadcast on transports without
-     * `onPeerConnect`) never reaches these handlers. A corrupted (CRC32
+     * change" with no extra filtering needed - a no-op SyncStep2 reply, a
+     * digest beacon, or a duplicate/no-change awareness re-announce (e.g. a
+     * JOIN-triggered presence response that changed nothing) never reaches
+     * these handlers. A corrupted (CRC32
      * mismatch) message is real evidence of wire activity that neither
      * handler would ever see (it's rejected before decoding) - see the
      * explicit call in `_processWrappedMessage()`'s corruption branch.
@@ -841,7 +836,7 @@ export class GenericProvider extends Observable {
             this._pendingPeerConnectSyncTimeoutId = undefined;
             if (!this.transport.isConnected || this._destroying)
                 return;
-            this.syncNow();
+            this._syncNow(0);
         }, this._peerConnectDebounceMs);
     }
     /**
@@ -1103,16 +1098,17 @@ export class GenericProvider extends Observable {
                 }
                 break;
             }
+            case MESSAGE_SYNC_DIGEST: {
+                this._handleDigest(decoder);
+                break;
+            }
             case MESSAGE_SYNC: {
                 const encoder = encoding.createEncoder();
                 encoding.writeVarUint(encoder, MESSAGE_SYNC);
                 const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
                 if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
                     // If we received SyncStep2, we're synced
-                    if (!this._synced) {
-                        this._synced = true;
-                        this.emit('synced', [true]);
-                    }
+                    this._markSynced();
                     // Someone else's SyncStep2 reply just arrived - our own pending
                     // reply (if any) is now most likely redundant.
                     this._cancelPendingSyncReply();
@@ -1122,12 +1118,7 @@ export class GenericProvider extends Observable {
                 // there's no "someone else" to rely on, so reply immediately
                 // (still rate-limited via _sendSyncReply() as a hard backstop).
                 if (encoding.length(encoder) > 1) {
-                    if (this.awareness.getStates().size >= 3) {
-                        this._scheduleSyncReply(encoding.toUint8Array(encoder));
-                    }
-                    else {
-                        this._sendSyncReply(encoding.toUint8Array(encoder));
-                    }
+                    this._replyToSyncRequest(encoding.toUint8Array(encoder));
                 }
                 break;
             }
@@ -1235,10 +1226,8 @@ export class GenericProvider extends Observable {
                 }
                 // If we received SyncStep2, we're synced (unless hash mismatched)
                 if (syncMessageType === syncProtocol.messageYjsSyncStep2 &&
-                    !this._synced &&
                     localHash === expectedHash) {
-                    this._synced = true;
-                    this.emit('synced', [true]);
+                    this._markSynced();
                 }
                 // Send reply if needed (as standard MESSAGE_SYNC). Suppression
                 // only engages with genuine redundancy (>=2 other known peers via
@@ -1249,17 +1238,75 @@ export class GenericProvider extends Observable {
                 // since every peer answering a post-mismatch SyncStep1 replied
                 // immediately via this path.
                 if (encoding.length(encoder) > 1) {
-                    if (this.awareness.getStates().size >= 3) {
-                        this._scheduleSyncReply(encoding.toUint8Array(encoder));
-                    }
-                    else {
-                        this._sendSyncReply(encoding.toUint8Array(encoder));
-                    }
+                    this._replyToSyncRequest(encoding.toUint8Array(encoder));
                 }
                 break;
             }
             default:
                 console.warn('Unknown message type:', messageType);
+        }
+    }
+    /**
+     * Handle a digest beacon (MESSAGE_SYNC_DIGEST). Reply rule (design doc
+     * §3): SyncStep2 if the sender is behind us or its delete-set hash
+     * differs from ours (the SyncStep2 always carries our full delete set, so
+     * it also heals a lost delete on their side - and their beacon does the
+     * same for us, symmetrically, within one interval); our own beacon as an
+     * ack if the beacon is JOIN-flagged and states are equal; nothing
+     * otherwise - which is what removes the ~5-12 empty replies per heartbeat
+     * measured at N=50 in test/dummy/bench-idle-room.ts. "Sender is ahead of
+     * us" triggers no reply: our own next beacon fetches it. Nothing here
+     * removes a recovery path (the round-2 lesson in
+     * 2026-09-04-resync-message-reduction-design.md's addendum), only
+     * replies that carry no information.
+     *
+     * `synced`: a beacon we are not behind, with equal delete-set hash, is a
+     * stronger statement than the empty SyncStep2 it replaces ("you lack
+     * nothing I have"), so it marks us synced too - this is what keeps two
+     * fresh peers, or a whole concurrent join burst, converging to `synced`
+     * with no acks needing to survive the rate limiter.
+     */
+    _handleDigest(decoder) {
+        decoding.readVarUint(decoder); // DIGEST_VERSION - append-only, nothing to branch on yet
+        const flags = decoding.readVarUint(decoder);
+        decoding.readVarUint(decoder); // sender clientID - reserved for unicast replies (round-4 research item 6)
+        const remoteSv = decoding.readVarUint8Array(decoder);
+        const remoteDsHash = decoding.readVarUint(decoder);
+        // Any trailing bytes belong to a newer version; ignored by design.
+        const remote = Y.decodeStateVector(remoteSv);
+        const local = Y.decodeStateVector(Y.encodeStateVector(this.doc));
+        let senderBehind = false;
+        for (const [client, clock] of local) {
+            if ((remote.get(client) ?? 0) < clock) {
+                senderBehind = true;
+                break;
+            }
+        }
+        let weBehind = false;
+        for (const [client, clock] of remote) {
+            if ((local.get(client) ?? 0) < clock) {
+                weBehind = true;
+                break;
+            }
+        }
+        const dsEqual = remoteDsHash === this._deleteSetHash();
+        if (senderBehind || !dsEqual) {
+            const encoder = encoding.createEncoder();
+            encoding.writeVarUint(encoder, MESSAGE_SYNC);
+            syncProtocol.writeSyncStep2(encoder, this.doc, remoteSv);
+            this._replyToSyncRequest(encoding.toUint8Array(encoder));
+        }
+        else if (flags & DIGEST_FLAG_JOIN) {
+            this._replyToSyncRequest(this._encodeSyncStep1(0));
+        }
+        if (!weBehind && dsEqual) {
+            this._markSynced();
+        }
+        if (flags & DIGEST_FLAG_JOIN && this.awareness.getLocalState() !== null) {
+            // Presence on demand: the joiner asked. Throttled like every other
+            // awareness broadcast, never suppressed (each responder's state is
+            // distinct). Skipped when we have no state to announce.
+            this._broadcastAwareness([this.doc.clientID]);
         }
     }
     /**
@@ -1325,6 +1372,28 @@ export class GenericProvider extends Observable {
             this._pendingSyncReplyTimeoutId = undefined;
         }
         this._pendingSyncReply = null;
+    }
+    /**
+     * Route a SyncStep2 (or digest-ack) reply through the redundancy
+     * suppression when there's genuine redundancy (>= 2 other known peers via
+     * awareness - below that there's no "someone else" to rely on), else send
+     * immediately. Both paths are rate-limited by `_sendSyncReply()`. Shared
+     * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
+     */
+    _replyToSyncRequest(reply) {
+        if (this.awareness.getStates().size >= 3) {
+            this._scheduleSyncReply(reply);
+        }
+        else {
+            this._sendSyncReply(reply);
+        }
+    }
+    /** Flip `synced` once and emit; idempotent. */
+    _markSynced() {
+        if (!this._synced) {
+            this._synced = true;
+            this.emit('synced', [true]);
+        }
     }
     /**
      * Delay a pure timeout-removal awareness broadcast and drop it if
@@ -1618,44 +1687,31 @@ export class GenericProvider extends Observable {
         return true;
     }
     /**
-     * Encode a SyncStep1 message requesting missing updates, without sending
-     * it. Extracted from the old `_writeSyncStep1()` so callers that want to
-     * fold this into a larger batch (see `_sendBatch()`) can get the raw
-     * encoded bytes; `_sendSyncStep1()` below is the send-immediately form
-     * most callers still want.
+     * Encode the digest beacon that replaces SyncStep1 (see
+     * MESSAGE_SYNC_DIGEST). Still the one place every "request sync" path
+     * goes through (connect()'s syncNow(), the periodic tick,
+     * _requestResync()'s retry), so they all switched together.
      */
-    _encodeSyncStep1() {
+    _encodeSyncStep1(flags = 0) {
         const encoder = encoding.createEncoder();
-        // SyncStep1 is always sent as standard MESSAGE_SYNC (no verification)
-        // It's just a request, not an assertion of state
-        encoding.writeVarUint(encoder, MESSAGE_SYNC);
-        syncProtocol.writeSyncStep1(encoder, this.doc);
+        encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST);
+        encoding.writeVarUint(encoder, DIGEST_VERSION);
+        encoding.writeVarUint(encoder, flags);
+        encoding.writeVarUint(encoder, this.doc.clientID);
+        encoding.writeVarUint8Array(encoder, Y.encodeStateVector(this.doc));
+        encoding.writeVarUint(encoder, this._deleteSetHash());
         return encoding.toUint8Array(encoder);
     }
     /**
-     * Send SyncStep1 message to request missing updates.
-     * This is sent when first connecting to sync with remote peers.
-     * Note: SyncStep1 is just a request and doesn't include hash verification.
-     * Rate limited to prevent spam. Returns whether it actually sent (false
-     * means rate-limited).
-     *
-     * @param extra - optional already-encoded sub-messages (e.g. an awareness
-     * update ready to send "now" - see `_tryImmediateAwarenessMessage()`) to
-     * fold into the same batched wire send as the SyncStep1 message, instead
-     * of each going out as its own separate message. Only ever included when
-     * this actually sends (i.e. not rate-limited) - a caller passing `extra`
-     * must handle the `false`-return/not-sent case itself (see call site in
-     * `connect()`'s periodic-sync tick).
+     * Send the periodic digest beacon. Rate limited to prevent spam. Returns
+     * whether it actually sent (false means rate-limited).
      */
-    _sendSyncStep1(extra) {
+    _sendSyncStep1() {
         if (!this._tryReserveSyncSlot()) {
             console.warn(`[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`);
             return false; // Drop the request
         }
-        const messages = [this._encodeSyncStep1()];
-        if (extra)
-            messages.push(...extra);
-        this._sendBatch(messages);
+        this._send(this._encodeSyncStep1());
         return true;
     }
     /**
@@ -1790,8 +1846,8 @@ export class GenericProvider extends Observable {
     /**
      * Attempt to build an awareness broadcast message for immediate
      * inclusion in the same wire send as a sync message a caller is about to
-     * send anyway (see `_trySyncPushPull`/`_sendSyncStep1`'s `extra`/
-     * `buildExtra` parameters), instead of going through
+     * send anyway (see `_trySyncPushPull`'s `buildExtra` parameter), instead
+     * of going through
      * `_broadcastAwareness()`'s independent debounce.
      *
      * Only returns non-null when the throttle would have let an immediate
@@ -1905,8 +1961,8 @@ export class GenericProvider extends Observable {
      * there's more than one to send. Used at trigger points that
      * conceptually produce a single event but historically sent multiple
      * independent messages for it (sync push, sync pull, awareness) - see
-     * `_trySyncPushPull()`, `_sendSyncStep1()`'s `extra` parameter, and
-     * `connect()`'s periodic-sync tick.
+     * `_trySyncPushPull()` (connect-time push + digest beacon + awareness in
+     * one wire message).
      *
      * Design (see the task's framing requirements):
      * - Each sub-message is length-prefixed with `writeVarUint8Array`,

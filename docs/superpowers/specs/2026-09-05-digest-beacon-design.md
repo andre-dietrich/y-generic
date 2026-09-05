@@ -254,7 +254,154 @@ WebSocket 26-42, WebRTC 26-40, Gun 331-350, Matrix 474-497. `Hash mismatch`
 warnings per run: 9 / 21 / 19 — all in 2-client runs with zero loss and
 zero reordering, i.e. item 12 again.
 
-Remaining baseline gates (`bench-late-join` ×3, `bench-corruption-storm`,
-`bench-user-scaling`, `bench-packet-loss` ×3) were still running from the
-same `bench-dist-baseline/` snapshot when Task 1 was committed; their
-numbers are appended below in the commit that records them.
+The remaining baseline gates were still running from the same
+`bench-dist-baseline/` snapshot when Task 1 was committed; recorded here
+with the Task 3 results:
+
+**`bench-late-join`**, 3 runs, all cells converged (both scenarios, both
+profiles, 0 % and 3 % loss). Selected cells (`msgs` = mean per run,
+`mismatch` = the bench's own hash-mismatch tally):
+
+| scenario | profile | M | K | msgs (3 runs) | mismatch (3 runs) |
+|---|---|---|---|---|---|
+| idle late join | WebSocket | 10 | 5 | 821 / 811 / 811 | 0 |
+| idle late join | WebSocket | 40 | 10 | 9,412 / 9,412 / 8,546 | 0 |
+| idle late join | Matrix | 40 | 10 | 10,555 / 10,245 / 10,555 | 0 |
+| join during edit burst | WebSocket | 40 | 10 | 15,502 / 15,029 / 15,421 | 1,460 / 1,422 / 1,434 |
+| join during edit burst | Matrix | 40 | 10 | 18,116 / 19,191 / 18,112 | 4,724 / 4,633 / 4,165 |
+
+**`bench-corruption-storm`**, N=10 rows (`msgs` during the 3 s edit stream,
+SyncStep2 : SyncStep1 ratio): 5 % → 1,170 / 3.24; 20 % → 1,422 / 4.21;
+50 % → 1,341 / 3.50. Both RESULT lines pass (no storm, all converged).
+
+**`bench-user-scaling`**, WebSocket profile: fan-out is exactly linear
+(990 messages for a 10-edit burst at N=100); join-burst 40,915 messages /
+440,931 bytes at N=50 and 184,140 / 1,953,019 at N=100.
+
+**`bench-packet-loss`**, 3 runs, every cell converged. Fan-out at N=50,
+WebSocket, mean messages per run: 1 % loss → 3,936 / 4,688 / 6,435; 3 % →
+7,513 / 5,521 / 6,615; 10 % → 4,737 / 7,219 / 6,158 (490 at 0 %, i.e. the
+loss-free cost is exactly linear and every message above it is recovery
+traffic). Join-burst at N=50 stays at ~40.9k messages regardless of loss.
+
+### After Task 3 — digest beacon (branch tip after the Task 3 commit)
+
+Same scripts, same parameters, `bench-dist/` compiled from the changed
+`src/`. Both gate sets ran concurrently on the same machine; message
+counts are unaffected by that, wall-clock columns are noisier than usual.
+
+**`bench-idle-room` (a)** — the change this phase exists for:
+
+| N | deliveries | Δ | request | syncStep2 | awareness |
+|---|---|---|---|---|---|
+| 5 | 400 → 192 | −52 % | 112 → 192 | 208 → **0** | 192 → **0** |
+| 20 | 9,082 → 1,083 | −88 % | 1,045 → 1,083 | 5,301 → **0** | 3,781 → **0** |
+| 50 | 70,854 → 7,497 | **−89 %** | 2,891 → 7,497 | 46,109 → **0** | 24,745 → **0** |
+
+An idle room now carries beacons and nothing else. Requests went *up*
+because the rate limiter is no longer drained by replies (still below the
+24,500 floor at N=50: the join-time ack burst spends most of each peer's
+20-per-10 s budget, so ticks in the first ~10 s after a 50-peer join are
+throttled — see the follow-up below). Awareness is 0 in the window because
+the y-protocols 15 s renewal falls outside the 10 s observation; the
+per-tick re-announce is gone on every transport.
+
+**`bench-idle-room` (b)** — lost delete: 5/5 converged, heal latency
+127-1,019 ms, always via one beacon + one SyncStep2 (the `dsHash`
+mismatch path), zero warnings in the heal window. Same latency envelope as
+the baseline's empty-reply path; the delete-set hash does what it is for.
+
+**`bench-idle-room` (c)** — `HASHPROPS ... => PASS`.
+
+**`bench-periodic-awareness`** (rewritten expectations): 0 periodic
+awareness sends on both configs; the late joiner into a 5-peer room saw all
+5 remote presence states after **34 ms** (baseline: 285 ms, via the next
+tick) and was `synced` after 47 ms. All four checks PASS.
+
+**`bench-sync-latency`**, 3 runs: `msgCount` identical to baseline in
+every cell; `totalMs` within the baseline spread. `Hash mismatch` warnings
+per run 15 / 11 / 19 (baseline 9 / 21 / 19) — item 12 is untouched by this
+phase.
+
+**`bench-late-join`**, 3 runs, every cell converged, `mismatch` column
+unchanged within noise (item 12). Message counts in the join window went
+**up**:
+
+| scenario | profile | M | K | baseline msgs | after msgs |
+|---|---|---|---|---|---|
+| idle late join | WebSocket | 10 | 5 | 811-821 | 1,199-1,213 |
+| idle late join | WebSocket | 40 | 10 | 8,546-9,412 | 13,708-13,871 |
+| idle late join | Matrix | 40 | 10 | 10,245-10,555 | 18,461-18,608 |
+| join during edit burst | WebSocket | 40 | 10 | 15,029-15,502 | 19,586-20,027 |
+| join during edit burst | Matrix | 40 | 10 | 18,112-19,191 | 22,474-23,346 |
+
+This is the designed trade: the bench runs with `syncInterval: 0`, so it
+sees only the join-time cost (presence responses + acks to the JOIN
+beacon) and never the removed per-tick re-announce. At M+K=50 the extra
+~4,400 deliveries equal roughly one old heartbeat tick (50·49 = 2,450
+awareness + the replies to it); the break-even is one interval, then the
+idle census applies. The 12.6 : 1 idle reply ratio and the 40 % awareness
+share are gone; the join got ~45 % more expensive in a bench that never
+charges for idling.
+
+**`bench-corruption-storm`**, N=10 rows (msgs / SyncStep2 : SyncStep1):
+5 % → 747 / 1.18 (was 1,170 / 3.24); 20 % → 1,413 / 3.90 (was 1,422 /
+4.21); 50 % → 1,179 / 2.60 (was 1,341 / 3.50). Both RESULT lines pass.
+Fewer empty replies during recovery, same convergence.
+
+**`bench-user-scaling`**, WebSocket: fan-out identical (990 at N=100).
+Join-burst **message count identical** (40,915 at N=50, 184,140 at N=100):
+the ack beacons replaced the empty SyncStep2 replies one for one under the
+same rate limiter, and the JOIN-triggered presence response replaced the
+duplicate awareness broadcast that `connect()` used to schedule 100 ms
+after `syncNow()`. Bytes +52 % (440,931 → 670,866 at N=50; 1,953,019 →
+2,997,326 at N=100): an ack beacon (~12 B) is larger than an empty
+SyncStep2 (~4 B), times ~38k reply deliveries.
+
+**`bench-packet-loss`**, 3 runs, every cell converged (the hard gate that
+killed round 2's Item 2). Fan-out at N=50, mean messages per run,
+baseline → after:
+
+| profile | loss | baseline (3 runs) | after (3 runs) |
+|---|---|---|---|
+| WebSocket | 0 % | 490 / 490 / 490 | 490 / 490 / 490 |
+| WebSocket | 1 % | 3,936 / 4,688 / 6,435 | 1,437 / 1,160 / 1,111 |
+| WebSocket | 3 % | 7,513 / 5,521 / 6,615 | 2,777 / 3,691 / 1,895 |
+| WebSocket | 5 % | 4,753 / 8,689 / 7,677 | 4,051 / 3,463 / 4,149 |
+| WebSocket | 10 % | 4,737 / 7,219 / 6,158 | 5,602 / 4,704 / 5,063 |
+| Matrix | 0 % | 1,519 / 1,601 / 1,535 | 1,241 / 1,323 / 1,372 |
+| Matrix | 1 % | 4,671 / 6,141 / 3,071 | 4,181 / 5,276 / 3,626 |
+| Matrix | 10 % | 10,976 / 9,653 / 12,397 | 7,007 / 6,778 / 8,575 |
+
+Recovery traffic at realistic loss (1-3 %) roughly halved to quartered:
+the resync round trips no longer collect an empty SyncStep2 from every
+peer that had nothing to add. Join-burst at N=50: WebSocket unchanged
+(~40.9k at every loss rate), **Matrix up from ~37.9k to ~47.5k (+25 %)**.
+Cause: at 350 ms latency the 50 JOIN beacons arrive spread over several
+100 ms awareness-throttle windows, so a peer answers with 2-3 presence
+broadcasts instead of the single coalesced one it sends at WebSocket
+latency. Recorded, not gated: 50 simultaneous joiners on a transport that
+Synapse rate-limits to 0.2 messages/s is not a scenario this transport
+survives either way; a real fix would be a presence-response coalescing
+window decoupled from the 100 ms cursor throttle — a candidate for phase
+1b, together with item 12.
+
+**Gate verdict for Task 3:** all gates pass (idle census −89 % at N=50
+against the ≥ 90 % SyncStep2-class target it exceeds; awareness class at
+0 against the 2×-floor cap; lost delete 5/5; packet-loss / late-join /
+sync-latency 3 × 3 runs with zero timeouts; corruption-storm and
+user-scaling reported; periodic-awareness 4/4 PASS).
+
+**Follow-up decided from these numbers (Task 3b, own before/after).** In a
+join burst the acks are ~94 % of the messages and are almost all
+redundant: every joiner's own JOIN beacon is an equal-state beacon that
+already marks every other joiner `synced` (§4). Yet a pending ack is only
+cancelled by an overheard SyncStep2 (§3 as written: "an overheard beacon
+cancels nothing"), so acks ride the rate limiter instead of the
+suppression. Amendment to §3: **an overheard beacon whose digest equals
+ours cancels a pending *ack* (never a pending SyncStep2)** — the joiner it
+was meant for has received that same beacon and is synced by it. Expected:
+join-burst messages at N=50 drop from ~40.9k toward the ~2.5k connect
+batches plus a handful of surviving acks; `bench-idle-room` requests
+recover toward their floor because the budget is no longer spent on acks.
+Measured in the Task 3b section below.

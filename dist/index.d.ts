@@ -395,13 +395,24 @@ export declare class GenericProvider extends Observable<string> {
      * `_tryImmediateAwarenessMessage()`). Pure wire-framing: whether a caller
      * passes this never changes whether/when the push+pull half itself sends,
      * only how many separate `transport.send()`/`bc.publish()` calls it costs.
+     * @param flags - digest beacon flags: DIGEST_FLAG_JOIN from syncNow(), 0
+     * from the peer-connect debounce and the resync retry (see _syncNow()).
      */
     private _trySyncPushPull;
     /**
      * Force an immediate sync with remote peers.
      * Useful after network interruptions or to manually trigger re-sync.
+     * Sends the beacon with DIGEST_FLAG_JOIN: peers answer with their
+     * presence and, if our state already matches theirs, with an ack beacon
+     * so `synced` flips without a data round trip.
      */
     syncNow(): void;
+    /**
+     * syncNow() body. `flags` = 0 for callers that must NOT request presence:
+     * `_schedulePeerConnectSync()` (mesh transports already re-broadcast
+     * presence to a newcomer via their own onPeerConnect -> syncNow()).
+     */
+    private _syncNow;
     /**
      * Compute the next periodic-sync delay, jittered by ~+/-20% around
      * `_currentSyncIntervalMs` (== `_syncInterval` unless `idleBackoffEnabled`
@@ -432,10 +443,10 @@ export declare class GenericProvider extends Observable<string> {
      * (`hasContent`/non-empty added+updated+removed - confirmed by reading
      * yjs's `Transaction.js` and y-protocols' `awareness.js` directly), so
      * hooking THOSE instead is exactly "local or remote document/awareness
-     * change" with no extra filtering needed - a no-op SyncStep2 reply or a
-     * duplicate/no-change awareness re-announce (e.g. this same periodic
-     * tick's own presence re-broadcast on transports without
-     * `onPeerConnect`) never reaches these handlers. A corrupted (CRC32
+     * change" with no extra filtering needed - a no-op SyncStep2 reply, a
+     * digest beacon, or a duplicate/no-change awareness re-announce (e.g. a
+     * JOIN-triggered presence response that changed nothing) never reaches
+     * these handlers. A corrupted (CRC32
      * mismatch) message is real evidence of wire activity that neither
      * handler would ever see (it's rejected before decoding) - see the
      * explicit call in `_processWrappedMessage()`'s corruption branch.
@@ -518,6 +529,27 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _dispatchMessage;
     /**
+     * Handle a digest beacon (MESSAGE_SYNC_DIGEST). Reply rule (design doc
+     * §3): SyncStep2 if the sender is behind us or its delete-set hash
+     * differs from ours (the SyncStep2 always carries our full delete set, so
+     * it also heals a lost delete on their side - and their beacon does the
+     * same for us, symmetrically, within one interval); our own beacon as an
+     * ack if the beacon is JOIN-flagged and states are equal; nothing
+     * otherwise - which is what removes the ~5-12 empty replies per heartbeat
+     * measured at N=50 in test/dummy/bench-idle-room.ts. "Sender is ahead of
+     * us" triggers no reply: our own next beacon fetches it. Nothing here
+     * removes a recovery path (the round-2 lesson in
+     * 2026-09-04-resync-message-reduction-design.md's addendum), only
+     * replies that carry no information.
+     *
+     * `synced`: a beacon we are not behind, with equal delete-set hash, is a
+     * stronger statement than the empty SyncStep2 it replaces ("you lack
+     * nothing I have"), so it marks us synced too - this is what keeps two
+     * fresh peers, or a whole concurrent join burst, converging to `synced`
+     * with no acks needing to survive the rate limiter.
+     */
+    private _handleDigest;
+    /**
      * Max random delay (ms) before replying to a SyncStep1 request, scaled by
      * a room-size signal already available (`this.awareness.getStates().size`
      * - the same signal read at the `>= 3` suppression gate). A fixed window
@@ -555,6 +587,16 @@ export declare class GenericProvider extends Observable<string> {
     private _scheduleSyncReply;
     /** Cancel a pending suppressed reply, if any. */
     private _cancelPendingSyncReply;
+    /**
+     * Route a SyncStep2 (or digest-ack) reply through the redundancy
+     * suppression when there's genuine redundancy (>= 2 other known peers via
+     * awareness - below that there's no "someone else" to rely on), else send
+     * immediately. Both paths are rate-limited by `_sendSyncReply()`. Shared
+     * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
+     */
+    private _replyToSyncRequest;
+    /** Flip `synced` once and emit; idempotent. */
+    private _markSynced;
     /**
      * Delay a pure timeout-removal awareness broadcast and drop it if
      * another peer's broadcast of the SAME removal is overheard first (see
@@ -664,27 +706,15 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _tryReserveSyncSlot;
     /**
-     * Encode a SyncStep1 message requesting missing updates, without sending
-     * it. Extracted from the old `_writeSyncStep1()` so callers that want to
-     * fold this into a larger batch (see `_sendBatch()`) can get the raw
-     * encoded bytes; `_sendSyncStep1()` below is the send-immediately form
-     * most callers still want.
+     * Encode the digest beacon that replaces SyncStep1 (see
+     * MESSAGE_SYNC_DIGEST). Still the one place every "request sync" path
+     * goes through (connect()'s syncNow(), the periodic tick,
+     * _requestResync()'s retry), so they all switched together.
      */
     private _encodeSyncStep1;
     /**
-     * Send SyncStep1 message to request missing updates.
-     * This is sent when first connecting to sync with remote peers.
-     * Note: SyncStep1 is just a request and doesn't include hash verification.
-     * Rate limited to prevent spam. Returns whether it actually sent (false
-     * means rate-limited).
-     *
-     * @param extra - optional already-encoded sub-messages (e.g. an awareness
-     * update ready to send "now" - see `_tryImmediateAwarenessMessage()`) to
-     * fold into the same batched wire send as the SyncStep1 message, instead
-     * of each going out as its own separate message. Only ever included when
-     * this actually sends (i.e. not rate-limited) - a caller passing `extra`
-     * must handle the `false`-return/not-sent case itself (see call site in
-     * `connect()`'s periodic-sync tick).
+     * Send the periodic digest beacon. Rate limited to prevent spam. Returns
+     * whether it actually sent (false means rate-limited).
      */
     private _sendSyncStep1;
     /**
@@ -733,8 +763,8 @@ export declare class GenericProvider extends Observable<string> {
     /**
      * Attempt to build an awareness broadcast message for immediate
      * inclusion in the same wire send as a sync message a caller is about to
-     * send anyway (see `_trySyncPushPull`/`_sendSyncStep1`'s `extra`/
-     * `buildExtra` parameters), instead of going through
+     * send anyway (see `_trySyncPushPull`'s `buildExtra` parameter), instead
+     * of going through
      * `_broadcastAwareness()`'s independent debounce.
      *
      * Only returns non-null when the throttle would have let an immediate
@@ -767,8 +797,8 @@ export declare class GenericProvider extends Observable<string> {
      * there's more than one to send. Used at trigger points that
      * conceptually produce a single event but historically sent multiple
      * independent messages for it (sync push, sync pull, awareness) - see
-     * `_trySyncPushPull()`, `_sendSyncStep1()`'s `extra` parameter, and
-     * `connect()`'s periodic-sync tick.
+     * `_trySyncPushPull()` (connect-time push + digest beacon + awareness in
+     * one wire message).
      *
      * Design (see the task's framing requirements):
      * - Each sub-message is length-prefixed with `writeVarUint8Array`,

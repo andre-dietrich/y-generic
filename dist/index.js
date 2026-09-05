@@ -360,8 +360,15 @@ export class GenericProvider extends Observable {
         // own. See _requestResync().
         this._resyncAttemptCount = 0;
         this._lastResyncAttemptTime = 0;
-        // Rate limiting for sync requests
+        // Rate limiting for sync traffic - two budgets since phase 1b: one for
+        // what we ask for (beacons, pushes, syncNow), one for what we owe
+        // (SyncStep2 replies, acks). With a single shared budget a join burst's
+        // replies spent the slots a peer needed for its own recovery (measured:
+        // joiners arriving within 10 s of a burst converged in 13 s once, and a
+        // 50-peer room's periodic beacons ran at a third of their rate for 10 s
+        // after every join burst). Same size, same window, independent.
         this._syncRequestTimes = [];
+        this._syncReplyTimes = [];
         // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
         // a SyncStep1 request briefly, and drop it if another peer's reply is
         // overheard first - since every reply is broadcast to the whole room
@@ -608,6 +615,7 @@ export class GenericProvider extends Observable {
         // _tryReserveSyncSlot()), a rate-limited reconnect could silently skip
         // the very push that delivers edits made while offline.
         this._syncRequestTimes = [];
+        this._syncReplyTimes = [];
         // A pending response-wait belongs to a request on the old connection.
         if (this._responseWaitTimer !== undefined) {
             clearTimeout(this._responseWaitTimer);
@@ -1818,7 +1826,7 @@ export class GenericProvider extends Observable {
      * would itself become log spam exactly when things are already noisy.
      */
     _sendSyncReply(reply) {
-        if (!this._tryReserveSyncSlot()) {
+        if (!this._tryReserveReplySlot()) {
             return; // Rate limited - drop the reply silently
         }
         this._send(reply);
@@ -1968,13 +1976,26 @@ export class GenericProvider extends Observable {
      * its own uncapped or separately-capped allowance.
      */
     _tryReserveSyncSlot() {
+        return this._tryReserveSlot(this._syncRequestTimes);
+    }
+    /** Same limiter, separate budget, for SyncStep2 replies and acks. */
+    _tryReserveReplySlot() {
+        return this._tryReserveSlot(this._syncReplyTimes);
+    }
+    _tryReserveSlot(times) {
         const now = Date.now();
-        // Clean up old entries outside the rate limit window
-        this._syncRequestTimes = this._syncRequestTimes.filter((t) => now - t < this._syncRequestWindowMs);
-        if (this._syncRequestTimes.length >= this._maxSyncRequestsPerWindow) {
+        // Drop entries outside the rolling window (in place: the arrays are
+        // referenced from two fields)
+        let keep = 0;
+        for (const t of times) {
+            if (now - t < this._syncRequestWindowMs)
+                times[keep++] = t;
+        }
+        times.length = keep;
+        if (times.length >= this._maxSyncRequestsPerWindow) {
             return false;
         }
-        this._syncRequestTimes.push(now);
+        times.push(now);
         return true;
     }
     /**

@@ -410,9 +410,16 @@ export class GenericProvider extends Observable<string> {
   private _lastResyncAttemptTime: number = 0
   private _pendingResyncTimeoutId?: ReturnType<typeof setTimeout>
 
-  // Rate limiting for sync requests
+  // Rate limiting for sync traffic - two budgets since phase 1b: one for
+  // what we ask for (beacons, pushes, syncNow), one for what we owe
+  // (SyncStep2 replies, acks). With a single shared budget a join burst's
+  // replies spent the slots a peer needed for its own recovery (measured:
+  // joiners arriving within 10 s of a burst converged in 13 s once, and a
+  // 50-peer room's periodic beacons ran at a third of their rate for 10 s
+  // after every join burst). Same size, same window, independent.
   private _syncRequestTimes: number[] = []
-  private _maxSyncRequestsPerWindow: number // max requests per window
+  private _syncReplyTimes: number[] = []
+  private _maxSyncRequestsPerWindow: number // max requests per window (per budget)
   private _syncRequestWindowMs: number // rate-limit window, ms
 
   // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
@@ -566,8 +573,10 @@ export class GenericProvider extends Observable<string> {
        */
       awarenessInterval?: number
       /**
-       * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
-       * combined) this provider will send within `syncRequestWindowMs`.
+       * Max number of sync requests (digest beacons and syncNow() pushes
+       * combined) this provider will send within `syncRequestWindowMs` -
+       * and, as a separate budget of the same size, max number of sync
+       * replies (SyncStep2, acks) it will send in that window.
        * Protects against self-inflicted resync storms (e.g. many hash
        * mismatches firing in a short window under packet loss). Raise this
        * if legitimate resyncs are being throttled under heavy loss; lower
@@ -929,6 +938,7 @@ export class GenericProvider extends Observable<string> {
     // _tryReserveSyncSlot()), a rate-limited reconnect could silently skip
     // the very push that delivers edits made while offline.
     this._syncRequestTimes = []
+    this._syncReplyTimes = []
 
     // A pending response-wait belongs to a request on the old connection.
     if (this._responseWaitTimer !== undefined) {
@@ -2311,7 +2321,7 @@ export class GenericProvider extends Observable<string> {
    * would itself become log spam exactly when things are already noisy.
    */
   private _sendSyncReply(reply: Uint8Array): void {
-    if (!this._tryReserveSyncSlot()) {
+    if (!this._tryReserveReplySlot()) {
       return // Rate limited - drop the reply silently
     }
     this._send(reply)
@@ -2482,18 +2492,30 @@ export class GenericProvider extends Observable<string> {
    * its own uncapped or separately-capped allowance.
    */
   private _tryReserveSyncSlot(): boolean {
+    return this._tryReserveSlot(this._syncRequestTimes)
+  }
+
+  /** Same limiter, separate budget, for SyncStep2 replies and acks. */
+  private _tryReserveReplySlot(): boolean {
+    return this._tryReserveSlot(this._syncReplyTimes)
+  }
+
+  private _tryReserveSlot(times: number[]): boolean {
     const now = Date.now()
 
-    // Clean up old entries outside the rate limit window
-    this._syncRequestTimes = this._syncRequestTimes.filter(
-      (t) => now - t < this._syncRequestWindowMs,
-    )
+    // Drop entries outside the rolling window (in place: the arrays are
+    // referenced from two fields)
+    let keep = 0
+    for (const t of times) {
+      if (now - t < this._syncRequestWindowMs) times[keep++] = t
+    }
+    times.length = keep
 
-    if (this._syncRequestTimes.length >= this._maxSyncRequestsPerWindow) {
+    if (times.length >= this._maxSyncRequestsPerWindow) {
       return false
     }
 
-    this._syncRequestTimes.push(now)
+    times.push(now)
     return true
   }
 

@@ -117,6 +117,7 @@ export declare class GenericProvider extends Observable<string> {
     private _lastResyncAttemptTime;
     private _pendingResyncTimeoutId?;
     private _syncRequestTimes;
+    private _syncReplyTimes;
     private _maxSyncRequestsPerWindow;
     private _syncRequestWindowMs;
     private _pendingSyncReply;
@@ -199,8 +200,10 @@ export declare class GenericProvider extends Observable<string> {
          */
         awarenessInterval?: number;
         /**
-         * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
-         * combined) this provider will send within `syncRequestWindowMs`.
+         * Max number of sync requests (digest beacons and syncNow() pushes
+         * combined) this provider will send within `syncRequestWindowMs` -
+         * and, as a separate budget of the same size, max number of sync
+         * replies (SyncStep2, acks) it will send in that window.
          * Protects against self-inflicted resync storms (e.g. many hash
          * mismatches firing in a short window under packet loss). Raise this
          * if legitimate resyncs are being throttled under heavy loss; lower
@@ -770,6 +773,9 @@ export declare class GenericProvider extends Observable<string> {
      * its own uncapped or separately-capped allowance.
      */
     private _tryReserveSyncSlot;
+    /** Same limiter, separate budget, for SyncStep2 replies and acks. */
+    private _tryReserveReplySlot;
+    private _tryReserveSlot;
     /**
      * Encode the digest beacon that replaces SyncStep1 (see
      * MESSAGE_SYNC_DIGEST). Still the one place every "request sync" path

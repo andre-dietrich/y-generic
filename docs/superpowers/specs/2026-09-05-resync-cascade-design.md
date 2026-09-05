@@ -269,3 +269,14 @@ totals in this bench are dominated by the presence responses now (4,116 /
 4,361 of ~5,500), as are Matrix's (~9,200 of ~11,800) — Task 6. Concurrent
 late-join probe on Matrix (M=40, K=10, 10 keystrokes): 11,860 deliveries,
 SyncStep2 1,029 (phase 1 end: 18,181 / 5,586), zero warnings.
+
+### After Task 4 — separate request and reply budgets (design item 2)
+
+`bench-idle-room` (a) with the **default** 2.5 s settle, i.e. measured
+right after the 50-peer join burst: N=50 requests 18,081 (phase 1 end) →
+19,502 (Task 1) → **24,843** — the floor (24,500), reached without waiting
+out the limiter window, because the burst's replies no longer spend the
+request budget. N=20: 3,895 (floor 3,800). (b) 5/5. `bench-join-after-
+burst` single run: WebSocket in-budget 4,020 / 106 ms, Matrix in-budget
+11,713 / 622 ms — within the Task 3 spread; the in-budget variant is what
+this change is for, and its per-task set is the record.

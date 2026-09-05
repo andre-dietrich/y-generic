@@ -132,6 +132,7 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingCheckTimer?;
     private _rttSamples;
     private _requestSentAt;
+    private _confirmed;
     private _knownPeers;
     private _presenceResponseTimer?;
     private _pendingAwarenessRemoval;

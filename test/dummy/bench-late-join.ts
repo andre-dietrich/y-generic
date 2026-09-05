@@ -32,6 +32,13 @@ import {
   type Profile,
 } from './bench-user-scaling'
 
+// Periodic beacon interval for the peers under test (see bench-packet-loss
+// for the reasoning, same finding in phase 1b: with syncInterval 0 a lost
+// LAST keystroke has, by design, nothing to recover it, and the pre-phase-1b
+// builds only recovered it through the resync storms other losses triggered;
+// the 3 % cells of this bench timed out in 1 of 9 samples on the final build
+// before this change). Override: SYNC_INTERVAL_MS.
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)
 const TEST_PROFILES: Profile[] = PROFILES.filter(
   (p) => p.name.startsWith('WebSocket') || p.name.startsWith('Matrix'),
 )
@@ -101,7 +108,7 @@ async function runOnce(
     const room = `bench-latejoin-${Math.random().toString(36).slice(2)}`
     const hub = new DummyHub()
     const stats = instrumentHub(hub)
-    const { providers } = makeProviders(hub, profile, M + K, dropRate)
+    const { providers } = makeProviders(hub, profile, M + K, dropRate, SYNC_INTERVAL_MS)
 
     const settled = providers.slice(0, M)
     const late = providers.slice(M)
@@ -169,7 +176,7 @@ async function runWithConcurrentEdit(
     const room = `bench-latejoin-edit-${Math.random().toString(36).slice(2)}`
     const hub = new DummyHub()
     const stats = instrumentHub(hub)
-    const { docs, providers } = makeProviders(hub, profile, M + K, dropRate)
+    const { docs, providers } = makeProviders(hub, profile, M + K, dropRate, SYNC_INTERVAL_MS)
 
     const settledProviders = providers.slice(0, M)
     const lateProviders = providers.slice(M)

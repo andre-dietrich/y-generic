@@ -46,6 +46,15 @@ const DIGEST_FLAG_ACK = 2;
 // an equal room every peer would answer, and at high latency the
 // suppression window cannot thin those replies (measured 4-5x more acks).
 const DIGEST_FLAG_CONFIRM = 4;
+// bit 3: the sender is CONFIRMED - it has received a SyncStep2, or an equal
+// digest from a confirmed peer, or its own join asked three times and got
+// nothing better (so it is the room). A joiner's response wait is satisfied
+// only by data (SyncStep2) or by an equal digest carrying this bit: an
+// equal ack from a fellow joiner says nothing about whether the room holds
+// more than both of us, and treating it as an answer left a joiner whose
+// SyncStep2 was lost with an empty document (measured: 1 of 150 lossy
+// 15-peer joins; research doc item 13 follow-up in the phase-1b design).
+const DIGEST_FLAG_SETTLED = 8;
 // Full-state push (connect()/syncNow()): the whole document as one update,
 // no hash, no sequence number, applied and nothing else. Before this type a
 // push was a MESSAGE_SYNC_VERIFIED update whose hash was the PUSHER's state
@@ -410,6 +419,8 @@ export class GenericProvider extends Observable {
         // retries on the Matrix profile). See the phase-1b design doc, 1c.
         this._rttSamples = [];
         this._requestSentAt = 0;
+        // See DIGEST_FLAG_SETTLED. Reset on connect (a re-joining peer is a joiner).
+        this._confirmed = false;
         // ClientIDs we have heard from directly (beacon and verified-update
         // senders). The reply-suppression gate ("is there someone else who could
         // answer?") used awareness alone, and in a join burst the awareness
@@ -651,6 +662,7 @@ export class GenericProvider extends Observable {
         this._responseSeen = false;
         this._rttSamples = [];
         this._requestSentAt = 0;
+        this._confirmed = false;
         // Drop any pending suppressed sync reply - safe to simply discard (not
         // flush/send like batched updates/awareness below), since a suppressed
         // reply is by design redundant with whatever the room already has.
@@ -848,6 +860,8 @@ export class GenericProvider extends Observable {
             console.warn('Cannot sync: transport not connected');
             return;
         }
+        if (flags & DIGEST_FLAG_JOIN)
+            this._confirmed = false; // a (re-)joiner until answered
         // Try to fold the awareness broadcast into the same wire send as the
         // sync push+pull below. _tryImmediateAwarenessMessage() only returns
         // non-null (and only mutates awareness-throttle state) when the
@@ -1223,7 +1237,9 @@ export class GenericProvider extends Observable {
                 encoding.writeVarUint(encoder, MESSAGE_SYNC);
                 const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
                 if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-                    // If we received SyncStep2, we're synced
+                    // If we received SyncStep2, we're synced (and confirmed: we have
+                    // heard from a peer that had data for us)
+                    this._confirmed = true;
                     this._noteResponse(true);
                     this._markSynced();
                     // Someone else's SyncStep2 reply just arrived - our own pending
@@ -1310,6 +1326,7 @@ export class GenericProvider extends Observable {
                 // triggered it, so the same suppression scheme applies here too.
                 if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
                     this._cancelPendingSyncReply();
+                    this._confirmed = true;
                     this._noteResponse(true);
                 }
                 // Read the expected hash from sender (signed integer)
@@ -1445,7 +1462,10 @@ export class GenericProvider extends Observable {
             // ours, we're synced; if we were about to confirm the same state, we
             // no longer need to. Never a request: no reply, no presence.
             if (equal) {
-                this._noteResponse(true);
+                if (flags & DIGEST_FLAG_SETTLED) {
+                    this._confirmed = true;
+                    this._noteResponse(true);
+                }
                 this._markSynced();
                 this._cancelPendingAck();
             }
@@ -1460,9 +1480,13 @@ export class GenericProvider extends Observable {
         // pending ack - identical bytes, since it echoes that same state -
         // answers it as well, and _scheduleSyncReply() dedupes it below.
         if (equal && !(flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM))) {
-            // A settled peer's periodic beacon in our state: it confirms us (and
-            // whoever we were about to ack) as well as any ack would.
-            this._noteResponse(false);
+            // A peer's periodic/resync beacon in our state: it makes our pending
+            // ack redundant, and - if that peer is confirmed - it answers our
+            // own outstanding join as well as any ack would.
+            if (flags & DIGEST_FLAG_SETTLED) {
+                this._confirmed = true;
+                this._noteResponse(false);
+            }
             this._cancelPendingAck();
         }
         if (senderBehind || !dsEqual) {
@@ -1664,8 +1688,14 @@ export class GenericProvider extends Observable {
             // 300 ms while the settled peers' replies were still delayed by a
             // window of up to ~300 ms, and every such re-beacon collected
             // another round of replies).
-            if (this._responseWaitTimer !== undefined)
+            if (this._responseWaitTimer !== undefined) {
+                // Look again once that request is answered or given up - dropping
+                // the check here left a joiner whose SyncStep2 predated the
+                // keystrokes it had received with nine pending updates and no
+                // trigger (measured: 2 of 150 lossy 15-peer joins).
+                this._schedulePendingCheck();
                 return;
+            }
             if (this.doc.store.pendingStructs !== null ||
                 this.doc.store.pendingDs !== null) {
                 this._requestResync();
@@ -1749,6 +1779,11 @@ export class GenericProvider extends Observable {
                 this._responseWaitAttempts >= 3 ||
                 !this.transport.isConnected ||
                 this._destroying) {
+                // Asked three times, nobody had more for us: we are the room's
+                // state (or its first peer). Bootstraps DIGEST_FLAG_SETTLED in a
+                // brand-new room so later joiners are confirmed by our acks.
+                if (this._responseWaitAttempts >= 3)
+                    this._confirmed = true;
                 this._responseWaitAttempts = 0;
                 return;
             }
@@ -2077,6 +2112,8 @@ export class GenericProvider extends Observable {
      * _requestResync()'s retry), so they all switched together.
      */
     _encodeSyncStep1(flags = 0) {
+        if (this._confirmed)
+            flags |= DIGEST_FLAG_SETTLED;
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST);
         encoding.writeVarUint(encoder, DIGEST_VERSION);
@@ -2095,7 +2132,7 @@ export class GenericProvider extends Observable {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST);
         encoding.writeVarUint(encoder, DIGEST_VERSION);
-        encoding.writeVarUint(encoder, DIGEST_FLAG_ACK);
+        encoding.writeVarUint(encoder, DIGEST_FLAG_ACK | (this._confirmed ? DIGEST_FLAG_SETTLED : 0));
         encoding.writeVarUint(encoder, this.doc.clientID);
         encoding.writeVarUint8Array(encoder, ackedSv);
         encoding.writeVarUint(encoder, ackedDsHash);

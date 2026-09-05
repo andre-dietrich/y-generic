@@ -372,3 +372,36 @@ runs: WebSocket in-budget **4,706 / 5,343** (SyncStep2 539 / 1,176;
 before: 9,802-9,998 with ~6,100), fresh 4,559 / 4,461; Matrix in-budget
 6,283 / 6,205, fresh 5,539 / 5,784. All variants PASS; two fresh peers and
 a 3-peer simultaneous join reach `synced`.
+
+### After Task 8 — a joiner's wait ends only with data or a confirmed peer's word
+
+Found by the final gate: `bench-late-join` run 1, "join during edit burst",
+WebSocket, 3 % loss, M=10 K=5 — 2/3. Repeating that cell (150 ×, 6 s cap,
+`syncInterval: 0`) on the Task 7 build failed 5 times, always a *joiner*
+that reported `synced` while lacking content, in three shapes:
+
+- **missing 1 keystroke:** the last update was lost and nothing later
+  arrived to open a gap — by design only the periodic beacon recovers
+  this; the bench now runs one (see the packet-loss note above).
+- **missing 10 (all keystrokes, content present):** the joiner received
+  the keystrokes before its SyncStep2 (all pending on the first one, which
+  was lost), the pending check fired while the JOIN response wait was
+  running and — as of Task 5 — deferred to it and never looked again.
+  Fixed: the check re-arms while a request is outstanding.
+- **missing 510 (empty document, `synced`):** the joiner's SyncStep2 was
+  lost; an *equal ack from a fellow empty joiner* then ended its response
+  wait, so nothing ever asked again. Fixed with `DIGEST_FLAG_SETTLED`
+  (bit 3): every beacon and ack carries whether its sender is *confirmed*
+  — has received a SyncStep2, or an equal digest from a confirmed peer,
+  or asked three times and got nothing better (the bootstrap for a
+  brand-new room). Only data or an equal digest with that bit satisfies a
+  joiner's wait; `synced` keeps its phase-1 meaning ("some peer has my
+  state") — the two are now different things, and the design doc for
+  phase 1 §4 should be read with that in mind.
+
+Cost: in a brand-new room nobody is confirmed for the first ~7 s, so the
+first peers each retry their JOIN three times (CONFIRM beacons, no
+presence) before bootstrapping — join burst N=50 in an empty room (probe):
+5,880 → 7,203 deliveries. Rooms with a settled peer pay nothing: its acks
+carry the bit. Task 8 replaces Task 5's "defer" rule and is the last code
+change of the phase; the final gates below ran on this build.

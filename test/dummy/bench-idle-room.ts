@@ -39,7 +39,12 @@ const JITTER = 0.25
 // than the 10s sync rate-limit window (the default 2500 sits inside the
 // post-join resync-retry storm described in the design doc's Results).
 const SETTLE_MS = Number(process.env.SETTLE_MS ?? 2500)
-const OBSERVE_MS = 10000
+// Override with OBSERVE_MS=<ms> for a longer window (e.g. 60000 to see
+// idleBackoffEnabled's doubling reach its 60 s cap).
+const OBSERVE_MS = Number(process.env.OBSERVE_MS ?? 10000)
+// IDLE_BACKOFF=1 enables GenericProvider's opt-in idle backoff (round 3,
+// default off) for the peers under test - the phase-1c decision numbers.
+const IDLE_BACKOFF = process.env.IDLE_BACKOFF === '1'
 const N_VALUES = [5, 20, 50]
 const LOST_DELETE_CAP_MS = 5000
 const LOST_DELETE_SAMPLES = 5
@@ -150,6 +155,7 @@ function makeProvider(hub: DummyHub, doc: Y.Doc, id: number | string): GenericPr
     verifyUpdates: true,
     syncInterval: SYNC_INTERVAL_MS,
     disableBc: true,
+    idleBackoffEnabled: IDLE_BACKOFF,
   })
   provider.awareness.setLocalStateField('user', { id })
   return provider
@@ -357,7 +363,7 @@ async function main() {
   if (!hashOk) process.exitCode = 1
 
   console.log(
-    `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms\n`,
+    `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms idleBackoff=${IDLE_BACKOFF}\n`,
   )
   if (!process.env.SKIP_CENSUS) for (const N of N_VALUES) await runCensus(N)
   console.log(`\n(b) lost delete-only update, 2 peers, ${LOST_DELETE_SAMPLES} samples (cap ${LOST_DELETE_CAP_MS}ms):\n`)

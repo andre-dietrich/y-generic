@@ -54,7 +54,7 @@ export declare class DummyHub {
     /**
      * Register a transport in a room.
      */
-    join(room: string, transport: DummyTransport, callback: (data: Uint8Array) => void): void;
+    join(room: string, transport: DummyTransport, callback: (data: Uint8Array, from?: string) => void): void;
     /**
      * Unregister a transport from a room.
      */
@@ -80,6 +80,17 @@ export declare class DummyHub {
      * Broadcast a message to all clients in a room except the sender.
      */
     broadcast(room: string, data: Uint8Array, sender: DummyTransport, options?: {
+        latency?: number;
+        dropRate?: number;
+        jitter?: number;
+    }): void;
+    /**
+     * Deliver a message to ONE client in a room (Transport.sendTo), with the
+     * same latency/jitter/drop model as broadcast(). Silently does nothing if
+     * the target has left. Used only by transports created with
+     * `unicast: true`.
+     */
+    unicast(room: string, targetId: string, data: Uint8Array, sender: DummyTransport, options?: {
         latency?: number;
         dropRate?: number;
         jitter?: number;
@@ -154,6 +165,16 @@ export interface DummyTransportOptions {
      */
     simulatePeerConnect?: boolean;
     /**
+     * Model a transport that can address a single peer (Transport.sendTo,
+     * like peerjs/simple-peer/trystero): `sendTo` is present and delivers to
+     * one client via DummyHub.unicast(), and every delivery carries the
+     * sender's transport id as `from`. Off by default so plain benchmarks
+     * keep modelling a broadcast relay (websocket/pubnub/gun/matrix/...),
+     * on which GenericProvider's unicast paths never engage.
+     * @default false
+     */
+    unicast?: boolean;
+    /**
      * Simulate a chunking transport's hard per-message size limit (bytes),
      * mirroring how PubNub (`src/providers/pubnub/index.ts`, ~30KB) and Ably
      * (`src/providers/ably/index.ts`) split any `send()` payload larger than
@@ -195,6 +216,12 @@ export declare class DummyTransport implements Transport {
     private _connected;
     private _room;
     private _callback?;
+    /**
+     * Transport.sendTo - present only when `unicast` is on (feature-detected
+     * by GenericProvider via `typeof transport.sendTo === 'function'`, so it
+     * must be genuinely absent otherwise, same pattern as onPeerConnect).
+     */
+    readonly sendTo?: (peerId: string, data: Uint8Array) => void;
     private _peerConnectCallback?;
     /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
     private _chunkBuffers;
@@ -272,7 +299,7 @@ export declare class DummyTransport implements Transport {
     /**
      * Register callback for incoming messages.
      */
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
     /**
      * Check if connected.
      */

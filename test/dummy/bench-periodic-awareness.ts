@@ -80,7 +80,12 @@ function withSendClassification(counts: { awareness: number; syncStep1: number }
 }
 
 function makeProvider(hub: DummyHub, simulatePeerConnect: boolean, id: number | string): GenericProvider {
-  const transport = new DummyTransport({ hub, latency: LATENCY, simulatePeerConnect })
+  const transport = new DummyTransport({
+    hub,
+    latency: LATENCY,
+    simulatePeerConnect,
+    unicast: process.env.DUMMY_UNICAST === '1',
+  })
   const provider = new GenericProvider(new Y.Doc(), transport, {
     batchUpdates: 0,
     verifyUpdates: true,

@@ -84,7 +84,12 @@ function classifyOne(msg: Uint8Array, census: Census, mult: number): void {
 function makeProvider(hub: DummyHub, profile: Profile, id: number): GenericProvider {
   const provider = new GenericProvider(
     new Y.Doc(),
-    new DummyTransport({ hub, latency: profile.latency, jitter: profile.jitter }),
+    new DummyTransport({
+      hub,
+      latency: profile.latency,
+      jitter: profile.jitter,
+      unicast: process.env.DUMMY_UNICAST === '1',
+    }),
     { batchUpdates: 0, verifyUpdates: true, syncInterval: 0 },
   )
   provider.awareness.setLocalStateField('user', { id })
@@ -111,6 +116,20 @@ async function run(profile: Profile, joinAfterMs: number): Promise<{ ms: number;
         if (data.length >= 5) classifyOne(data.subarray(4), census, n)
       }
       return original(r, data, sender, options)
+    }
+    const originalUnicast = hub.unicast.bind(hub)
+    ;(hub as unknown as { unicast: typeof hub.unicast }).unicast = (
+      r: string,
+      targetId: string,
+      data: Uint8Array,
+      sender: DummyTransport,
+      options?: { latency?: number; dropRate?: number; jitter?: number },
+    ) => {
+      if (counting) {
+        deliveries += 1
+        if (data.length >= 5) classifyOne(data.subarray(4), census, 1)
+      }
+      return originalUnicast(r, targetId, data, sender, options)
     }
 
     const settled: GenericProvider[] = []

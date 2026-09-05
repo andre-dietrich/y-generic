@@ -492,6 +492,15 @@ export class GenericProvider extends Observable<string> {
   // (phase-1b design, item 3). Cleared on disconnect.
   private _knownPeers: Set<number> = new Set()
 
+  // Transport address (the `from` of Transport.onMessage) per remote
+  // clientID, learned from beacons and verified updates; lets replies, acks
+  // and presence responses go to the requester alone when the transport
+  // has sendTo (phase-1c design, item B). Cleared on disconnect.
+  private _peerAddress: Map<number, string> = new Map()
+  // Requesters whose JOIN presence request the pending presence-response
+  // timer covers (see _schedulePresenceResponse).
+  private _presencePending: Set<number> = new Set()
+
   // One timer that answers every JOIN beacon arriving within its window
   // with a single presence broadcast (phase-1b design, item 4). The 100 ms
   // cursor throttle is the wrong coalescing window for this: at 350 ms
@@ -830,8 +839,8 @@ export class GenericProvider extends Observable<string> {
       // before that promise resolves. Registering after the await left
       // exactly that window uncovered: whatever arrived during it was
       // silently dropped since neither callback was wired up yet.
-      this._unsubscribeTransport = this.transport.onMessage((data) => {
-        this._handleIncomingMessage(data)
+      this._unsubscribeTransport = this.transport.onMessage((data, from) => {
+        this._handleIncomingMessage(data, from)
       })
 
       if (this.transport.onPeerConnect) {
@@ -983,6 +992,8 @@ export class GenericProvider extends Observable<string> {
     this._syncRequestTimes = []
     this._syncReplyTimes = []
     this._knownPeers.clear()
+    this._peerAddress.clear()
+    this._presencePending.clear()
 
     // A pending response-wait belongs to a request on the old connection.
     if (this._responseWaitTimer !== undefined) {
@@ -1540,9 +1551,9 @@ export class GenericProvider extends Observable<string> {
    * that per-sender gap detection actually relies on ordering-sensitive
    * heuristics for.
    */
-  private _handleIncomingMessage(data: Uint8Array): void {
+  private _handleIncomingMessage(data: Uint8Array, from?: string): void {
     if (!this._compressionThresholdBytes) {
-      this._processWrappedMessage(data)
+      this._processWrappedMessage(data, from)
       return
     }
 
@@ -1557,7 +1568,7 @@ export class GenericProvider extends Observable<string> {
     const rest = data.subarray(1)
 
     if (flag === 0) {
-      this._processWrappedMessage(rest)
+      this._processWrappedMessage(rest, from)
       return
     }
 
@@ -1569,7 +1580,7 @@ export class GenericProvider extends Observable<string> {
     }
 
     decompressDeflateRaw(rest)
-      .then((wrapped) => this._processWrappedMessage(wrapped))
+      .then((wrapped) => this._processWrappedMessage(wrapped, from))
       .catch((error) => {
         // Treat decompression failure the same as a CRC32 mismatch on the
         // uncompressed path: request a resync rather than silently dropping.
@@ -1588,7 +1599,7 @@ export class GenericProvider extends Observable<string> {
    * _handleIncomingMessage() - this is the pre-compression-feature
    * implementation, unchanged.
    */
-  private _processWrappedMessage(data: Uint8Array): void {
+  private _processWrappedMessage(data: Uint8Array, from?: string): void {
     // Verify message integrity with CRC32 checksum
     const message = unwrapAndVerifyMessage(data)
 
@@ -1622,7 +1633,7 @@ export class GenericProvider extends Observable<string> {
 
     // Message integrity verified - safe to decode
     try {
-      this._dispatchMessage(message)
+      this._dispatchMessage(message, from)
     } catch (error) {
       // This should only happen for logic errors, not corruption
       // (corruption is caught by CRC32 check above)
@@ -1641,7 +1652,7 @@ export class GenericProvider extends Observable<string> {
    * a logic error aborting a single top-level message today, just now
    * scoped to "the rest of this batch" instead of "this one message".
    */
-  private _dispatchMessage(message: Uint8Array): void {
+  private _dispatchMessage(message: Uint8Array, from?: string): void {
     const decoder = decoding.createDecoder(message)
     const messageType = decoding.readVarUint(decoder)
 
@@ -1653,13 +1664,13 @@ export class GenericProvider extends Observable<string> {
         // comment - so just decode and dispatch each one directly.
         while (decoding.hasContent(decoder)) {
           const subMessage = decoding.readVarUint8Array(decoder)
-          this._dispatchMessage(subMessage)
+          this._dispatchMessage(subMessage, from)
         }
         break
       }
 
       case MESSAGE_SYNC_DIGEST: {
-        this._handleDigest(decoder)
+        this._handleDigest(decoder, from)
         break
       }
 
@@ -1763,6 +1774,7 @@ export class GenericProvider extends Observable<string> {
         // the update below (see _trackRemoteSeq() for why).
         this._trackRemoteSeq(senderClientID, seqNum)
         this._knownPeers.add(senderClientID)
+        if (from !== undefined) this._peerAddress.set(senderClientID, from)
 
         // Always apply the update. Yjs updates are idempotent/commutative,
         // so re-applying an already-seen update is a harmless no-op.
@@ -1916,10 +1928,12 @@ export class GenericProvider extends Observable<string> {
    * fresh peers, or a whole concurrent join burst, converging to `synced`
    * with no acks needing to survive the rate limiter.
    */
-  private _handleDigest(decoder: decoding.Decoder): void {
+  private _handleDigest(decoder: decoding.Decoder, from?: string): void {
     decoding.readVarUint(decoder) // DIGEST_VERSION - append-only, nothing to branch on yet
     const flags = decoding.readVarUint(decoder)
-    this._knownPeers.add(decoding.readVarUint(decoder)) // sender clientID
+    const senderClientID = decoding.readVarUint(decoder)
+    this._knownPeers.add(senderClientID)
+    if (from !== undefined) this._peerAddress.set(senderClientID, from)
     const remoteSv = decoding.readVarUint8Array(decoder)
     const remoteDsHash = decoding.readVarUint(decoder)
     // Any trailing bytes belong to a newer version; ignored by design.
@@ -1981,9 +1995,19 @@ export class GenericProvider extends Observable<string> {
       const encoder = encoding.createEncoder()
       encoding.writeVarUint(encoder, MESSAGE_SYNC)
       syncProtocol.writeSyncStep2(encoder, this.doc, remoteSv)
-      this._replyToSyncRequest(encoding.toUint8Array(encoder), false, remoteSv)
+      this._replyToSyncRequest(
+        encoding.toUint8Array(encoder),
+        false,
+        remoteSv,
+        senderClientID,
+      )
     } else if (flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM)) {
-      this._replyToSyncRequest(this._encodeAck(remoteSv, remoteDsHash), true)
+      this._replyToSyncRequest(
+        this._encodeAck(remoteSv, remoteDsHash),
+        true,
+        null,
+        senderClientID,
+      )
     }
 
     if (!weBehind && dsEqual) {
@@ -1995,7 +2019,7 @@ export class GenericProvider extends Observable<string> {
       // joiners (see _schedulePresenceResponse), never suppressed (each
       // responder's state is distinct). Skipped when we have no state to
       // announce.
-      this._schedulePresenceResponse()
+      this._schedulePresenceResponse(senderClientID)
     }
   }
 
@@ -2005,14 +2029,24 @@ export class GenericProvider extends Observable<string> {
    * enough to cover a join burst spread by latency, short enough that a
    * lone joiner sees the room's presence within a few round trips.
    */
-  private _schedulePresenceResponse(): void {
+  private _schedulePresenceResponse(requester: number): void {
+    this._presencePending.add(requester)
     if (this._presenceResponseTimer !== undefined) return
     const rtt = this._rttMinMs()
     const delay = Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt))
     this._presenceResponseTimer = setTimeout(() => {
       this._presenceResponseTimer = undefined
+      const requesters = Array.from(this._presencePending)
+      this._presencePending.clear()
       if (this._destroying || !this.transport.isConnected) return
-      if (this.awareness.getLocalState() !== null) {
+      if (this.awareness.getLocalState() === null) return
+      // Every joiner covered by this timer is addressable: one unicast
+      // each ((N-1) deliveries per joiner room-wide) instead of one
+      // broadcast ((N-1)^2). Otherwise the broadcast, as before.
+      if (requesters.every((id) => this._canUnicast(id))) {
+        const msg = this._encodeAwareness([this.doc.clientID])
+        for (const id of requesters) this._sendDirect(id, msg)
+      } else {
         this._broadcastAwareness([this.doc.clientID])
       }
     }, delay)
@@ -2162,7 +2196,22 @@ export class GenericProvider extends Observable<string> {
     reply: Uint8Array,
     isAck: boolean = false,
     targetSv: Uint8Array | null = null,
+    toClientID?: number,
   ): void {
+    // Unicast path (transport has sendTo and we know the requester's
+    // address): nobody overhears a unicast, so the delay-and-cancel
+    // suppression below cannot thin the replies. Instead each candidate
+    // responder decides for itself whether it is one of ~3 that answer
+    // (_selectedResponder), and answers at once - no suppression delay,
+    // one delivery. The requester's response wait retries if all ~3 are
+    // lost. Phase-1c design, item B.
+    if (toClientID !== undefined && this._canUnicast(toClientID)) {
+      if (!this._selectedResponder(toClientID)) return
+      if (!this._tryReserveReplySlot()) return
+      this._sendDirect(toClientID, reply)
+      return
+    }
+
     // Acks ALWAYS take the delayed/suppressible path: they carry no data,
     // so the only cost of delaying one is a few ms on the joiner's `synced`
     // flip (measured before this rule: 37,240 of a 50-peer join burst's
@@ -2174,6 +2223,57 @@ export class GenericProvider extends Observable<string> {
     } else {
       this._sendSyncReply(reply)
     }
+  }
+
+  /** Whether a reply to `clientID` can go over Transport.sendTo. */
+  private _canUnicast(clientID: number): boolean {
+    return (
+      typeof this.transport.sendTo === 'function' &&
+      this._peerAddress.has(clientID)
+    )
+  }
+
+  /**
+   * Responder self-selection for unicast replies: the three peers whose
+   * hash for this requester ranks lowest among the peers we know answer
+   * it. Every candidate ranks itself against the same known set, so the
+   * sets agree wherever the views agree, and the peer that ranks first in
+   * the true order always ranks first in its own view - the selection is
+   * never empty. A 2 s time bucket in the hash rotates the ranking, so
+   * three departed peers at the top only delay a reply until the
+   * requester's next attempt. Everyone answers in rooms of four or fewer.
+   * (A first cut chose each responder independently with probability 3/N;
+   * ~5 % of requests then selected nobody and waited for the 1 s retry.)
+   */
+  private _selectedResponder(requester: number): boolean {
+    if (this._peerCount() < 4) return true
+    const bucket = Math.floor(Date.now() / 2000)
+    const rank = (id: number) =>
+      (Math.imul(requester ^ bucket, 0x9e3779b1) ^ Math.imul(id, 0x85ebca6b)) >>> 0
+    const mine = rank(this.doc.clientID)
+    let better = 0
+    for (const id of this._knownPeers) {
+      if (id === requester || id === this.doc.clientID) continue
+      if (rank(id) < mine && ++better >= 3) return false
+    }
+    return true
+  }
+
+  /**
+   * Send one already-encoded message to a single peer over
+   * Transport.sendTo, with the same CRC32 wrapping and optional compression
+   * as a broadcast. Not mirrored to BroadcastChannel (a same-browser tab
+   * never appears as an addressable peer). Returns false if the peer's
+   * address is unknown or the transport cannot unicast.
+   */
+  private _sendDirect(clientID: number, data: Uint8Array): boolean {
+    const address = this._peerAddress.get(clientID)
+    if (address === undefined || typeof this.transport.sendTo !== 'function') {
+      return false
+    }
+    if (!this.transport.isConnected) return false
+    this._sendToTransport(wrapMessageWithChecksum(data), address)
+    return true
   }
 
   /**
@@ -3112,35 +3212,41 @@ export class GenericProvider extends Observable<string> {
    * clears it. See that option's doc comment for the size threshold
    * reasoning and the wire-format compatibility tradeoff of enabling it.
    */
-  private _sendToTransport(wrappedData: Uint8Array): void {
+  private _sendToTransport(wrappedData: Uint8Array, to?: string): void {
     const threshold = this._compressionThresholdBytes
     if (!threshold) {
-      this._dispatchToTransport(wrappedData)
+      this._dispatchToTransport(wrappedData, to)
       return
     }
 
     if (!COMPRESSION_AVAILABLE || wrappedData.length < threshold) {
-      this._dispatchToTransport(prefixCompressionFlag(0, wrappedData))
+      this._dispatchToTransport(prefixCompressionFlag(0, wrappedData), to)
       return
     }
 
     compressDeflateRaw(wrappedData)
       .then((compressed) => {
-        this._dispatchToTransport(prefixCompressionFlag(1, compressed))
+        this._dispatchToTransport(prefixCompressionFlag(1, compressed), to)
       })
       .catch((error) => {
         console.error(
           '[GenericProvider] Compression failed, sending uncompressed:',
           error,
         )
-        this._dispatchToTransport(prefixCompressionFlag(0, wrappedData))
+        this._dispatchToTransport(prefixCompressionFlag(0, wrappedData), to)
       })
   }
 
-  /** Hand fully-framed bytes to transport.send(), tolerating a sync or async send(). */
-  private _dispatchToTransport(data: Uint8Array): void {
+  /**
+   * Hand fully-framed bytes to transport.send() - or transport.sendTo() when
+   * a peer address is given - tolerating a sync or async result.
+   */
+  private _dispatchToTransport(data: Uint8Array, to?: string): void {
     try {
-      const result = this.transport.send(data)
+      const result =
+        to !== undefined && typeof this.transport.sendTo === 'function'
+          ? this.transport.sendTo(to, data)
+          : this.transport.send(data)
       // Handle async send
       if (result instanceof Promise) {
         result.catch((error) => {

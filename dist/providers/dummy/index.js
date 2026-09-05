@@ -148,7 +148,7 @@ export class DummyHub {
             if (actualDelay > 0) {
                 setTimeout(() => {
                     try {
-                        client.callback(data);
+                        client.callback(data, sender.id);
                     }
                     catch (error) {
                         console.error('Error delivering message:', error);
@@ -157,12 +157,49 @@ export class DummyHub {
             }
             else {
                 try {
-                    client.callback(data);
+                    client.callback(data, sender.id);
                 }
                 catch (error) {
                     console.error('Error delivering message:', error);
                 }
             }
+        }
+    }
+    /**
+     * Deliver a message to ONE client in a room (Transport.sendTo), with the
+     * same latency/jitter/drop model as broadcast(). Silently does nothing if
+     * the target has left. Used only by transports created with
+     * `unicast: true`.
+     */
+    unicast(room, targetId, data, sender, options) {
+        const clients = this.rooms.get(room);
+        if (!clients)
+            return;
+        for (const client of clients) {
+            if (client.transport.id !== targetId || client.transport === sender)
+                continue;
+            const dropRate = options?.dropRate ?? 0;
+            if (dropRate > 0 && Math.random() < dropRate)
+                return;
+            const latency = options?.latency ?? 0;
+            const jitter = options?.jitter ?? 0;
+            let actualDelay = latency;
+            if (latency > 0 && jitter > 0) {
+                actualDelay = latency * (1 - jitter) + Math.random() * (2 * latency * jitter);
+            }
+            const deliver = () => {
+                try {
+                    client.callback(data, sender.id);
+                }
+                catch (error) {
+                    console.error('Error delivering message:', error);
+                }
+            };
+            if (actualDelay > 0)
+                setTimeout(deliver, actualDelay);
+            else
+                deliver();
+            return;
         }
     }
     /**
@@ -252,8 +289,22 @@ export class DummyTransport {
             jitter: options.jitter ?? 0,
             autoConnect: options.autoConnect ?? false,
             simulatePeerConnect: options.simulatePeerConnect ?? false,
+            unicast: options.unicast ?? false,
             chunkSizeLimit: options.chunkSizeLimit,
         };
+        if (this.options.unicast) {
+            this.sendTo = (peerId, data) => {
+                if (!this._connected || !this.hub)
+                    return;
+                // Unicast is never chunked here - the chunk simulation models
+                // relay size limits, which is a broadcast-transport concern.
+                this.hub.unicast(this._room, peerId, data, this, {
+                    latency: this.options.latency,
+                    dropRate: this.options.dropRate,
+                    jitter: this.options.jitter,
+                });
+            };
+        }
         if (this.options.simulatePeerConnect) {
             this.onPeerConnect = (callback) => {
                 this._peerConnectCallback = callback;
@@ -404,10 +455,10 @@ export class DummyTransport {
     onMessage(callback) {
         const limit = this.options.chunkSizeLimit;
         const wrappedCallback = limit
-            ? (packed) => {
+            ? (packed, from) => {
                 const reassembled = this._reassembleChunk(packed);
                 if (reassembled)
-                    callback(reassembled);
+                    callback(reassembled, from);
             }
             : callback;
         this._callback = wrappedCallback;

@@ -72,6 +72,19 @@ export function instrumentHub(hub: DummyHub) {
     bytes += recipients * data.length
     return original(room, data, sender, options)
   }
+  // A unicast (DUMMY_UNICAST=1) is one delivery.
+  const originalUnicast = hub.unicast.bind(hub)
+  ;(hub as unknown as { unicast: typeof hub.unicast }).unicast = (
+    room: string,
+    targetId: string,
+    data: Uint8Array,
+    sender: DummyTransport,
+    options?: { latency?: number; dropRate?: number; jitter?: number },
+  ) => {
+    messages += 1
+    bytes += data.length
+    return originalUnicast(room, targetId, data, sender, options)
+  }
   return {
     get messages() {
       return messages
@@ -116,6 +129,9 @@ export function makeProviders(
       latency: profile.latency,
       jitter: profile.jitter,
       dropRate,
+      // DUMMY_UNICAST=1 models a mesh transport with Transport.sendTo
+      // (phase-1c design, item B); default = broadcast relay, as always.
+      unicast: process.env.DUMMY_UNICAST === '1',
     })
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,

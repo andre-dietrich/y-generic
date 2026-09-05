@@ -134,6 +134,8 @@ export declare class GenericProvider extends Observable<string> {
     private _requestSentAt;
     private _confirmed;
     private _knownPeers;
+    private _peerAddress;
+    private _presencePending;
     private _presenceResponseTimer?;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
@@ -639,6 +641,29 @@ export declare class GenericProvider extends Observable<string> {
      * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
      */
     private _replyToSyncRequest;
+    /** Whether a reply to `clientID` can go over Transport.sendTo. */
+    private _canUnicast;
+    /**
+     * Responder self-selection for unicast replies: the three peers whose
+     * hash for this requester ranks lowest among the peers we know answer
+     * it. Every candidate ranks itself against the same known set, so the
+     * sets agree wherever the views agree, and the peer that ranks first in
+     * the true order always ranks first in its own view - the selection is
+     * never empty. A 2 s time bucket in the hash rotates the ranking, so
+     * three departed peers at the top only delay a reply until the
+     * requester's next attempt. Everyone answers in rooms of four or fewer.
+     * (A first cut chose each responder independently with probability 3/N;
+     * ~5 % of requests then selected nobody and waited for the 1 s retry.)
+     */
+    private _selectedResponder;
+    /**
+     * Send one already-encoded message to a single peer over
+     * Transport.sendTo, with the same CRC32 wrapping and optional compression
+     * as a broadcast. Not mirrored to BroadcastChannel (a same-browser tab
+     * never appears as an addressable peer). Returns false if the peer's
+     * address is unknown or the transport cannot unicast.
+     */
+    private _sendDirect;
     /**
      * Re-check Yjs's pending-struct store after the gap grace period and
      * request a resync (a beacon, see _requestResync) only if something is
@@ -943,7 +968,10 @@ export declare class GenericProvider extends Observable<string> {
      * reasoning and the wire-format compatibility tradeoff of enabling it.
      */
     private _sendToTransport;
-    /** Hand fully-framed bytes to transport.send(), tolerating a sync or async send(). */
+    /**
+     * Hand fully-framed bytes to transport.send() - or transport.sendTo() when
+     * a peer address is given - tolerating a sync or async result.
+     */
     private _dispatchToTransport;
     /**
      * Update connection status and emit event.

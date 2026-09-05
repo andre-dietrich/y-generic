@@ -121,11 +121,30 @@ function shadowHub(hub: DummyHub) {
     }
     return original(room, data, sender, options)
   }
+  const originalUnicast = hub.unicast.bind(hub)
+  ;(hub as unknown as { unicast: typeof hub.unicast }).unicast = (
+    room: string,
+    targetId: string,
+    data: Uint8Array,
+    sender: DummyTransport,
+    options?: { latency?: number; dropRate?: number; jitter?: number },
+  ) => {
+    if (state.counting) {
+      state.deliveries += 1
+      if (data.length >= 5) classifyOne(data.subarray(4), state.census, 1)
+    }
+    return originalUnicast(room, targetId, data, sender, options)
+  }
   return state
 }
 
 function makeProvider(hub: DummyHub, doc: Y.Doc, id: number | string): GenericProvider {
-  const transport = new DummyTransport({ hub, latency: LATENCY, jitter: JITTER })
+  const transport = new DummyTransport({
+    hub,
+    latency: LATENCY,
+    jitter: JITTER,
+    unicast: process.env.DUMMY_UNICAST === '1',
+  })
   const provider = new GenericProvider(doc, transport, {
     batchUpdates: 0,
     verifyUpdates: true,

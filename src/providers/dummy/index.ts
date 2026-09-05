@@ -56,7 +56,7 @@ export class DummyHub {
     string,
     Set<{
       transport: DummyTransport
-      callback: (data: Uint8Array) => void
+      callback: (data: Uint8Array, from?: string) => void
     }>
   > = new Map()
 
@@ -66,7 +66,7 @@ export class DummyHub {
   join(
     room: string,
     transport: DummyTransport,
-    callback: (data: Uint8Array) => void,
+    callback: (data: Uint8Array, from?: string) => void,
   ): void {
     if (!this.rooms.has(room)) {
       this.rooms.set(room, new Set())
@@ -179,18 +179,56 @@ export class DummyHub {
       if (actualDelay > 0) {
         setTimeout(() => {
           try {
-            client.callback(data)
+            client.callback(data, sender.id)
           } catch (error) {
             console.error('Error delivering message:', error)
           }
         }, actualDelay)
       } else {
         try {
-          client.callback(data)
+          client.callback(data, sender.id)
         } catch (error) {
           console.error('Error delivering message:', error)
         }
       }
+    }
+  }
+
+  /**
+   * Deliver a message to ONE client in a room (Transport.sendTo), with the
+   * same latency/jitter/drop model as broadcast(). Silently does nothing if
+   * the target has left. Used only by transports created with
+   * `unicast: true`.
+   */
+  unicast(
+    room: string,
+    targetId: string,
+    data: Uint8Array,
+    sender: DummyTransport,
+    options?: { latency?: number; dropRate?: number; jitter?: number },
+  ): void {
+    const clients = this.rooms.get(room)
+    if (!clients) return
+    for (const client of clients) {
+      if (client.transport.id !== targetId || client.transport === sender) continue
+      const dropRate = options?.dropRate ?? 0
+      if (dropRate > 0 && Math.random() < dropRate) return
+      const latency = options?.latency ?? 0
+      const jitter = options?.jitter ?? 0
+      let actualDelay = latency
+      if (latency > 0 && jitter > 0) {
+        actualDelay = latency * (1 - jitter) + Math.random() * (2 * latency * jitter)
+      }
+      const deliver = () => {
+        try {
+          client.callback(data, sender.id)
+        } catch (error) {
+          console.error('Error delivering message:', error)
+        }
+      }
+      if (actualDelay > 0) setTimeout(deliver, actualDelay)
+      else deliver()
+      return
     }
   }
 
@@ -295,6 +333,17 @@ export interface DummyTransportOptions {
   simulatePeerConnect?: boolean
 
   /**
+   * Model a transport that can address a single peer (Transport.sendTo,
+   * like peerjs/simple-peer/trystero): `sendTo` is present and delivers to
+   * one client via DummyHub.unicast(), and every delivery carries the
+   * sender's transport id as `from`. Off by default so plain benchmarks
+   * keep modelling a broadcast relay (websocket/pubnub/gun/matrix/...),
+   * on which GenericProvider's unicast paths never engage.
+   * @default false
+   */
+  unicast?: boolean
+
+  /**
    * Simulate a chunking transport's hard per-message size limit (bytes),
    * mirroring how PubNub (`src/providers/pubnub/index.ts`, ~30KB) and Ably
    * (`src/providers/ably/index.ts`) split any `send()` payload larger than
@@ -344,7 +393,14 @@ export class DummyTransport implements Transport {
   private options: DummyTransportOptions
   private _connected: boolean = false
   private _room: string = ''
-  private _callback?: (data: Uint8Array) => void
+  private _callback?: (data: Uint8Array, from?: string) => void
+
+  /**
+   * Transport.sendTo - present only when `unicast` is on (feature-detected
+   * by GenericProvider via `typeof transport.sendTo === 'function'`, so it
+   * must be genuinely absent otherwise, same pattern as onPeerConnect).
+   */
+  readonly sendTo?: (peerId: string, data: Uint8Array) => void
   private _peerConnectCallback?: (peerId: string) => void
   /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
   private _chunkBuffers: Map<number, Map<number, Uint8Array>> = new Map()
@@ -403,7 +459,21 @@ export class DummyTransport implements Transport {
       jitter: options.jitter ?? 0,
       autoConnect: options.autoConnect ?? false,
       simulatePeerConnect: options.simulatePeerConnect ?? false,
+      unicast: options.unicast ?? false,
       chunkSizeLimit: options.chunkSizeLimit,
+    }
+
+    if (this.options.unicast) {
+      this.sendTo = (peerId: string, data: Uint8Array) => {
+        if (!this._connected || !this.hub) return
+        // Unicast is never chunked here - the chunk simulation models
+        // relay size limits, which is a broadcast-transport concern.
+        this.hub.unicast(this._room, peerId, data, this, {
+          latency: this.options.latency,
+          dropRate: this.options.dropRate,
+          jitter: this.options.jitter,
+        })
+      }
     }
 
     if (this.options.simulatePeerConnect) {
@@ -581,12 +651,12 @@ export class DummyTransport implements Transport {
   /**
    * Register callback for incoming messages.
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     const limit = this.options.chunkSizeLimit
     const wrappedCallback = limit
-      ? (packed: Uint8Array) => {
+      ? (packed: Uint8Array, from?: string) => {
           const reassembled = this._reassembleChunk(packed)
-          if (reassembled) callback(reassembled)
+          if (reassembled) callback(reassembled, from)
         }
       : callback
     this._callback = wrappedCallback

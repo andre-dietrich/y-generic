@@ -31,10 +31,26 @@ export interface Transport {
    * Register a callback for incoming binary data.
    * The transport calls this callback whenever data is received.
    *
-   * @param callback - Function to call with received data
+   * @param callback - Function to call with received data. Transports that
+   * know which peer a message came from pass that peer's address as the
+   * second argument (the same id `sendTo` accepts); relays that only see a
+   * room call it with the data alone. GenericProvider remembers the address
+   * per remote clientID and, when `sendTo` exists, answers that peer's
+   * requests directly instead of broadcasting the reply to the room.
    * @returns Cleanup function to unregister the callback
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void
+
+  /**
+   * Optional: send binary data to ONE peer, identified by the address the
+   * transport passed as `from` to the onMessage callback. Mesh transports
+   * (peerjs, simple-peer, trystero) implement this with the peer's data
+   * channel; relays leave it undefined and every reply stays a broadcast,
+   * exactly as before this method existed. When present, SyncStep2 replies,
+   * acks and presence responses to a join go to the requester only: N-1
+   * deliveries per request become 1.
+   */
+  sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
 
   /**
    * Optional: register a callback that fires whenever a new peer data channel

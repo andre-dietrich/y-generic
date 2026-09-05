@@ -114,8 +114,9 @@ export class TrysteroTransport {
         receive((data, peerId) => {
             this.log(`Received update from ${peerId} (${data.byteLength} bytes)`);
             if (this._callback) {
-                // Convert ArrayBuffer to Uint8Array
-                this._callback(new Uint8Array(data));
+                // Convert ArrayBuffer to Uint8Array; peerId lets GenericProvider
+                // answer this peer directly via sendTo()
+                this._callback(new Uint8Array(data), peerId);
             }
         });
         // Track peers
@@ -154,6 +155,18 @@ export class TrysteroTransport {
         // Send to all peers (null = broadcast)
         this.log(`Sending update (${data.byteLength} bytes) to ${this.peers.size} peers`);
         await this.sendUpdate(data, null);
+    }
+    /**
+     * Transport.sendTo: deliver to one peer (Trystero's action send accepts
+     * a target peer id). Used by GenericProvider for replies, acks and
+     * presence responses.
+     */
+    async sendTo(peerId, data) {
+        if (!this._connected || !this.sendUpdate)
+            return;
+        if (!this.peers.has(peerId))
+            return;
+        await this.sendUpdate(data, peerId);
     }
     onMessage(callback) {
         this._callback = callback;

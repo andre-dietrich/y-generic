@@ -356,6 +356,28 @@ export class PeerJSTransport {
         };
     }
     /**
+     * Transport.sendTo: deliver to one connected peer (the `from` id passed
+     * to onMessage). GenericProvider uses it for replies, acks and presence
+     * responses so a join costs one delivery per responder instead of one
+     * per peer per responder.
+     */
+    sendTo(peerId, data) {
+        if (!this._connected)
+            return;
+        const peerConn = this.peers.get(peerId);
+        if (!peerConn || !peerConn.connected)
+            return;
+        const dataToSend = this.options.password
+            ? this.encrypt(data, this.options.password)
+            : data;
+        try {
+            peerConn.conn.send(dataToSend);
+        }
+        catch (error) {
+            this.log('Error sending to peer:', peerId, error);
+        }
+    }
+    /**
      * Check if connected.
      */
     get isConnected() {
@@ -484,7 +506,7 @@ export class PeerJSTransport {
                                     const decryptedData = this.options.password
                                         ? this.decrypt(uint8Data, this.options.password)
                                         : uint8Data;
-                                    this._callback(decryptedData);
+                                    this._callback(decryptedData, this.coordinatorPeerId);
                                 }
                                 catch (error) {
                                     this.log('Error handling coordinator data:', error);
@@ -932,7 +954,7 @@ export class PeerJSTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(uint8Data, this.options.password)
                         : uint8Data;
-                    this._callback(decryptedData);
+                    this._callback(decryptedData, remotePeerId);
                 }
                 catch (error) {
                     this.log('Error handling peer data:', error);

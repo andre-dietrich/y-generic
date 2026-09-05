@@ -165,7 +165,13 @@ export declare class TrysteroTransport implements Transport {
     connect(config: ConnectionConfig): Promise<void>;
     disconnect(): void;
     send(data: Uint8Array): Promise<void>;
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    /**
+     * Transport.sendTo: deliver to one peer (Trystero's action send accepts
+     * a target peer id). Used by GenericProvider for replies, acks and
+     * presence responses.
+     */
+    sendTo(peerId: string, data: Uint8Array): Promise<void>;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
     /**
      * Register callback for new peer data-channel connections. Lets
      * GenericProvider push our current doc/awareness state to a peer as

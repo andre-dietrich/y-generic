@@ -184,7 +184,7 @@ export class SimplePeerTransport implements Transport {
   }
   private _connected: boolean = false
   private _room: string = ''
-  private _callback?: (data: Uint8Array) => void
+  private _callback?: (data: Uint8Array, from?: string) => void
   private _peerConnectCallback?: (peerId: string) => void
   private peerId: string
   private peers: Map<string, PeerConnection> = new Map()
@@ -469,10 +469,28 @@ export class SimplePeerTransport implements Transport {
   /**
    * Register callback for incoming messages.
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     this._callback = callback
     return () => {
       this._callback = undefined
+    }
+  }
+
+  /**
+   * Transport.sendTo: deliver to one connected peer (the `from` id passed
+   * to onMessage), chunked and flow-controlled like a broadcast send.
+   */
+  sendTo(peerId: string, data: Uint8Array): void {
+    if (!this._connected) return
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn || !peerConn.connected) return
+    const dataToSend = this.options.password
+      ? this.encrypt(data, this.options.password)
+      : data
+    try {
+      this.sendToPeer(peerConn, dataToSend)
+    } catch (error) {
+      this.log(`❌ sendTo failed for ${peerId}:`, (error as Error).message)
     }
   }
 
@@ -788,7 +806,7 @@ export class SimplePeerTransport implements Transport {
           const decryptedData = this.options.password
             ? this.decrypt(payload, this.options.password)
             : payload
-          this._callback(decryptedData)
+          this._callback(decryptedData, remotePeerId)
         } else if (msgType === MSG_TYPE_CHUNKED) {
           // Chunked message - reassemble
           const view = new DataView(uint8Data.buffer, uint8Data.byteOffset)
@@ -830,7 +848,7 @@ export class SimplePeerTransport implements Transport {
             const decryptedData = this.options.password
               ? this.decrypt(fullMessage, this.options.password)
               : fullMessage
-            this._callback(decryptedData)
+            this._callback(decryptedData, remotePeerId)
             this.log(
               `📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`,
             )
@@ -840,7 +858,7 @@ export class SimplePeerTransport implements Transport {
           const decryptedData = this.options.password
             ? this.decrypt(uint8Data, this.options.password)
             : uint8Data
-          this._callback(decryptedData)
+          this._callback(decryptedData, remotePeerId)
         }
       } catch (error) {
         this.log('Error handling peer data:', error)

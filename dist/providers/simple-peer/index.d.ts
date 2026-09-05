@@ -162,7 +162,12 @@ export declare class SimplePeerTransport implements Transport {
     /**
      * Register callback for incoming messages.
      */
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
+    /**
+     * Transport.sendTo: deliver to one connected peer (the `from` id passed
+     * to onMessage), chunked and flow-controlled like a broadcast send.
+     */
+    sendTo(peerId: string, data: Uint8Array): void;
     /**
      * Register callback for new peer data-channel connections.
      */

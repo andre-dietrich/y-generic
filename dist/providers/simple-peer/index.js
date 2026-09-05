@@ -281,6 +281,26 @@ export class SimplePeerTransport {
         };
     }
     /**
+     * Transport.sendTo: deliver to one connected peer (the `from` id passed
+     * to onMessage), chunked and flow-controlled like a broadcast send.
+     */
+    sendTo(peerId, data) {
+        if (!this._connected)
+            return;
+        const peerConn = this.peers.get(peerId);
+        if (!peerConn || !peerConn.connected)
+            return;
+        const dataToSend = this.options.password
+            ? this.encrypt(data, this.options.password)
+            : data;
+        try {
+            this.sendToPeer(peerConn, dataToSend);
+        }
+        catch (error) {
+            this.log(`❌ sendTo failed for ${peerId}:`, error.message);
+        }
+    }
+    /**
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback) {
@@ -540,7 +560,7 @@ export class SimplePeerTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(payload, this.options.password)
                         : payload;
-                    this._callback(decryptedData);
+                    this._callback(decryptedData, remotePeerId);
                 }
                 else if (msgType === MSG_TYPE_CHUNKED) {
                     // Chunked message - reassemble
@@ -577,7 +597,7 @@ export class SimplePeerTransport {
                         const decryptedData = this.options.password
                             ? this.decrypt(fullMessage, this.options.password)
                             : fullMessage;
-                        this._callback(decryptedData);
+                        this._callback(decryptedData, remotePeerId);
                         this.log(`📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`);
                     }
                 }
@@ -586,7 +606,7 @@ export class SimplePeerTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(uint8Data, this.options.password)
                         : uint8Data;
-                    this._callback(decryptedData);
+                    this._callback(decryptedData, remotePeerId);
                 }
             }
             catch (error) {

@@ -134,7 +134,14 @@ export declare class PeerJSTransport implements Transport {
     /**
      * Register callback for incoming messages.
      */
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
+    /**
+     * Transport.sendTo: deliver to one connected peer (the `from` id passed
+     * to onMessage). GenericProvider uses it for replies, acks and presence
+     * responses so a join costs one delivery per responder instead of one
+     * per peer per responder.
+     */
+    sendTo(peerId: string, data: Uint8Array): void;
     /**
      * Check if connected.
      */

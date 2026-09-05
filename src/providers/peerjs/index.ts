@@ -98,7 +98,7 @@ export class PeerJSTransport implements Transport {
   private options: Required<PeerJSTransportOptions>
   private _connected: boolean = false
   private _room: string = ''
-  private _callback?: (data: Uint8Array) => void
+  private _callback?: (data: Uint8Array, from?: string) => void
   private _peerConnectCallback?: (peerId: string) => void
   private peer: any = null // PeerJS Peer instance
   private peerId: string = ''
@@ -475,10 +475,30 @@ export class PeerJSTransport implements Transport {
   /**
    * Register callback for incoming messages.
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     this._callback = callback
     return () => {
       this._callback = undefined
+    }
+  }
+
+  /**
+   * Transport.sendTo: deliver to one connected peer (the `from` id passed
+   * to onMessage). GenericProvider uses it for replies, acks and presence
+   * responses so a join costs one delivery per responder instead of one
+   * per peer per responder.
+   */
+  sendTo(peerId: string, data: Uint8Array): void {
+    if (!this._connected) return
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn || !peerConn.connected) return
+    const dataToSend = this.options.password
+      ? this.encrypt(data, this.options.password)
+      : data
+    try {
+      peerConn.conn.send(dataToSend)
+    } catch (error) {
+      this.log('Error sending to peer:', peerId, error)
     }
   }
 
@@ -629,7 +649,7 @@ export class PeerJSTransport implements Transport {
                     ? this.decrypt(uint8Data, this.options.password)
                     : uint8Data
 
-                  this._callback(decryptedData)
+                  this._callback(decryptedData, this.coordinatorPeerId)
                 } catch (error) {
                   this.log('Error handling coordinator data:', error)
                 }
@@ -1159,7 +1179,7 @@ export class PeerJSTransport implements Transport {
             ? this.decrypt(uint8Data, this.options.password)
             : uint8Data
 
-          this._callback(decryptedData)
+          this._callback(decryptedData, remotePeerId)
         } catch (error) {
           this.log('Error handling peer data:', error)
         }

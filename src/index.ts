@@ -1220,7 +1220,35 @@ export class GenericProvider extends Observable<string> {
       // _markActivity()'s doc comment.
       this._markActivity()
 
-      // Broadcast awareness changes (unless they came from remote)
+      // Broadcast awareness changes, UNLESS they came from remote (this
+      // comment described the intent since the very first commit, but the
+      // actual origin check was never implemented until now - confirmed by
+      // `git log -p` on this handler). `origin === this` is exactly the
+      // signature the MESSAGE_AWARENESS handler stamps on an update applied
+      // from an incoming wire message (`applyAwarenessUpdate(this.awareness,
+      // ..., this)`, below). Every transport this project targets is a
+      // full-room relay (websocket/pubnub/gun/matrix/ably/supabase) or a
+      // full mesh (peerjs/simple-peer/trystero - see CLAUDE.md), so the
+      // sender's own broadcast already reached every other peer directly;
+      // re-broadcasting it here on receipt is pure redundant traffic that
+      // compounds across every OTHER receiver doing the same thing.
+      // Verified with a throwaway probe: a single awareness field change in
+      // an N-peer room cost N*(N-1) wire deliveries before this check (one
+      // echo per receiver, each reaching N-1 peers) vs. N-1 after - e.g.
+      // N=20: 380 -> 19.
+      //
+      // Carve-out: `applyAwarenessUpdate` has its own defense against a
+      // remote peer incorrectly removing OUR OWN state (a stale/racy
+      // timeout-removal from someone else's clock) - it bumps our clock
+      // instead of deleting our state, but (a quirk of that function) still
+      // reports it via `removed` including our own clientID. That specific
+      // case must still be broadcast so the room's stale belief that we're
+      // gone gets corrected promptly, instead of only self-healing on our
+      // next unrelated state change/renewal (up to ~15s later).
+      if (origin === this && !removed.includes(this.awareness.clientID)) {
+        return
+      }
+
       const changedClients = added.concat(updated).concat(removed)
       this._broadcastAwareness(changedClients)
     }

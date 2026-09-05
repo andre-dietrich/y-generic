@@ -28,6 +28,7 @@
     "test/dummy/bench-compression-ratio.ts",
     "test/dummy/bench-chunking-compression.ts",
     "test/dummy/bench-idle-backoff.ts",
+    "test/dummy/bench-awareness-echo.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

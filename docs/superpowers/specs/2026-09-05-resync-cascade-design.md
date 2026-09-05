@@ -52,9 +52,13 @@ the latter is what *their* periodic beacons and the connect push are for.
 `syncNow()` (public; connect) is unchanged: push + JOIN beacon.
 
 **1c. Suppression window and response wait follow the measured RTT.**
-`_rttEstimateMs` (EWMA, α = 0.3, seeded from the first sample): when a
+~~`_rttEstimateMs` (EWMA, α = 0.3, seeded from the first sample)~~ **As
+built (Task 3): the minimum of the last 8 samples** — a sample includes the
+responder's random suppression delay, so a mean would feed the window back
+into itself; the fastest reply carries the least delay. When a
 JOIN/CONFIRM/resync beacon goes out, remember the time; the first
-SyncStep2 or matching ack after it yields one RTT sample.
+SyncStep2 or matching ack after it yields one RTT sample (an equal periodic
+beacon ends the wait but is not a sample).
 `_replySuppressionMaxDelay()` becomes
 `min(2000, max(current formula, 1.5 · rtt))`; `_armResponseWait()`'s first
 delay becomes `max(1000, 4 · rtt)`. With no sample yet both keep today's
@@ -307,3 +311,29 @@ racing suppression at 15 ms latency. Deduping by requested state vector
 instead of reply bytes would remove the first; noted for a later phase,
 not done here. Join burst N=50 (probe): 5,880 / 174 ms. Two fresh peers and
 a 3-peer simultaneous join reach `synced`.
+
+### After Task 6 — presence responses coalesced (design item 4)
+
+One timer per peer answers every JOIN beacon that arrives within
+`clamp(2 · minRTT, 100, 500)` ms of the first. `bench-join-after-burst`,
+two runs, awareness class: Matrix in-budget 9,069-9,265 → **3,561**,
+Matrix fresh 9,167 → **3,140**; total Matrix deliveries 11.4-12.0k →
+**5.6-6.2k**. WebSocket unchanged (2,891: at 15 ms latency the 100 ms
+cursor throttle already coalesced a burst). `bench-periodic-awareness`
+Part 2 still passes: the late joiner sees all five presence states after
+137 ms (was 33-36 ms; the coalescing delay is ~100 ms at WebSocket RTT),
+inside the 330 ms bound, and is `synced` after 47 ms.
+
+The WebSocket "in budget window" row of `bench-join-after-burst` swung
+again (9,998 / 9,802 with SyncStep2 ~6,100 in two consecutive runs; 4,363
+vs 9,606 in two runs of the equivalent probe). A per-sender breakdown of
+the probe pins it: all of those SyncStep2s come from the settled peers,
+~3 per peer, and the joiners' acks drop to 1 (their pending acks are
+cancelled by the flood of overheard SyncStep2s). Cause: the ten keystrokes
+are broadcast in the same tick as the ten JOIN beacons, so at each settled
+peer keystroke and beacon arrivals interleave at random; every keystroke
+that lands between two beacons changes the bytes of the reply to an empty
+requester, the byte-identical dedupe misses, and the pending reply is
+flushed as "a different request" — up to ten flushed replies per settled
+peer instead of one. Fixed next (Task 7): dedupe by the requested state
+vector and refresh the pending reply's bytes instead of flushing.

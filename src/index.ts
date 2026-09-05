@@ -471,6 +471,13 @@ export class GenericProvider extends Observable<string> {
   // (phase-1b design, item 3). Cleared on disconnect.
   private _knownPeers: Set<number> = new Set()
 
+  // One timer that answers every JOIN beacon arriving within its window
+  // with a single presence broadcast (phase-1b design, item 4). The 100 ms
+  // cursor throttle is the wrong coalescing window for this: at 350 ms
+  // latency a 50-peer join burst's beacons spread over several of them and
+  // each peer re-announced presence 2-3 times per burst.
+  private _presenceResponseTimer?: ReturnType<typeof setTimeout>
+
   // Same NACK-style suppression as _pendingSyncReply above, applied to
   // awareness updates that are a pure timeout-triggered removal (see
   // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
@@ -957,6 +964,10 @@ export class GenericProvider extends Observable<string> {
     if (this._pendingCheckTimer !== undefined) {
       clearTimeout(this._pendingCheckTimer)
       this._pendingCheckTimer = undefined
+    }
+    if (this._presenceResponseTimer !== undefined) {
+      clearTimeout(this._presenceResponseTimer)
+      this._presenceResponseTimer = undefined
     }
     this._responseWaitAttempts = 0
     this._responseSeen = false
@@ -1940,11 +1951,31 @@ export class GenericProvider extends Observable<string> {
     }
 
     if (flags & DIGEST_FLAG_JOIN && this.awareness.getLocalState() !== null) {
-      // Presence on demand: the joiner asked. Throttled like every other
-      // awareness broadcast, never suppressed (each responder's state is
-      // distinct). Skipped when we have no state to announce.
-      this._broadcastAwareness([this.doc.clientID])
+      // Presence on demand: the joiner asked. One broadcast per burst of
+      // joiners (see _schedulePresenceResponse), never suppressed (each
+      // responder's state is distinct). Skipped when we have no state to
+      // announce.
+      this._schedulePresenceResponse()
     }
+  }
+
+  /**
+   * Answer a JOIN beacon's presence request once for all JOIN beacons that
+   * arrive within `clamp(2 * minRTT, 100, 500)` ms of the first - long
+   * enough to cover a join burst spread by latency, short enough that a
+   * lone joiner sees the room's presence within a few round trips.
+   */
+  private _schedulePresenceResponse(): void {
+    if (this._presenceResponseTimer !== undefined) return
+    const rtt = this._rttMinMs()
+    const delay = Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt))
+    this._presenceResponseTimer = setTimeout(() => {
+      this._presenceResponseTimer = undefined
+      if (this._destroying || !this.transport.isConnected) return
+      if (this.awareness.getLocalState() !== null) {
+        this._broadcastAwareness([this.doc.clientID])
+      }
+    }, delay)
   }
 
   /**

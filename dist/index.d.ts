@@ -132,6 +132,7 @@ export declare class GenericProvider extends Observable<string> {
     private _rttSamples;
     private _requestSentAt;
     private _knownPeers;
+    private _presenceResponseTimer?;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
@@ -561,6 +562,13 @@ export declare class GenericProvider extends Observable<string> {
      * with no acks needing to survive the rate limiter.
      */
     private _handleDigest;
+    /**
+     * Answer a JOIN beacon's presence request once for all JOIN beacons that
+     * arrive within `clamp(2 * minRTT, 100, 500)` ms of the first - long
+     * enough to cover a join burst spread by latency, short enough that a
+     * lone joiner sees the room's presence within a few round trips.
+     */
+    private _schedulePresenceResponse;
     /**
      * Max random delay (ms) before replying to a SyncStep1 request, scaled by
      * a room-size signal already available (`this.awareness.getStates().size`

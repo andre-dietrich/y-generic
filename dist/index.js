@@ -633,6 +633,10 @@ export class GenericProvider extends Observable {
             clearTimeout(this._pendingCheckTimer);
             this._pendingCheckTimer = undefined;
         }
+        if (this._presenceResponseTimer !== undefined) {
+            clearTimeout(this._presenceResponseTimer);
+            this._presenceResponseTimer = undefined;
+        }
         this._responseWaitAttempts = 0;
         this._responseSeen = false;
         this._rttSamples = [];
@@ -1464,11 +1468,32 @@ export class GenericProvider extends Observable {
             this._markSynced();
         }
         if (flags & DIGEST_FLAG_JOIN && this.awareness.getLocalState() !== null) {
-            // Presence on demand: the joiner asked. Throttled like every other
-            // awareness broadcast, never suppressed (each responder's state is
-            // distinct). Skipped when we have no state to announce.
-            this._broadcastAwareness([this.doc.clientID]);
+            // Presence on demand: the joiner asked. One broadcast per burst of
+            // joiners (see _schedulePresenceResponse), never suppressed (each
+            // responder's state is distinct). Skipped when we have no state to
+            // announce.
+            this._schedulePresenceResponse();
         }
+    }
+    /**
+     * Answer a JOIN beacon's presence request once for all JOIN beacons that
+     * arrive within `clamp(2 * minRTT, 100, 500)` ms of the first - long
+     * enough to cover a join burst spread by latency, short enough that a
+     * lone joiner sees the room's presence within a few round trips.
+     */
+    _schedulePresenceResponse() {
+        if (this._presenceResponseTimer !== undefined)
+            return;
+        const rtt = this._rttMinMs();
+        const delay = Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt));
+        this._presenceResponseTimer = setTimeout(() => {
+            this._presenceResponseTimer = undefined;
+            if (this._destroying || !this.transport.isConnected)
+                return;
+            if (this.awareness.getLocalState() !== null) {
+                this._broadcastAwareness([this.doc.clientID]);
+            }
+        }, delay);
     }
     /**
      * Max random delay (ms) before replying to a SyncStep1 request, scaled by

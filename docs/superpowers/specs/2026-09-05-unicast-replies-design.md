@@ -325,3 +325,211 @@ vectors (one answer that contains everything either requester lacks) and
 keeps its timer and its suppressibility. Acks and legacy plain-`SyncStep1`
 requests (no target state vector) keep the flush. ~25 lines including a
 `minStateVector` helper (`Y.encodeStateVector` accepts a `Map`).
+
+### After Task 6 — overlapping requests share one pending reply (`bench-dist-t1c6` = commit `267991e`; probe logs `probe12-*-r2`)
+
+Same probe as above (Matrix fan-out N=50, 1/3/5/10 % loss, 3 samples
+each, back-to-back runs of both builds under the same machine load):
+
+| regime | build | deliveries median (range) | SyncStep2 median (range) | convergence median (range) |
+|---|---|---|---|---|
+| fresh budget | Task 1-5 build | 9,947 (4,557-14,798) | 7,301 (1,960-11,662) | 749 ms (565-831) |
+| fresh budget | **Task 6 build** | **4,018 (2,695-6,076)** | **1,323 (490-2,646)** | 803 ms (576-916) |
+| default (spent budget) | Task 1-5 build | 19,796 (10,339-25,529) | 16,513 (7,301-21,903) | 922 ms (820-950) |
+| default (spent budget) | **Task 6 build** | **4,655 (3,920-5,635)** | **1,176 (882-1,764)** | 1,038 ms (918-1,893) |
+
+SyncStep2 traffic −80 %, total deliveries −60 % (fresh) / −77 %
+(default); below the phase-1b baseline (5,684 / ~7-10k) as well.
+Convergence is 50-115 ms later at the median: the flush had answered the
+second requester at once, the merged reply waits for the pending timer
+(one default-regime sample at 1,893 ms: a lost reply, healed by the
+response-wait re-beacon). The gap-check and beacon counts are unchanged,
+i.e. the fix removes replies, not requests.
+
+Per-task set on the same build (`after1c-fixC`, relay mode, one run):
+every gate passes (late-join and packet-loss all cells 3/3, both
+corruption RESULT lines, periodic-awareness 4/4, LOSTDELETE 5/5). The fix
+reaches beyond the probe's scenario — every cell in which several peers
+are behind at the same time:
+
+| bench | cell | Task 1-5 build | Task 6 build |
+|---|---|---|---|
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 15,532-23,454 / 14,771-21,928 | **6,107 / 6,639** |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 5,149-5,394 / 5,361-5,492 | 5,296 / 4,298 |
+| late-join idle, M=40 K=10 | Matrix / WebSocket | 6,881-7,011 / 4,383-5,069 | 6,894-7,025 / 4,808-5,102 |
+| packet-loss fan-out N=50, default regime | Matrix 1 / 3 / 5 / 10 % | 11,972-17,346 | **3,169 / 3,463 / 4,067 / 4,475** |
+| packet-loss fan-out N=50, default regime | WebSocket 3 / 5 / 10 % | 5,619-12,364 | **1,307 / 1,339 / 1,617** |
+| packet-loss fan-out N=50, default regime | WebSocket 1 % | 2,989-8,036 | 9,130 (882-25,039: one storm sample, as 1b's 25,235) |
+| packet-loss join burst N=50, 0-10 % | Matrix / WebSocket | 4,296-4,704 / 4,508-6,011 | 4,377-4,524 / 4,720-4,851 |
+| join-after-burst | WebSocket in-budget / fresh | 4,412 / 4,314 | 4,804 / 4,314 |
+| join-after-burst | Matrix in-budget / fresh | 5,835 / 4,510 | 5,737 / 4,265 |
+| idle census N=50 | 15 s regime | 24,549 | 24,647 |
+| corruption N=10 | 5 % | 873 | 846 |
+
+Convergence under loss: fan-out Matrix 961-1,124 ms (was 886-1,070),
+WebSocket 487-845 ms (was 545-777); late-join unchanged (Matrix during
+edits 1,645-1,650 ms, was 1,572-1,619).
+
+### Final gates — unicast mode (Task 1-5 build `bench-dist-t1c3`; logs `after1c-final-unicast`)
+
+`DUMMY_UNICAST=1`: `bench-sync-latency` ×3 with 0 hash-mismatch warnings,
+`bench-late-join` ×3 and `bench-packet-loss` ×3 + fresh with every cell
+3/3, `bench-periodic-awareness` 4/4 (presence 134 ms, synced 32 ms),
+`bench-idle-room` LOSTDELETE 5/5 in both regimes. **One RESULT line
+failed:** `bench-corruption-storm`'s N=5 / 50 % cell did not converge
+within its 15 s settle timeout (all other 11 cells did; storm check
+passed). That bench constructed its transports without the `unicast`
+option, so the cell ran the relay path — and the stall turned out to be
+the bench's, not the protocol's (next section).
+
+| bench | cell | relay (same build) | unicast |
+|---|---|---|---|
+| late-join idle, M=40 K=10 (3 runs) | WebSocket / Matrix | 4,383-5,069 / 6,881-7,011 | **947-968 / 4,743-4,772** |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 5,149-5,394 / 5,361-5,492 | **1,355-1,356 / 3,451-3,470** |
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 15,532-23,454 / 14,771-21,928 | **4,444-4,567 / 5,114-5,232** |
+| packet-loss fan-out N=50, default regime | WebSocket 1-10 % | 2,989-12,364 | 3,114-4,421 |
+| packet-loss fan-out N=50, default regime | Matrix 1-10 % | 11,972-17,346 | 3,469-5,010 |
+| packet-loss fan-out N=50, fresh regime | WebSocket / Matrix 1-10 % | 1,176-5,227 / 3,283-7,971 | 3,092-4,162 / 4,152-8,320 |
+| packet-loss join burst N=50, 0-10 % | WebSocket / Matrix | 4,508-6,011 / 4,296-4,704 | 5,134-5,320 / 2,682-2,872 |
+| user-scaling join burst N=100, default / fresh | Gun | 17,820 / 17,226 | **10,956 / 10,915** |
+| user-scaling join burst N=100, default / fresh | Matrix | 17,820 / 18,216 | **10,907 / 10,911** |
+| user-scaling join burst N=100, default / fresh | WebSocket / WebRTC | 22,473 / 17,127, 34,254 / 19,899 | 20,808 / 20,800, 20,769 / 20,806 |
+| user-scaling join burst N=50, default | Gun / Matrix / WebRTC / WebSocket | 4,704 / 4,410 / 5,047 / 4,851 | 2,849 / 2,853 / 5,295 / 4,071 |
+| join-after-burst | WebSocket in-budget / fresh | 4,412 / 4,314 | **1,845 / 1,843** |
+| join-after-burst | Matrix in-budget / fresh | 5,835 / 4,510 | **2,137 / 1,346** |
+| idle census N=50 | default / 15 s | 24,941 / 24,549 | 24,941 / 24,206 |
+| corruption N=10 | 5 % | 873 | 918 |
+
+Convergence, the price of unicast under loss (nobody is healed by
+somebody else's reply): late-join during edits at 3 % loss WebSocket
+805-819 ms (relay 214-227), Matrix 2,250-2,348 ms (relay 1,598-1,612);
+fan-out N=50 WebSocket 792-1,568 ms (relay 545-777), Matrix 1,360-2,283
+ms default / 2,219-3,813 ms fresh (relay 886-1,070 / 496-791). Deliveries
+are flat across loss rates in unicast mode (the ~3,1xx WebSocket fan-out
+cells are 490 keystrokes + one 2 s periodic-beacon round of 49 peers + a
+handful of unicast replies) — recovery there is paced by the periodic
+beacon, not by replies.
+
+### Finding from the unicast final gates: the corruption bench never stopped corrupting
+
+Repeating `bench-corruption-storm` showed the N=2 / 50 % cell stalling in
+3 of 5 runs on the Task 1-5 build and converging only after 5-10 s in
+most others (both builds), while a probe with the same shape — 25 runs at
+N=2 and 25 at N=5, 50 % corruption for 3 s, then observe — converged
+every time, mostly within 0.3 s, worst case one 5 s resync backoff. An
+instrumented copy of the bench then showed the stalled runs' state: the
+peer behind had pending structs and an armed resync timer, its beacons
+were being sent (3-4 request slots used), the editor's reply budget was
+being used — i.e. requests and replies kept flowing and kept failing.
+
+The cause is in the bench: `withCorruption` corrupts inside the callback
+it registers on the transport at `connect()`, and its restore function
+only put the transport's `onMessage` *method* back. The registered closure
+— the one actually delivering to the provider — kept flipping bits for
+the transport's lifetime, so the "converged once corruption stopped"
+column was measured under continued corruption. At 5-20 % that still
+converges (most replies get through); at 50 % every reply is a coin flip
+and the single-responder N=2 cell fails whenever three 5 s retries in a
+row lose. Fixed on 2026-09-06: the restore flips a flag the closure reads.
+The bench also gains `unicast: DUMMY_UNICAST === '1'` like the other
+benches, so its unicast-mode runs now exercise unicast replies. No
+protocol change; the two other bench observations stand as before (no
+storm; convergence once corruption really stops).
+
+With the fixed bench on the Task 6 build (`corr-fixed`): relay mode 3/3
+runs pass every cell; unicast mode 2/3 — one N=10 / 50 % cell did not
+converge within 15 s, and eight instrumented unicast repeats of that cell
+all converged, each at 5.0 s (the resync coordinator's backoff cap). Relay
+mode converges the same cells in 0.04-0.4 s most of the time. This one is
+the protocol's, and specific to unicast replies: a requester's response
+wait ends on the first SyncStep2 it receives (`_noteResponse(true)`),
+also when the responder was itself only partly caught up and its diff
+does not complete the requester. In relay mode other peers' broadcast
+replies fill the rest in; in unicast mode nothing arrives until the
+requester's own next trigger — the coalesced resync timer (5 s cap) or,
+in real deployments, the periodic beacon (`syncInterval` default 5 s; the
+bench sets 0, which is why its stall is permanent). A stall needs a
+second failed round on top. Not changed in this phase; candidates, in
+order: **(B)** a peer that is itself mid-recovery (pending structs or an
+outstanding response wait) does not act as a unicast responder — the
+2 s rank bucket rotates the top-3 for the retry; **(A)** in unicast mode
+re-arm one confirmation beacon after a data reply and stop only when it
+draws no data; **(C)** request a resync when an overheard beacon shows
+us behind (`weBehind`) — needs an in-flight guard of ≥ 1 RTT or it
+storms during typing at Matrix latency.
+
+### Final gates — Task 6 build, relay mode (`bench-dist-t1c6` = commits `267991e` + bench fix `f78a350`; logs `after1c6-final-relay`)
+
+Every gate passes: `bench-sync-latency` ×3 with 0 hash-mismatch warnings,
+`bench-late-join` ×3 and `bench-packet-loss` ×3 + fresh with every cell
+3/3, both `bench-corruption-storm` RESULT lines (fixed bench), `bench-
+periodic-awareness` 4/4 (presence 138 ms, synced 30 ms), `bench-idle-room`
+LOSTDELETE 5/5 in both regimes. Task 1-5 build → Task 6 build, relay
+mode, three runs each where the bench has them:
+
+| bench | cell | Task 1-5 build | Task 6 build |
+|---|---|---|---|
+| late-join idle, M=40 K=10 | WebSocket / Matrix | 4,383-5,069 / 6,881-7,011 | 4,530-5,118 / 6,858-7,205 |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 5,149-5,394 / 5,361-5,492 | 4,724-5,231 / 4,838-5,312 |
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 15,532-23,454 / 14,771-21,928 | **6,097-6,444 / 6,360-6,686** |
+| packet-loss fan-out N=50, default regime | WebSocket 1-10 % | 2,989-12,364 | **1,111-2,123** (one 1 % run 5,374) |
+| packet-loss fan-out N=50, default regime | Matrix 1-10 % | 11,972-17,346 | **3,071-4,737** |
+| packet-loss fan-out N=50, fresh regime | WebSocket / Matrix 1-10 % | 1,176-5,227 / 3,283-7,971 | **866-1,568 / 2,189-3,071** |
+| packet-loss join burst N=50, 0-10 % | WebSocket / Matrix | 4,508-6,011 / 4,296-4,704 | 4,296-5,913 / 4,247-4,655 |
+| user-scaling join burst N=100, default / fresh | Gun | 17,820 / 17,226 | 17,622 / 17,622 |
+| user-scaling join burst N=100, default / fresh | Matrix | 17,820 / 18,216 | 18,018 / 17,523 |
+| user-scaling join burst N=100, default / fresh | WebSocket / WebRTC | 22,473 / 17,127, 34,254 / 19,899 | 20,790 / 16,236, 23,958 / 15,840 |
+| user-scaling join burst N=50, default | Gun / Matrix / WebRTC / WebSocket | 4,704 / 4,410 / 5,047 / 4,851 | 4,508 / 4,753 / 4,508 / 4,949 |
+| user-scaling fan-out N=100, fresh | all profiles | 990 | 990 |
+| join-after-burst | WebSocket in-budget / fresh | 4,412 / 4,314 | 4,363 / 4,069 |
+| join-after-burst | Matrix in-budget / fresh | 5,835 / 4,510 | 5,737 / 4,265 |
+| idle census N=50 | default / 15 s | 24,941 / 24,549 | 24,745 / 24,598 |
+| corruption N=10 | 5 % | 873 | 846 |
+
+Convergence under loss, Task 1-5 → Task 6: fan-out N=50 default regime
+WebSocket 545-777 → 493-796 ms, Matrix 886-1,070 → 1,000-1,321 ms; fresh
+regime WebSocket 119-380 → 105-266 ms, Matrix 496-791 → 696-881 ms;
+late-join unchanged (Matrix during edits 1,631-1,703 ms). The Matrix
+fan-out pays 100-250 ms for a third of the deliveries; everything else
+is equal or faster.
+
+### Final gates — Task 6 build, unicast mode (`bench-dist-t1c6`; logs `after1c6-final-unicast`)
+
+`DUMMY_UNICAST=1`: `bench-sync-latency` ×3 with 0 hash-mismatch warnings,
+`bench-late-join` ×3 and `bench-packet-loss` ×3 + fresh with every cell
+3/3, `bench-periodic-awareness` 4/4 (presence 133 ms, synced 25 ms),
+`bench-idle-room` LOSTDELETE 5/5 in both regimes, `bench-user-scaling`
+identical to the Task 1-5 build (join burst N=100 Gun 10,934 / Matrix
+10,911 / WebRTC 20,807 / WebSocket 20,814; fan-out N=100 fresh 990). Task
+1-5 build → Task 6 build, unicast mode:
+
+| bench | cell | Task 1-5 build | Task 6 build |
+|---|---|---|---|
+| late-join idle, M=40 K=10 (3 runs) | WebSocket / Matrix | 947-968 / 4,743-4,772 | 951-976 / 4,731-4,754 |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 1,355-1,356 / 3,451-3,470 | 1,355-1,361 / 3,466-4,239 |
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 4,444-4,567 / 5,114-5,232 | 4,397-4,779 / 5,282-6,427 |
+| packet-loss fan-out N=50, default regime | WebSocket / Matrix 1-10 % | 3,114-4,421 / 3,469-5,010 | 3,106-4,440 / 4,586-5,772 |
+| packet-loss fan-out N=50, fresh regime | WebSocket / Matrix 1-10 % | 3,092-4,162 / 4,152-8,320 | 2,125-3,678 / 3,349-7,887 |
+| packet-loss join burst N=50, 0-10 % | WebSocket / Matrix | 5,134-5,320 / 2,682-2,872 | 5,158-5,319 / 2,703-2,855 |
+| join-after-burst | WebSocket in-budget / fresh | 1,845 / 1,843 | **not converged (30 s; 7,349)** / 1,834 |
+| join-after-burst | Matrix in-budget / fresh | 2,137 / 1,346 | 2,154 / 1,348 |
+| idle census N=50 | default / 15 s | 24,941 / 24,206 | 24,451 / 24,647 |
+| corruption N=10 | 5 % | 918 | 800 |
+
+Two things did not pass in this mode, both of the kind described under
+"the corruption bench never stopped corrupting" (a peer left behind with
+no unicast reply completing it and no periodic beacon to fall back on):
+`bench-corruption-storm` N=5 and N=10 at 50 % did not converge within
+15 s (N=2 did, in 3.8 s; the three earlier fixed-bench runs on this build
+had 0, 0 and 1 such cells), and `bench-join-after-burst`'s WebSocket
+"in budget window" variant did not converge within 30 s once in five
+unicast runs of that bench tonight (request=539 plain beacons over the 30
+s, syncStep2=43 against 40 in a passing run: the peer behind kept asking
+and got almost nothing back; 40 instrumented repeats of that variant
+afterwards all converged in 33-86 ms, so the stall is rare and its peer
+state was not captured). Convergence in unicast mode is otherwise
+what Task 2 measured: late-join during edits at 3 % loss WebSocket 819 /
+1,312 / 1,318 ms (Task 1-5 build 805-819), Matrix 2,375-3,155 ms
+(2,250-2,348); fan-out N=50 WebSocket 795-1,693 ms, Matrix 1,618-2,498
+ms. Relay mode has none of this: every relay run of every bench on the
+Task 6 build passed.

@@ -130,14 +130,36 @@ interface Transport {
   
   // Data transmission
   send(data: Uint8Array): void | Promise<void>
-  onMessage(callback: (data: Uint8Array) => void): () => void
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void
   
   // Status
   readonly isConnected: boolean
+
+  // Optional - each one unlocks a cheaper code path when present
+  onPeerConnect?(callback: (peerId: string) => void): () => void
+  sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
+  readonly preferredBatchMs?: number
+  readonly expectedRttMs?: number
 }
 ```
 
-**That's it!** Just 4 methods + 1 property.
+**That's it!** Just 4 methods + 1 property. The optional members:
+
+- `onPeerConnect` - mesh transports fire it per newly opened peer channel so
+  the provider can push its state to that peer right away.
+- `from` + `sendTo` - if your transport knows which peer a message came
+  from, pass that peer's id as the second callback argument and implement
+  `sendTo`. The provider then answers that peer's sync requests directly
+  (SyncStep2, acks, presence) instead of broadcasting the answer to the
+  room: about three unicast replies per join instead of every peer
+  answering everyone. Relays that only see a room leave both out and keep
+  today's broadcast behaviour.
+- `preferredBatchMs` - default `batchUpdates` for transports with a high
+  per-message cost (HTTP polling, internally debounced relays).
+- `expectedRttMs` - the round-trip time class you expect (e.g. 700 for a
+  Matrix homeserver). Seeds the provider's latency estimate so the first
+  join on a slow transport does not retry before the first replies can
+  have arrived; measured samples take over immediately.
 
 ### GenericProvider Class
 

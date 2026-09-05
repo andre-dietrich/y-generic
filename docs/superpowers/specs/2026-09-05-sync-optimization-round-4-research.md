@@ -831,3 +831,44 @@ nothing else); `bench-sync-latency` hash-mismatch warnings 9-21 per run →
 latency hint for the first response wait (Matrix join bursts still pay
 CONFIRM retries), `Transport.sendTo` (item 6), idle backoff re-decision,
 and the orphaned subdoc work.
+
+**Status (2026-09-05, night): phase 1c done** — see
+`2026-09-05-unicast-replies-design.md`. `Transport.expectedRttMs` seeds
+the round-trip estimate: join burst N=100 Matrix 81,774 → 17,325
+deliveries, Gun 54,054 → 17,919 (what WebSocket costs). `Transport.sendTo`
++ `from` (item 6): peerjs, simple-peer and trystero now answer a joiner
+directly, ~3 self-selected responders per request instead of every peer
+that overheard nothing in time; in the dummy's unicast mode a late join
+into M=40 costs 967 deliveries instead of ~5,000 (WebSocket) and 4,754
+instead of ~15,000 (Matrix), packet-loss fan-out N=50 stays at ~3.1k
+across loss rates instead of 1.6-15k. The trade: recovery under loss is
+roughly twice as slow, because a unicast reply heals only its addressee.
+Idle backoff: the decision numbers are in the design doc (quiet room N=50
+156,555 → 52,920 deliveries in the first minute, converging to ~2,450 per
+minute; worst-case recovery of a loss during idle = one backed-off
+interval, up to 60 s at the defaults); the default stays off, the decision
+is open. The final gates also surfaced a pre-existing amplifier: a second
+SyncStep2 request inside the suppression window flushed the pending reply
+as an unsuppressed broadcast; with the RTT-scaled window that made a
+lossy edit burst on Matrix cost ~4-5 replies per beacon (present since 1b
+Task 3 in any room older than one answered request, made visible at once
+by the hint). Fixed in phase 1c Task 6 by merging both requests into one
+SyncStep2 from the componentwise minimum state vector: Matrix fan-out
+N=50 under 1-10 % loss, median deliveries 9,947 → 4,018 (fresh budget),
+19,796 → 4,655 (default regime). A second finding was a bench bug:
+`bench-corruption-storm` never actually stopped corrupting after its edit
+stream (its restore only swapped the transport's `onMessage` method, the
+registered closure kept flipping bits), so its "converged once corruption
+stopped" column was a 50 %-per-reply coin flip in the 50 % cells; fixed,
+no protocol change. **Open, unicast mode only:** a requester's response
+wait ends on the first SyncStep2 it receives, also when that reply came
+from a responder that was itself only partly caught up; with unicast
+replies nobody else's broadcast fills the rest in, so with `syncInterval:
+0` a peer can stay behind until its 5 s resync backoff fires — or stall
+(the fixed corruption bench at 50 % in about one run of three, one
+join-after-burst run in five). Relay mode is unaffected; the default 5 s
+periodic beacon bounds it in deployments. Candidates: mid-recovery peers
+do not act as unicast responders; a confirmation beacon after a data
+reply; a resync request when an overheard beacon shows us behind (needs an
+in-flight guard). Still open from the phase-1c list: the orphaned subdoc
+work (`test/dummy/bench-subdocs.ts`).

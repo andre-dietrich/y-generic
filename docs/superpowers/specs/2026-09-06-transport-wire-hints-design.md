@@ -190,3 +190,22 @@ header stays "Disconnected" - the shared `updateStatus()` helper writes
 to `#connection-status`, which every playground uses as the indicator
 element; the indicator colour and the log are right. Pre-existing,
 shared with the Supabase playground, not touched.)
+
+### Supabase, tested against a real project (2026-09-06, 21:25; supabase-js 2.115.0)
+
+Two Node peers plus a late joiner, Realtime broadcast, provider defaults
+(no batching, compression off - this transport strips the CRC header):
+
+| step | result |
+|---|---|
+| connect both | 749 ms |
+| both synced | 124-150 ms |
+| small update A→B / B→A | 60-62 ms |
+| 80 KB insert (binary payload, one broadcast) | 181-183 ms |
+| 320 KB insert (above the 200 KB cap → base64 chunks) | 324-356 ms |
+| late joiner: content / all 3 presence states | 560-605 ms / +80 ms |
+
+Playground `npm run dev:supabase` in two browser tabs (CDN `supabase-js@2`
+= 2.115): text typed in one tab appears in the other, both list the
+other user, no console warnings. Persistent mode (a `yjs_documents`
+table) not tested - no table in the project yet.

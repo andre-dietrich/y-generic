@@ -1931,10 +1931,18 @@ export class GenericProvider extends Observable {
      */
     _replyDelay(requester) {
         const window = this._replySuppressionMaxDelay();
-        if (requester === null || this._rttMinMs() === null)
+        const rtt = this._rttMinMs();
+        if (requester === null || rtt === null)
             return Math.random() * window;
+        // Half a window per rank (0.75 x the minimum round trip): a rank that
+        // stays silent (pending structs during a lossy burst, phase 1d B)
+        // costs the requester half a window, not a whole one - at a full
+        // window the Matrix 5 % loss fan-out's median convergence doubled
+        // (1.1 -> 2.2 s, worst 7.6 s); the price is an occasional second
+        // reply where the jitter exceeds ~1/3 (probe numbers in the design doc).
+        const slot = Math.max(this._syncReplySuppressionMs, 0.75 * rtt);
         const rank = this._responderRank(requester, 8);
-        return rank * window + (rank >= 8 ? Math.random() * window : 0);
+        return rank * slot + (rank >= 8 ? Math.random() * window : 0);
     }
     /**
      * Send one already-encoded message to a single peer over

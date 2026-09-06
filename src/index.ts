@@ -2264,9 +2264,25 @@ export class GenericProvider extends Observable<string> {
         this._pendingSyncReplyTargetSv = merged
         return
       }
+      // Phase 1e: an ack and a SyncStep2 never flush each other. A room
+      // whose JOIN waits expire together sends N CONFIRMs in the same
+      // millisecond; while a lossy edit burst is still healing, some of
+      // them find us equal (ack) and some behind (SyncStep2), and the flush
+      // rule below turned every type change into an immediate broadcast -
+      // ~650 replies in 200 ms at N=50, 5 % loss (probe timeline in the
+      // phase-1e design doc). An ack adds nothing to a pending reply of
+      // either kind (the requester's wait retries, or an equal peer's
+      // SETTLED ack confirms it); a SyncStep2 replaces a pending ack.
+      if (isAck) return
+      if (this._pendingSyncReplyIsAck) {
+        clearTimeout(this._pendingSyncReplyTimeoutId)
+        this._pendingSyncReplyTimeoutId = undefined
+      }
     }
 
     if (this._pendingSyncReplyTimeoutId !== undefined) {
+      // Only a legacy plain SyncStep1 (no target state vector) still
+      // flushes a pending SyncStep2.
       if (this._pendingSyncReply) {
         this._sendSyncReply(this._pendingSyncReply)
       }

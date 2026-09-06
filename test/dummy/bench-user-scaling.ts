@@ -261,8 +261,10 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
     }
     const totalMs = Date.now() - start
     const atConvergence = stats.messages
-    // Phase 1e: count until quiet (was: latency*2+50 ms after all synced,
-    // which missed every CONFIRM retry of a fresh room - 19k vs 92k at N=100).
+    // Phase 1e: count until 1 s of quiet (was: latency*2+50 ms after all
+    // synced). A fresh room's CONFIRM retries come at 1/2/4 s (x RTT), so
+    // this still stops in the first retry gap; the full tail is what
+    // bench-join-census.ts (b) counts (3 s quiet: 19k vs 92k at N=100).
     await untilQuiet(stats, 1000, 15000)
     const cpuAfter = process.cpuUsage(cpuBefore)
     const cpuMs = (cpuAfter.user + cpuAfter.system) / 1000

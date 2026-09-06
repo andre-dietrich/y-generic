@@ -2189,6 +2189,7 @@ export class GenericProvider extends Observable<string> {
     reply: Uint8Array,
     isAck: boolean = false,
     targetSv: Uint8Array | null = null,
+    requester: number | null = null,
   ): void {
     if (this._pendingSyncReplyTimeoutId !== undefined && this._pendingSyncReply !== null) {
       if (bytesEqual(this._pendingSyncReply, reply)) {
@@ -2240,7 +2241,7 @@ export class GenericProvider extends Observable<string> {
     this._pendingSyncReply = reply
     this._pendingSyncReplyIsAck = isAck
     this._pendingSyncReplyTargetSv = targetSv
-    const delay = Math.random() * this._replySuppressionMaxDelay()
+    const delay = this._replyDelay(requester)
     this._pendingSyncReplyTimeoutId = setTimeout(() => {
       this._pendingSyncReplyTimeoutId = undefined
       if (this._pendingSyncReply) {
@@ -2324,7 +2325,7 @@ export class GenericProvider extends Observable<string> {
     // suppression once there is someone else who could answer - counted
     // from beacon/update senders as well as awareness, see _peerCount().
     if (isAck || this._peerCount() >= 3) {
-      this._scheduleSyncReply(reply, isAck, targetSv)
+      this._scheduleSyncReply(reply, isAck, targetSv, toClientID ?? null)
     } else {
       this._sendSyncReply(reply)
     }
@@ -2352,6 +2353,16 @@ export class GenericProvider extends Observable<string> {
    */
   private _selectedResponder(requester: number): boolean {
     if (this._peerCount() < 4) return true
+    return this._responderRank(requester, 3) < 3
+  }
+
+  /**
+   * How many known peers rank below us for `requester` in the current 2 s
+   * bucket (counting stops at `cap`). Shared by unicast self-selection
+   * (rank < 3 answers) and, since phase 1e, the relay-mode reply delay
+   * (rank r waits r slots, see _replyDelay()).
+   */
+  private _responderRank(requester: number, cap: number): number {
     const bucket = Math.floor(Date.now() / 2000)
     const rank = (id: number) =>
       (Math.imul(requester ^ bucket, 0x9e3779b1) ^ Math.imul(id, 0x85ebca6b)) >>> 0
@@ -2359,9 +2370,32 @@ export class GenericProvider extends Observable<string> {
     let better = 0
     for (const id of this._knownPeers) {
       if (id === requester || id === this.doc.clientID) continue
-      if (rank(id) < mine && ++better >= 3) return false
+      if (rank(id) < mine && ++better >= cap) break
     }
-    return true
+    return better
+  }
+
+  /**
+   * Delay before a suppressible reply goes out (relay path). Phase 1e:
+   * ranked, not uniform. A uniform draw from [0, W] lets ~N * L / W
+   * repliers fire before the first reply is overheard (L = one-way
+   * latency): 10-27 SyncStep2 sends per request at N=100 in
+   * test/dummy/bench-join-census.ts, and the WebRTC join-burst cell's
+   * 16-34k spread. With the responder rank (the same hash the unicast
+   * self-selection uses) rank 0 answers at once and rank r waits r
+   * windows (W = _replySuppressionMaxDelay(), 1.5x the minimum round
+   * trip: with request arrival spread 2jL and reply flight L(1+j), rank 1
+   * has overheard rank 0 iff the slot is >= L(1+3j), which 3L(1-j) covers
+   * up to j~0.33). Ranks >= 8 add a random window on top so a room whose
+   * first eight ranked peers are all gone does not answer in one
+   * avalanche. Without an RTT sample or a requester id (legacy SyncStep1)
+   * the uniform window stays.
+   */
+  private _replyDelay(requester: number | null): number {
+    const window = this._replySuppressionMaxDelay()
+    if (requester === null || this._rttMinMs() === null) return Math.random() * window
+    const rank = this._responderRank(requester, 8)
+    return rank * window + (rank >= 8 ? Math.random() * window : 0)
   }
 
   /**

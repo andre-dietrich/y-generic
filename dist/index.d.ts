@@ -658,6 +658,30 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _selectedResponder;
     /**
+     * How many known peers rank below us for `requester` in the current 2 s
+     * bucket (counting stops at `cap`). Shared by unicast self-selection
+     * (rank < 3 answers) and, since phase 1e, the relay-mode reply delay
+     * (rank r waits r slots, see _replyDelay()).
+     */
+    private _responderRank;
+    /**
+     * Delay before a suppressible reply goes out (relay path). Phase 1e:
+     * ranked, not uniform. A uniform draw from [0, W] lets ~N * L / W
+     * repliers fire before the first reply is overheard (L = one-way
+     * latency): 10-27 SyncStep2 sends per request at N=100 in
+     * test/dummy/bench-join-census.ts, and the WebRTC join-burst cell's
+     * 16-34k spread. With the responder rank (the same hash the unicast
+     * self-selection uses) rank 0 answers at once and rank r waits r
+     * windows (W = _replySuppressionMaxDelay(), 1.5x the minimum round
+     * trip: with request arrival spread 2jL and reply flight L(1+j), rank 1
+     * has overheard rank 0 iff the slot is >= L(1+3j), which 3L(1-j) covers
+     * up to j~0.33). Ranks >= 8 add a random window on top so a room whose
+     * first eight ranked peers are all gone does not answer in one
+     * avalanche. Without an RTT sample or a requester id (legacy SyncStep1)
+     * the uniform window stays.
+     */
+    private _replyDelay;
+    /**
      * Send one already-encoded message to a single peer over
      * Transport.sendTo, with the same CRC32 wrapping and optional compression
      * as a broadcast. Not mirrored to BroadcastChannel (a same-browser tab

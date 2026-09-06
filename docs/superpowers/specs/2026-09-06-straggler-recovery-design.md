@@ -125,6 +125,20 @@ then at the base until the next quiet tick). Measured in
 `bench-idle-backoff` part (b) before and after; the option stays for
 those who want the fixed cadence.
 
+### F. The pending-struct check defers only to a recent request (found by the final gates)
+
+`_schedulePendingCheck` deferred to *any* outstanding response wait
+("look again once that request is answered"). A new room's first peers
+keep their JOIN wait parked for three retries with nobody SETTLED yet —
+19.6 s on a 700 ms link with the phase-1c hint — so a peer that lost a
+keystroke in such a room never asked on its own; in phase 1c it was
+rescued by the SyncStep2 broadcasts that other peers' requests drew
+(`_noteResponse(true)` clears the wait), and with design B thinning those
+broadcasts the fresh-budget Matrix fan-out took 1.5-2.2 s instead of
+0.5-0.9 s. The check now defers only if a request of ours went out within
+`max(gapGraceMs, 2 · minRTT)` — the same rule as design A's behind check,
+for the same reason.
+
 ## Benchmarks and gates
 
 Baseline = `main` @ `abc7852` (snapshot `bench-dist-t1c6`; logs
@@ -144,7 +158,10 @@ the last commit: the phase-1c gate list, 3 × 3, in both dummy modes.
    backoff` recovery, fan-out-under-loss probe).
 4. D — default flip + README; measure `bench-idle-backoff` and
    `bench-idle-room` (60 s window).
-5. Final gates, results, research-doc status.
+5. F — pending check defers only to a recent request (found by the
+   Task 4 final gates); measure with the fan-out-under-loss probe and the
+   per-task set; final gates again.
+6. Final gates, results, research-doc status.
 
 ## Results
 
@@ -272,11 +289,99 @@ behind check gated on "a response wait is outstanding", was 1,846 ms —
 the JOIN wait of a new room's first two peers stays parked for 7 s, and
 the check never fired; hence the `_requestSentAt` condition in design A.
 
-Nothing else moved: `bench-idle-room` census N=50 24,696 (bench forces
-backoff off), LOSTDELETE 5/5 with backoff on and off (with backoff on,
+Nothing else moved: `bench-idle-room` census N=50 24,696 in the 10 s
+window (bench forces backoff off) and 51,156 in a 60 s window with
+backoff on (phase 1c measured 52,920 on / 156,555 off — the re-arm fires
+only on activity, a quiet room is as quiet as before), LOSTDELETE 5/5
+with backoff on and off (with backoff on,
 the lost delete-only update heals in 66-930 ms — design A again);
 `bench-user-scaling` join burst N=100 Gun 19,008 / Matrix 17,721 / WebRTC
 18,216 / WebSocket 17,919, fan-out fresh 990; `bench-periodic-awareness`
 4/4; `bench-corruption-storm` ×1 both modes pass (unicast N=10 at 50 %:
 3.0 s); `bench-join-after-burst` ×1 both modes pass; `bench-late-join`
 relay ×1 every cell 3/3.
+
+### Final gates — relay mode (`bench-dist-t1d4` = commit `4f8bdd3`; logs `after1d-final-relay`)
+
+Every gate passes: `bench-sync-latency` ×3 with 0 hash-mismatch warnings,
+`bench-late-join` ×3 and `bench-packet-loss` ×3 + fresh with every cell
+3/3, both `bench-corruption-storm` RESULT lines, `bench-periodic-
+awareness` 4/4 (presence 133 ms, synced 66 ms), `bench-idle-room`
+LOSTDELETE 5/5 in both regimes. Phase-1c final (Task 6 build) → phase-1d
+final, relay mode:
+
+| bench | cell | 1c final | 1d final |
+|---|---|---|---|
+| late-join idle, M=40 K=10 | WebSocket / Matrix | 4,530-5,118 / 6,858-7,205 | 4,862-5,044 / 6,832-6,861 |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 4,724-5,231 / 4,838-5,312 | 5,378 / 4,740 |
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 6,097-6,444 / 6,360-6,686 | 5,990 / 6,123 |
+| packet-loss fan-out N=50, default regime | WebSocket 1-10 % | 1,111-2,123 | 1,045-1,846 (one 1 % run 3,512) |
+| packet-loss fan-out N=50, default regime | Matrix 1-10 % | 3,071-4,737 | 3,201-4,377 |
+| packet-loss fan-out N=50, fresh regime | WebSocket / Matrix 1-10 % | 866-1,568 / 2,189-3,071 | 1,078-1,601 / **1,519-2,319** |
+| user-scaling join burst N=100, default / fresh | Gun / Matrix | 17,622 / 17,622, 18,018 / 17,523 | 17,622 / 17,721, 17,028 / 18,513 |
+| user-scaling join burst N=100, default / fresh | WebSocket / WebRTC | 20,790 / 16,236, 23,958 / 15,840 | 20,493 / 17,028, 17,127 / 22,968 |
+| user-scaling fan-out N=100, fresh | all profiles | 990 | 990 |
+| join-after-burst (2 s beacon since 1d) | WebSocket in-budget / fresh | 4,461-4,559 / 4,020-4,706 (1d baseline) | 4,412 / 4,216 |
+| join-after-burst (2 s beacon since 1d) | Matrix in-budget / fresh | 7,158-7,697 / 5,537-6,018 (1d baseline) | 7,942 / 4,412 |
+| idle census N=50 | default / 15 s | 24,745 / 24,598 | 24,500 / 24,843 |
+| corruption N=10 | 5 % | 846 | 909 |
+
+Convergence: fan-out N=50 default regime WebSocket 564-888 ms (1c
+493-796), Matrix 999-1,210 ms (1,000-1,321); **fresh regime Matrix
+1,524-1,867 ms (1c 696-881)**, WebSocket 582-766 ms (105-266 — that
+range was the pre-1d "spent-budget-free" best case; the default regime
+did not move). The fresh-regime Matrix cell trades a third of its
+deliveries for 0.8-1.0 s: with design B, responders that are transiently
+reordering the burst (Matrix jitter puts keystrokes 100 ms apart out of
+order at many receivers) stay silent, and a request that finds all of
+them so is answered only on the response wait's retry (4 × RTT ≈ 2 s) or
+the next beacon plus grace. Examined with a variant probe below.
+
+### After Task 5 — the pending check defers only to a recent request (design F; `bench-dist-t1d5`; logs `after1d-t5`, `varcmp`, `varcmp2`)
+
+The fresh-budget Matrix fan-out, taken apart with the probe (N=50, 1/3/5/10
+% loss, 3 samples each, medians):
+
+| build | deliveries | SyncStep2 | convergence |
+|---|---|---|---|
+| 1c final (`t1c6`) | 3,822 | 1,225 | 761 ms (504-858) |
+| Task 4 build (`t1d4`) | 6,762 | 1,029 | 2,079 ms (1,323-2,215) |
+| Task 4 build, design B relaxed (answer while the reordering is inside the grace) | 7,105 | 1,127 | 2,166 ms |
+| Task 4 build, design B removed | 6,909 | 1,274 | 2,166 ms |
+| **Task 5 build** (`t1d5`) | **2,744** | 637 | **1,336 ms** (1,228-1,582) |
+| Task 5 build, design B relaxed | 2,744 | 735 | 1,355 ms |
+| Task 5 build, design B removed | 2,646 | 784 | 1,307 ms |
+| Task 5 build, idle backoff off | 4,508 | 1,274 | 883 ms (724-952) |
+
+Three things fall out. **(1)** Design B costs nothing here — strict,
+relaxed and removed are the same; it stays strict. **(2)** The Task 4
+build's 2.1 s was the pending check parked behind the JOIN wait
+(timeline: `pendingCheck wait=true attempts=2 sentAt=-3.6 s` five times
+in a row, then a request only once an overheard reply cleared the wait;
+"before burst: waits outstanding=50, confirmed=0" — a fresh 50-peer room
+on a 700 ms link stays unconfirmed for 19.6 s). Design F removes that:
+the loser asks 300 ms after the gap shows, one coordinator delay and one
+round trip later it is healed — 1.2-1.4 s at this latency, every time.
+**(3)** The remaining gap to 1c (1.34 s vs 0.76 s, with 30 % fewer
+deliveries) is idle backoff, now on by default: the bench's 12 s settle
+is an idle room, the 2 s beacon had backed off to 8 s, and in 1c the
+periodic beacons that happened to fall into the first second of the burst
+drew broadcast replies that healed every loser at once. With backoff off
+on the same build: 883 ms and 4,508 deliveries. So the price of design D
+in this cell is half a second of recovery after an idle stretch, paid in
+exchange for the idle traffic; the recovery itself no longer depends on a
+beacon landing by chance. A cheaper first beacon after backoff (re-arm at
+a random point inside the base interval instead of a full one) would buy
+some of it back — noted, not done.
+
+Per-task set on the Task 5 build: `bench-corruption-storm` 3 runs per
+mode, every RESULT line passes (50 % cells: relay 0.04-1.25 s, unicast
+0.10-2.99 s); `bench-join-after-burst` 3 runs per mode, all converged
+(relay WebSocket in-budget 4,510-4,608 / fresh 4,167-4,461, Matrix
+7,550-7,893 / 3,971-4,461; unicast WebSocket 1,850-3,220 (52 / 79 / 820
+ms) / 1,829-1,836, Matrix 4,098-4,115 / 1,341-1,727); `bench-idle-backoff`
+recovery median 731 ms on / 203 ms off (part a: 23 vs 71);
+`bench-user-scaling` join burst N=100 Gun 17,919 / Matrix 18,018 / WebRTC
+21,087 / WebSocket 16,731, fan-out fresh 990; idle census N=50 24,990;
+`bench-periodic-awareness` 4/4; `bench-late-join` and `bench-packet-loss`
+×1 in both modes: every cell 3/3.

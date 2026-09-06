@@ -1920,7 +1920,7 @@ export class GenericProvider extends Observable {
             this._pendingCheckTimer = undefined;
             if (this._destroying || !this.transport.isConnected)
                 return;
-            // A request of ours is already outstanding (JOIN or resync beacon
+            // A request of ours may already be outstanding (JOIN or resync beacon
             // with its response wait running): whatever is pending is what that
             // request is fetching, and the response wait retries if it is lost.
             // Asking again here just raced the responders' suppression window
@@ -1928,11 +1928,20 @@ export class GenericProvider extends Observable {
             // 300 ms while the settled peers' replies were still delayed by a
             // window of up to ~300 ms, and every such re-beacon collected
             // another round of replies).
-            if (this._responseWaitTimer !== undefined) {
-                // Look again once that request is answered or given up - dropping
-                // the check here left a joiner whose SyncStep2 predated the
-                // keystrokes it had received with nine pending updates and no
-                // trigger (measured: 2 of 150 lossy 15-peer joins).
+            // ... but only a request that went out within the last grace, whose
+            // answer may still be on its way. Deferring to ANY outstanding
+            // response wait (the rule until phase 1d) parked every pending check
+            // behind a new room's JOIN wait - three retries with nobody SETTLED
+            // yet, 19.6 s on a 700 ms link - so a peer that lost a keystroke in
+            // such a room asked only once an overheard reply happened to clear
+            // that wait (phase-1d design doc, "After Task 4", the fresh-budget
+            // Matrix fan-out). Look again once the recent request is answered or
+            // given up - dropping the check here left a joiner whose SyncStep2
+            // predated the keystrokes it had received with nine pending updates
+            // and no trigger (measured: 2 of 150 lossy 15-peer joins).
+            const rtt = this._rttMinMs();
+            const recent = Math.max(this._gapGraceMs, rtt === null ? 0 : 2 * rtt);
+            if (this._requestSentAt > 0 && Date.now() - this._requestSentAt < recent) {
                 this._schedulePendingCheck();
                 return;
             }

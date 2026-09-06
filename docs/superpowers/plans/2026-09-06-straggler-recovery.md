@@ -46,6 +46,12 @@
 - [ ] `idleBackoffEnabled` default `true`; doc comments updated; README. `_markActivity()` re-arms a backed-off periodic timer at the base interval immediately (`_periodicScheduler` kept from `connect()`). The behind check's skip condition becomes "a request went out within the last grace" (`_requestSentAt`), not "a response wait is outstanding".
 - [ ] `npm run build`; bench build `bench-dist-t1d4/`; `bench-idle-backoff`, `bench-idle-room` with `OBSERVE_MS=60000 SETTLE_MS=15000` at N=50 (default now on; compare with `IDLE_BACKOFF=0`... the bench's switch becomes an explicit override), `bench-periodic-awareness`, `bench-user-scaling`; record; commit `Idle backoff on by default`.
 
-### Task 5: final gates, results
+### Task 5: pending check defers only to a recent request (design F; found by the Task 4 final gates)
 
-- [ ] Phase-1c gate list 3 × 3 in both dummy modes on the Task 4 build; Results; research-doc status; commit `Phase 1d results`.
+**Files:** `src/index.ts` (`_schedulePendingCheck` callback: replace the `_responseWaitTimer !== undefined` deferral with `_requestSentAt > 0 && Date.now() - _requestSentAt < max(_gapGraceMs, 2 * minRTT)`).
+
+- [ ] Implement; `npm run build`; bench build `bench-dist-t1d5/`; fan-out-under-loss probe (Matrix fresh + default, K=3) and the timeline probe; per-task set (corruption ×3 both modes, join-after-burst both modes, idle-backoff, user-scaling both regimes, late-join ×1 and packet-loss ×1 both modes); record; commit `The pending-struct check defers only to a request sent within the grace`.
+
+### Task 6: final gates, results
+
+- [ ] Phase-1c gate list 3 × 3 in both dummy modes on the Task 5 build; Results; research-doc status; commit `Phase 1d results`.

@@ -16,10 +16,15 @@ trickle, visibility, locks, piggyback, keep-alive, `'change'`,
 ## Status
 
 Research **and implementation** (branch `round-5`, from `main` @
-bd77eb9): on 2026-09-06 André asked for the plan to be executed with a
-before/after benchmark for every change. The "Results" section at the end
-records each item as it lands, with the exact commands. Items 6, 9 and 10
-wait for the decisions listed under "Decisions for André".
+bd77eb9, 2026-09-06/07): André asked for the plan to be executed with a
+before/after benchmark for every change. Shipped: items 1, 2, 3, 5, 7, 8
+and the lost-delete ask-back found by item 2's gate (seven commits after
+the doc/bench commit). Measured and not shipped: item 4. Waiting for the
+decisions listed under "Decisions for André": items 6, 9, 10, plus
+`onPeerDisconnect` for Ably, Supabase and Matrix (the signal exists,
+untested backends) and the lease length on transports without a leave
+signal. The "Results" section at the end records each item with the exact
+commands; the summary table is at its end.
 
 Method as in rounds 1-4: read `src/index.ts` end to end (3,584 lines at
 the start of the round), the y-protocols awareness source, every provider
@@ -832,3 +837,34 @@ N_VALUES=20 node bench-dist/test/dummy/bench-typing-census.js
 The editor bindings (y-quill, y-codemirror.next, y-prosemirror) dedupe
 the cursor by relative position themselves, so this pays only for apps
 that write unchanged presence state. Gates: `bench-periodic-awareness` 0 periodic awareness sends, joiner sees all presence in 35 ms; `bench-awareness-removal-burst` via the sweep 1 detector / 1 broadcast / 30 s at every N; `bench-awareness-echo` exactly N-1 at every N; `bench-idle-room` N=20 at the cap: the renewals still go out (1,292 awareness deliveries in the 60 s window, 19 beacons), lost delete 5/5; `bench-join-census` late join N=100 500, fresh burst 52,272 / 49,104.
+
+### Summary — baseline (`main` @ bd77eb9) → final build (`dc26ed8`)
+
+Same commands as the baseline section; final numbers from the final
+build. "peer events" = a transport with `onPeerConnect`/`onPeerDisconnect`
+(peerjs, simple-peer, trystero, PubNub); "relay" = one without (WebSocket,
+Gun, Nostr, Matrix, Supabase, Ably today).
+
+| Scenario | baseline | final | change |
+|---|---|---|---|
+| typing N=20, base cadence, sends / keystroke | 2.46 | **1.28** | −48 % |
+| typing N=50, base cadence, sends / keystroke (deliveries) | 3.72 (9,114) | **1.42** (3,479) | −62 % (−62 %) |
+| typing N=50, steady state, relay, sends / keystroke (deliveries) | 3.02 (7,399) | **1.56** (3,822) | −48 % (−48 %) |
+| typing N=50, steady state, peer events, sends / keystroke (deliveries) | 3.02 (7,399) | **1.04** (2,548) | −66 % (−66 %) |
+| idle N=20 at the 60 s cap, deliveries / min | 1,900 | 1,311 (relay; renewals) | −31 % |
+| idle N=50 at the 60 s cap, relay, deliveries / min | 12,250 | 8,673 (49 beacons + 8,624 renewals in this window; 9,800 renewals long-run) | −20 % structural (the beacon term; renewals unchanged on a relay) |
+| idle N=50 at the 60 s cap, peer events, deliveries / 5 min | 61,250 (5 × 12,250) | **4,949** (245 beacons + 4,704 renewals) | −92 % |
+| one departure, N=50: broadcasts / detection | 1 / 30 s (timeout sweep) | 1 / 30 s relay; **2 / 7 ms** peer events | — |
+| reconnect of a settled peer, 50 KB doc, 16 KB chunks: sends (doc bytes) | 6 (50 KB) | **3 (0.1 KB)** | −50 % (−99 %) |
+| rejoin with a persisted copy loading late, 16 KB chunks: sends (doc bytes) | 8 (50 KB + the load) | **3 (0)** with `waitFor` | −63 % |
+| mesh join burst with sendTo, M=20 K=10: messages | 2,480 | **1,523** | −39 % |
+| lost delete-only update under idle backoff, 5 s interval: heal ≤ 11 s | 9 / 10, worst 9.7 s | **10 / 10**, worst 4.0 s | — |
+| app re-setting unchanged presence, N=20: awareness deliveries / 50 calls | 950 | **19** | −98 % |
+
+What is left on a relay transport is the awareness renewal (one broadcast
+per peer per 15 s: 80 % of the idle N=50 room, a third of a typing room
+at N=50) - the lease length is decision 1 - and, everywhere, the
+keystroke itself (one broadcast per keystroke, N-1 deliveries) and the
+cursor-only traffic of non-typing peers (decision 5, item 9).
+
+Final gates on `dc26ed8`: `bench-packet-loss` every cell converged on both profiles; `bench-corruption-storm` bounded and converged; `bench-idle-backoff` recovery median 244 ms off / 510 ms on (phase 1e: 546 ms); `bench-late-join` all cells converged in relay and unicast mode; `bench-join-census` unicast late join N=100 403, fresh burst N=100 45,867 WebSocket / 39,628 Gun; `bench-sync-latency` one message per edit on all profiles; `bench-join-after-burst` all four variants PASS; plus, on the same build, `bench-periodic-awareness`, `bench-awareness-echo`, `bench-awareness-removal-burst`, `bench-idle-room` lost delete, `bench-rejoin-blank-doc`, `bench-asymmetric-join`, `bench-reconnect-cycling`, `bench-mesh-join-burst` - all green.

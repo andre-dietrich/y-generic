@@ -161,13 +161,17 @@ async function connect() {
     provider = new GenericProvider(doc, transport)
 
     // Connect with configuration
+    const persistent = (document.getElementById('persistent') as HTMLInputElement).checked
     await provider.connect({
       supabaseUrl,
       supabaseKey,
       room,
       password: password || undefined,
+      persistent,
+      doc,
       debug: true,
     })
+    if (persistent) log('Persistent mode: table yjs_documents')
 
     // Bind Quill to Yjs
     const cursors = quill!.getModule('cursors')
@@ -233,7 +237,6 @@ async function disconnect() {
     binding = null
 
     updateStatus('disconnected', 'Disconnected')
-    document.getElementById('mode-text')!.textContent = '-'
     document.getElementById('room-text')!.textContent = '-'
     document.getElementById('synced-text')!.textContent = '-'
     document.getElementById('user-count')!.textContent = '0'

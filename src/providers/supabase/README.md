@@ -38,12 +38,11 @@ CREATE TABLE yjs_documents (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Optional: Add RLS policies if needed
+-- The dashboard's Table Editor enables row level security by default;
+-- without a policy the anon key can neither read nor write the row.
 ALTER TABLE yjs_documents ENABLE ROW LEVEL SECURITY;
-
--- Allow public read/write (adjust as needed)
 CREATE POLICY "Public Access" ON yjs_documents
-  FOR ALL USING (true);
+  FOR ALL USING (true) WITH CHECK (true);
 ```
 
 ## Usage
@@ -85,14 +84,17 @@ await provider.connect({
   supabaseUrl: 'https://xxxxx.supabase.co',
   supabaseKey: 'your-anon-key',
   room: 'my-room',
-  persistent: true, // Enable persistence
-  password: 'optional-secret', // Optional password protection
-  persistDebounceMs: 2000 // Debounce database writes (default: 2000ms)
+  persistent: true,
+  doc, // the Y.Doc to persist - required with persistent: true
+  password: 'optional-secret', // optional; hashed into the row id
+  tableName: 'yjs_documents', // default
+  persistDebounceMs: 2000, // default
 })
 
-// States are synchronized AND saved to database
-// Document is loaded from database on connect
-// Updates are debounced and saved automatically
+// On connect the stored state is applied like a peer's full-state push;
+// every document update schedules a debounced write of the full state
+// (one row per room); disconnect() flushes a pending write. Not usable
+// together with compressionThresholdBytes.
 ```
 
 ### With Password Protection
@@ -118,10 +120,9 @@ interface SupabaseConfig {
 
   // Optional
   password?: string          // Password to secure the room (hashed)
-  persistent?: boolean       // Enable database persistence (default: false)
-  tableName?: string         // Database table name (default: 'yjs_documents')
-  columnName?: string        // Column for document data (default: 'content')
-  idColumnName?: string      // Column for document ID (default: 'id')
+  persistent?: boolean       // Persist the document in a table (default: false)
+  doc?: Y.Doc                // The Y.Doc to persist (required with persistent)
+  tableName?: string         // Table name (default: 'yjs_documents')
   persistDebounceMs?: number // Debounce delay for DB writes (default: 2000)
   debug?: boolean            // Enable debug logging
 }

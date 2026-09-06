@@ -209,3 +209,33 @@ Playground `npm run dev:supabase` in two browser tabs (CDN `supabase-js@2`
 = 2.115): text typed in one tab appears in the other, both list the
 other user, no console warnings. Persistent mode (a `yjs_documents`
 table) not tested - no table in the project yet.
+
+### Supabase persistence, rebuilt (2026-09-06, 22:10)
+
+The README documented a persistent mode (`persistent`, `persistDebounceMs`)
+that commit `c7b023b` (2026-03-25, "remove persistency in supabase") had
+deleted from the provider; André chose to have it back. Rebuilt on the
+Ably pattern with the old Supabase code as the template: one row per
+room in `yjs_documents` (`id`, `content` = base64 of
+`Y.encodeStateAsUpdate(doc)`, `updated_at`), loaded on connect and
+delivered as a `MESSAGE_SYNC_PUSH` frame (applied like a peer's full-state
+push: no hash check, no `synced` flip — a stored copy says nothing about
+who is online; the old code delivered the raw update with a CRC header
+and no message type, which the provider could not have parsed), written
+with a debounce after every document update, flushed on disconnect.
+Options: `persistent`, `doc` (required), `tableName`, `persistDebounceMs`.
+The Table Editor enables RLS by default, so the README's SQL now carries
+the policy the anon key needs (`FOR ALL USING (true) WITH CHECK (true)`)
+— without it the first probe got 42501 on insert and an empty select.
+
+Measured against André's project (Node, debounce 1 s in the test): row
+written 2.5 s after the first edit (6,708 chars), the flush on destroy
+carried the second edit (6,736); a persistent peer connecting alone had
+the document immediately (0 ms after connect, `synced` false as it
+should be); an ephemeral peer joining it had it after 122 ms; a third,
+persistent peer saw the ephemeral peer's edit through the first peer's
+write. Browser: tab 1 with "Persist" checked types and disconnects
+(row updated at the flush), tab 2 opens the room alone and shows the
+text, no console warnings. Playground gained the checkbox and lost a
+stale `mode-text` line that made disconnect() throw after the provider
+had already disconnected.

@@ -669,3 +669,37 @@ of this item but a pre-existing gap: a lost delete-only update is healed
 only by the loser's own beacon, which idle backoff parks for up to 60 s
 (the item-3 run of the same command passed 5/5 by phase luck). Fixed in
 the next commit.
+
+### Lost delete: the mismatch reply asks back (commit 5, found by item 2's gate)
+
+A delete-only update moves no clock, so a beacon cannot show who lacks a
+delete; both sides answer each other's beacon with their full delete set,
+which heals the *sender* of the beacon being answered. The loser of a
+lost delete was therefore healed only by its own next beacon - up to the
+60 s idle-backoff cap - the one recovery path phase 1d's behind check did
+not cover. Now a reply to a beacon whose delete-set hash differs carries
+our own beacon in the same batch (`_encodeBatch([SyncStep2, beacon])`):
+if the beacon's sender is the one ahead, it answers that with its delete
+set. It terminates - a peer healed by the SyncStep2 half sees an equal
+digest in the beacon half and stays silent - and costs 12 bytes on a
+reply that goes out anyway.
+
+A first version armed the phase-1d behind check on the mismatch instead
+and asked after the grace. It healed the two-peer bench too, but every
+peer that overheard the loser's beacon armed the same check, asked, and
+got no answer (nobody was behind it), so its response wait retried:
+`bench-packet-loss` fan-out on the Matrix profile cost ~2x the deliveries
+at 3-10 % loss (N=25: 288 → 472, 232 → 640, 200 → 456). Reverted.
+
+```
+SKIP_CENSUS=1 SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1 node bench-dist/test/dummy/bench-idle-room.js   # x2
+```
+
+| | heal time, 10 samples | deliveries per heal | converged within 11 s |
+|---|---|---|---|
+| before (item-2 build) | 473 - 9,691 ms, median ~1.9 s | 2-6 | 9 / 10 |
+| after | 330 - 3,968 ms, median ~1.9 s | 2-3 | **10 / 10** |
+
+The bound is now the editor's own re-armed beacon (≤ one base interval)
+plus one round trip, no longer the loser's backed-off tick. Gates:
+`bench-packet-loss` all cells converged, fan-out and join burst within the item-3 build's spread on both profiles (Matrix fan-out 10 % N=50: 1,405 → 1,192; 5 % N=25: 232 → 360 with a 48-984 spread); `bench-idle-backoff` recovery after backoff median 547 ms; `bench-late-join` all cells converged.

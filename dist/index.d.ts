@@ -1120,6 +1120,8 @@ export declare class GenericProvider extends Observable<string> {
      *   through here - no separate BC-specific batching logic needed.
      */
     private _sendBatch;
+    /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */
+    private _encodeBatch;
     /**
      * Send data through both BroadcastChannel (if connected) and transport.
      * All messages are wrapped with CRC32 checksum for integrity verification.

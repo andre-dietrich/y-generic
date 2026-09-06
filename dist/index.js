@@ -1727,7 +1727,23 @@ export class GenericProvider extends Observable {
             const encoder = encoding.createEncoder();
             encoding.writeVarUint(encoder, MESSAGE_SYNC);
             syncProtocol.writeSyncStep2(encoder, this.doc, remoteSv);
-            this._replyToSyncRequest(encoding.toUint8Array(encoder), false, remoteSv, senderClientID);
+            let reply = encoding.toUint8Array(encoder);
+            if (!dsEqual) {
+                // Round 5: a delete moves no clock, so the hash cannot say which of
+                // us lacks a delete - and a SyncStep2 heals only its receiver. The
+                // loser of a delete-only update was healed only by its OWN next
+                // beacon, which idle backoff parks for up to 60 s (bench-idle-room
+                // part b failed its 11 s cap at a 5 s interval). So the reply asks
+                // back: our beacon rides in the same batch, and if the sender is
+                // the one ahead it answers with its delete set. Terminates: a peer
+                // healed by the SyncStep2 half sees an equal digest in the beacon
+                // half and stays silent. (A behind-check timer on the mismatch was
+                // tried first: every peer that overheard the loser's beacon armed
+                // one and asked - ~2x the deliveries of a lossy edit burst on the
+                // Matrix profile.)
+                reply = this._encodeBatch([reply, this._encodeSyncStep1(0)]);
+            }
+            this._replyToSyncRequest(reply, false, remoteSv, senderClientID);
         }
         else if (flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM)) {
             this._replyToSyncRequest(this._encodeAck(remoteSv, remoteDsHash), true, null, senderClientID);
@@ -3024,12 +3040,16 @@ export class GenericProvider extends Observable {
             this._send(messages[0]);
             return;
         }
+        this._send(this._encodeBatch(messages));
+    }
+    /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */
+    _encodeBatch(messages) {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_BATCH);
         for (const message of messages) {
             encoding.writeVarUint8Array(encoder, message);
         }
-        this._send(encoding.toUint8Array(encoder));
+        return encoding.toUint8Array(encoder);
     }
     /**
      * Send data through both BroadcastChannel (if connected) and transport.

@@ -777,3 +777,58 @@ CHUNK_KB=0 node bench-dist/test/dummy/bench-reconnect-push.js
 Without `sendTo` the peer-connect sync still broadcasts a beacon (and no
 longer a full push, which is the 7 % at M=20); with it, the burst's cost
 is the joiners' own JOIN path. Gates: `bench-join-census` late join N=100 500 (relay) / 403 (unicast), fresh burst N=100 53,658 WebSocket / 49,896 Gun (item-3 build 51,975 / 51,282 - noise); `bench-late-join` all cells converged in relay and unicast mode; `bench-reconnect-cycling` 0 spurious gap checks; `bench-rejoin-blank-doc` 10/10 both variants (a new provider has nothing confirmed and still pushes everything); `bench-asymmetric-join` all converged.
+
+### Item 7 — persistence first: `connect({ waitFor })` (commit 7)
+
+What changed: `ConnectionConfig.waitFor?: Promise<unknown>` - typically
+the connect() promise of a persistence provider on the same document.
+`connect()` awaits it after the transport is up and before the first
+beacon; while waiting, doc updates are the local load and are not
+broadcast (`_loading`), and afterwards the loaded state counts as
+confirmed by the room (`_confirmedSv`, item 5) so there is no full-state
+push. The beacon reconciles both directions: peers behind us (our offline
+edits) see themselves behind and ask, peers ahead answer.
+
+A first version only delayed the beacon. It made things worse: the load's
+own updates went out as a broadcast (the provider cannot tell a replay
+from an edit) and the push then sent the whole document again - 100 KB
+for a 50 KB copy, against 50 KB without `waitFor`.
+
+```
+node bench-dist/test/dummy/bench-reconnect-push.js              # part 2, 16 KB chunks
+CHUNK_KB=0 node bench-dist/test/dummy/bench-reconnect-push.js
+```
+
+| Rejoin with a 50 KB persisted copy that loads 100 ms after connect | sends | document bytes on the wire |
+|---|---|---|
+| without `waitFor`, 16 KB chunks | 8 | 50 KB SyncStep2 from the room (4 chunks) + the load's broadcast |
+| without `waitFor`, no chunking | 4 | 50 KB SyncStep2 |
+| with `waitFor` (first version: beacon delayed only) | 4-10 | 100 KB (the load's broadcast + the push) |
+| with `waitFor` (shipped) | **3** | **0** (beacon + awareness, ack, presence) |
+
+Note for the two-provider pattern: the same applies to any transport
+that replays into the doc with its own origin (y-indexeddb does) - without
+`waitFor` a page load re-broadcasts the persisted copy to the room.
+
+### Item 8 — broadcast on `'change'`, not `'update'` (commit 7)
+
+What changed: when the provider owns the `Awareness` instance it listens
+on `'change'` (y-protocols filters updates whose state deep-equals the
+previous one); the sweep's renewal, an equal-state update by definition,
+is broadcast explicitly. An app-supplied instance keeps `'update'`, since
+y-protocols' own sweep renews through that event only.
+
+```
+SAME_CURSOR=1 N_VALUES=20 node bench-dist/test/dummy/bench-typing-census.js   # the typist re-sets an unchanged cursor
+N_VALUES=20 node bench-dist/test/dummy/bench-typing-census.js
+```
+
+| typing N=20, base cadence, 50 keystrokes | sends / keystroke | awareness deliveries |
+|---|---|---|
+| cursor moves with every keystroke (editor bindings) | 1.32 | 950 |
+| cursor re-set to the same value (an app writing unchanged state), before | 1.38-1.44 | 950 |
+| same, after | 1.38 | **19** (the initial state) |
+
+The editor bindings (y-quill, y-codemirror.next, y-prosemirror) dedupe
+the cursor by relative position themselves, so this pays only for apps
+that write unchanged presence state. Gates: `bench-periodic-awareness` 0 periodic awareness sends, joiner sees all presence in 35 ms; `bench-awareness-removal-burst` via the sweep 1 detector / 1 broadcast / 30 s at every N; `bench-awareness-echo` exactly N-1 at every N; `bench-idle-room` N=20 at the cap: the renewals still go out (1,292 awareness deliveries in the 60 s window, 19 beacons), lost delete 5/5; `bench-join-census` late join N=100 500, fresh burst 52,272 / 49,104.

@@ -82,6 +82,36 @@ async function main() {
       for (const k of CLASSES) shadow.census[k] = { count: 0, bytes: 0 }
     }
     a.provider.destroy()
+
+    // Part 2 (round 5, item 7): a fresh peer whose persisted copy of the
+    // document loads LOAD_MS after connect() (the IndexedDB replay racing
+    // the network connect), with and without waitFor. Counted: what the
+    // room sends it in the 2 s after connect.
+    const LOAD_MS = 100
+    const snapshot = Y.encodeStateAsUpdate(b.doc)
+    for (const waitFor of [false, true]) {
+      const c = make()
+      const loaded = new Promise<void>((resolve) =>
+        setTimeout(() => {
+          Y.applyUpdate(c.doc, snapshot)
+          resolve()
+        }, LOAD_MS),
+      )
+      shadow.counting = true
+      await c.provider.connect({ room, waitFor: waitFor ? loaded : undefined })
+      await sleep(2000)
+      shadow.counting = false
+      const parts = CLASSES.filter((k) => shadow.census[k].count > 0)
+        .map((k) => `${k} ${shadow.census[k].count} (${(shadow.census[k].bytes / 1024).toFixed(1)} KB)`)
+        .join(', ')
+      console.log(
+        `rejoin with a persisted copy loaded after ${LOAD_MS} ms, waitFor=${waitFor}: deliveries=${shadow.deliveries} sends=${shadow.sends} synced=${c.provider.synced} | ${parts}`,
+      )
+      shadow.deliveries = 0
+      shadow.sends = 0
+      for (const k of CLASSES) shadow.census[k] = { count: 0, bytes: 0 }
+      c.provider.destroy()
+    }
     b.provider.destroy()
     hub.clear()
   })

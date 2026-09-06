@@ -123,6 +123,19 @@ export interface ConnectionConfig {
     room: string;
     /** Optional password for encrypted communication */
     password?: string;
+    /**
+     * Optional: a promise GenericProvider.connect() awaits after the
+     * transport is connected and before it sends its first sync - typically
+     * the connect() promise of a persistence provider (IndexedDB) on the same
+     * document. Sent before the local copy is loaded, the first beacon
+     * carries an empty state vector and the room answers with the whole
+     * document although it is already on disk (round 5, item 7). While
+     * waiting, doc updates are treated as the load and not broadcast, and
+     * the loaded state then counts as confirmed by the room (no full-state
+     * push): the beacon reconciles both directions. Incoming messages are
+     * processed while waiting; a rejected promise is ignored.
+     */
+    waitFor?: Promise<unknown>;
     /** Any other backend-specific configuration */
     [key: string]: any;
 }

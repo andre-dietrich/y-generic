@@ -179,6 +179,11 @@ interface Transport {
   whose backend rate-limits sends per user (Matrix sets 2000 against
   Synapse's default 0.2 messages/s).
 
+When a persistence provider (IndexedDB) shares the document, pass its
+connect() promise as `connect({ room, waitFor })`: the first beacon then
+says what is already on disk, the load is not re-broadcast, and the room
+answers with nothing instead of the whole document.
+
 ### GenericProvider Class
 
 ```typescript

@@ -152,6 +152,7 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingPeerConnectIds;
     private _confirmedSv;
     private _confirmedDsHash;
+    private _loading;
     private _compressionThresholdBytes?;
     private _dsHashCache;
     private _localSeqNum;

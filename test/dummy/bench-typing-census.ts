@@ -39,6 +39,11 @@ const SETTLE_MS = Number(process.env.SETTLE_MS ?? 3000)
 // 5 min and the listeners' 15 s renewals leave the steady-state count
 // (round 5, item 2).
 const PEER_EVENTS = process.env.DUMMY_PEER_EVENTS === '1'
+// SAME_CURSOR=1: the typist re-sets the SAME cursor value on every
+// keystroke - an app that writes unchanged presence state. Before round 5
+// item 8 every such call was a broadcast (y-protocols emits 'update' for
+// every setLocalState); now only a changed state is.
+const SAME_CURSOR = process.env.SAME_CURSOR === '1'
 const LATENCY = 20
 const JITTER = 0.25
 
@@ -77,7 +82,10 @@ async function run(N: number): Promise<void> {
       for (let t = 0; t < TYPISTS; t++) {
         const text = docs[t].getText('t')
         text.insert(text.length, 'a')
-        providers[t].awareness.setLocalStateField('cursor', { anchor: text.length, head: text.length })
+        providers[t].awareness.setLocalStateField(
+          'cursor',
+          SAME_CURSOR ? { anchor: 0, head: 0 } : { anchor: text.length, head: text.length },
+        )
       }
       await sleep(GAP_MS)
     }

@@ -598,6 +598,8 @@ export class GenericProvider extends Observable<string> {
   // confirmation: the first connect still pushes everything.
   private _confirmedSv: Uint8Array | null = null
   private _confirmedDsHash: number | null = null
+  // connect() is awaiting ConnectionConfig.waitFor: doc updates are the local load.
+  private _loading: boolean = false
 
   // Outgoing-payload compression, gated by size. See
   // compressionThresholdBytes's doc comment for the wire-format
@@ -1034,6 +1036,29 @@ export class GenericProvider extends Observable<string> {
         this._rttSamples = [this.transport.expectedRttMs]
       }
 
+      // Persistence first (round 5, item 7): let a local copy load before
+      // the first beacon says what we have. While it loads, the doc
+      // updates it produces are the load, not edits - they are not
+      // broadcast - and afterwards the loaded state counts as confirmed:
+      // no full-state push. The beacon reconciles: peers behind us (our
+      // offline edits) see themselves behind and ask; peers ahead of us
+      // answer. Measured in bench-reconnect-push part 2: a 50 KB copy that
+      // loaded 100 ms after connect cost the room a 50 KB SyncStep2, and a
+      // first version of waitFor that only delayed the beacon cost 100 KB
+      // (the load's broadcast plus the push). See ConnectionConfig.waitFor.
+      if (config.waitFor) {
+        this._loading = true
+        try {
+          await config.waitFor
+        } catch {
+          // The local load failed; sync from the room as if there were none.
+        }
+        this._loading = false
+        if (this._destroying || !this.transport.isConnected) return
+        this._confirmedSv = Y.encodeStateVector(this.doc)
+        this._confirmedDsHash = this._deleteSetHash()
+      }
+
       // Send initial sync pushing our local state plus requesting remote state.
       // syncNow() is used instead of _sendSyncStep1() so that any offline edits
       // made before this connect() call are pushed to currently-connected peers
@@ -1293,7 +1318,10 @@ export class GenericProvider extends Observable<string> {
 
     // Remove awareness update listener
     if (this._awarenessUpdateHandler) {
-      this.awareness.off('update', this._awarenessUpdateHandler)
+      this.awareness.off(
+        this._ownsAwareness ? 'change' : 'update',
+        this._awarenessUpdateHandler,
+      )
       this._awarenessUpdateHandler = undefined
     }
     if (this._awarenessSweepId !== undefined) {
@@ -1571,6 +1599,7 @@ export class GenericProvider extends Observable<string> {
         lease / 2 <= now - mine.lastUpdated
       ) {
         this.awareness.setLocalState(this.awareness.getLocalState()) // renew: bumps the clock
+        this._broadcastAwareness([this.doc.clientID]) // 'change' does not fire for an equal state (item 8)
       }
       const remove: number[] = []
       this.awareness.meta.forEach((meta, clientID) => {
@@ -1684,11 +1713,10 @@ export class GenericProvider extends Observable<string> {
       // keystroke (phase 1d design A). Before this, one typist kept all N
       // peers at the base cadence: N*(N-1) deliveries per interval against
       // N-1 per keystroke.
-      if (origin !== this) this._markActivity()
-
-      // Don't send updates that originated from this provider
-      // This prevents infinite loops when receiving updates
-      if (origin !== this) {
+      // Don't send updates that originated from this provider (received
+      // from the wire) or from the local load connect() is waiting for.
+      if (origin !== this && !this._loading) {
+        this._markActivity()
         this._batchUpdate(update)
       }
     }
@@ -1832,7 +1860,18 @@ export class GenericProvider extends Observable<string> {
       this._broadcastAwareness(changedClients)
     }
 
-    this.awareness.on('update', this._awarenessUpdateHandler)
+    // Round 5, item 8: broadcast on 'change' (y-protocols filters updates
+    // whose state deep-equals the previous one) rather than 'update'
+    // (every setLocalState call) - an app that re-sets unchanged state no
+    // longer costs a broadcast per call. The renewal is the one
+    // equal-state update that must go out; the provider's own sweep sends
+    // it explicitly (_startAwarenessSweep). With an app-supplied Awareness
+    // y-protocols' own sweep renews through 'update' only, so that case
+    // keeps listening on 'update'.
+    this.awareness.on(
+      this._ownsAwareness ? 'change' : 'update',
+      this._awarenessUpdateHandler,
+    )
 
     // Cleanup: mark as offline and disconnect BC when page unloads
     if (typeof window !== 'undefined') {

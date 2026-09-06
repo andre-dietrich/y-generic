@@ -3,13 +3,20 @@
  * (or a mesh with DUMMY_UNICAST=1)?
  *
  *  (a) LATE JOIN: one empty peer joins a settled N-peer room with content
- *      (fresh budgets: settle > the 10 s rate-limit window). Counted until
- *      1 s of silence.
+ *      (settle 20 s: past the 10 s rate-limit window and past the 15 s
+ *      awareness renewal). Counted for a fixed 6 s window.
  *  (b) FRESH BURST: N empty peers connect concurrently into an empty room.
- *      Counted until 3 s of silence - this includes the CONFIRM retries of
- *      the response wait (1/2/4 s), which a count that stops at "all synced"
- *      misses entirely (phase 1e: 19k at all-synced vs 92k until quiet at
- *      N=100 on the phase-1d build).
+ *      Counted for a fixed 20 s window - this includes the CONFIRM retries of
+ *      the response wait (1/2/4 s x RTT), which a count that stops at "all
+ *      synced" misses entirely (phase 1e: 19k at all-synced vs 92k until
+ *      quiet at N=100 on the phase-1d build), and, identically for every
+ *      build, one 15 s awareness renewal per peer.
+ *
+ * Fixed windows and a 60 s periodic beacon (idle backoff off) keep periodic
+ * traffic out of the count: with a quiet-based window and the 5 s beacon,
+ * whether a build's backed-off ticks and the 15 s renewals landed inside
+ * the window depended on the build's own backoff timing (phase 1e Task 4
+ * measured 10,400 vs 30,500 for the same join for that reason alone).
  *
  * Deliveries are per recipient (a broadcast = N-1, a unicast = 1); the
  * number after the slash is broadcast/unicast sends. Presence is the
@@ -28,8 +35,10 @@ import { PROFILES as ALL_PROFILES, sleep, silenced, type Profile } from './bench
 const N_VALUES = (process.env.N ?? '50,100').split(',').map(Number)
 const PROFILE_NAMES = (process.env.PROFILES ?? 'WebSocket,Gun').split(',')
 const PROFILES: Profile[] = ALL_PROFILES.filter((p) => PROFILE_NAMES.some((n) => p.name.startsWith(n)))
-const SETTLE_MS = Number(process.env.SETTLE_MS ?? 11000)
-const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 5000)
+const SETTLE_MS = Number(process.env.SETTLE_MS ?? 20000)
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 60000)
+const LATE_WINDOW_MS = 6000
+const FRESH_WINDOW_MS = 20000
 const UNICAST = process.env.DUMMY_UNICAST === '1'
 
 type Cls = 'beacon' | 'ack' | 'syncStep2' | 'push' | 'awareness' | 'other'
@@ -67,11 +76,10 @@ function newCensus(): Census {
 
 /** Shadow broadcast and unicast on the hub; count while `counting`. */
 function shadowHub(hub: DummyHub) {
-  const s = { counting: false, deliveries: newCensus(), sends: newCensus(), lastSend: 0 }
+  const s = { counting: false, deliveries: newCensus(), sends: newCensus() }
   const count = (data: Uint8Array, recipients: number) => {
     if (!s.counting || data.length < 5) return
-    s.lastSend = Date.now()
-    classify(data.subarray(4), s.deliveries, recipients)
+        classify(data.subarray(4), s.deliveries, recipients)
     classify(data.subarray(4), s.sends, 1)
   }
   const origB = hub.broadcast.bind(hub)
@@ -100,15 +108,21 @@ function mk(hub: DummyHub, p: Profile, id: number) {
   const prov = new GenericProvider(
     doc,
     new DummyTransport({ hub, latency: p.latency, jitter: p.jitter, unicast: UNICAST }),
-    { batchUpdates: 0, verifyUpdates: true, syncInterval: SYNC_INTERVAL_MS, disableBc: true },
+    {
+      batchUpdates: 0,
+      verifyUpdates: true,
+      syncInterval: SYNC_INTERVAL_MS,
+      idleBackoffEnabled: false,
+      disableBc: true,
+    },
   )
   prov.awareness.setLocalStateField('user', { id })
   return { doc, prov }
 }
 
-async function untilQuiet(s: ReturnType<typeof shadowHub>, quietMs: number, capMs: number, tick?: () => void) {
+async function forWindow(windowMs: number, tick?: () => void) {
   const t0 = Date.now()
-  while (Date.now() - s.lastSend < quietMs && Date.now() - t0 < capMs) {
+  while (Date.now() - t0 < windowMs) {
     tick?.()
     await sleep(5)
   }
@@ -127,11 +141,10 @@ async function lateJoin(N: number, p: Profile): Promise<void> {
     const joiner = mk(hub, p, N)
     s.counting = true
     const t0 = Date.now()
-    s.lastSend = t0
     await joiner.prov.connect({ room })
     let syncedAt = -1
     let contentAt = -1
-    await untilQuiet(s, 1000, 8000, () => {
+    await forWindow(LATE_WINDOW_MS, () => {
       if (syncedAt < 0 && joiner.prov.synced) syncedAt = Date.now() - t0
       if (contentAt < 0 && joiner.doc.getText('t').length > 0) contentAt = Date.now() - t0
     })
@@ -151,11 +164,10 @@ async function freshBurst(N: number, p: Profile): Promise<void> {
     const peers = Array.from({ length: N }, (_, i) => mk(hub, p, i))
     s.counting = true
     const t0 = Date.now()
-    s.lastSend = t0
     await Promise.all(peers.map((x) => x.prov.connect({ room })))
     let allSyncedAt = -1
     let atAllSynced = 0
-    await untilQuiet(s, 3000, 25000, () => {
+    await forWindow(FRESH_WINDOW_MS, () => {
       if (allSyncedAt < 0 && peers.every((x) => x.prov.synced)) {
         allSyncedAt = Date.now() - t0
         atAllSynced = CLASSES.reduce((a, c) => a + s.deliveries[c], 0)
@@ -163,7 +175,7 @@ async function freshBurst(N: number, p: Profile): Promise<void> {
     })
     s.counting = false
     console.log(
-      `${p.name.split(' ')[0].padEnd(9)} N=${String(N).padStart(3)} | ${fmt(s)} | all synced ${allSyncedAt} ms at ${atAllSynced}, quiet after ${Date.now() - t0} ms`,
+      `${p.name.split(' ')[0].padEnd(9)} N=${String(N).padStart(3)} | ${fmt(s)} | all synced ${allSyncedAt} ms at ${atAllSynced}`,
     )
     for (const x of peers) x.prov.destroy()
     hub.clear()
@@ -172,9 +184,9 @@ async function freshBurst(N: number, p: Profile): Promise<void> {
 
 async function main() {
   console.log(`mode: ${UNICAST ? 'unicast' : 'relay'}, syncInterval ${SYNC_INTERVAL_MS} ms`)
-  console.log('\n=== (a) one late joiner into a settled room with content (deliveries/sends per class) ===')
+  console.log(`\n=== (a) one late joiner into a settled room with content, ${LATE_WINDOW_MS / 1000} s window (deliveries/sends per class) ===`)
   for (const p of PROFILES) for (const N of N_VALUES) await lateJoin(N, p)
-  console.log('\n=== (b) fresh-room join burst, counted until 3 s of quiet ===')
+  console.log(`\n=== (b) fresh-room join burst, ${FRESH_WINDOW_MS / 1000} s window ===`)
   for (const p of PROFILES) for (const N of N_VALUES) await freshBurst(N, p)
 }
 main()

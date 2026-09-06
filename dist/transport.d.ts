@@ -57,6 +57,17 @@ export interface Transport {
      */
     onPeerConnect?(callback: (peerId: string) => void): () => void;
     /**
+     * Optional: the counterpart of onPeerConnect - fires when a peer's data
+     * channel closes (mesh transports) or the backend's presence service
+     * reports it gone (PubNub leave/timeout). The id is the one `onMessage`
+     * passed as `from` for that peer. GenericProvider then drops that peer's
+     * awareness state at once instead of after the awareness lease, forgets
+     * its address, and - since departures are reported by the transport -
+     * lets `awarenessTimeoutMs` default to a long safety net, which removes
+     * the 15 s awareness renewal broadcasts (round 5, item 2).
+     */
+    onPeerDisconnect?(callback: (peerId: string) => void): () => void;
+    /**
      * Check if the transport is currently connected.
      */
     readonly isConnected: boolean;

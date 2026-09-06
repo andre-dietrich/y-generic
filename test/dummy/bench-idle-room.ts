@@ -48,6 +48,12 @@ const OBSERVE_MS = Number(process.env.OBSERVE_MS ?? 10000)
 // IDLE_BACKOFF=1 enables GenericProvider's opt-in idle backoff (round 3,
 // default off) for the peers under test - the phase-1c decision numbers.
 const IDLE_BACKOFF = process.env.IDLE_BACKOFF === '1'
+// DUMMY_PEER_EVENTS=1 models a transport that reports peer joins and
+// departures (onPeerConnect/onPeerDisconnect: the mesh transports, PubNub
+// presence). With the leave signal present the awareness lease defaults to
+// 5 min instead of y-protocols' 30 s (round 5, item 2), so the 15 s
+// renewals disappear from the census.
+const PEER_EVENTS = process.env.DUMMY_PEER_EVENTS === '1'
 // Override with N_VALUES=20,50 to run a subset.
 const N_VALUES = (process.env.N_VALUES ?? '5,20,50').split(',').map(Number)
 const LOST_DELETE_CAP_MS = Math.max(5000, 2 * SYNC_INTERVAL_MS + 1000)
@@ -156,6 +162,7 @@ function makeProvider(hub: DummyHub, doc: Y.Doc, id: number | string): GenericPr
     latency: LATENCY,
     jitter: JITTER,
     unicast: process.env.DUMMY_UNICAST === '1',
+    simulatePeerConnect: PEER_EVENTS,
   })
   const provider = new GenericProvider(doc, transport, {
     batchUpdates: 0,
@@ -373,7 +380,7 @@ async function main() {
   if (!hashOk) process.exitCode = 1
 
   console.log(
-    `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms idleBackoff=${IDLE_BACKOFF}\n`,
+    `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms idleBackoff=${IDLE_BACKOFF} peerEvents=${PEER_EVENTS}\n`,
   )
   if (!process.env.SKIP_CENSUS) for (const N of N_VALUES) await runCensus(N)
   console.log(`\n(b) lost delete-only update, 2 peers, ${LOST_DELETE_SAMPLES} samples (cap ${LOST_DELETE_CAP_MS}ms):\n`)

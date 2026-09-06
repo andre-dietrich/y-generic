@@ -137,6 +137,7 @@ interface Transport {
 
   // Optional - each one unlocks a cheaper code path when present
   onPeerConnect?(callback: (peerId: string) => void): () => void
+  onPeerDisconnect?(callback: (peerId: string) => void): () => void
   sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
   readonly preferredBatchMs?: number
   readonly expectedRttMs?: number
@@ -148,7 +149,15 @@ interface Transport {
 **That's it!** Just 4 methods + 1 property. The optional members:
 
 - `onPeerConnect` - mesh transports fire it per newly opened peer channel so
-  the provider can push its state to that peer right away.
+  the provider can send that peer a sync beacon right away (a full-state
+  push to every connection before round 5).
+- `onPeerDisconnect` - the counterpart: a peer's channel closed, or the
+  backend's presence service reports it gone (peerjs, simple-peer,
+  trystero, PubNub implement it). The provider drops that peer's presence
+  at once instead of after the awareness lease, and lets the lease default
+  to 5 minutes instead of 30 s - which removes the 15 s presence renewal
+  every peer otherwise broadcasts (80 % of an idle room's traffic once the
+  beacons have backed off).
 - `from` + `sendTo` - if your transport knows which peer a message came
   from, pass that peer's id as the second callback argument and implement
   `sendTo`. The provider then answers that peer's sync requests directly
@@ -189,8 +198,10 @@ class GenericProvider extends Observable<string> {
     syncInterval?: number     // Auto-sync interval in ms (default: 5000, set 0 to disable)
     idleBackoffEnabled?: boolean // Double the interval while the room is idle, up to idleBackoffMaxMs (default: true)
     idleBackoffMaxMs?: number // Ceiling for the backed-off interval (default: 60000)
+    trickleK?: number         // Skip a periodic beacon when this many equal digests were overheard since the last one (default: 1, 0 = off)
+    awarenessTimeoutMs?: number // Presence lease; renew after half of it (default: 30000, or 300000 when the transport has onPeerDisconnect)
     verifyUpdates?: boolean   // Send hash with each update for fast desync detection (default: true)
-    batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = disabled, recommended: 50-200)
+    batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = end of the current task, recommended: 50-200)
   })
   
   connect(config: ConnectionConfig): Promise<void>
@@ -463,7 +474,10 @@ const provider = new GenericProvider(doc, transport, {
 - Performance impact is minimal: each tick sends one small digest beacon
   (state vector plus a hash of the delete set), and peers answer only when
   the sender is actually missing something. A fully synced room exchanges
-  beacons and nothing else.
+  beacons and nothing else - and since round 5 a peer that overheard a
+  beacon with exactly its own digest since its last tick stays silent at
+  the next one (Trickle, RFC 6206; `trickleK`), so an idle room sends one
+  or two beacons per interval in total instead of one per peer.
 
 For most production scenarios, the default 5-second interval provides good resilience without excessive traffic. For testing with simulated packet loss, use a shorter interval (e.g., 2 seconds).
 
@@ -487,7 +501,12 @@ flight). `idleBackoffEnabled: false` keeps the fixed cadence.
 
 ### Update Batching (Debouncing)
 
-By default, every document change triggers an immediate network transmission. For performance optimization, you can enable **update batching** (also called **debouncing**):
+By default, every document change is sent at the end of the task that
+produced it (a microtask, no timer): the several Yjs transactions one
+input event can produce leave as one message, and the cursor update an
+editor binding sets right after the text change rides in the same wire
+message - one keystroke, one message. For further reduction you can
+enable **update batching** (also called **debouncing**):
 
 ```typescript
 // Default behavior - send updates immediately

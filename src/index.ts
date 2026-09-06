@@ -629,6 +629,26 @@ export class GenericProvider extends Observable<string> {
 
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
+
+  // Round 5, item 2 - the awareness lease. y-protocols/awareness renews the
+  // local state every outdatedTimeout/2 = 15 s and drops silent peers at
+  // 30 s, both module constants (awareness.js). Measured in
+  // test/dummy/bench-idle-room.ts (steady-state mode): once idle backoff
+  // has parked the beacons at the 60 s cap, those renewals are 80 % of an
+  // idle room's deliveries (N=50: 9,800 of 12,250 per minute) and a third
+  // of a typing room's. When the provider created the Awareness instance
+  // it replaces that sweep with its own at `_awarenessTimeoutMs`
+  // (`_awarenessSweepId`), renews only after lease/2 of silence - any
+  // digest, verified update or ack we send counts as presence
+  // (`_touchPeer`, the MQTT keep-alive rule), and any such message from a
+  // peer refreshes its lease here - and removes with origin 'timeout', so
+  // the existing removal suppression applies. Transports that report
+  // departures (onPeerDisconnect) default the lease to 5 min: the renewal
+  // class then all but disappears. Room-wide setting - a removal is
+  // authoritative by clock, so the shortest lease in a room decides.
+  private _awarenessTimeoutMs: number
+  private _awarenessSweepId?: ReturnType<typeof setTimeout>
+  private _ownsAwareness: boolean
   private _unsubscribeTransport?: () => void
   private _beforeUnloadHandler?: () => void
 
@@ -801,6 +821,23 @@ export class GenericProvider extends Observable<string> {
        */
       compressionThresholdBytes?: number
       /**
+       * Awareness lease (ms): a peer whose presence has not been refreshed
+       * for this long is removed; our own state is re-announced after half
+       * of it without any digest, update or ack from us. Replaces
+       * y-protocols/awareness's fixed 30 s / 15 s when the provider created
+       * the Awareness instance (an `awareness` passed in keeps y-protocols'
+       * own sweep and constants). Every peer of a room must use the same
+       * value: a removal is authoritative, so the shortest lease in the room
+       * decides for everyone and a longer-lease peer would flap. Longer =
+       * fewer renewal broadcasts (N(N-1) per lease/2), but a crashed peer's
+       * presence lingers up to this long on transports without a leave
+       * signal.
+       * @default 300000 when the transport implements `onPeerDisconnect`
+       * (departures are reported, the lease is only a safety net), else
+       * 30000 (y-protocols' value)
+       */
+      awarenessTimeoutMs?: number
+      /**
        * Trickle redundancy constant (RFC 6206 §4.2) for the periodic
        * beacon: the tick stays silent when at least this many periodic
        * beacons with a digest equal to ours were overheard since the
@@ -891,6 +928,11 @@ export class GenericProvider extends Observable<string> {
     this._idleBackoffEnabled = options.idleBackoffEnabled ?? true
     this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000
     this._trickleK = options.trickleK ?? 1
+    this._ownsAwareness = !options.awareness
+    this._awarenessTimeoutMs =
+      options.awarenessTimeoutMs ??
+      (typeof transport.onPeerDisconnect === 'function' ? 300000 : 30000)
+    if (this._ownsAwareness) this._startAwarenessSweep()
     this._currentSyncIntervalMs = this._syncInterval
 
     this._setupDocumentSync()
@@ -948,6 +990,16 @@ export class GenericProvider extends Observable<string> {
         this._unsubscribeTransport = () => {
           originalUnsub?.()
           unsubPeer()
+        }
+      }
+      if (this.transport.onPeerDisconnect) {
+        const unsubLeave = this.transport.onPeerDisconnect((peerId: string) => {
+          if (!this._destroying) this._handlePeerLeave(peerId)
+        })
+        const originalUnsub = this._unsubscribeTransport
+        this._unsubscribeTransport = () => {
+          originalUnsub?.()
+          unsubLeave()
         }
       }
 
@@ -1224,6 +1276,10 @@ export class GenericProvider extends Observable<string> {
       this.awareness.off('update', this._awarenessUpdateHandler)
       this._awarenessUpdateHandler = undefined
     }
+    if (this._awarenessSweepId !== undefined) {
+      clearTimeout(this._awarenessSweepId)
+      this._awarenessSweepId = undefined
+    }
 
     // Remove beforeunload handler
     if (this._beforeUnloadHandler && typeof window !== 'undefined') {
@@ -1455,6 +1511,90 @@ export class GenericProvider extends Observable<string> {
     }
   }
 
+  /**
+   * Replace y-protocols' awareness sweep (awareness.js `_checkInterval`:
+   * renew at outdatedTimeout/2, remove at outdatedTimeout, every
+   * outdatedTimeout/10) with the same loop at `_awarenessTimeoutMs`, the
+   * period jittered so a room that joined together does not renew in one
+   * burst (measured: all 49 listeners of a 50-peer room renewed inside the
+   * same 10 s window). Only when we created the instance - see
+   * `_ownsAwareness`.
+   */
+  private _startAwarenessSweep(): void {
+    const aw = this.awareness as unknown as { _checkInterval?: ReturnType<typeof setInterval> }
+    if (aw._checkInterval !== undefined) clearInterval(aw._checkInterval)
+    const lease = this._awarenessTimeoutMs
+    const arm = () => {
+      this._awarenessSweepId = setTimeout(tick, (lease / 10) * (0.8 + Math.random() * 0.4))
+    }
+    const tick = () => {
+      const now = Date.now()
+      const mine = this.awareness.meta.get(this.doc.clientID)
+      if (
+        this.awareness.getLocalState() !== null &&
+        mine !== undefined &&
+        lease / 2 <= now - mine.lastUpdated
+      ) {
+        this.awareness.setLocalState(this.awareness.getLocalState()) // renew: bumps the clock
+      }
+      const remove: number[] = []
+      this.awareness.meta.forEach((meta, clientID) => {
+        if (
+          clientID !== this.doc.clientID &&
+          lease <= now - meta.lastUpdated &&
+          this.awareness.getStates().has(clientID)
+        ) {
+          remove.push(clientID)
+        }
+      })
+      if (remove.length > 0) {
+        awarenessProtocol.removeAwarenessStates(this.awareness, remove, 'timeout')
+      }
+      if (!this._destroying) arm()
+    }
+    arm()
+  }
+
+  /**
+   * A digest, verified update or ack from `clientID` (or one we are about
+   * to send, for our own id) is proof of presence: refresh the lease the
+   * sweep above checks. Only for ids with a state - a departed peer's
+   * `meta` entry survives its removal (y-protocols keeps it for the clock)
+   * and must not be revived by a late message.
+   */
+  private _touchPeer(clientID: number): void {
+    const meta = this.awareness.meta.get(clientID)
+    if (meta !== undefined && this.awareness.getStates().has(clientID)) {
+      meta.lastUpdated = Date.now()
+    }
+  }
+
+  /**
+   * Transport.onPeerDisconnect: the peer at `peerId` is gone. Forget its
+   * address and id, drop its awareness state with origin 'peer-left': the
+   * broadcast goes through the same suppression as a timeout removal, but
+   * with a long window - every peer gets the leave signal in the same
+   * millisecond, and at the reply window (~170 ms at N=50) 28 of 49
+   * survivors broadcast before the first broadcast could be overheard
+   * (bench-awareness-removal-burst, DUMMY_PEER_EVENTS=1). One broadcast
+   * room-wide is still worth having: it corrects a joiner that received
+   * this peer in a relayed presence table but had no channel to it yet.
+   */
+  private _handlePeerLeave(peerId: string): void {
+    const gone: number[] = []
+    for (const [clientID, address] of this._peerAddress) {
+      if (address === peerId) gone.push(clientID)
+    }
+    for (const id of gone) {
+      this._peerAddress.delete(id)
+      this._knownPeers.delete(id)
+    }
+    const present = gone.filter((id) => this.awareness.getStates().has(id))
+    if (present.length > 0) {
+      awarenessProtocol.removeAwarenessStates(this.awareness, present, 'peer-left')
+    }
+  }
+
   /** Cached delete-set hash - see computeDeleteSetHash(). */
   private _deleteSetHash(): number {
     if (this._dsHashCache === null) {
@@ -1637,8 +1777,8 @@ export class GenericProvider extends Observable<string> {
       // redundant) or to added/updated clients (every sender's
       // cursor/presence data is meaningfully different and must never be
       // suppressed).
-      if (origin === 'timeout') {
-        this._scheduleAwarenessRemoval(changedClients)
+      if (origin === 'timeout' || origin === 'peer-left') {
+        this._scheduleAwarenessRemoval(changedClients, origin)
         return
       }
 
@@ -1921,6 +2061,7 @@ export class GenericProvider extends Observable<string> {
         this._trackRemoteSeq(senderClientID, seqNum)
         this._knownPeers.add(senderClientID)
         if (from !== undefined) this._peerAddress.set(senderClientID, from)
+        this._touchPeer(senderClientID)
 
         // Always apply the update. Yjs updates are idempotent/commutative,
         // so re-applying an already-seen update is a harmless no-op.
@@ -2081,6 +2222,7 @@ export class GenericProvider extends Observable<string> {
     const senderClientID = decoding.readVarUint(decoder)
     this._knownPeers.add(senderClientID)
     if (from !== undefined) this._peerAddress.set(senderClientID, from)
+    this._touchPeer(senderClientID)
     const remoteSv = decoding.readVarUint8Array(decoder)
     const remoteDsHash = decoding.readVarUint(decoder)
     // Any trailing bytes belong to a newer version; ignored by design.
@@ -2799,27 +2941,33 @@ export class GenericProvider extends Observable<string> {
    * (`_replySuppressionMaxDelay()`).
    *
    * A pending removal already queued when this is called is for a
-   * DIFFERENT departure (two peers timing out within the same suppression
-   * window) - flush it immediately rather than silently overwrite it, then
-   * queue the new one fresh. If it turns out to cover more than one
-   * clientID and only some overlap with a later-overheard broadcast,
-   * `_cancelPendingAwarenessRemovalIfOverlaps()` drops the whole pending
-   * set on ANY overlap rather than partially trimming it - simpler, and
-   * the dropped-but-not-actually-covered client(s) are still safe: every
-   * OTHER surviving peer is independently running this same suppression
-   * for them too.
+   * DIFFERENT departure (two peers timing out, or leaving, within the same
+   * window): since round 5 the ids are merged into the pending set and its
+   * timer kept - one broadcast carries both - instead of flushing the
+   * first as an unsuppressed broadcast (with the long leave window below a
+   * burst of departures would have flushed on every peer). An overheard
+   * broadcast trims only the ids it covers from the pending set
+   * (`_cancelPendingAwarenessRemovalIfOverlaps()`).
+   *
+   * Window: the reply-suppression window for timeouts (sweeps are spread
+   * over seconds anyway); for leaves reported by the transport - all
+   * survivors learn of them in the same millisecond - ten times that,
+   * at least a second, so the first broadcast is overheard before the
+   * rest fire. A departure is not urgent: every peer already dropped the
+   * state locally.
    */
-  private _scheduleAwarenessRemoval(clients: number[]): void {
+  private _scheduleAwarenessRemoval(clients: number[], origin: string = 'timeout'): void {
     if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
-      if (this._pendingAwarenessRemoval) {
-        this._broadcastAwareness(this._pendingAwarenessRemoval)
-      }
-      clearTimeout(this._pendingAwarenessRemovalTimeoutId)
-      this._pendingAwarenessRemovalTimeoutId = undefined
+      const pending = this._pendingAwarenessRemoval ?? []
+      for (const id of clients) if (!pending.includes(id)) pending.push(id)
+      this._pendingAwarenessRemoval = pending
+      return
     }
 
-    this._pendingAwarenessRemoval = clients
-    const delay = Math.random() * this._replySuppressionMaxDelay()
+    this._pendingAwarenessRemoval = clients.slice()
+    const window = this._replySuppressionMaxDelay()
+    const delay =
+      Math.random() * (origin === 'peer-left' ? Math.max(1000, 10 * window) : window)
     this._pendingAwarenessRemovalTimeoutId = setTimeout(() => {
       this._pendingAwarenessRemovalTimeoutId = undefined
       if (this._pendingAwarenessRemoval) {
@@ -2873,17 +3021,20 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Drop a pending suppressed removal broadcast if it overlaps
-   * `removedClientIds` - someone else already broadcast (at least part of)
-   * the same departure, so ours is redundant.
+   * Trim a pending suppressed removal broadcast by `removedClientIds` -
+   * someone else already broadcast those departures; what they did not
+   * cover stays queued.
    */
   private _cancelPendingAwarenessRemovalIfOverlaps(
     removedClientIds: number[],
   ): void {
     if (!this._pendingAwarenessRemoval) return
-    if (
-      !this._pendingAwarenessRemoval.some((id) => removedClientIds.includes(id))
-    ) {
+    const rest = this._pendingAwarenessRemoval.filter(
+      (id) => !removedClientIds.includes(id),
+    )
+    if (rest.length === this._pendingAwarenessRemoval.length) return
+    if (rest.length > 0) {
+      this._pendingAwarenessRemoval = rest // someone covered part of it; the rest stays queued
       return
     }
     if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
@@ -3128,6 +3279,7 @@ export class GenericProvider extends Observable<string> {
    */
   private _encodeSyncStep1(flags: number = 0): Uint8Array {
     if (this._confirmed) flags |= DIGEST_FLAG_SETTLED
+    this._touchPeer(this.doc.clientID)
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST)
     encoding.writeVarUint(encoder, DIGEST_VERSION)
@@ -3144,6 +3296,7 @@ export class GenericProvider extends Observable<string> {
    * of ours (see DIGEST_FLAG_ACK for why it must never carry our own state).
    */
   private _encodeAck(ackedSv: Uint8Array, ackedDsHash: number): Uint8Array {
+    this._touchPeer(this.doc.clientID)
     const encoder = encoding.createEncoder()
     encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST)
     encoding.writeVarUint(encoder, DIGEST_VERSION)
@@ -3187,6 +3340,7 @@ export class GenericProvider extends Observable<string> {
     const encoder = encoding.createEncoder()
 
     if (this._verifyUpdates) {
+      this._touchPeer(this.doc.clientID)
       // Use verified sync protocol with sequence number and hash
       encoding.writeVarUint(encoder, MESSAGE_SYNC_VERIFIED)
 

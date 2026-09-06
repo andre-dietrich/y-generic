@@ -121,9 +121,10 @@ export class PubNubTransport {
                                 ? this.base64ToUint8(event.message)
                                 : new Uint8Array(event.message);
                             this.log(`📨 Received ${data.length} bytes from ${event.publisher}`);
-                            // If callback is set, process immediately
+                            // If callback is set, process immediately (the publisher
+                            // uuid is the peer id onPeerDisconnect reports)
                             if (this.messageCallback) {
-                                this.messageCallback(data);
+                                this.messageCallback(data, event.publisher);
                             }
                             else {
                                 // Buffer message until callback is registered
@@ -138,6 +139,13 @@ export class PubNubTransport {
                 },
                 presence: (event) => {
                     this.log(`Presence: ${event.action}`, event);
+                    // PubNub presence (withPresence below): leave = clean unsubscribe,
+                    // timeout = heartbeat missed. Both mean the peer is gone.
+                    if ((event.action === 'leave' || event.action === 'timeout') &&
+                        event.uuid &&
+                        event.uuid !== this.uuid) {
+                        this._peerDisconnectCallback?.(event.uuid);
+                    }
                 },
             });
             // Subscribe to channel
@@ -261,7 +269,7 @@ export class PubNubTransport {
                 const reassembledData = this.base64ToUint8(base64Data);
                 this.log(`✅ Message reassembled: ${reassembledData.length} bytes from ${publisher}`);
                 if (this.messageCallback) {
-                    this.messageCallback(reassembledData);
+                    this.messageCallback(reassembledData, publisher);
                 }
                 else {
                     this.messageBuffer.push(reassembledData);
@@ -287,6 +295,17 @@ export class PubNubTransport {
         }
         return () => {
             this.messageCallback = undefined;
+        };
+    }
+    /**
+     * Transport.onPeerDisconnect: PubNub presence leave/timeout events for
+     * the channel (the subscription already runs withPresence). Peer ids are
+     * publisher uuids, the same `from` onMessage passes.
+     */
+    onPeerDisconnect(callback) {
+        this._peerDisconnectCallback = callback;
+        return () => {
+            this._peerDisconnectCallback = undefined;
         };
     }
     /**

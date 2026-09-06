@@ -595,3 +595,77 @@ converged on WebSocket and Matrix, 0 and 3 % loss; `bench-join-census`
 late join N=100 500 deliveries (phase 1e: 500), fresh burst N=100
 WebSocket 51,975 / Gun 51,282 (phase 1e: ~54k) - the join path never
 suppresses; `bench-packet-loss` every cell 3/3 converged at 0-10 % loss, N 5-50, WebSocket and Matrix profiles (Matrix 10 % N=50: 4,426 deliveries, inside the phase-1e range); `bench-corruption-storm` bounded and converged at every rate (N=10, 50 % corruption: 873 deliveries during the 3 s stream vs 792 at 0 %).
+
+### Item 2 — awareness lease: transport liveness, own sweep, keep-alive (commit 4)
+
+What changed:
+- `src/transport.ts`: optional `onPeerDisconnect?(cb(peerId))`, the
+  counterpart of `onPeerConnect`; implemented by the dummy
+  (`simulatePeerConnect`: the hub reports a transport leaving the room),
+  trystero (`onPeerLeave`), simple-peer and peerjs (`removePeer`: channel
+  close/error, coordinator `peer-left`), PubNub (presence `leave`/`timeout`
+  on the subscription that already ran `withPresence`; messages now pass
+  the publisher uuid as `from`). Ably (`presence.subscribe`), Supabase
+  (`channel.track()` + presence events) and Matrix (`m.room.member`) have
+  the signal too and are left for a later commit - untested backends.
+- `src/index.ts`: `awarenessTimeoutMs` option (default 30 000, or
+  300 000 when the transport implements `onPeerDisconnect`); when the
+  provider created the `Awareness` instance it clears y-protocols'
+  `_checkInterval` and runs its own sweep (`_startAwarenessSweep`: renew
+  at lease/2 of silence, remove at the lease, period lease/10 jittered
+  ±20 %); any digest, verified update or ack we send counts as our
+  presence and any such message from a peer refreshes its lease
+  (`_touchPeer`, the MQTT keep-alive rule); a reported leave removes that
+  peer's state with origin `'peer-left'`, forgets its id and address
+  (`_handlePeerLeave`). Leave-triggered removal broadcasts take a ten
+  times longer suppression window (≥ 1 s): every survivor learns of a
+  leave in the same millisecond, and at the reply window 28 of 49 fired
+  before the first could be overheard. Pending removals are now merged
+  (one broadcast for a burst of departures) instead of the first being
+  flushed unsuppressed, and an overheard removal trims only the ids it
+  covers.
+
+```
+SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1 SETTLE_MS=90000 OBSERVE_MS=60000 N_VALUES=50 \
+  node bench-dist/test/dummy/bench-idle-room.js                                   # relay control
+DUMMY_PEER_EVENTS=1 SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1 SETTLE_MS=90000 OBSERVE_MS=300000 N_VALUES=50 \
+  node bench-dist/test/dummy/bench-idle-room.js                                   # one full 5-min lease
+SETTLE_MS=90000 N_VALUES=50 [DUMMY_PEER_EVENTS=1] node bench-dist/test/dummy/bench-typing-census.js
+[DUMMY_PEER_EVENTS=1] node bench-dist/test/dummy/bench-awareness-removal-burst.js
+```
+
+| Scenario | before (item-3 build) → after | request | awareness |
+|---|---|---|---|
+| idle N=50 at the cap, relay (lease 30 s), 60 s | 9,849 → 8,869 deliveries | 49 → 49 | 9,800 → 8,820 (window effect of the jitter; the long-run rate, one renewal per peer per 15 s, is unchanged on transports without a leave signal) |
+| idle N=50 at the cap, **peer events** (lease 5 min), 300 s | 49,245 (5 × 9,849) → **4,998** (−90 %; 17 /s, 0.3 /s/peer) | 245 | 4,753 (one renewal per peer per 150 s) |
+| typing N=50 steady, relay | 4,949 → 4,018; 2.02 → 1.64 sends / keystroke | 98 | 3,920 (30 renewals in the window instead of 49 - the burst is spread, not gone) |
+| typing N=50 steady, **peer events** | 4,949 → **2,548** (−49 %); 2.02 → **1.04** sends / keystroke | 98 | 2,450 (cursor only) |
+
+Departure of one peer (`bench-awareness-removal-burst`, detectors = survivors that dropped the state on their own; removalMsgs/removalDlvr = removal-only broadcasts and their deliveries; detectMs = until every survivor had dropped it):
+
+| N | timeout sweep (control): detectors / msgs / deliveries / ms | leave signal: detectors / msgs / deliveries / ms |
+|---|---|---|
+| 5 | 2 / 1 / 3 / 30,177 | 4 / 1 / 3 / 8 |
+| 10 | 1 / 1 / 8 / 30,339 | 9 / 1 / 8 / 5 |
+| 20 | 2 / 1 / 18 / 30,094 | 19 / 4 / 72 / 5 |
+| 50 | 3 / 1 / 48 / 29,987 | 49 / 2 / 96 / 7 |
+
+(Before round 5 the timeout path already cost ~1 broadcast per departure
+thanks to the round-3 suppression, at 30 s detection; the jittered sweep
+now lets the first detector's broadcast pre-empt the others' sweeps, so
+1-2 survivors detect on their own instead of all N-1 in the same 3 s
+tick. The first leave-signal run, at the reply window, cost 28 broadcasts
+/ 1,344 deliveries at N=50 - the number that motivated the long window.
+A first version of that bench also counted its own teardown, where every
+`destroy()` is a reported leave: 70 "removal" broadcasts at N=50 that
+were the bench, not the protocol.)
+
+Gates on the item-2 build: `bench-periodic-awareness` 0 periodic
+awareness sends in both configs, joiner sees all presence in 37 ms;
+`bench-idle-backoff` recovery after backoff median 630 ms (item-3 build: 608 ms; off: 262 ms). The lost-delete check (`bench-idle-room` part b)
+with `SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1` failed its 11 s cap in 2 of 5
+samples on this build and 1 of 5 on the relay control - not a regression
+of this item but a pre-existing gap: a lost delete-only update is healed
+only by the loser's own beacon, which idle backoff parks for up to 60 s
+(the item-3 run of the same command passed 5/5 by phase luck). Fixed in
+the next commit.

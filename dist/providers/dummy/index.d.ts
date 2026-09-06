@@ -60,6 +60,16 @@ export declare class DummyHub {
      */
     leave(room: string, transport: DummyTransport): void;
     private peerConnectSubs;
+    private peerDisconnectSubs;
+    /** Register a transport's onPeerDisconnect callback (see notifyLeave). */
+    registerPeerDisconnect(room: string, transport: DummyTransport, callback: (peerId: string) => void): void;
+    unregisterPeerDisconnect(room: string, transport: DummyTransport): void;
+    /**
+     * Simulate the leave notification a mesh transport's channel close (or a
+     * presence service) gives every other peer: called by DummyTransport
+     * when it leaves a room with `simulatePeerConnect` on.
+     */
+    notifyLeave(room: string, transport: DummyTransport): void;
     /**
      * Register a transport's onPeerConnect callback and simulate the
      * peer-discovery notifications a real mesh transport (peerjs,
@@ -223,6 +233,7 @@ export declare class DummyTransport implements Transport {
      */
     readonly sendTo?: (peerId: string, data: Uint8Array) => void;
     private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
     /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
     private _chunkBuffers;
     /**
@@ -243,6 +254,7 @@ export declare class DummyTransport implements Transport {
      * silently suppressing periodic awareness re-announce for plain
      * DummyTransport usage too - a real bug, not just untidiness.
      */
+    readonly onPeerDisconnect?: (callback: (peerId: string) => void) => () => void;
     readonly onPeerConnect?: (callback: (peerId: string) => void) => () => void;
     /**
      * Create a new DummyTransport.

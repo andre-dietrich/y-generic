@@ -125,6 +125,7 @@ export declare class SimplePeerTransport implements Transport {
     private _room;
     private _callback?;
     private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
     private peerId;
     private peers;
     private signalingConns;
@@ -172,6 +173,8 @@ export declare class SimplePeerTransport implements Transport {
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
+    /** Transport.onPeerDisconnect: a peer's channel closed or errored (removePeer). */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
      * Check if connected.
      */

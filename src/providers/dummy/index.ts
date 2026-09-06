@@ -96,6 +96,46 @@ export class DummyHub {
     string,
     Set<{ transport: DummyTransport; callback: (peerId: string) => void }>
   > = new Map()
+  private peerDisconnectSubs: Map<
+    string,
+    Set<{ transport: DummyTransport; callback: (peerId: string) => void }>
+  > = new Map()
+
+  /** Register a transport's onPeerDisconnect callback (see notifyLeave). */
+  registerPeerDisconnect(
+    room: string,
+    transport: DummyTransport,
+    callback: (peerId: string) => void,
+  ): void {
+    if (!this.peerDisconnectSubs.has(room)) {
+      this.peerDisconnectSubs.set(room, new Set())
+    }
+    this.peerDisconnectSubs.get(room)!.add({ transport, callback })
+  }
+
+  unregisterPeerDisconnect(room: string, transport: DummyTransport): void {
+    const subs = this.peerDisconnectSubs.get(room)
+    if (!subs) return
+    for (const entry of subs) {
+      if (entry.transport === transport) {
+        subs.delete(entry)
+        break
+      }
+    }
+  }
+
+  /**
+   * Simulate the leave notification a mesh transport's channel close (or a
+   * presence service) gives every other peer: called by DummyTransport
+   * when it leaves a room with `simulatePeerConnect` on.
+   */
+  notifyLeave(room: string, transport: DummyTransport): void {
+    const subs = this.peerDisconnectSubs.get(room)
+    if (!subs) return
+    for (const entry of subs) {
+      if (entry.transport !== transport) entry.callback(transport.id)
+    }
+  }
 
   /**
    * Register a transport's onPeerConnect callback and simulate the
@@ -402,6 +442,7 @@ export class DummyTransport implements Transport {
    */
   readonly sendTo?: (peerId: string, data: Uint8Array) => void
   private _peerConnectCallback?: (peerId: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
   /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
   private _chunkBuffers: Map<number, Map<number, Uint8Array>> = new Map()
 
@@ -423,6 +464,9 @@ export class DummyTransport implements Transport {
    * silently suppressing periodic awareness re-announce for plain
    * DummyTransport usage too - a real bug, not just untidiness.
    */
+  readonly onPeerDisconnect?: (
+    callback: (peerId: string) => void,
+  ) => () => void
   readonly onPeerConnect?: (
     callback: (peerId: string) => void,
   ) => () => void
@@ -491,6 +535,18 @@ export class DummyTransport implements Transport {
           }
         }
       }
+      // The counterpart: a transport that leaves the room tells every
+      // other subscribed transport, like a data channel closing.
+      this.onPeerDisconnect = (callback: (peerId: string) => void) => {
+        this._peerDisconnectCallback = callback
+        if (this._connected && this._room && this.hub) {
+          this.hub.registerPeerDisconnect(this._room, this, callback)
+        }
+        return () => {
+          this._peerDisconnectCallback = undefined
+          if (this.hub) this.hub.unregisterPeerDisconnect(this._room, this)
+        }
+      }
     }
   }
 
@@ -531,6 +587,9 @@ export class DummyTransport implements Transport {
     if (this._peerConnectCallback) {
       this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback)
     }
+    if (this._peerDisconnectCallback) {
+      this.hub.registerPeerDisconnect(this._room, this, this._peerDisconnectCallback)
+    }
   }
 
   /**
@@ -542,6 +601,8 @@ export class DummyTransport implements Transport {
     if (this.hub) {
       this.hub.leave(this._room, this)
       this.hub.unregisterPeerConnect(this._room, this)
+      if (this.options.simulatePeerConnect) this.hub.notifyLeave(this._room, this)
+      this.hub.unregisterPeerDisconnect(this._room, this)
     }
     this._connected = false
   }

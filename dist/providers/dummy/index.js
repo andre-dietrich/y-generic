@@ -52,6 +52,7 @@ export class DummyHub {
     constructor() {
         this.rooms = new Map();
         this.peerConnectSubs = new Map();
+        this.peerDisconnectSubs = new Map();
     }
     /**
      * Register a transport in a room.
@@ -77,6 +78,38 @@ export class DummyHub {
             if (clients.size === 0) {
                 this.rooms.delete(room);
             }
+        }
+    }
+    /** Register a transport's onPeerDisconnect callback (see notifyLeave). */
+    registerPeerDisconnect(room, transport, callback) {
+        if (!this.peerDisconnectSubs.has(room)) {
+            this.peerDisconnectSubs.set(room, new Set());
+        }
+        this.peerDisconnectSubs.get(room).add({ transport, callback });
+    }
+    unregisterPeerDisconnect(room, transport) {
+        const subs = this.peerDisconnectSubs.get(room);
+        if (!subs)
+            return;
+        for (const entry of subs) {
+            if (entry.transport === transport) {
+                subs.delete(entry);
+                break;
+            }
+        }
+    }
+    /**
+     * Simulate the leave notification a mesh transport's channel close (or a
+     * presence service) gives every other peer: called by DummyTransport
+     * when it leaves a room with `simulatePeerConnect` on.
+     */
+    notifyLeave(room, transport) {
+        const subs = this.peerDisconnectSubs.get(room);
+        if (!subs)
+            return;
+        for (const entry of subs) {
+            if (entry.transport !== transport)
+                entry.callback(transport.id);
         }
     }
     /**
@@ -318,6 +351,19 @@ export class DummyTransport {
                     }
                 };
             };
+            // The counterpart: a transport that leaves the room tells every
+            // other subscribed transport, like a data channel closing.
+            this.onPeerDisconnect = (callback) => {
+                this._peerDisconnectCallback = callback;
+                if (this._connected && this._room && this.hub) {
+                    this.hub.registerPeerDisconnect(this._room, this, callback);
+                }
+                return () => {
+                    this._peerDisconnectCallback = undefined;
+                    if (this.hub)
+                        this.hub.unregisterPeerDisconnect(this._room, this);
+                };
+            };
         }
     }
     /**
@@ -351,6 +397,9 @@ export class DummyTransport {
         if (this._peerConnectCallback) {
             this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback);
         }
+        if (this._peerDisconnectCallback) {
+            this.hub.registerPeerDisconnect(this._room, this, this._peerDisconnectCallback);
+        }
     }
     /**
      * Disconnect from the hub.
@@ -361,6 +410,9 @@ export class DummyTransport {
         if (this.hub) {
             this.hub.leave(this._room, this);
             this.hub.unregisterPeerConnect(this._room, this);
+            if (this.options.simulatePeerConnect)
+                this.hub.notifyLeave(this._room, this);
+            this.hub.unregisterPeerDisconnect(this._room, this);
         }
         this._connected = false;
     }

@@ -192,6 +192,7 @@ export class TrysteroTransport implements Transport {
   private peers: Set<string> = new Set()
   private onJoinErrorCallback?: (details: any) => void
   private _peerConnectCallback?: (peerId: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
 
   constructor(options: TrysteroTransportOptions) {
     this.options = {
@@ -296,6 +297,7 @@ export class TrysteroTransport implements Transport {
     this.room.onPeerLeave((peerId) => {
       this.peers.delete(peerId)
       this.log(`Peer left: ${peerId} (${this.peers.size} remaining)`)
+      this._peerDisconnectCallback?.(peerId)
     })
 
     this._connected = true
@@ -368,6 +370,14 @@ export class TrysteroTransport implements Transport {
 
     return () => {
       this._peerConnectCallback = undefined
+    }
+  }
+
+  /** Transport.onPeerDisconnect: Trystero's onPeerLeave, the same peer id. */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
     }
   }
 

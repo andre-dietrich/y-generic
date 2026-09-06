@@ -309,6 +309,13 @@ export class SimplePeerTransport {
             this._peerConnectCallback = undefined;
         };
     }
+    /** Transport.onPeerDisconnect: a peer's channel closed or errored (removePeer). */
+    onPeerDisconnect(callback) {
+        this._peerDisconnectCallback = callback;
+        return () => {
+            this._peerDisconnectCallback = undefined;
+        };
+    }
     /**
      * Check if connected.
      */
@@ -663,6 +670,7 @@ export class SimplePeerTransport {
             this.announcedPeers.delete(peerId);
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`);
+            this._peerDisconnectCallback?.(peerId);
         }
     }
     /**

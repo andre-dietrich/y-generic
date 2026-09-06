@@ -34,6 +34,11 @@ const TYPISTS = Number(process.env.TYPISTS ?? 1)
 const GAP_MS = Number(process.env.GAP_MS ?? 200)
 const DURATION_MS = Number(process.env.DURATION_MS ?? 10000)
 const SETTLE_MS = Number(process.env.SETTLE_MS ?? 3000)
+// DUMMY_PEER_EVENTS=1: a transport that reports joins and departures (the
+// mesh transports, PubNub presence) - the awareness lease then defaults to
+// 5 min and the listeners' 15 s renewals leave the steady-state count
+// (round 5, item 2).
+const PEER_EVENTS = process.env.DUMMY_PEER_EVENTS === '1'
 const LATENCY = 20
 const JITTER = 0.25
 
@@ -51,6 +56,7 @@ async function run(N: number): Promise<void> {
         latency: LATENCY,
         jitter: JITTER,
         unicast: process.env.DUMMY_UNICAST === '1',
+        simulatePeerConnect: PEER_EVENTS,
       })
       const provider = new GenericProvider(doc, transport, {
         batchUpdates: 0,
@@ -100,7 +106,7 @@ async function run(N: number): Promise<void> {
 
 async function main() {
   console.log(
-    `typing census: latency=${LATENCY}ms±${JITTER * 100}% typists=${TYPISTS} gap=${GAP_MS}ms duration=${DURATION_MS}ms settle=${SETTLE_MS}ms unicast=${process.env.DUMMY_UNICAST === '1'}\n`,
+    `typing census: latency=${LATENCY}ms±${JITTER * 100}% typists=${TYPISTS} gap=${GAP_MS}ms duration=${DURATION_MS}ms settle=${SETTLE_MS}ms unicast=${process.env.DUMMY_UNICAST === '1'} peerEvents=${PEER_EVENTS}\n`,
   )
   for (const N of N_VALUES) await run(N)
   process.exit(0)

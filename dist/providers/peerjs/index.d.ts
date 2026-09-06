@@ -86,6 +86,7 @@ export declare class PeerJSTransport implements Transport {
     private _room;
     private _callback?;
     private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
     private peer;
     private peerId;
     private peers;
@@ -127,6 +128,8 @@ export declare class PeerJSTransport implements Transport {
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
+    /** Transport.onPeerDisconnect: a connection closed/errored, or the coordinator said peer-left (removePeer). */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
      * Send data to all connected peers.
      */

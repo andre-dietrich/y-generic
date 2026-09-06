@@ -48,6 +48,7 @@ export declare class PubNubTransport implements Transport {
     private channel;
     private uuid;
     private messageCallback?;
+    private _peerDisconnectCallback?;
     private _isConnected;
     private config;
     private debug;
@@ -79,7 +80,13 @@ export declare class PubNubTransport implements Transport {
     /**
      * Register message callback
      */
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
+    /**
+     * Transport.onPeerDisconnect: PubNub presence leave/timeout events for
+     * the channel (the subscription already runs withPresence). Peer ids are
+     * publisher uuids, the same `from` onMessage passes.
+     */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
      * Get presence information (list of peers)
      */

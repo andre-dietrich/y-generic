@@ -166,6 +166,9 @@ export declare class GenericProvider extends Observable<string> {
     private _lastAwarenessTime;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
+    private _awarenessTimeoutMs;
+    private _awarenessSweepId?;
+    private _ownsAwareness;
     private _unsubscribeTransport?;
     private _beforeUnloadHandler?;
     /**
@@ -333,6 +336,23 @@ export declare class GenericProvider extends Observable<string> {
          * @default the transport's `preferredCompressMinBytes` hint, else undefined
          */
         compressionThresholdBytes?: number;
+        /**
+         * Awareness lease (ms): a peer whose presence has not been refreshed
+         * for this long is removed; our own state is re-announced after half
+         * of it without any digest, update or ack from us. Replaces
+         * y-protocols/awareness's fixed 30 s / 15 s when the provider created
+         * the Awareness instance (an `awareness` passed in keeps y-protocols'
+         * own sweep and constants). Every peer of a room must use the same
+         * value: a removal is authoritative, so the shortest lease in the room
+         * decides for everyone and a longer-lease peer would flap. Longer =
+         * fewer renewal broadcasts (N(N-1) per lease/2), but a crashed peer's
+         * presence lingers up to this long on transports without a leave
+         * signal.
+         * @default 300000 when the transport implements `onPeerDisconnect`
+         * (departures are reported, the lease is only a safety net), else
+         * 30000 (y-protocols' value)
+         */
+        awarenessTimeoutMs?: number;
         /**
          * Trickle redundancy constant (RFC 6206 §4.2) for the periodic
          * beacon: the tick stays silent when at least this many periodic
@@ -510,6 +530,36 @@ export declare class GenericProvider extends Observable<string> {
      * corrupted-message branch (wire noise, not silence).
      */
     private _markActivity;
+    /**
+     * Replace y-protocols' awareness sweep (awareness.js `_checkInterval`:
+     * renew at outdatedTimeout/2, remove at outdatedTimeout, every
+     * outdatedTimeout/10) with the same loop at `_awarenessTimeoutMs`, the
+     * period jittered so a room that joined together does not renew in one
+     * burst (measured: all 49 listeners of a 50-peer room renewed inside the
+     * same 10 s window). Only when we created the instance - see
+     * `_ownsAwareness`.
+     */
+    private _startAwarenessSweep;
+    /**
+     * A digest, verified update or ack from `clientID` (or one we are about
+     * to send, for our own id) is proof of presence: refresh the lease the
+     * sweep above checks. Only for ids with a state - a departed peer's
+     * `meta` entry survives its removal (y-protocols keeps it for the clock)
+     * and must not be revived by a late message.
+     */
+    private _touchPeer;
+    /**
+     * Transport.onPeerDisconnect: the peer at `peerId` is gone. Forget its
+     * address and id, drop its awareness state with origin 'peer-left': the
+     * broadcast goes through the same suppression as a timeout removal, but
+     * with a long window - every peer gets the leave signal in the same
+     * millisecond, and at the reply window (~170 ms at N=50) 28 of 49
+     * survivors broadcast before the first broadcast could be overheard
+     * (bench-awareness-removal-burst, DUMMY_PEER_EVENTS=1). One broadcast
+     * room-wide is still worth having: it corrects a joiner that received
+     * this peer in a relayed presence table but had no channel to it yet.
+     */
+    private _handlePeerLeave;
     /** Cached delete-set hash - see computeDeleteSetHash(). */
     private _deleteSetHash;
     /**
@@ -806,15 +856,20 @@ export declare class GenericProvider extends Observable<string> {
      * (`_replySuppressionMaxDelay()`).
      *
      * A pending removal already queued when this is called is for a
-     * DIFFERENT departure (two peers timing out within the same suppression
-     * window) - flush it immediately rather than silently overwrite it, then
-     * queue the new one fresh. If it turns out to cover more than one
-     * clientID and only some overlap with a later-overheard broadcast,
-     * `_cancelPendingAwarenessRemovalIfOverlaps()` drops the whole pending
-     * set on ANY overlap rather than partially trimming it - simpler, and
-     * the dropped-but-not-actually-covered client(s) are still safe: every
-     * OTHER surviving peer is independently running this same suppression
-     * for them too.
+     * DIFFERENT departure (two peers timing out, or leaving, within the same
+     * window): since round 5 the ids are merged into the pending set and its
+     * timer kept - one broadcast carries both - instead of flushing the
+     * first as an unsuppressed broadcast (with the long leave window below a
+     * burst of departures would have flushed on every peer). An overheard
+     * broadcast trims only the ids it covers from the pending set
+     * (`_cancelPendingAwarenessRemovalIfOverlaps()`).
+     *
+     * Window: the reply-suppression window for timeouts (sweeps are spread
+     * over seconds anyway); for leaves reported by the transport - all
+     * survivors learn of them in the same millisecond - ten times that,
+     * at least a second, so the first broadcast is overheard before the
+     * rest fire. A departure is not urgent: every peer already dropped the
+     * state locally.
      */
     private _scheduleAwarenessRemoval;
     /**
@@ -832,9 +887,9 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _scanAwarenessPayload;
     /**
-     * Drop a pending suppressed removal broadcast if it overlaps
-     * `removedClientIds` - someone else already broadcast (at least part of)
-     * the same departure, so ours is redundant.
+     * Trim a pending suppressed removal broadcast by `removedClientIds` -
+     * someone else already broadcast those departures; what they did not
+     * cover stays queued.
      */
     private _cancelPendingAwarenessRemovalIfOverlaps;
     /** Cancel a pending suppressed awareness-removal broadcast, if any. */

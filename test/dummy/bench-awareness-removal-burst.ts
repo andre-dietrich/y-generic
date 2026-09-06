@@ -60,11 +60,20 @@ const LATENCY = 15
 // outdatedTimeout (30000) + one _checkInterval period (3000) worst case,
 // plus a margin for scheduling slop.
 const TIMEOUT_WAIT_MS = 34000
+// DUMMY_PEER_EVENTS=1: the departing peer's transport closes its channel
+// (transport.disconnect(), not provider.disconnect() - no clean-departure
+// awareness broadcast from the leaver) and the dummy hub reports the
+// leave to every other transport, as a mesh transport or PubNub presence
+// would (round 5, item 2). Detection then comes from
+// Transport.onPeerDisconnect instead of the awareness timeout sweep.
+const PEER_EVENTS = process.env.DUMMY_PEER_EVENTS === '1'
 
 interface Stats {
   totalMessages: number
   removalOnlyBroadcastCalls: number
   removalOnlyDeliveries: number
+  /** Counting stops before teardown: with a transport that reports leaves, destroy() itself triggers removals. */
+  active: boolean
 }
 
 /**
@@ -113,6 +122,7 @@ function instrumentAwareness(hub: DummyHub): Stats {
     totalMessages: 0,
     removalOnlyBroadcastCalls: 0,
     removalOnlyDeliveries: 0,
+    active: true,
   }
   const original = hub.broadcast.bind(hub)
   ;(hub as unknown as { broadcast: typeof hub.broadcast }).broadcast = (
@@ -121,11 +131,13 @@ function instrumentAwareness(hub: DummyHub): Stats {
     sender: DummyTransport,
     options?: { latency?: number; dropRate?: number; jitter?: number },
   ) => {
-    const recipients = Math.max(0, hub.getRoomSize(room) - 1)
-    stats.totalMessages += recipients
-    if (data.length > 4 && isRemovalOnlyAwareness(data.subarray(4))) {
-      stats.removalOnlyBroadcastCalls++
-      stats.removalOnlyDeliveries += recipients
+    if (stats.active) {
+      const recipients = Math.max(0, hub.getRoomSize(room) - 1)
+      stats.totalMessages += recipients
+      if (data.length > 4 && isRemovalOnlyAwareness(data.subarray(4))) {
+        stats.removalOnlyBroadcastCalls++
+        stats.removalOnlyDeliveries += recipients
+      }
     }
     return original(room, data, sender, options)
   }
@@ -141,7 +153,12 @@ function makeRoom(
   const transports: DummyTransport[] = []
   for (let i = 0; i < N; i++) {
     const doc = new Y.Doc()
-    const transport = new DummyTransport({ hub, latency: LATENCY, jitter: 0.1 })
+    const transport = new DummyTransport({
+      hub,
+      latency: LATENCY,
+      jitter: 0.1,
+      simulatePeerConnect: PEER_EVENTS,
+    })
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
       verifyUpdates: true,
@@ -165,6 +182,7 @@ interface RunResult {
   N: number
   detectors: number
   stats: Stats
+  detectMs: number // until every survivor dropped the departed peer's state (-1: not within the window)
 }
 
 async function runOnce(N: number): Promise<RunResult> {
@@ -195,7 +213,10 @@ async function runOnce(N: number): Promise<RunResult> {
       p.awareness.on(
         'update',
         ({ removed }: { removed: number[] }, origin: any) => {
-          if (origin === 'timeout' && removed.includes(victimClientId)) {
+          if (
+            (origin === 'timeout' || origin === 'peer-left') &&
+            removed.includes(victimClientId)
+          ) {
             detectors++
           }
         },
@@ -204,7 +225,20 @@ async function runOnce(N: number): Promise<RunResult> {
 
     const stats = instrumentAwareness(hub)
 
-    crashPeer(hub, room, transports[0])
+    const departedId = docs[0].clientID
+    const departedAt = Date.now()
+    let detectedAllAt = 0
+    if (PEER_EVENTS) transports[0].disconnect()
+    else crashPeer(hub, room, transports[0])
+    const survivorProviders = providers.slice(1)
+    const detectPoll = setInterval(() => {
+      if (
+        detectedAllAt === 0 &&
+        survivorProviders.every((p) => !p.awareness.getStates().has(departedId))
+      ) {
+        detectedAllAt = Date.now()
+      }
+    }, 5)
 
     // Simulate realistic per-peer presence activity (cursor moves, etc.)
     // during the wait window at a cadence well under
@@ -242,10 +276,12 @@ async function runOnce(N: number): Promise<RunResult> {
     await sleep(TIMEOUT_WAIT_MS)
 
     for (const t of activityIntervals) clearInterval(t)
+    clearInterval(detectPoll)
+    stats.active = false
     for (const p of providers) p.destroy()
     hub.clear()
 
-    return { N, detectors, stats }
+    return { N, detectors, stats, detectMs: detectedAllAt === 0 ? -1 : detectedAllAt - departedAt }
   })
 }
 
@@ -254,7 +290,7 @@ function printRow(r: RunResult): void {
     `${String(r.N).padStart(5)} | ${String(r.detectors).padStart(9)} | ` +
       `${String(r.stats.removalOnlyBroadcastCalls).padStart(11)} | ` +
       `${String(r.stats.removalOnlyDeliveries).padStart(11)} | ` +
-      `${String(r.stats.totalMessages).padStart(13)}`,
+      `${String(r.stats.totalMessages).padStart(13)} | ${String(r.detectMs).padStart(8)}`,
   )
 }
 
@@ -263,7 +299,8 @@ async function main() {
     'One peer crashes (no clean disconnect) mid-room; measuring the awareness-removal burst as OTHER peers independently timeout-detect it.',
   )
   console.log(`Each row waits ~${TIMEOUT_WAIT_MS / 1000}s of real time to observe the outdatedTimeout sweep.\n`)
-  console.log('    N | detectors | removalMsgs | removalDlvr | totalWindowMsgs')
+  console.log(`departure: ${PEER_EVENTS ? 'channel close reported by the transport (DUMMY_PEER_EVENTS=1)' : 'silent crash, awareness timeout sweep'}`)
+  console.log('    N | detectors | removalMsgs | removalDlvr | totalWindowMsgs | detectMs')
   const results: RunResult[] = []
   for (const N of ROOM_SIZES) {
     const r = await runOnce(N)
@@ -275,6 +312,7 @@ async function main() {
   console.log('removalMsgs  = # wire sends classified as removal-only awareness broadcasts')
   console.log('removalDlvr  = total recipient deliveries attributable to those sends (the real message-count cost)')
   console.log('totalWindowMsgs = all messages delivered during the ~34s observation window (includes simulated per-peer presence-activity traffic, unrelated to this burst)')
+  console.log('detectMs     = ms from the departure until every survivor had dropped its awareness state (-1: not within the window)')
 
   process.exit(0)
 }

@@ -128,6 +128,7 @@ export class TrysteroTransport {
         this.room.onPeerLeave((peerId) => {
             this.peers.delete(peerId);
             this.log(`Peer left: ${peerId} (${this.peers.size} remaining)`);
+            this._peerDisconnectCallback?.(peerId);
         });
         this._connected = true;
         this.log(`✅ Connected to room: ${room}`);
@@ -187,6 +188,13 @@ export class TrysteroTransport {
         this._peerConnectCallback = callback;
         return () => {
             this._peerConnectCallback = undefined;
+        };
+    }
+    /** Transport.onPeerDisconnect: Trystero's onPeerLeave, the same peer id. */
+    onPeerDisconnect(callback) {
+        this._peerDisconnectCallback = callback;
+        return () => {
+            this._peerDisconnectCallback = undefined;
         };
     }
     /**

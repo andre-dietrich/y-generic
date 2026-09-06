@@ -186,6 +186,7 @@ export class SimplePeerTransport implements Transport {
   private _room: string = ''
   private _callback?: (data: Uint8Array, from?: string) => void
   private _peerConnectCallback?: (peerId: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
   private peerId: string
   private peers: Map<string, PeerConnection> = new Map()
   private signalingConns: WebSocket[] = []
@@ -501,6 +502,14 @@ export class SimplePeerTransport implements Transport {
     this._peerConnectCallback = callback
     return () => {
       this._peerConnectCallback = undefined
+    }
+  }
+
+  /** Transport.onPeerDisconnect: a peer's channel closed or errored (removePeer). */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
     }
   }
 
@@ -931,6 +940,7 @@ export class SimplePeerTransport implements Transport {
       this.log(
         `🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`,
       )
+      this._peerDisconnectCallback?.(peerId)
     }
   }
 

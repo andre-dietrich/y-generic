@@ -159,6 +159,7 @@ export declare class TrysteroTransport implements Transport {
     private peers;
     private onJoinErrorCallback?;
     private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
     constructor(options: TrysteroTransportOptions);
     private log;
     get isConnected(): boolean;
@@ -180,6 +181,8 @@ export declare class TrysteroTransport implements Transport {
      * periodic sync tick.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
+    /** Transport.onPeerDisconnect: Trystero's onPeerLeave, the same peer id. */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
      * Set a callback for join errors (optional).
      */

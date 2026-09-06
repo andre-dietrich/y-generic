@@ -319,6 +319,13 @@ export class PeerJSTransport {
             this._peerConnectCallback = undefined;
         };
     }
+    /** Transport.onPeerDisconnect: a connection closed/errored, or the coordinator said peer-left (removePeer). */
+    onPeerDisconnect(callback) {
+        this._peerDisconnectCallback = callback;
+        return () => {
+            this._peerDisconnectCallback = undefined;
+        };
+    }
     /**
      * Send data to all connected peers.
      */
@@ -984,6 +991,7 @@ export class PeerJSTransport {
                 // Ignore errors during cleanup
             }
             this.peers.delete(peerId);
+            this._peerDisconnectCallback?.(peerId);
         }
     }
     /**

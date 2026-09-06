@@ -100,6 +100,7 @@ export class PeerJSTransport implements Transport {
   private _room: string = ''
   private _callback?: (data: Uint8Array, from?: string) => void
   private _peerConnectCallback?: (peerId: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
   private peer: any = null // PeerJS Peer instance
   private peerId: string = ''
   private peers: Map<string, PeerConnectionInfo> = new Map()
@@ -439,6 +440,14 @@ export class PeerJSTransport implements Transport {
     this._peerConnectCallback = callback
     return () => {
       this._peerConnectCallback = undefined
+    }
+  }
+
+  /** Transport.onPeerDisconnect: a connection closed/errored, or the coordinator said peer-left (removePeer). */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
     }
   }
 
@@ -1211,6 +1220,7 @@ export class PeerJSTransport implements Transport {
         // Ignore errors during cleanup
       }
       this.peers.delete(peerId)
+      this._peerDisconnectCallback?.(peerId)
     }
   }
 

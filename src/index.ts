@@ -2277,7 +2277,15 @@ export class GenericProvider extends Observable<string> {
     this._pendingSyncReply = reply
     this._pendingSyncReplyIsAck = isAck
     this._pendingSyncReplyTargetSv = targetSv
-    const delay = this._replyDelay(requester)
+    // Acks keep the uniform window: they carry no data, so their delay
+    // costs nothing but a few ms on a joiner's `synced` flip, and in a
+    // join burst one pending ack answers every equal JOIN that arrives
+    // inside that window (identical bytes, deduped above). Ranked, rank 0
+    // fired at once for every requester - measured: fresh-burst acks
+    // 6,039 -> 15,147 at Gun N=100, join-after-burst Matrix 147 -> 686.
+    const delay = isAck
+      ? Math.random() * this._replySuppressionMaxDelay()
+      : this._replyDelay(requester)
     this._pendingSyncReplyTimeoutId = setTimeout(() => {
       this._pendingSyncReplyTimeoutId = undefined
       if (this._pendingSyncReply) {

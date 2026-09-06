@@ -129,6 +129,7 @@ export declare class GenericProvider extends Observable<string> {
     private _responseWaitTimer?;
     private _responseWaitAttempts;
     private _responseSeen;
+    private _equalUnsettledSeen;
     private _responseWaitFlags;
     private _pendingCheckTimer?;
     private _behindCheckTimer?;

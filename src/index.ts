@@ -486,6 +486,11 @@ export class GenericProvider extends Observable<string> {
   private _responseWaitTimer?: ReturnType<typeof setTimeout>
   private _responseWaitAttempts: number = 0
   private _responseSeen: boolean = false
+  // Phase 1e: an equal ack or equal beacon from an UNSETTLED peer arrived
+  // during the current response wait. Not a response (a settled peer with
+  // content may still answer), but evidence that the room is a fresh one
+  // whose peers are all in our state - see _armResponseWait().
+  private _equalUnsettledSeen: boolean = false
   private _responseWaitFlags: number = 0 // flags for the retry beacon: CONFIRM after a JOIN, 0 after a resync
   private _pendingCheckTimer?: ReturnType<typeof setTimeout> // see _schedulePendingCheck()
   // Phase 1d (design A): a beacon showed its sender ahead of us. Re-check
@@ -1037,6 +1042,7 @@ export class GenericProvider extends Observable<string> {
     }
     this._responseWaitAttempts = 0
     this._responseSeen = false
+    this._equalUnsettledSeen = false
     this._rttSamples = []
     this._requestSentAt = 0
     this._confirmed = false
@@ -2015,6 +2021,8 @@ export class GenericProvider extends Observable<string> {
         if (flags & DIGEST_FLAG_SETTLED) {
           this._confirmed = true
           this._noteResponse(true)
+        } else {
+          this._equalUnsettledSeen = true
         }
         this._markSynced()
         this._cancelPendingAck()
@@ -2037,6 +2045,8 @@ export class GenericProvider extends Observable<string> {
       if (flags & DIGEST_FLAG_SETTLED) {
         this._confirmed = true
         this._noteResponse(false)
+      } else {
+        this._equalUnsettledSeen = true
       }
       this._cancelPendingAck()
     }
@@ -2536,6 +2546,7 @@ export class GenericProvider extends Observable<string> {
   private _armResponseWait(retryFlags: number): void {
     if (this._responseWaitTimer !== undefined) return
     this._responseSeen = false
+    if (this._responseWaitAttempts === 0) this._equalUnsettledSeen = false
     this._responseWaitFlags = retryFlags
     this._requestSentAt = Date.now()
     const rtt = this._rttMinMs()
@@ -2544,16 +2555,25 @@ export class GenericProvider extends Observable<string> {
       Math.pow(2, this._responseWaitAttempts)
     this._responseWaitTimer = setTimeout(() => {
       this._responseWaitTimer = undefined
+      // Phase 1e: a fresh room - equal but unsettled peers answered both
+      // the JOIN and one CONFIRM retry, nobody settled did. Two rounds
+      // instead of three; the first confirmed peers' acks then carry
+      // SETTLED for everyone after them. Measured in
+      // test/dummy/bench-join-census.ts (b): the third round was ~a third
+      // of a fresh N=100 room's 92k-delivery join burst.
+      const freshRoomDone =
+        this._equalUnsettledSeen && this._responseWaitAttempts >= 1
       if (
         this._responseSeen ||
         this._responseWaitAttempts >= 3 ||
+        freshRoomDone ||
         !this.transport.isConnected ||
         this._destroying
       ) {
         // Asked three times, nobody had more for us: we are the room's
         // state (or its first peer). Bootstraps DIGEST_FLAG_SETTLED in a
         // brand-new room so later joiners are confirmed by our acks.
-        if (this._responseWaitAttempts >= 3) this._confirmed = true
+        if (this._responseWaitAttempts >= 3 || freshRoomDone) this._confirmed = true
         this._responseWaitAttempts = 0
         return
       }

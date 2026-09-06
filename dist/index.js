@@ -458,6 +458,11 @@ export class GenericProvider extends Observable {
         // Requesters whose JOIN presence request the pending presence-response
         // timer covers (see _schedulePresenceResponse).
         this._presencePending = new Set();
+        // Phase 1e: an awareness message carrying OUR state at our current clock
+        // arrived since the presence-response timer was armed - the room's
+        // relayer (see _schedulePresenceResponse) already told the joiner about
+        // us, our own response would repeat it.
+        this._presenceCovered = false;
         // Same NACK-style suppression as _pendingSyncReply above, applied to
         // awareness updates that are a pure timeout-triggered removal (see
         // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
@@ -1342,10 +1347,12 @@ export class GenericProvider extends Observable {
                 // MESSAGE_SYNC/MESSAGE_SYNC_VERIFIED case above cancels
                 // _pendingSyncReply on seeing a SyncStep2 message TYPE arrive, not
                 // on whether it changed anything locally.
-                const removedIds = this._extractRemovedClientIds(payload);
-                if (removedIds.length > 0) {
-                    this._cancelPendingAwarenessRemovalIfOverlaps(removedIds);
+                const scan = this._scanAwarenessPayload(payload);
+                if (scan.removed.length > 0) {
+                    this._cancelPendingAwarenessRemovalIfOverlaps(scan.removed);
                 }
+                if (scan.coversUs)
+                    this._presenceCovered = true;
                 awarenessProtocol.applyAwarenessUpdate(this.awareness, payload, this);
                 break;
             }
@@ -1607,8 +1614,27 @@ export class GenericProvider extends Observable {
         this._presencePending.add(requester);
         if (this._presenceResponseTimer !== undefined)
             return;
+        this._presenceCovered = false;
         const rtt = this._rttMinMs();
-        const delay = Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt));
+        // Phase 1e, relay path: one peer per 2 s bucket - the first-ranked
+        // for a constant requester - relays the whole awareness table at once
+        // (the way y-websocket's server does; clocks travel with the states,
+        // a peer's own echoed state at an equal clock is ignored by
+        // applyAwarenessUpdate). Everyone else waits the usual window, and
+        // stays silent if that table carried their state (_presenceCovered).
+        // Presence per late join: ~N deliveries instead of (N-1)^2 - it was
+        // 82% of a late join into a 100-peer room (bench-join-census). Bytes
+        // are unchanged (the table goes to everyone). Peers that cannot yet
+        // tell (no RTT estimate on a slow link, so the table may arrive after
+        // their window) fall back to the broadcast of their own state, as
+        // before. The unicast path below is untouched.
+        // Needs a view of the room: in a fresh burst the first JOIN arrives
+        // before any peer is known, everyone would rank first and relay a
+        // table each - the broadcast fallback is right for that case.
+        const relayer = !this._canUnicast(requester) &&
+            this._knownPeers.size >= 3 &&
+            this._responderRank(0, 1) === 0;
+        const delay = relayer ? 0 : Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt));
         this._presenceResponseTimer = setTimeout(() => {
             this._presenceResponseTimer = undefined;
             const requesters = Array.from(this._presencePending);
@@ -1625,7 +1651,10 @@ export class GenericProvider extends Observable {
                 for (const id of requesters)
                     this._sendDirect(id, msg);
             }
-            else {
+            else if (relayer) {
+                this._sendAwarenessNow(Array.from(this.awareness.getStates().keys()));
+            }
+            else if (!this._presenceCovered) {
                 this._broadcastAwareness([this.doc.clientID]);
             }
         }, delay);
@@ -2175,26 +2204,29 @@ export class GenericProvider extends Observable {
      * wire-message level, before `applyAwarenessUpdate()` runs - see the
      * `MESSAGE_AWARENESS` case's comment for why timing matters here.
      */
-    _extractRemovedClientIds(payload) {
+    _scanAwarenessPayload(payload) {
+        const removed = [];
+        let coversUs = false;
         try {
             const d = decoding.createDecoder(payload);
             const len = decoding.readVarUint(d);
-            const removed = [];
+            const ourClock = this.awareness.meta.get(this.awareness.clientID)?.clock ?? 0;
             for (let i = 0; i < len; i++) {
                 const clientID = decoding.readVarUint(d);
-                decoding.readVarUint(d); // clock, unused here
+                const clock = decoding.readVarUint(d);
                 const state = JSON.parse(decoding.readVarString(d));
                 if (state === null)
                     removed.push(clientID);
+                else if (clientID === this.awareness.clientID && clock >= ourClock)
+                    coversUs = true;
             }
-            return removed;
         }
         catch {
             // Malformed payload - let applyAwarenessUpdate() below be the one
             // that deals with it (or throws); suppression is a pure optimization,
             // never worth failing the actual message handling over.
-            return [];
         }
+        return { removed, coversUs };
     }
     /**
      * Drop a pending suppressed removal broadcast if it overlaps

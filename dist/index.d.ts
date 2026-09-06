@@ -140,6 +140,7 @@ export declare class GenericProvider extends Observable<string> {
     private _knownPeers;
     private _peerAddress;
     private _presencePending;
+    private _presenceCovered;
     private _presenceResponseTimer?;
     private _pendingAwarenessRemoval;
     private _pendingAwarenessRemovalTimeoutId?;
@@ -790,7 +791,7 @@ export declare class GenericProvider extends Observable<string> {
      * wire-message level, before `applyAwarenessUpdate()` runs - see the
      * `MESSAGE_AWARENESS` case's comment for why timing matters here.
      */
-    private _extractRemovedClientIds;
+    private _scanAwarenessPayload;
     /**
      * Drop a pending suppressed removal broadcast if it overlaps
      * `removedClientIds` - someone else already broadcast (at least part of)

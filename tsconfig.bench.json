@@ -32,6 +32,7 @@
     "test/dummy/bench-awareness-removal-burst.ts",
     "test/dummy/bench-idle-room.ts",
     "test/dummy/bench-join-after-burst.ts",
+    "test/dummy/bench-join-census.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

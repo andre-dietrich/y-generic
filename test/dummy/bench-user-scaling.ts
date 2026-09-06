@@ -154,6 +154,33 @@ export function makeProviders(
   return { docs, providers }
 }
 
+/**
+ * Keep counting until the room has been quiet for quietMs (cap capMs): the
+ * hash-mismatch/resync cascade under jitter runs on for seconds AFTER every
+ * doc has the content (research doc item 13) - counting only to convergence
+ * hid ~95% of it on the Gun/Matrix profiles at N=100 (9,405 at convergence
+ * vs ~199,000 until quiet). Phase 1e: the join burst uses it too - a fresh
+ * room's CONFIRM retries (1/2/4 s) all fall after "all synced".
+ */
+export async function untilQuiet(
+  stats: { readonly messages: number },
+  quietMs: number,
+  capMs: number,
+): Promise<void> {
+  const tailStart = Date.now()
+  let lastCount = stats.messages
+  let quietSince = Date.now()
+  while (Date.now() - tailStart < capMs) {
+    await sleep(50)
+    if (stats.messages !== lastCount) {
+      lastCount = stats.messages
+      quietSince = Date.now()
+    } else if (Date.now() - quietSince >= quietMs) {
+      break
+    }
+  }
+}
+
 async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
   return silenced(async () => {
     const room = `bench-fanout-${Math.random().toString(36).slice(2)}`
@@ -196,25 +223,7 @@ async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
     const cpuMs = (cpuAfter.user + cpuAfter.system) / 1000
     const atConvergence = stats.messages - preExisting.messages
 
-    // Keep counting until the room has been quiet for QUIET_MS (cap
-    // TAIL_CAP_MS): the hash-mismatch/resync cascade under jitter runs on
-    // for seconds AFTER every doc has the content (research doc item 13) -
-    // counting only to convergence hid ~95% of it on the Gun/Matrix
-    // profiles at N=100 (9,405 at convergence vs ~199,000 until quiet).
-    const QUIET_MS = 1000
-    const TAIL_CAP_MS = 10000
-    const tailStart = Date.now()
-    let lastCount = stats.messages
-    let quietSince = Date.now()
-    while (Date.now() - tailStart < TAIL_CAP_MS) {
-      await sleep(50)
-      if (stats.messages !== lastCount) {
-        lastCount = stats.messages
-        quietSince = Date.now()
-      } else if (Date.now() - quietSince >= QUIET_MS) {
-        break
-      }
-    }
+    await untilQuiet(stats, 1000, 10000)
 
     const result: RunResult = {
       totalMs,
@@ -250,10 +259,11 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
       }
       await sleep(5)
     }
-    // Short settle window for trailing awareness/sync replies to land.
-    await sleep(profile.latency * 2 + 50)
-
     const totalMs = Date.now() - start
+    const atConvergence = stats.messages
+    // Phase 1e: count until quiet (was: latency*2+50 ms after all synced,
+    // which missed every CONFIRM retry of a fresh room - 19k vs 92k at N=100).
+    await untilQuiet(stats, 1000, 15000)
     const cpuAfter = process.cpuUsage(cpuBefore)
     const cpuMs = (cpuAfter.user + cpuAfter.system) / 1000
 
@@ -262,6 +272,7 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
       cpuMs,
       messages: stats.messages,
       bytes: stats.bytes,
+      atConvergence,
     }
 
     for (const p of providers) p.destroy()
@@ -293,7 +304,7 @@ async function main() {
   console.log('\n=== Join-burst cost (N clients connecting concurrently) ===')
   for (const profile of PROFILES) {
     console.log(`\n-- Profile: ${profile.name} (latency=${profile.latency}ms, jitter=${profile.jitter}) --`)
-    console.log('users | totalMs |  cpuMs | messages |     bytes')
+    console.log('users | totalMs |  cpuMs | messages |     bytes |   atConv')
     for (const N of USER_COUNTS) {
       const r = await runJoinBurst(N, profile)
       printRow(N, r)

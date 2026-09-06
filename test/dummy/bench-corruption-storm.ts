@@ -54,6 +54,11 @@ const N_VALUES = [2, 5, 10]
 const EDIT_STREAM_MS = 3000 // how long the edit burst + corruption runs
 const EDIT_INTERVAL_MS = 50 // one insert every 50ms while corrupting
 const SETTLE_TIMEOUT_MS = 15000 // convergence grace period once corruption stops
+// Periodic beacon for the peers under test (override: SYNC_INTERVAL_MS).
+// Phase 1d: with 0, a peer left behind by corruption has no fallback at all
+// once its own retries are spent - that measures the option, not the
+// protocol. bench-packet-loss and bench-late-join run with 2 s since 1b.
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)
 
 interface WarnCounts {
   corrupted: number
@@ -211,7 +216,7 @@ function makeProviders(
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
       verifyUpdates: true,
-      syncInterval: 0,
+      syncInterval: SYNC_INTERVAL_MS,
       ...(syncReplySuppressionMs !== undefined ? { syncReplySuppressionMs } : {}),
     })
     // Bump local awareness state past the genesis clock (0) - required for
@@ -317,6 +322,25 @@ async function runOnce(
       await sleep(20)
     }
     const convergeMs = Date.now() - convergeStart
+    if (!converged) {
+      // Diagnostics for the rare stall: which peers are behind, and what
+      // state their recovery machinery is in (private fields, on purpose).
+      const typist = docs[0].clientID
+      providers.forEach((p, i) => {
+        const txt = docs[i].getText('content').toString()
+        if (txt === target) return
+        const q = p as unknown as Record<string, unknown>
+        const sv = Y.decodeStateVector(Y.encodeStateVector(docs[i]))
+        console.log(
+          `  STALL peer ${i}: len=${txt.length}/${target.length} typistClock=${sv.get(typist) ?? 0} ` +
+            `pending=${docs[i].store.pendingStructs !== null} wait=${q._responseWaitTimer !== undefined} ` +
+            `waitAttempts=${q._responseWaitAttempts} resyncTimer=${q._pendingResyncTimeoutId !== undefined} ` +
+            `resyncAttempts=${q._resyncAttemptCount} reqBudget=${(q._syncRequestTimes as number[]).length} ` +
+            `replyBudget=${(q._syncReplyTimes as number[]).length} synced=${p.synced} confirmed=${q._confirmed} ` +
+            `knownPeers=${(q._knownPeers as Set<number>).size} addresses=${(q._peerAddress as Map<number, string>).size}`,
+        )
+      })
+    }
 
     for (const p of providers) p.destroy()
     hub.clear()

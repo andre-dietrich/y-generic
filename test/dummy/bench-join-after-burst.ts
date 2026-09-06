@@ -25,6 +25,13 @@ import { PROFILES, sleep, silenced, type Profile } from './bench-user-scaling'
 const M = 40
 const K = 10
 const EDITS = 10
+// Periodic beacon for every peer (override: SYNC_INTERVAL_MS). Phase 1d: a
+// joiner whose reply predates the typist's last keystroke (in flight at the
+// responder when it answered, broadcast before the joiner was in the room)
+// has, by design, no trigger but a periodic beacon; with 0 that joiner stays
+// one keystroke short forever - measured in unicast mode, 3 of 3 runs under
+// load. The window here is well under 2 s, so the beacon rarely lands in it.
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)
 const CONTENT_CHARS = 2000
 const JOIN_AFTER_MS = 600
 const SETTLE_LONG_MS = 12000
@@ -90,7 +97,7 @@ function makeProvider(hub: DummyHub, profile: Profile, id: number): GenericProvi
       jitter: profile.jitter,
       unicast: process.env.DUMMY_UNICAST === '1',
     }),
-    { batchUpdates: 0, verifyUpdates: true, syncInterval: 0 },
+    { batchUpdates: 0, verifyUpdates: true, syncInterval: SYNC_INTERVAL_MS },
   )
   provider.awareness.setLocalStateField('user', { id })
   return provider
@@ -158,6 +165,26 @@ async function run(profile: Profile, joinAfterMs: number): Promise<{ ms: number;
     }
     const ms = Date.now() - start
     const converged = all.every((p) => p.doc.getText('t').toString() === target) && joiners.every((p) => p.synced)
+    if (!converged) {
+      // Diagnostics for the rare stall (1 in ~45 unicast runs of the WebSocket
+      // "in budget window" variant, phase 1c): every peer that is not at the
+      // target, with the state of its recovery machinery (private fields).
+      const typist = settled[0].doc.clientID
+      all.forEach((p, i) => {
+        const txt = p.doc.getText('t').toString()
+        if (txt === target && (i < M || p.synced)) return
+        const q = p as unknown as Record<string, unknown>
+        const sv = Y.decodeStateVector(Y.encodeStateVector(p.doc))
+        console.log(
+          `  STALL ${i < M ? 'settled' : 'joiner'} ${i}: len=${txt.length}/${target.length} typistClock=${sv.get(typist) ?? 0} ` +
+            `pending=${p.doc.store.pendingStructs !== null} wait=${q._responseWaitTimer !== undefined} ` +
+            `waitAttempts=${q._responseWaitAttempts} resyncTimer=${q._pendingResyncTimeoutId !== undefined} ` +
+            `resyncAttempts=${q._resyncAttemptCount} reqBudget=${(q._syncRequestTimes as number[]).length} ` +
+            `replyBudget=${(q._syncReplyTimes as number[]).length} synced=${p.synced} confirmed=${q._confirmed} ` +
+            `knownPeers=${(q._knownPeers as Set<number>).size} addresses=${(q._peerAddress as Map<number, string>).size}`,
+        )
+      })
+    }
     await sleep(profile.latency * 2 + 100)
     counting = false
 

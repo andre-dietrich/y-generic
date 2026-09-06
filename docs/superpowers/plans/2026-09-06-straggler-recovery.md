@@ -20,10 +20,10 @@
 
 ### Task 1: corruption bench beacon + diagnostics (design C) + baseline
 
-**Files:** `test/dummy/bench-corruption-storm.ts` (`SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)` passed as `syncInterval`; DIAG dump after the convergence loop when `!converged`), `test/dummy/bench-join-after-burst.ts` (same dump).
+**Files:** `test/dummy/bench-corruption-storm.ts` and `test/dummy/bench-join-after-burst.ts` (`SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)` passed as `syncInterval`; STALL dump of every non-converged peer after the convergence loop).
 
 - [ ] Implement both; `npx tsc -p tsconfig.bench.json`; snapshot `bench-dist-base1d/`; run the corruption bench ×3 in both modes on the current code; record the baseline in the design doc's Results.
-- [ ] Commit `bench-corruption-storm: peers run a 2 s periodic beacon; both join benches dump peer state on a stall`.
+- [ ] Commit `bench-corruption-storm, bench-join-after-burst: peers run a 2 s periodic beacon; both dump peer state on a stall`.
 
 ### Task 2: no partial responders (design B)
 

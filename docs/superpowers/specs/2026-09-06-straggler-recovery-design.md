@@ -78,16 +78,33 @@ other's last update would then both stay silent for the 7 s of their
 retries, while their (mutually partial but each complete for the other)
 replies heal both at once.
 
-### C. Corruption bench: realistic beacon, diagnostics
+### C. Join benches: realistic beacon, diagnostics
 
-`bench-corruption-storm` runs its peers with `syncInterval` 2000
-(override `SYNC_INTERVAL_MS`, as `bench-packet-loss` and `bench-late-join`
-since phase 1b): with `0` a peer left behind by corruption has no
-fallback at all, which is a statement about the option, not the protocol.
-Both it and `bench-join-after-burst` print every non-converged peer's
-state (length, typist clock, pending structs, response wait, resync
-timer, budgets, `synced`) when a run fails, so the next rare stall is
-captured instead of counted.
+`bench-corruption-storm` and `bench-join-after-burst` run their peers with
+`syncInterval` 2000 (override `SYNC_INTERVAL_MS`, as `bench-packet-loss`
+and `bench-late-join` since phase 1b): with `0` a peer left behind — by
+corruption, or a joiner whose reply predates the typist's last keystroke
+— has no fallback at all, which is a statement about the option, not the
+protocol. Both print every non-converged peer's state (length, typist
+clock, pending structs, response wait, resync timer, budgets, `synced`)
+when a run fails, so a rare stall is captured instead of counted. The
+first such capture (baseline, below) is what turned design B from a
+heuristic into a diagnosis: joiners stranded with *pending structs*,
+`synced`, no request outstanding, never having requested a resync.
+
+### E. A reply that leaves us with pending structs arms the gap check
+
+`Y.encodeStateAsUpdate` — hence a SyncStep2 — includes the encoder's own
+*pending* structs. A responder that is itself missing a struct therefore
+hands its requester the same hole: the requester integrates what it can,
+inherits the pending rest, flips `synced` and clears its response wait
+(`_noteResponse(true)`), and nothing checks the store — the pending-struct
+grace check (`_schedulePendingCheck`) was armed only from the
+hash-mismatch branch of the *update* handler. Design B removes the
+source; E removes the consequence: after applying a SyncStep2 or a push,
+if `doc.store.pendingStructs`/`pendingDs` is non-null, arm the same grace
+check, which requests the difference through the coordinator once the
+response wait is over. Belt and braces, both cheap.
 
 ### D. Idle backoff on by default
 
@@ -109,11 +126,12 @@ the last commit: the phase-1c gate list, 3 × 3, in both dummy modes.
 
 ## Work items
 
-1. C — bench beacon + diagnostics; baseline runs of the corruption bench
-   with the beacon on the current code (both modes).
+1. C — bench beacons + diagnostics; baseline runs of both benches with
+   the beacon on the current code (both modes).
 2. B — no partial responders; measure.
-3. A — behind check; measure (headline: unicast corruption 50 % cells,
-   `bench-idle-backoff` recovery, fan-out-under-loss probe).
+3. A + E — behind check, pending check after replies; measure (headline:
+   unicast corruption 50 % cells, join-after-burst unicast, `bench-idle-
+   backoff` recovery, fan-out-under-loss probe).
 4. D — default flip + README; measure `bench-idle-backoff` and
    `bench-idle-room` (60 s window).
 5. Final gates, results, research-doc status.
@@ -121,3 +139,44 @@ the last commit: the phase-1c gate list, 3 × 3, in both dummy modes.
 ## Results
 
 Appended per step as measured, baseline first.
+
+### Baseline (`main` @ `abc7852` + the Task 1 bench changes; logs `base1d`)
+
+`bench-corruption-storm` with the 2 s beacon, 3 runs per mode, 50 % cells
+(converged / convergence): relay N=2 0.20-0.55 s, N=5 0.06-0.63 s, N=10
+0.08-0.25 s, every RESULT line passes; unicast N=2 0.22-0.35 s, N=5
+0.87-0.99 s, N=10 1.4-2.9 s, every RESULT line passes — the beacon turns
+the 1c stalls into "within one beacon interval" (the 5 s backoff no longer
+decides). `bench-join-after-burst` still with `syncInterval 0` at this
+point (the beacon was added to it after these runs, see below): relay
+WebSocket in-budget 4,265-4,853 / fresh 4,167-4,363, Matrix 5,590-6,021 /
+3,873-4,314, all converged; **unicast WebSocket "in budget window": 3 of 3
+runs stalled** (30 s; 7,511-7,882 deliveries) — under the parallel load of
+two bench processes, where the timing that produces the stall is common.
+Captured state of the stranded joiners, e.g.:
+
+```
+STALL joiner 43: len=2005/2010 typistClock=2005 pending=true wait=false waitAttempts=0 resyncTimer=false resyncAttempts=0 reqBudget=1 synced=true confirmed=true
+STALL joiner 47: len=2009/2010 typistClock=2009 pending=false wait=false ... resyncAttempts=0 synced=true confirmed=true
+```
+
+Two kinds. Joiners 43/44/49-type: `synced`, no request outstanding, never
+requested a resync, *pending structs* — a SyncStep2 from a responder that
+was itself missing a keystroke (in flight) handed over the hole (design
+E's diagnosis; design B's source). Joiner 47-type: one keystroke short,
+no pending structs — the responder answered before the typist's last
+keystroke reached it, and that keystroke was broadcast before the joiner
+was in the room; with `syncInterval 0` nothing can ever tell it (design
+C's beacon, design A's trigger). `bench-idle-backoff`: idle messages
+72 → 23 with backoff on; recovery of the update dropped before idle
+median 68 ms (off) vs 1,843 ms (on), the number design D has to fix.
+
+`bench-join-after-burst` with the 2 s beacon (3 runs per mode): all
+variants converge in both modes. Relay WebSocket in-budget 4,216-4,510 /
+fresh 3,961-4,637, Matrix 7,158-7,697 / 5,537-6,018 (the beacons of the 50
+peers now land inside Matrix's ~600 ms window: request=1,568-1,960);
+unicast WebSocket in-budget 1,842-3,683 (64 / 104 / **1,030 ms** — the
+third run is a joiner-47-type straggler healed by the first periodic
+beacon, ~1 s after the join) / fresh 2,081-2,315, Matrix 4,099-4,102 /
+3,181-3,227. This is the 1d baseline for that bench; the 1c numbers
+(syncInterval 0) are not comparable.

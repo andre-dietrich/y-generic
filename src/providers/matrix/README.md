@@ -221,7 +221,13 @@ Yjs updates are sent as Matrix events:
 - **Guest Access Required**: Homeserver must support guest registration
 - **Base64 Overhead**: ~33% size increase due to JSON encoding
 - **Public Rooms**: Guest users typically limited to public rooms
-- **Rate Limits**: Subject to homeserver rate limiting
+- **Rate Limits**: Synapse's default `rc_message` is 0.2 messages/s per user
+  with a burst of 10, so the transport hints `batchUpdates` and
+  `awarenessInterval` of 2 s (override per `GenericProvider` option if your
+  homeserver allows more)
+- **Event size**: 65,536 bytes per event; larger updates are sent as several
+  events and reassembled (each counts against the rate limit), and updates
+  above 2 KB are compressed first (`compressionThresholdBytes` hint)
 - **No E2E Encryption Yet**: Current implementation doesn't support encrypted rooms
 
 ## Comparison with Other Providers

@@ -49,6 +49,11 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
+import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
+
+// Common relays (strfry default) cap an event at 64 KiB; content is the
+// base64 payload, tags and signature add a few hundred bytes.
+const MAX_CONTENT_CHARS = 60000
 
 // ---------------------------------------------------------------------------
 // CRC32 translation helpers
@@ -274,6 +279,8 @@ export class NostrTransport implements Transport {
    * round trips.
    */
   readonly preferredBatchMs = 150
+  // 64 KiB per event on the common relays: compress first, chunk after.
+  readonly preferredCompressMinBytes = 2048
   // Relay round trip incl. signature verification: a few hundred ms.
   readonly expectedRttMs = 600
 
@@ -281,6 +288,7 @@ export class NostrTransport implements Transport {
   private _connected = false
   private _callback?: (data: Uint8Array) => void
   private _buffer: Uint8Array[] = []
+  private _chunks = new ChunkAssembler()
 
   private pool: InstanceType<NostrTransportOptions['SimplePool']> | null = null
   private sub: { close(): void } | null = null
@@ -373,7 +381,15 @@ export class NostrTransport implements Transport {
         }
 
         try {
-          const raw = base64ToUint8Array(event.content)
+          let content: string = event.content
+          if (content.startsWith('{')) {
+            const parsed = JSON.parse(content)
+            if (!isChunk(parsed)) return
+            const whole = this._chunks.push(parsed)
+            if (whole === null) return
+            content = whole
+          }
+          const raw = base64ToUint8Array(content)
           const withHeader = addCRC32Header(raw)
           this._deliver(withHeader)
         } catch (err) {
@@ -417,21 +433,28 @@ export class NostrTransport implements Transport {
 
     // Strip the 4-byte CRC32 header added by GenericProvider before encoding
     const raw = stripCRC32Header(data)
-    const content = uint8ArrayToBase64(raw)
+    const base64 = uint8ArrayToBase64(raw)
+    // Above the relays' event size cap: one event per chunk.
+    const contents =
+      base64.length > MAX_CONTENT_CHARS
+        ? splitChunks(base64, MAX_CONTENT_CHARS).map((c) => JSON.stringify(c))
+        : [base64]
 
-    const event = this.opts.finalizeEvent(
-      {
-        kind: this.eventKind,
-        created_at: Math.floor(Date.now() / 1000),
-        // Tag `r` is used as the room/document identifier for filtering
-        tags: [['r', this.roomTag]],
-        content,
-      },
-      this.secretKey,
-    )
+    for (const content of contents) {
+      const event = this.opts.finalizeEvent(
+        {
+          kind: this.eventKind,
+          created_at: Math.floor(Date.now() / 1000),
+          // Tag `r` is used as the room/document identifier for filtering
+          tags: [['r', this.roomTag]],
+          content,
+        },
+        this.secretKey,
+      )
 
-    // Publish to all relays; ignore individual relay errors
-    await Promise.allSettled(this.pool.publish(this.relays, event))
+      // Publish to all relays; ignore individual relay errors
+      await Promise.allSettled(this.pool.publish(this.relays, event))
+    }
   }
 
   onMessage(callback: (data: Uint8Array) => void): () => void {

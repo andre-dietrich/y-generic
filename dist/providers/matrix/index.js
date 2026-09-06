@@ -1,3 +1,7 @@
+import { splitChunks, isChunk, ChunkAssembler } from '../chunking';
+// Synapse rejects events above 65,536 bytes of canonical JSON; the body is
+// the base64 payload, the rest of the event is a few hundred bytes.
+const MAX_BODY_CHARS = 60000;
 /**
  * Matrix Transport for Yjs
  *
@@ -33,7 +37,14 @@ export class MatrixTransport {
          * unlike push-style transports, there's no cheaper round trip to lose by
          * batching. Recommends GenericProvider debounce rapid edits by default.
          */
-        this.preferredBatchMs = 150;
+        // Synapse's default rc_message is 0.2 messages/s per user with a burst of
+        // 10: at 150 ms batches and 100 ms awareness a typing peer was
+        // rate-limited within seconds. 2 s each keeps a minute of activity inside
+        // the burst; operators who raise rc_message override per call.
+        this.preferredBatchMs = 2000;
+        this.preferredAwarenessMs = 2000;
+        // A 65,536-byte canonical-JSON cap per event: compress first, chunk after.
+        this.preferredCompressMinBytes = 2048;
         // HTTP PUT to send, long-poll to receive: several hundred ms one way.
         this.expectedRttMs = 700;
         this.config = null;
@@ -49,6 +60,7 @@ export class MatrixTransport {
         // Message buffering
         this.messageQueue = [];
         this.receivedBuffer = [];
+        this.chunks = new ChunkAssembler();
     }
     get isConnected() {
         return this._isConnected;
@@ -202,9 +214,19 @@ export class MatrixTransport {
                     // Ignore our own messages
                     if (event.sender === this.userId)
                         continue;
-                    // Decode the Yjs update from base64
+                    // Decode the Yjs update from base64 (a chunk of one above
+                    // MAX_BODY_CHARS: reassemble first)
                     try {
-                        const updateBase64 = event.content.body;
+                        let updateBase64 = event.content.body;
+                        if (updateBase64.startsWith('{')) {
+                            const parsed = JSON.parse(updateBase64);
+                            if (!isChunk(parsed))
+                                continue;
+                            const whole = this.chunks.push(parsed);
+                            if (whole === null)
+                                continue;
+                            updateBase64 = whole;
+                        }
                         const update = this.base64ToUint8(updateBase64);
                         this.log(`📨 Received ${update.length} bytes from ${event.sender}`);
                         if (this.messageCallback) {
@@ -245,8 +267,22 @@ export class MatrixTransport {
             return;
         }
         try {
-            // Encode update as base64 for JSON transport
+            // Encode update as base64 for JSON transport; above the event size
+            // cap, one event per chunk (each counts against rc_message - the
+            // only option Synapse leaves).
             const base64Data = this.uint8ToBase64(data);
+            const bodies = base64Data.length > MAX_BODY_CHARS
+                ? splitChunks(base64Data, MAX_BODY_CHARS).map((c) => JSON.stringify(c))
+                : [base64Data];
+            for (const body of bodies)
+                this.sendEvent(body, data.length);
+        }
+        catch (error) {
+            this.log('❌ Send error:', error);
+        }
+    }
+    sendEvent(body, byteCount) {
+        try {
             // Send as custom message type
             const txnId = `y${this.txnId++}_${Date.now()}`;
             const url = `${this.config.homeserverUrl}/_matrix/client/v3/rooms/${encodeURIComponent(this.roomId)}/send/m.room.message/${txnId}`;
@@ -259,11 +295,11 @@ export class MatrixTransport {
                 },
                 body: JSON.stringify({
                     msgtype: 'y.update',
-                    body: base64Data,
+                    body,
                 }),
             }).then((response) => {
                 if (response.ok) {
-                    this.log(`📤 Sent ${data.length} bytes`);
+                    this.log(`📤 Sent ${byteCount} bytes`);
                 }
                 else {
                     this.log(`❌ Send failed: ${response.statusText}`);

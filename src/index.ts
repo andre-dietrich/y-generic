@@ -647,7 +647,7 @@ export class GenericProvider extends Observable<string> {
        * Awareness updates (cursors, presence) are batched and sent at this interval.
        * Set to 0 for immediate transmission (not recommended for high-frequency updates).
        * This prevents awareness from flooding document sync on limited transports.
-       * @default 100 (100ms between awareness broadcasts)
+       * @default the transport's `preferredAwarenessMs` hint if it declares one, else 100
        */
       awarenessInterval?: number
       /**
@@ -751,9 +751,12 @@ export class GenericProvider extends Observable<string> {
        * detail - which is why this defaults to fully disabled rather than
        * auto-enabling above some size unconditionally.
        *
-       * `0` or `undefined` disables compression entirely and keeps the wire
-       * format byte-for-byte identical to before this option existed.
-       * @default undefined (compression disabled, wire format unchanged)
+       * `0` disables compression entirely and keeps the wire format
+       * byte-for-byte identical to before this option existed; `undefined`
+       * takes the transport's `preferredCompressMinBytes` hint (2048 on
+       * Ably, PubNub, Matrix, Nostr, Supabase - transports that cap or
+       * bill message size), else disabled.
+       * @default the transport's `preferredCompressMinBytes` hint, else undefined
        */
       compressionThresholdBytes?: number
       /**
@@ -818,14 +821,18 @@ export class GenericProvider extends Observable<string> {
     this._batchUpdates =
       options.batchUpdates ?? transport.preferredBatchMs ?? 0
     this._disableBc = options.disableBc ?? false
-    this._awarenessInterval = options.awarenessInterval ?? 100
+    this._awarenessInterval =
+      options.awarenessInterval ?? transport.preferredAwarenessMs ?? 100
     this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20
     this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000
     this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30
     this._peerConnectDebounceMs = options.peerConnectDebounceMs ?? 50
     this._gapGraceMs = options.gapGraceMs ?? 300
     this._seqWindowSize = options.seqWindowSize ?? 64
-    this._compressionThresholdBytes = options.compressionThresholdBytes || undefined
+    // Explicit 0 disables even when the transport hints a floor.
+    this._compressionThresholdBytes =
+      (options.compressionThresholdBytes ?? transport.preferredCompressMinBytes) ||
+      undefined
     this._idleBackoffEnabled = options.idleBackoffEnabled ?? true
     this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000
     this._currentSyncIntervalMs = this._syncInterval

@@ -1,3 +1,10 @@
+import { splitChunks, isChunk, ChunkAssembler } from '../chunking';
+// Realtime caps a broadcast at 256 KB on the free tier (3 MB above). Below
+// this the raw bytes go out as a binary payload (supabase-js >= 2.91.0 on
+// EVERY peer - an older client drops binary broadcasts silently); above
+// it, base64 chunks in the JSON path.
+const MAX_BINARY_BYTES = 200000;
+const MAX_CHUNK_CHARS = 200000;
 // ---------------------------------------------------------------------------
 // CRC32 helpers (GenericProvider wraps messages with CRC32 header)
 // ---------------------------------------------------------------------------
@@ -77,7 +84,11 @@ export class SupabaseTransport {
         this.options = options;
         this.supabase = null;
         this.channel = null;
+        // Broadcasts count against a per-project messages/s cap and one
+        // broadcast is N events: compress the big ones.
+        this.preferredCompressMinBytes = 2048;
         this.config = null;
+        this.chunks = new ChunkAssembler();
         this._isConnected = false;
         this.debug = false;
         this.roomId = '';
@@ -143,14 +154,20 @@ export class SupabaseTransport {
         }
         // Strip CRC32 header before sending
         const payload = stripCRC32Header(data);
-        // Convert Uint8Array to base64 for JSON transport
+        if (payload.length <= MAX_BINARY_BYTES) {
+            // Binary broadcast: no base64 (33 % smaller on the wire)
+            this.channel.send({
+                type: 'broadcast',
+                event: 'message',
+                payload: payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength),
+            });
+            return;
+        }
+        // Too large for one broadcast: base64 chunks through the JSON path
         const base64 = this.uint8ArrayToBase64(payload);
-        // Broadcast to channel
-        this.channel.send({
-            type: 'broadcast',
-            event: 'message',
-            payload: base64,
-        });
+        for (const chunk of splitChunks(base64, MAX_CHUNK_CHARS)) {
+            this.channel.send({ type: 'broadcast', event: 'message', payload: chunk });
+        }
     }
     onMessage(callback) {
         this.messageCallback = callback;
@@ -165,10 +182,25 @@ export class SupabaseTransport {
         if (!this.messageCallback)
             return;
         try {
-            // Convert base64 back to Uint8Array
-            const data = typeof payload === 'string'
-                ? this.base64ToUint8Array(payload)
-                : new Uint8Array(0);
+            let data;
+            if (payload instanceof ArrayBuffer) {
+                data = new Uint8Array(payload);
+            }
+            else if (ArrayBuffer.isView(payload)) {
+                data = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength);
+            }
+            else if (typeof payload === 'string') {
+                data = this.base64ToUint8Array(payload); // an older sender
+            }
+            else if (isChunk(payload)) {
+                const whole = this.chunks.push(payload);
+                if (whole === null)
+                    return;
+                data = this.base64ToUint8Array(whole);
+            }
+            else {
+                return;
+            }
             // Add CRC32 header for GenericProvider
             const wrapped = addCRC32Header(data);
             this.messageCallback(wrapped);

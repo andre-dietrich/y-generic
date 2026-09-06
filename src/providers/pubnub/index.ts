@@ -55,6 +55,9 @@ export class PubNubTransport implements Transport {
   private debug: boolean = false
   private messageBuffer: Uint8Array[] = [] // Buffer messages until callback is set
   private chunkBuffer: Map<string, Map<number, string>> = new Map() // Buffer for reassembling chunks
+  // Compress a full-document push before it is base64-encoded and chunked
+  // (see Transport.preferredCompressMinBytes).
+  readonly preferredCompressMinBytes = 2048
 
   // PubNub has a 32 KiB message limit. We use 30 KB for safety (after base64 encoding)
   private readonly MAX_MESSAGE_SIZE = 30000

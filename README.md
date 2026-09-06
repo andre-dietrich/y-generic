@@ -140,6 +140,8 @@ interface Transport {
   sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
   readonly preferredBatchMs?: number
   readonly expectedRttMs?: number
+  readonly preferredCompressMinBytes?: number
+  readonly preferredAwarenessMs?: number
 }
 ```
 
@@ -160,6 +162,13 @@ interface Transport {
   Matrix homeserver). Seeds the provider's latency estimate so the first
   join on a slow transport does not retry before the first replies can
   have arrived; measured samples take over immediately.
+- `preferredCompressMinBytes` - default `compressionThresholdBytes` for
+  transports that cap or bill message size (Ably, PubNub, Matrix, Nostr,
+  Supabase set 2048): a full-document push is compressed before it is
+  chunked. Same-version-room rule applies, as for every wire change.
+- `preferredAwarenessMs` - default `awarenessInterval` for transports
+  whose backend rate-limits sends per user (Matrix sets 2000 against
+  Synapse's default 0.2 messages/s).
 
 ### GenericProvider Class
 

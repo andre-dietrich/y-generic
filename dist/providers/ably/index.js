@@ -146,6 +146,9 @@ export class AblyTransport {
         this.debug = false;
         this.messageBuffer = [];
         this.chunkBuffer = new Map();
+        // Compress a full-document push before it is base64-encoded and chunked
+        // (see Transport.preferredCompressMinBytes).
+        this.preferredCompressMinBytes = 2048;
         // Persistence
         this.persistentMode = false;
         this.persistDoc = null;

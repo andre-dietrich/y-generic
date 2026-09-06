@@ -61,8 +61,10 @@ export declare class SupabaseTransport implements Transport {
     private readonly options;
     private supabase;
     private channel;
+    readonly preferredCompressMinBytes = 2048;
     private config;
     private messageCallback?;
+    private chunks;
     private _isConnected;
     private debug;
     private roomId;

@@ -19,6 +19,14 @@ Real-time collaborative editing with Supabase Realtime and optional database per
 npm install y-generic @supabase/supabase-js yjs
 ```
 
+## Wire format
+
+Updates are broadcast as **binary payloads** (no base64), which needs
+`@supabase/supabase-js` **2.91.0 or newer on every peer** - an older client
+silently drops binary broadcasts. Updates above 200 KB are sent as base64
+chunks and reassembled; updates above 2 KB are compressed first
+(`compressionThresholdBytes` hint, see the `GenericProvider` option).
+
 ## Database Setup (for Persistent Mode)
 
 Create a table in your Supabase project:

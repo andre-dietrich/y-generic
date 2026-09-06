@@ -53,6 +53,7 @@ export declare class PubNubTransport implements Transport {
     private debug;
     private messageBuffer;
     private chunkBuffer;
+    readonly preferredCompressMinBytes = 2048;
     private readonly MAX_MESSAGE_SIZE;
     get isConnected(): boolean;
     /**

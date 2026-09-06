@@ -502,14 +502,18 @@ export class GenericProvider extends Observable {
         this._batchUpdates =
             options.batchUpdates ?? transport.preferredBatchMs ?? 0;
         this._disableBc = options.disableBc ?? false;
-        this._awarenessInterval = options.awarenessInterval ?? 100;
+        this._awarenessInterval =
+            options.awarenessInterval ?? transport.preferredAwarenessMs ?? 100;
         this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20;
         this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000;
         this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30;
         this._peerConnectDebounceMs = options.peerConnectDebounceMs ?? 50;
         this._gapGraceMs = options.gapGraceMs ?? 300;
         this._seqWindowSize = options.seqWindowSize ?? 64;
-        this._compressionThresholdBytes = options.compressionThresholdBytes || undefined;
+        // Explicit 0 disables even when the transport hints a floor.
+        this._compressionThresholdBytes =
+            (options.compressionThresholdBytes ?? transport.preferredCompressMinBytes) ||
+                undefined;
         this._idleBackoffEnabled = options.idleBackoffEnabled ?? true;
         this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000;
         this._currentSyncIntervalMs = this._syncInterval;

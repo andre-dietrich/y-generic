@@ -48,7 +48,9 @@ export declare class MatrixTransport implements Transport {
      * unlike push-style transports, there's no cheaper round trip to lose by
      * batching. Recommends GenericProvider debounce rapid edits by default.
      */
-    readonly preferredBatchMs = 150;
+    readonly preferredBatchMs = 2000;
+    readonly preferredAwarenessMs = 2000;
+    readonly preferredCompressMinBytes = 2048;
     readonly expectedRttMs = 700;
     private config;
     private messageCallback?;
@@ -63,6 +65,7 @@ export declare class MatrixTransport implements Transport {
     private txnId;
     private messageQueue;
     private receivedBuffer;
+    private chunks;
     get isConnected(): boolean;
     /**
      * Connect to Matrix homeserver and join room
@@ -92,6 +95,7 @@ export declare class MatrixTransport implements Transport {
      * Send Yjs update to Matrix room
      */
     send(data: Uint8Array): void;
+    private sendEvent;
     /**
      * Register message callback
      */

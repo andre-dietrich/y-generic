@@ -207,7 +207,7 @@ export declare class GenericProvider extends Observable<string> {
          * Awareness updates (cursors, presence) are batched and sent at this interval.
          * Set to 0 for immediate transmission (not recommended for high-frequency updates).
          * This prevents awareness from flooding document sync on limited transports.
-         * @default 100 (100ms between awareness broadcasts)
+         * @default the transport's `preferredAwarenessMs` hint if it declares one, else 100
          */
         awarenessInterval?: number;
         /**
@@ -311,9 +311,12 @@ export declare class GenericProvider extends Observable<string> {
          * detail - which is why this defaults to fully disabled rather than
          * auto-enabling above some size unconditionally.
          *
-         * `0` or `undefined` disables compression entirely and keeps the wire
-         * format byte-for-byte identical to before this option existed.
-         * @default undefined (compression disabled, wire format unchanged)
+         * `0` disables compression entirely and keeps the wire format
+         * byte-for-byte identical to before this option existed; `undefined`
+         * takes the transport's `preferredCompressMinBytes` hint (2048 on
+         * Ably, PubNub, Matrix, Nostr, Supabase - transports that cap or
+         * bill message size), else disabled.
+         * @default the transport's `preferredCompressMinBytes` hint, else undefined
          */
         compressionThresholdBytes?: number;
         /**

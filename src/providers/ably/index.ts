@@ -249,6 +249,9 @@ export class AblyTransport implements Transport {
   private messageCallback?: (data: Uint8Array) => void
   private messageBuffer: Uint8Array[] = []
   private chunkBuffer: Map<string, Map<number, string>> = new Map()
+  // Compress a full-document push before it is base64-encoded and chunked
+  // (see Transport.preferredCompressMinBytes).
+  readonly preferredCompressMinBytes = 2048
 
   // Persistence
   private persistentMode: boolean = false

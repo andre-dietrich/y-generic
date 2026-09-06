@@ -156,11 +156,13 @@ export declare class NostrTransport implements Transport {
      * round trips.
      */
     readonly preferredBatchMs = 150;
+    readonly preferredCompressMinBytes = 2048;
     readonly expectedRttMs = 600;
     private readonly opts;
     private _connected;
     private _callback?;
     private _buffer;
+    private _chunks;
     private pool;
     private sub;
     private relays;

@@ -84,6 +84,24 @@ export interface Transport {
      * soon as they exist.
      */
     readonly expectedRttMs?: number;
+    /**
+     * Optional hint: default for `compressionThresholdBytes` when the caller
+     * passes nothing. Transports that cap a single message (PubNub 32 KiB,
+     * Ably 64 KiB, Matrix 64 KiB, Nostr 64 KiB) or bill per delivered size
+     * (Ably, 5 KiB units) set this so a full-document push is compressed
+     * before it is chunked. Changes the transport's default wire format (a
+     * 1-byte flag on every message) - all peers of a room must run the same
+     * library version, as the README already requires. An explicit
+     * `compressionThresholdBytes: 0` still disables compression.
+     */
+    readonly preferredCompressMinBytes?: number;
+    /**
+     * Optional hint: default for `awarenessInterval` (ms). A transport whose
+     * backend rate-limits sends per user (Synapse: 0.2 messages/s, burst 10
+     * by default) sets this well above the 100 ms default, so cursor traffic
+     * does not spend the burst within seconds.
+     */
+    readonly preferredAwarenessMs?: number;
 }
 /**
  * Connection configuration passed to transport.connect()

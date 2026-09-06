@@ -136,6 +136,10 @@ function makeMeshProvider(
     latency: 10,
     jitter: 0.1,
     simulatePeerConnect: true,
+    // DUMMY_UNICAST=1: the transport can address a peer (sendTo), as the
+    // real mesh transports can - round 5, item 5 sends each newly
+    // connected peer a beacon instead of pushing full state to everyone.
+    unicast: process.env.DUMMY_UNICAST === '1',
   })
   const provider = new GenericProvider(doc, transport, {
     batchUpdates: 0,

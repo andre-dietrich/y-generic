@@ -477,6 +477,24 @@ export class GenericProvider extends Observable {
         // this. See docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
         // item 7 and test/dummy/bench-awareness-removal-burst.ts.
         this._pendingAwarenessRemoval = null;
+        // Peers whose channel opened since the debounce timer was armed (the
+        // `from`/sendTo address). Round 5, item 5: on a transport with sendTo
+        // each gets a plain beacon addressed to it - it answers with what we
+        // lack and its own JOIN beacon makes us answer it - instead of the
+        // full-state push + beacon broadcast to EVERY connection that
+        // `_syncNow(0)` did (the O(N^2) mesh-join burst CLAUDE.md warns about).
+        this._pendingPeerConnectIds = new Set();
+        // Round 5, item 5: the state vector and delete-set hash the room last
+        // confirmed as equal to ours (an equal digest from any peer, see
+        // _handleDigest). A reconnect's push then carries only what we produced
+        // since - our offline edits, the one thing a push exists for (round 2:
+        // one message must survive alone) - instead of the whole document, which
+        // on a chunking transport was several messages per reconnect. A room
+        // that has been replaced meanwhile shows up behind in its own JOIN
+        // beacons and is answered like any late joiner. Null until the first
+        // confirmation: the first connect still pushes everything.
+        this._confirmedSv = null;
+        this._confirmedDsHash = null;
         // Cached computeDeleteSetHash(doc); null = stale. Invalidated on every
         // doc 'update' (deletes are content changes, so this is exact; inserts
         // invalidate needlessly but cheaply). See computeDeleteSetHash's doc for
@@ -576,9 +594,9 @@ export class GenericProvider extends Observable {
                 this._handleIncomingMessage(data, from);
             });
             if (this.transport.onPeerConnect) {
-                const unsubPeer = this.transport.onPeerConnect((_peerId) => {
+                const unsubPeer = this.transport.onPeerConnect((peerId) => {
                     if (!this._destroying)
-                        this._schedulePeerConnectSync();
+                        this._schedulePeerConnectSync(peerId);
                 });
                 const originalUnsub = this._unsubscribeTransport;
                 this._unsubscribeTransport = () => {
@@ -727,6 +745,7 @@ export class GenericProvider extends Observable {
             clearTimeout(this._pendingPeerConnectSyncTimeoutId);
             this._pendingPeerConnectSyncTimeoutId = undefined;
         }
+        this._pendingPeerConnectIds.clear();
         // Reset the sync rate-limit budget. Without this, a reconnect inherits
         // whatever budget was left over from before the disconnect - and since
         // syncNow()'s full-state push now shares this same limiter (see
@@ -907,11 +926,27 @@ export class GenericProvider extends Observable {
         if (!this._tryReserveSyncSlot())
             return false;
         const messages = [];
-        // Send our current document state to all peers
-        // This ensures any changes made while offline are transmitted
+        // Send our document state to all peers - everything on the first
+        // connect, only what we produced since the room last confirmed our
+        // state afterwards (see _confirmedSv). This is what carries edits made
+        // while offline.
         if (push) {
-            const update = Y.encodeStateAsUpdate(this.doc);
-            if (update.length > 0) {
+            const update = Y.encodeStateAsUpdate(this.doc, this._confirmedSv ?? undefined);
+            let worthPushing = update.length > 0;
+            if (worthPushing && this._confirmedSv !== null) {
+                // A diff against a confirmed state is never byte-empty (it always
+                // carries the delete set): push it only if it holds structs, or
+                // deletes the room has not confirmed.
+                try {
+                    worthPushing =
+                        Y.parseUpdateMeta(update).to.size > 0 ||
+                            this._deleteSetHash() !== this._confirmedDsHash;
+                }
+                catch {
+                    worthPushing = true;
+                }
+            }
+            if (worthPushing) {
                 messages.push(this._encodePush(update));
             }
         }
@@ -1137,13 +1172,27 @@ export class GenericProvider extends Observable {
      * connected (O(N^2) traffic), since onPeerConnect fires once per
      * newly-opened peer connection with no coalescing of its own.
      */
-    _schedulePeerConnectSync() {
+    _schedulePeerConnectSync(peerId) {
+        if (peerId !== undefined)
+            this._pendingPeerConnectIds.add(peerId);
         if (this._pendingPeerConnectSyncTimeoutId !== undefined)
             return;
         this._pendingPeerConnectSyncTimeoutId = setTimeout(() => {
             this._pendingPeerConnectSyncTimeoutId = undefined;
+            const ids = Array.from(this._pendingPeerConnectIds);
+            this._pendingPeerConnectIds.clear();
             if (!this.transport.isConnected || this._destroying)
                 return;
+            if (typeof this.transport.sendTo === 'function' && ids.length > 0) {
+                // Round 5, item 5: one plain beacon to each new peer, nothing to
+                // the rest of the mesh. Not rate-limited as a request: it answers
+                // a channel that just opened, and the peer's own JOIN beacon is
+                // the fallback if it is lost.
+                const beacon = wrapMessageWithChecksum(this._encodeSyncStep1(0));
+                for (const id of ids)
+                    this._sendToTransport(beacon, id);
+                return;
+            }
             this._syncNow(0);
         }, this._peerConnectDebounceMs);
     }
@@ -1683,6 +1732,11 @@ export class GenericProvider extends Observable {
         }
         const dsEqual = remoteDsHash === this._deleteSetHash();
         const equal = !senderBehind && !weBehind && dsEqual;
+        if (equal) {
+            // Any peer holding exactly our state has confirmed it - see _confirmedSv.
+            this._confirmedSv = remoteSv;
+            this._confirmedDsHash = remoteDsHash;
+        }
         if (flags & DIGEST_FLAG_ACK) {
             // Somebody confirmed the echoed state (see DIGEST_FLAG_ACK). If it is
             // ours, we're synced; if we were about to confirm the same state, we

@@ -149,6 +149,9 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
     private _pendingPeerConnectSyncTimeoutId?;
+    private _pendingPeerConnectIds;
+    private _confirmedSv;
+    private _confirmedDsHash;
     private _compressionThresholdBytes?;
     private _dsHashCache;
     private _localSeqNum;

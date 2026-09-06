@@ -703,3 +703,77 @@ SKIP_CENSUS=1 SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1 node bench-dist/test/dummy/be
 The bound is now the editor's own re-armed beacon (≤ one base interval)
 plus one round trip, no longer the loser's backed-off tick. Gates:
 `bench-packet-loss` all cells converged, fan-out and join burst within the item-3 build's spread on both profiles (Matrix fan-out 10 % N=50: 1,405 → 1,192; 5 % N=25: 232 → 360 with a 48-984 spread); `bench-idle-backoff` recovery after backoff median 547 ms; `bench-late-join` all cells converged.
+
+### Item 4 — in-flight grace for beacon replies: measured, not shipped
+
+What was tried in `src/index.ts`: `_recentArrivals` keeps, per client,
+the start clocks and arrival times of recently applied verified updates
+(our own stamped when sent); a periodic beacon whose sender is behind only
+by clocks younger than a grace gets no SyncStep2; JOIN/CONFIRM beacons
+and delete-set mismatches are answered as before.
+
+```
+N_VALUES=20 TYPISTS=5 node bench-dist/test/dummy/bench-typing-census.js   # x2, base cadence
+N_VALUES=50 node bench-dist/test/dummy/bench-typing-census.js             # x2
+node bench-dist/test/dummy/bench-packet-loss.js
+```
+
+| Scenario | before (item-2 build) → with item 4 | SyncStep2 deliveries |
+|---|---|---|
+| typing N=20, five typists, base cadence | 1.44 / 1.43 → 1.39 / 1.40 sends per keystroke; 6,859 / 6,783 → 6,612 / 6,650 deliveries | 209 / 114 → 0 / 0 |
+| typing N=50, one typist, base cadence | 1.46 / 1.54 → 1.54 / 1.54 | 49 / 49 → 0 / 0 |
+
+The class it targets does go to zero - but after Trickle (item 3) that
+class was worth 2-3 % of a base-cadence typing room (17 % before item 3)
+and nothing in the steady state. Against that, `bench-packet-loss` on the
+Matrix profile (350 ms ± 40 %):
+
+| grace | fan-out 10 % loss, N=50: deliveries mean (min/max), convergence | 1 % N=50 |
+|---|---|---|
+| none (previous build) | 1,192 (1,127-1,225), 1.1 s | 425 (392-490), 0.5 s |
+| `max(gapGraceMs, minRTT)` (the review's formula) | 3,969 (3,822-4,067), 3.3 s | 3,626 (3,528-3,773), 2.0 s |
+| `gapGraceMs` = 300 ms | 2,613 (1,127-4,949), 1.8 s | 702 (490-980), 0.7 s |
+
+The first grace swallowed the losers' gap-check resync beacons outright
+(the measured minimum round trip includes the responders' suppression
+delays, so it is longer than the review assumed); the second is correct
+by construction for the resync paths (a request arrives gap grace + 100
+ms + flight after the struct it lacks) yet still showed outliers up to
+4x and a slower mean at 10 % loss in three samples, and the bench is
+noisy enough that three samples cannot separate a small real effect
+from none. A 2 % gain does not pay for a recovery path that needs an
+argument to be safe. Not shipped; the measurement is the deliverable
+(`bench-idle-backoff`, `bench-late-join`, `bench-corruption-storm` were
+green on both variants).
+
+### Item 5 — the diff, not the document: reconnect push and peer-connect beacon (commit 6)
+
+What changed in `src/index.ts`: `_confirmedSv`/`_confirmedDsHash` remember
+the state any peer last confirmed equal to ours (the `equal` branch of
+`_handleDigest`); `_trySyncPushPull` pushes `encodeStateAsUpdate(doc,
+_confirmedSv)` - only what we produced since - and skips the push when
+that carries no structs and no unconfirmed deletes (the first connect,
+with nothing confirmed yet, still pushes everything). `onPeerConnect` now
+passes the peer id through; on a transport with `sendTo` the debounced
+peer-connect sync sends each new peer one plain beacon addressed to it
+instead of `_syncNow(0)`'s full-state push + beacon broadcast to every
+connection. `bench-mesh-join-burst` takes `DUMMY_UNICAST=1`;
+`test/dummy/bench-reconnect-push.ts` is new.
+
+```
+node bench-dist/test/dummy/bench-mesh-join-burst.js                 # relay-style mesh (no sendTo)
+DUMMY_UNICAST=1 node bench-dist/test/dummy/bench-mesh-join-burst.js # mesh with sendTo (peerjs, simple-peer, trystero)
+node bench-dist/test/dummy/bench-reconnect-push.js                  # 50 KB doc, 16 KB chunks, 5 reconnects
+CHUNK_KB=0 node bench-dist/test/dummy/bench-reconnect-push.js
+```
+
+| Scenario (messages attributable to the burst, debounce 50 ms) | before (item-2 build) → after |
+|---|---|
+| mesh join burst, no sendTo, M=5 K=5 / 10+10 / 20+10 | 242 / 1,038 / 2,217 → 242 / 1,019 / 2,072 |
+| mesh join burst, sendTo, M=5 K=5 / 10+10 / 20+10 | 278 / 1,152 / 2,480 → **216 / 873 / 1,523** (−22 / −24 / −39 %); rate-limit attempts 80 → 30 |
+| reconnect of a settled peer, 50 KB doc, 16 KB chunks | 6 sends (4 chunks of the 50 KB push + ack + presence) → **3 sends**, ~0.1 KB |
+| reconnect of a settled peer, 50 KB doc, no chunking | 3 sends / 50.2 KB pushed → 3-4 sends / 0 KB pushed (beacon + awareness, ack, presence) |
+
+Without `sendTo` the peer-connect sync still broadcasts a beacon (and no
+longer a full push, which is the 7 % at M=20); with it, the burst's cost
+is the joiners' own JOIN path. Gates: `bench-join-census` late join N=100 500 (relay) / 403 (unicast), fresh burst N=100 53,658 WebSocket / 49,896 Gun (item-3 build 51,975 / 51,282 - noise); `bench-late-join` all cells converged in relay and unicast mode; `bench-reconnect-cycling` 0 spurious gap checks; `bench-rejoin-blank-doc` 10/10 both variants (a new provider has nothing confirmed and still pushes everything); `bench-asymmetric-join` all converged.

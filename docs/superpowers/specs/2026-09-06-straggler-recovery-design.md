@@ -44,12 +44,15 @@ of ours (`weBehind`), remember that state vector and arm one check timer
 (`_behindCheckTimer`, coalesced: a newer beacon that shows us behind
 replaces the remembered vector, the timer keeps running) with delay
 `max(_gapGraceMs, 2 · minRTT)` — 300 ms on a 15 ms link, ~1-1.4 s on the
-Matrix profile. When it fires: if we are disconnected or a request of
-ours is outstanding (`_responseWaitTimer`), nothing (that request is
-being answered or retried); otherwise, if our current state vector is
+Matrix profile. When it fires: if we are disconnected, or a request of
+ours went out within the last grace (`_requestSentAt`; its answer is
+still on its way), nothing; otherwise, if our current state vector is
 still behind the remembered one, `_requestResync()` — the existing
 coordinator (coalesced, exponential backoff, rate-limited) sends the
-beacon and arms the response wait.
+beacon and arms the response wait. Not "a response wait is outstanding":
+a new room's first peers keep their JOIN wait parked for seconds (three
+retries, nobody SETTLED yet), and gated on that the check never fired in
+`bench-idle-backoff` (Task 4's first measurement, 1,846 ms unchanged).
 
 Why the grace: during typing at Matrix latency almost every receiver of a
 periodic beacon is "behind" by a keystroke that is still in flight
@@ -106,14 +109,21 @@ if `doc.store.pendingStructs`/`pendingDs` is non-null, arm the same grace
 check, which requests the difference through the coordinator once the
 response wait is over. Belt and braces, both cheap.
 
-### D. Idle backoff on by default
+### D. Idle backoff on by default, activity re-arms the timer at once
 
 `idleBackoffEnabled` defaults to `true`, `idleBackoffMaxMs` stays 60 s.
 With A, a peer that lost the last update before the room went idle is
-healed by the *typist's* next beacon (the typist had activity, its
-interval is at the base), so the loser's own backed-off interval no
-longer bounds the recovery. Measured in `bench-idle-backoff` part (b)
-before and after; the option stays for those who want the old cadence.
+healed by the *typist's* next beacon, so the loser's own backed-off
+interval no longer bounds the recovery — provided the typist's beacon
+does come soon. It did not: `_markActivity()` only stamped a time, and
+the interval was reset to the base at the *next tick*, up to the
+backed-off interval away (the option's doc comment claimed "immediately";
+Task 3's measurement shows the 1,845 ms that claim was hiding). Now any
+activity on a backed-off peer clears the pending tick and re-arms it at
+the base interval (at most once per idle stretch, since the interval is
+then at the base until the next quiet tick). Measured in
+`bench-idle-backoff` part (b) before and after; the option stays for
+those who want the fixed cadence.
 
 ## Benchmarks and gates
 
@@ -241,3 +251,32 @@ is still up to the backed-off interval away. So A's beacon arrives no
 sooner than B's own. Design D therefore also makes activity re-arm the
 periodic timer at the base interval immediately (the option's doc comment
 already claimed this).
+
+### After Task 4 — idle backoff on by default, activity re-arms the timer (design D; `bench-dist-t1d4`; logs `after1d-t4`)
+
+`bench-idle-backoff` part (b), recovery of the update dropped just before
+the room went idle (300 ms base / 2.4 s cap), two runs:
+
+| | backoff off | backoff on, before | backoff on, after |
+|---|---|---|---|
+| trials | 28-305 ms | 1,604-1,862 ms | 142-792 ms |
+| median | 202-204 ms | 1,843-1,846 ms | **753-770 ms** |
+
+The chain is now: the typist's beacon at the base interval (re-armed by
+its own edit), the loser's behind check one grace (300 ms) later, the
+resync coordinator's 100 ms, the round trip — ~740 ms in the timeline
+probe, three of three. At the defaults (5 s base) that is about one base
+interval instead of up to 60 s. Part (a) unchanged: 71-74 → 23-24 idle
+messages in the 9 s window. The first measurement of this task, with the
+behind check gated on "a response wait is outstanding", was 1,846 ms —
+the JOIN wait of a new room's first two peers stays parked for 7 s, and
+the check never fired; hence the `_requestSentAt` condition in design A.
+
+Nothing else moved: `bench-idle-room` census N=50 24,696 (bench forces
+backoff off), LOSTDELETE 5/5 with backoff on and off (with backoff on,
+the lost delete-only update heals in 66-930 ms — design A again);
+`bench-user-scaling` join burst N=100 Gun 19,008 / Matrix 17,721 / WebRTC
+18,216 / WebSocket 17,919, fan-out fresh 990; `bench-periodic-awareness`
+4/4; `bench-corruption-storm` ×1 both modes pass (unicast N=10 at 50 %:
+3.0 s); `bench-join-after-burst` ×1 both modes pass; `bench-late-join`
+relay ×1 every cell 3/3.

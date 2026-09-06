@@ -500,7 +500,7 @@ export class GenericProvider extends Observable {
         this._gapGraceMs = options.gapGraceMs ?? 300;
         this._seqWindowSize = options.seqWindowSize ?? 64;
         this._compressionThresholdBytes = options.compressionThresholdBytes || undefined;
-        this._idleBackoffEnabled = options.idleBackoffEnabled ?? false;
+        this._idleBackoffEnabled = options.idleBackoffEnabled ?? true;
         this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000;
         this._currentSyncIntervalMs = this._syncInterval;
         this._setupDocumentSync();
@@ -618,6 +618,7 @@ export class GenericProvider extends Observable {
                             scheduleNextPeriodicSync();
                     }, this._jitteredSyncInterval());
                 };
+                this._periodicScheduler = scheduleNextPeriodicSync;
                 scheduleNextPeriodicSync();
             }
         }
@@ -639,6 +640,7 @@ export class GenericProvider extends Observable {
             clearTimeout(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
+        this._periodicScheduler = undefined;
         // Reset resync escalation tracking
         this._resyncAttemptCount = 0;
         this._lastResyncAttemptTime = 0;
@@ -975,6 +977,21 @@ export class GenericProvider extends Observable {
      */
     _markActivity() {
         this._lastActivityTime = Date.now();
+        // A backed-off periodic timer is re-armed at the base interval NOW, not
+        // at its next tick (which may be idleBackoffMaxMs away). Design D of
+        // the phase-1d doc rests on it: the peer that just had activity beacons
+        // within one base interval, and a peer that lost that activity's
+        // message learns from that beacon that it is behind (design A) - its
+        // own backed-off interval no longer bounds the recovery. Measured in
+        // test/dummy/bench-idle-backoff.ts. At most once per idle stretch.
+        if (this._idleBackoffEnabled &&
+            this._currentSyncIntervalMs !== this._syncInterval &&
+            this._syncIntervalId !== undefined &&
+            this._periodicScheduler !== undefined) {
+            clearTimeout(this._syncIntervalId);
+            this._currentSyncIntervalMs = this._syncInterval;
+            this._periodicScheduler();
+        }
     }
     /** Cached delete-set hash - see computeDeleteSetHash(). */
     _deleteSetHash() {
@@ -1870,8 +1887,14 @@ export class GenericProvider extends Observable {
             this._behindSv = null;
             if (sv === null || this._destroying || !this.transport.isConnected)
                 return;
-            // A request of ours is outstanding: it is being answered or retried.
-            if (this._responseWaitTimer !== undefined)
+            // A request of ours sent within the grace is still being answered.
+            // An OLDER outstanding wait is not a reason to stay behind: a new
+            // room's first peers keep their JOIN wait parked for seconds (three
+            // retries, nobody SETTLED yet), and measured against it the check
+            // never fired - bench-idle-backoff's recovery stayed at one
+            // backed-off interval (1,846 ms) with this line reading
+            // `_responseWaitTimer !== undefined`.
+            if (this._requestSentAt > 0 && Date.now() - this._requestSentAt < delay)
                 return;
             const remote = Y.decodeStateVector(sv);
             const local = Y.decodeStateVector(Y.encodeStateVector(this.doc));

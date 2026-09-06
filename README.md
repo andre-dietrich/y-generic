@@ -178,6 +178,8 @@ class GenericProvider extends Observable<string> {
   constructor(doc: Y.Doc, transport: Transport, options?: {
     awareness?: Awareness
     syncInterval?: number     // Auto-sync interval in ms (default: 5000, set 0 to disable)
+    idleBackoffEnabled?: boolean // Double the interval while the room is idle, up to idleBackoffMaxMs (default: true)
+    idleBackoffMaxMs?: number // Ceiling for the backed-off interval (default: 60000)
     verifyUpdates?: boolean   // Send hash with each update for fast desync detection (default: true)
     batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = disabled, recommended: 50-200)
   })
@@ -451,6 +453,14 @@ const provider = new GenericProvider(doc, transport, {
   beacons and nothing else.
 
 For most production scenarios, the default 5-second interval provides good resilience without excessive traffic. For testing with simulated packet loss, use a shorter interval (e.g., 2 seconds).
+
+While a room is idle the interval doubles after each quiet tick, up to
+`idleBackoffMaxMs` (60 s by default); any document or awareness activity
+resets it to `syncInterval`. A peer that missed the last message before the
+room went quiet does not wait for its own backed-off tick: the next beacon
+from any peer that is ahead of it makes it ask for the difference (after a
+short grace for messages still in flight), so recovery stays within about
+one base interval. `idleBackoffEnabled: false` keeps the fixed cadence.
 
 > **Wire compatibility.** All peers in a room must run the same version of
 > this library. Sync requests travel as a private digest message (state

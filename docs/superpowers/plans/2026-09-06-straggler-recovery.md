@@ -43,7 +43,7 @@
 
 **Files:** `src/index.ts` (option doc + default), `README.md` (option table / periodic-sync paragraph).
 
-- [ ] `idleBackoffEnabled` default `true`; doc comments updated; README.
+- [ ] `idleBackoffEnabled` default `true`; doc comments updated; README. `_markActivity()` re-arms a backed-off periodic timer at the base interval immediately (`_periodicScheduler` kept from `connect()`). The behind check's skip condition becomes "a request went out within the last grace" (`_requestSentAt`), not "a response wait is outstanding".
 - [ ] `npm run build`; bench build `bench-dist-t1d4/`; `bench-idle-backoff`, `bench-idle-room` with `OBSERVE_MS=60000 SETTLE_MS=15000` at N=50 (default now on; compare with `IDLE_BACKOFF=0`... the bench's switch becomes an explicit override), `bench-periodic-awareness`, `bench-user-scaling`; record; commit `Idle backoff on by default`.
 
 ### Task 5: final gates, results

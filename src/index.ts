@@ -412,6 +412,9 @@ export class GenericProvider extends Observable<string> {
   private _currentSyncIntervalMs: number
   private _lastActivityTime: number = Date.now()
   private _lastPeriodicTickTime: number = Date.now()
+  // connect()'s periodic scheduler, kept so _markActivity() can re-arm a
+  // backed-off timer at the base interval right away (phase 1d, design D).
+  private _periodicScheduler?: () => void
 
   // BroadcastChannel state for cross-tab sync
   private _bcChannel: string = ''
@@ -759,22 +762,19 @@ export class GenericProvider extends Observable<string> {
        * (`_jitteredSyncInterval()`) at whatever the current backed-off value
        * is.
        *
-       * TRADEOFF - read before enabling: periodic sync exists as a
-       * loss-recovery backstop (catch a message that was silently dropped).
-       * Backing it off during idle periods directly trades away worst-case
-       * recovery latency for exactly the scenario it exists to cover: a
-       * message dropped right after the room goes quiet won't be caught by
-       * periodic sync until the NEXT tick, which by then may be up to
-       * `idleBackoffMaxMs` away instead of `syncInterval` away. Measured in
-       * test/dummy/bench-idle-backoff.ts: with default settings (5s base,
-       * 60s cap), a loss injected early in an idle stretch can take on the
-       * order of the current backed-off interval (up to ~60s) to recover,
-       * vs. one `syncInterval` (~5s) with this off - see that bench's own
-       * output/header for the exact run's numbers. This is a real
-       * bandwidth-vs-recovery-latency tradeoff, not a free win, which is why
-       * this defaults to OFF.
-       * @default false (no backoff - identical behavior to before this
-       * option existed)
+       * The tradeoff this used to carry - a message dropped right before
+       * the room went quiet was caught only by the loser's OWN next tick,
+       * up to `idleBackoffMaxMs` away - is gone since phase 1d: the sender
+       * of that message had activity, so its interval is at the base, and
+       * its next beacon shows the loser it is behind; the loser asks after a
+       * short grace (`_scheduleBehindCheck`). Measured in
+       * test/dummy/bench-idle-backoff.ts (300 ms base / 2.4 s cap so the
+       * effect fits a short run): recovery median 1,741 ms with the old
+       * rule, see the phase-1d design doc's "After Task 4" for the number
+       * with this one. What remains is the cadence of a fully idle room:
+       * one beacon per peer per `idleBackoffMaxMs` instead of per
+       * `syncInterval`. Off restores the fixed cadence.
+       * @default true
        */
       idleBackoffEnabled?: boolean
       /**
@@ -812,7 +812,7 @@ export class GenericProvider extends Observable<string> {
     this._gapGraceMs = options.gapGraceMs ?? 300
     this._seqWindowSize = options.seqWindowSize ?? 64
     this._compressionThresholdBytes = options.compressionThresholdBytes || undefined
-    this._idleBackoffEnabled = options.idleBackoffEnabled ?? false
+    this._idleBackoffEnabled = options.idleBackoffEnabled ?? true
     this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000
     this._currentSyncIntervalMs = this._syncInterval
 
@@ -949,6 +949,7 @@ export class GenericProvider extends Observable<string> {
             if (!this._destroying) scheduleNextPeriodicSync()
           }, this._jitteredSyncInterval())
         }
+        this._periodicScheduler = scheduleNextPeriodicSync
         scheduleNextPeriodicSync()
       }
     } catch (error) {
@@ -970,6 +971,7 @@ export class GenericProvider extends Observable<string> {
       clearTimeout(this._syncIntervalId)
       this._syncIntervalId = undefined
     }
+    this._periodicScheduler = undefined
 
     // Reset resync escalation tracking
     this._resyncAttemptCount = 0
@@ -1361,6 +1363,23 @@ export class GenericProvider extends Observable<string> {
    */
   private _markActivity(): void {
     this._lastActivityTime = Date.now()
+    // A backed-off periodic timer is re-armed at the base interval NOW, not
+    // at its next tick (which may be idleBackoffMaxMs away). Design D of
+    // the phase-1d doc rests on it: the peer that just had activity beacons
+    // within one base interval, and a peer that lost that activity's
+    // message learns from that beacon that it is behind (design A) - its
+    // own backed-off interval no longer bounds the recovery. Measured in
+    // test/dummy/bench-idle-backoff.ts. At most once per idle stretch.
+    if (
+      this._idleBackoffEnabled &&
+      this._currentSyncIntervalMs !== this._syncInterval &&
+      this._syncIntervalId !== undefined &&
+      this._periodicScheduler !== undefined
+    ) {
+      clearTimeout(this._syncIntervalId)
+      this._currentSyncIntervalMs = this._syncInterval
+      this._periodicScheduler()
+    }
   }
 
   /** Cached delete-set hash - see computeDeleteSetHash(). */
@@ -2387,8 +2406,14 @@ export class GenericProvider extends Observable<string> {
       const sv = this._behindSv
       this._behindSv = null
       if (sv === null || this._destroying || !this.transport.isConnected) return
-      // A request of ours is outstanding: it is being answered or retried.
-      if (this._responseWaitTimer !== undefined) return
+      // A request of ours sent within the grace is still being answered.
+      // An OLDER outstanding wait is not a reason to stay behind: a new
+      // room's first peers keep their JOIN wait parked for seconds (three
+      // retries, nobody SETTLED yet), and measured against it the check
+      // never fired - bench-idle-backoff's recovery stayed at one
+      // backed-off interval (1,846 ms) with this line reading
+      // `_responseWaitTimer !== undefined`.
+      if (this._requestSentAt > 0 && Date.now() - this._requestSentAt < delay) return
       const remote = Y.decodeStateVector(sv)
       const local = Y.decodeStateVector(Y.encodeStateVector(this.doc))
       for (const [client, clock] of remote) {

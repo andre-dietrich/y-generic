@@ -872,3 +872,34 @@ do not act as unicast responders; a confirmation beacon after a data
 reply; a resync request when an overheard beacon shows us behind (needs an
 in-flight guard). Still open from the phase-1c list: the orphaned subdoc
 work (`test/dummy/bench-subdocs.ts`).
+
+**Status (2026-09-06, morning): phase 1d** — see
+`2026-09-06-straggler-recovery-design.md`. The unicast finding above is
+closed at both ends: peers with pending structs no longer answer (their
+SyncStep2 would carry the same hole — `encodeStateAsUpdate` includes
+pending structs, which the bench diagnostics caught in the act), a reply
+that leaves pending structs arms the gap check, and a beacon that shows
+its sender ahead of us triggers our own request after a grace of
+`max(gapGraceMs, 2·RTT)` — a lost last update or a partially answered
+request is healed by the next beacon of any up-to-date peer instead of
+the loser's own. The join-after-burst unicast stall went from 3 of 3 runs
+(under load) to none; join bursts, fan-out and idle traffic are unchanged
+(the check finds every in-flight keystroke landed and sends nothing).
+Idle backoff is on by default: activity re-arms a backed-off timer at the
+base interval immediately, so the recovery of an update lost right before
+the room went idle is one base interval plus the grace (bench: median
+1,845 → 731-770 ms at a 300 ms base) instead of up to the 60 s cap. The
+final gates then caught a sibling of the behind-check rule in the
+pending-struct check, which deferred to *any* outstanding response wait —
+a fresh room's JOIN wait stays parked for 19.6 s on a 700 ms link, so a
+loser there never asked on its own; it now defers only to a request sent
+within the grace (fresh-budget Matrix fan-out 2.1 → 1.3 s). What remains
+in that cell against phase 1c (0.76 s) is the idle-backoff default: after
+an idle stretch the first second of a burst has fewer periodic beacons
+around, so a loss is healed by the gap check (~1.3 s at Matrix latency)
+rather than by a beacon landing by chance; with backoff off the same
+build measures 0.88 s. Both join benches run with a 2 s beacon now, like
+packet-loss and late-join.
+Still open from the phase-1c list: the orphaned subdoc work
+(`test/dummy/bench-subdocs.ts`); next lever for idle traffic: the 15 s
+awareness renewal, which is the floor once beacons are backed off.

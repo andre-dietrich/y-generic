@@ -301,7 +301,7 @@ the lost delete-only update heals in 66-930 ms — design A again);
 3.0 s); `bench-join-after-burst` ×1 both modes pass; `bench-late-join`
 relay ×1 every cell 3/3.
 
-### Final gates — relay mode (`bench-dist-t1d4` = commit `4f8bdd3`; logs `after1d-final-relay`)
+### Final gates on the Task 4 build — relay mode (`bench-dist-t1d4` = commit `4f8bdd3`; logs `after1d-final-relay`; superseded by Task 5, kept for the finding)
 
 Every gate passes: `bench-sync-latency` ×3 with 0 hash-mismatch warnings,
 `bench-late-join` ×3 and `bench-packet-loss` ×3 + fresh with every cell
@@ -385,3 +385,78 @@ recovery median 731 ms on / 203 ms off (part a: 23 vs 71);
 21,087 / WebSocket 16,731, fan-out fresh 990; idle census N=50 24,990;
 `bench-periodic-awareness` 4/4; `bench-late-join` and `bench-packet-loss`
 ×1 in both modes: every cell 3/3.
+
+### Final gates — relay mode (`bench-dist-t1d5` = commit `68e8b25`; logs `after1d5-final-relay`)
+
+Every gate passes: `bench-sync-latency` ×3 with 0 hash-mismatch warnings,
+`bench-late-join` ×3 and `bench-packet-loss` ×3 + fresh with every cell
+3/3, both `bench-corruption-storm` RESULT lines, `bench-periodic-
+awareness` 4/4 (presence 133 ms, synced 33 ms), `bench-idle-room`
+LOSTDELETE 5/5 in both regimes. Phase-1c final (Task 6 build) → phase-1d
+final, relay mode:
+
+| bench | cell | 1c final | 1d final |
+|---|---|---|---|
+| late-join idle, M=40 K=10 (3 runs) | WebSocket / Matrix | 4,530-5,118 / 6,858-7,205 | 4,607-5,004 / 6,901-7,253 |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 4,724-5,231 / 4,838-5,312 | 4,315-5,280 / 5,146-5,231 |
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 6,097-6,444 / 6,360-6,686 | 5,793-6,004 / 6,653-6,869 |
+| packet-loss fan-out N=50, default regime | WebSocket 1-10 % | 1,111-2,123 | 915-2,368 |
+| packet-loss fan-out N=50, default regime | Matrix 1-10 % | 3,071-4,737 | 3,479-5,096 |
+| packet-loss fan-out N=50, fresh regime | WebSocket / Matrix 1-10 % | 866-1,568 / 2,189-3,071 | 1,111-2,238 / **1,617-2,499** |
+| packet-loss join burst N=50, 0-10 % | WebSocket / Matrix | 4,296-5,913 / 4,247-4,655 | 4,459-6,615 / 4,198-4,639 |
+| user-scaling join burst N=100, default / fresh | Gun / Matrix | 17,622 / 17,622, 18,018 / 17,523 | 18,612 / 18,810, 17,919 / 17,523 |
+| user-scaling join burst N=100, default / fresh | WebSocket / WebRTC | 20,790 / 16,236, 23,958 / 15,840 | 18,117 / 17,523, 31,878 / 33,957 |
+| user-scaling fan-out N=100, fresh | all profiles | 990 | 990 |
+| join-after-burst (2 s beacon since 1d) | WebSocket in-budget / fresh | 4,461-4,559 / 4,020-4,706 (1d baseline) | 4,363 / 4,314 |
+| join-after-burst (2 s beacon since 1d) | Matrix in-budget / fresh | 7,158-7,697 / 5,537-6,018 (1d baseline) | 7,579 / 4,069 |
+| idle census N=50 | default / 15 s | 24,745 / 24,598 | 24,500 / 24,745 |
+| corruption N=10 (2 s beacon since 1d) | 5 % | 846 | 1,008 |
+
+Convergence: fan-out N=50 default regime WebSocket 464-746 ms (1c
+493-796), Matrix 1,007-1,239 ms (1,000-1,321); fresh regime WebSocket
+474-752 ms, Matrix 1,289-1,340 ms (1c 696-881 — the idle-backoff price
+analysed under Task 5; the same build with backoff off: 883 ms);
+late-join unchanged (Matrix during edits 1,658-1,716 ms; idle WebSocket
+190-205 ms). The WebRTC join burst at 31,878 / 33,957 is the noisy cell,
+not a change: a direct probe of that cell (N=100, 20 ms ± 10 %, three
+runs per build) gives 27,522-33,264 on this build and 29,898-33,759 on
+the 1c build — at that low jitter the 99 responders' suppression timers
+fall close together and more replies fire before any is overheard; the
+bench's own runs of it today spread 15,840-33,957 across builds. The
+three other profiles sit where they were.
+
+### Final gates — unicast mode (`bench-dist-t1d5`; logs `after1d5-final-unicast`)
+
+`DUMMY_UNICAST=1`: every gate passes — `bench-sync-latency` ×3 with 0
+hash-mismatch warnings, `bench-late-join` ×3 and `bench-packet-loss` ×3 +
+fresh with every cell 3/3, **both `bench-corruption-storm` RESULT lines
+(50 % cells: N=2 0.31 s, N=5 1.06 s, N=10 2.96 s; phase 1c: N=5 and N=10
+did not converge)**, `bench-join-after-burst` all variants (78 / 52 / 694
+/ 774 ms; phase 1c: one 30 s stall), `bench-periodic-awareness` 4/4,
+`bench-idle-room` LOSTDELETE 5/5 in both regimes, no STALL dump anywhere.
+Phase-1c final (Task 6 build) → phase-1d final, unicast mode:
+
+| bench | cell | 1c final | 1d final |
+|---|---|---|---|
+| late-join idle, M=40 K=10 (3 runs) | WebSocket / Matrix | 951-976 / 4,731-4,754 | 945-973 / 4,719-4,754 |
+| late-join during edits, M=40 K=10 | WebSocket 0 % / 3 % | 1,355-1,361 / 3,466-4,239 | 1,355-1,359 / **2,291-2,905** |
+| late-join during edits, M=40 K=10 | Matrix 0 % / 3 % | 4,397-4,779 / 5,282-6,427 | 4,465-4,574 / 5,117-6,967 |
+| packet-loss fan-out N=50, default regime | WebSocket / Matrix 1-10 % | 3,106-4,440 / 4,586-5,772 | 775-3,841 / 3,322-5,769 |
+| packet-loss fan-out N=50, fresh regime | WebSocket / Matrix 1-10 % | 2,125-3,678 / 3,349-7,887 | 1,092-4,011 / 2,348-8,498 |
+| packet-loss join burst N=50, 0-10 % | WebSocket / Matrix | 5,158-5,319 / 2,703-2,855 | 5,164-5,304 / 2,715-2,858 |
+| user-scaling join burst N=100, default / fresh | Gun / Matrix | 10,934 / 10,887, 10,911 / 10,932 | 10,907 / 10,907, 10,887 / 10,865 |
+| user-scaling join burst N=100, default / fresh | WebSocket / WebRTC | 20,814 / 20,832, 20,807 / 20,807 | 20,777 / 20,806, 20,768 / 20,778 |
+| join-after-burst (2 s beacon since 1d) | WebSocket in-budget / fresh | not converged (30 s) / 1,834 | 1,843 / 1,835 |
+| join-after-burst (2 s beacon since 1d) | Matrix in-budget / fresh | 2,154 / 1,348 | 4,107 / 1,386 |
+| idle census N=50 | default / 15 s | 24,451 / 24,647 | 24,892 / 24,402 |
+| corruption N=10 (2 s beacon since 1d) | 5 % | 800 | 853 |
+
+Convergence, unicast: late-join during edits at 3 % loss WebSocket
+658-742 ms (1c 819-1,318), Matrix 2,074-3,081 ms (2,375-3,155); fan-out
+N=50 default regime WebSocket 466-1,232 ms (795-1,693), Matrix 1,413-2,309
+ms (1,618-2,498); fresh regime WebSocket 1,020-2,203 ms, Matrix
+2,140-4,150 ms (1c 2,219-3,813). The Matrix join-after-burst in-budget
+variant carries the 2 s beacon round that now lands in its window
+(request=1,960, as in the 1d baseline of that bench); everything else is
+equal or better, and the two stall classes of phase 1c are gone with the
+periodic beacon the benches now run with.

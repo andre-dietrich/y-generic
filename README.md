@@ -224,6 +224,10 @@ All changes to the Yjs document are automatically sent through your transport.
 
 ### ✅ Awareness Protocol
 Presence information (cursors, users online, etc.) is handled automatically.
+A joiner asks for the room's presence once; on a relay transport one peer
+answers with the whole awareness table (the others stay silent when that
+table carried their state), on a transport with `sendTo` each peer answers
+the joiner directly. Nobody re-announces presence on a timer.
 
 ### ✅ State Vector Sync
 Efficient synchronization using Yjs state vectors - only missing data is transmitted.

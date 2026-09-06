@@ -180,3 +180,31 @@ third run is a joiner-47-type straggler healed by the first periodic
 beacon, ~1 s after the join) / fresh 2,081-2,315, Matrix 4,099-4,102 /
 3,181-3,227. This is the 1d baseline for that bench; the 1c numbers
 (syncInterval 0) are not comparable.
+
+### After Task 2 — peers with pending structs do not answer (design B; `bench-dist-t1d2`; logs `after1d-t2`)
+
+`bench-corruption-storm` (2 s beacon), 50 % cells, 3 runs: relay N=2 /
+5 / 10 converge in 0.06-0.30 / 0.06-0.20 / 0.10-0.61 s (baseline
+0.20-0.55 / 0.06-0.63 / 0.08-0.25), unicast 0.16-0.41 / 1.18-1.34 /
+1.18-3.10 s (baseline 0.22-0.35 / 0.87-0.99 / 1.4-2.9) — within noise,
+every RESULT line passes. `bench-join-after-burst`, still the
+`syncInterval 0` build of that bench (compiled before Task 1's beacon
+change): **unicast WebSocket "in budget window" converged in all 3 runs
+(53 / 53 / 94 ms; 1,850-1,853 deliveries)** where the baseline stalled 3
+of 3 under the same parallel load — the pending-struct inheritance was
+the common case of the stall. Relay unchanged (WebSocket 4,412-4,461 /
+4,118-4,412, Matrix 5,482-5,531 / 3,775-4,314). Fan-out-under-loss probe
+(Matrix, N=50): fresh median 4,018 (2,842-5,537), 848 ms; default 4,312
+(3,773-5,488), 1,100 ms — the Task 6 numbers. `bench-user-scaling` join
+burst N=100 within noise (Gun 18,414 / Matrix 17,523 / WebRTC 17,622 /
+WebSocket 20,988; fan-out fresh 990 everywhere).
+With the beacon build of `bench-join-after-burst` (rebuilt `t1d2`, 3 runs
+per mode): relay WebSocket in-budget 4,461-4,559 / fresh 4,020-4,706,
+Matrix 7,491-7,550 / 5,418-5,743 (baseline 4,216-4,510 / 3,961-4,637,
+7,158-7,697 / 5,537-6,018); unicast WebSocket in-budget 1,843-3,362 (86 /
+103 / 1,033 ms) / fresh 1,974-2,180, Matrix 4,095-4,110 / 2,941-7,132
+(728 / 929 / **2,446 ms**). Every run converged; the two slow ones are
+joiner-47-type stragglers healed by their *own* periodic beacon — design
+B closes the pending-struct source, not the in-flight-keystroke one; that
+is design A's job (any peer's beacon, after the grace).
+`bench-idle-backoff` unchanged (recovery median 41 ms off / 1,741 ms on).

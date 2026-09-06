@@ -2237,6 +2237,23 @@ export class GenericProvider extends Observable<string> {
     targetSv: Uint8Array | null = null,
     toClientID?: number,
   ): void {
+    // A peer that knows it is incomplete does not answer. A SyncStep2 is
+    // encoded from integrated structs only, so with structs (or a delete
+    // set) still pending ours would be provably partial - and the
+    // requester's response wait ends on the first SyncStep2 it gets, so a
+    // partial answer strands it until its next trigger (phase-1c gates:
+    // 5 s resync backoff, or a stall with syncInterval 0). In relay mode a
+    // partial broadcast also cancels the complete replies other peers had
+    // pending. Let them answer; the requester retries if nobody does, and
+    // in unicast mode the rank bucket rotates the responders every 2 s.
+    // An ack from us would likewise confirm a state we do not trust.
+    if (
+      this.doc.store.pendingStructs !== null ||
+      this.doc.store.pendingDs !== null
+    ) {
+      return
+    }
+
     // Unicast path (transport has sendTo and we know the requester's
     // address): nobody overhears a unicast, so the delay-and-cancel
     // suppression below cannot thin the replies. Instead each candidate

@@ -208,3 +208,36 @@ joiner-47-type stragglers healed by their *own* periodic beacon — design
 B closes the pending-struct source, not the in-flight-keystroke one; that
 is design A's job (any peer's beacon, after the grace).
 `bench-idle-backoff` unchanged (recovery median 41 ms off / 1,741 ms on).
+
+### After Task 3 — behind check + pending check after replies (designs A and E; `bench-dist-t1d3`; logs `after1d-t3`)
+
+Nothing got more expensive, and the loss gates hold: `bench-user-scaling`
+join burst N=100 Gun 18,018 / Matrix 17,226 / WebRTC 18,810 / WebSocket
+16,434 (Task 2: 18,414 / 17,523 / 17,622 / 20,988), fan-out N=100 fresh
+990 on every profile (the behind check schedules timers during typing and
+sends nothing); idle census N=50 24,696 (Task 2 build ~24,600);
+`bench-periodic-awareness` 4/4; fan-out-under-loss probe Matrix fresh
+median 3,969 / 841 ms, default 4,214 / 1,055 ms (Task 2: 4,018 / 848,
+4,312 / 1,100); `bench-late-join` and `bench-packet-loss` ×1 in both
+modes: every cell 3/3. `bench-corruption-storm` 50 % cells, 3 runs: relay
+0.06-0.31 / 0.08-0.13 / 0.10-1.05 s (N=2/5/10), unicast 0.14-0.26 /
+0.16-1.20 / 2.56-3.84 s — within the Task 2 ranges; the unicast N=10 cell
+is paced by the 2 s beacon (a straggler is healed by the first beacon
+that shows it behind plus the 300 ms grace), not by the 5 s backoff.
+`bench-join-after-burst` (beacon build): relay unchanged (WebSocket
+4,314-4,608, Matrix 7,589-8,226 in-budget); unicast WebSocket in-budget
+67 / 1,032 / 1,037 ms — the two ~1 s cases are joiners whose three
+responders all stayed silent (transient pending structs while the
+keystroke burst reorders at 40 receivers), healed by the response wait's
+1 s CONFIRM retry; the baseline had the same ~1,030 ms case in one run of
+three, before design B existed.
+
+**`bench-idle-backoff` recovery did not move: median 1,845 ms with
+backoff on (baseline 1,843).** The bench drops the update from A to B and
+then keeps both peers quiet; design A assumed A's next beacon comes at the
+base interval because A had activity — but `_markActivity()` only stamps
+a time, and the interval is reset to the base at the *next tick*, which
+is still up to the backed-off interval away. So A's beacon arrives no
+sooner than B's own. Design D therefore also makes activity re-arm the
+periodic timer at the base interval immediately (the option's doc comment
+already claimed this).

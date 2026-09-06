@@ -424,6 +424,7 @@ export class GenericProvider extends Observable {
         this._responseWaitAttempts = 0;
         this._responseSeen = false;
         this._responseWaitFlags = 0; // flags for the retry beacon: CONFIRM after a JOIN, 0 after a resync
+        this._behindSv = null;
         // Round-trip estimate from our own requests (JOIN/resync beacon -> first
         // SyncStep2 or ack): the minimum of the last 8 samples, because a sample
         // includes the responder's random suppression delay and the fastest
@@ -686,6 +687,11 @@ export class GenericProvider extends Observable {
             clearTimeout(this._pendingCheckTimer);
             this._pendingCheckTimer = undefined;
         }
+        if (this._behindCheckTimer !== undefined) {
+            clearTimeout(this._behindCheckTimer);
+            this._behindCheckTimer = undefined;
+        }
+        this._behindSv = null;
         if (this._presenceResponseTimer !== undefined) {
             clearTimeout(this._presenceResponseTimer);
             this._presenceResponseTimer = undefined;
@@ -1262,6 +1268,7 @@ export class GenericProvider extends Observable {
                 // Somebody's whole document: apply it, nothing else (see the
                 // constant's comment for why no hash check and no synced flip).
                 Y.applyUpdate(this.doc, decoding.readVarUint8Array(decoder), this);
+                this._checkPendingAfterReply();
                 break;
             }
             case MESSAGE_SYNC: {
@@ -1274,6 +1281,10 @@ export class GenericProvider extends Observable {
                     this._confirmed = true;
                     this._noteResponse(true);
                     this._markSynced();
+                    // Design E (phase 1d): a SyncStep2 carries its encoder's own pending
+                    // structs, so a responder missing a struct hands us the same hole.
+                    // Our response wait just ended - make sure something still asks.
+                    this._checkPendingAfterReply();
                     // Someone else's SyncStep2 reply just arrived - our own pending
                     // reply (if any) is now most likely redundant.
                     this._cancelPendingSyncReply();
@@ -1361,6 +1372,7 @@ export class GenericProvider extends Observable {
                 if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
                     this._cancelPendingSyncReply();
                     this._confirmed = true;
+                    this._checkPendingAfterReply();
                     this._noteResponse(true);
                 }
                 // Read the expected hash from sender (signed integer)
@@ -1537,6 +1549,11 @@ export class GenericProvider extends Observable {
         }
         if (!weBehind && dsEqual) {
             this._markSynced();
+        }
+        if (weBehind) {
+            // The sender has something we lack. Not a request yet - the update
+            // may still be in flight (see _scheduleBehindCheck).
+            this._scheduleBehindCheck(remoteSv);
         }
         if (flags & DIGEST_FLAG_JOIN && this.awareness.getLocalState() !== null) {
             // Presence on demand: the joiner asked. One broadcast per burst of
@@ -1822,6 +1839,57 @@ export class GenericProvider extends Observable {
      * still missing. One timer; a check scheduled while one is pending is
      * absorbed. Cleared on disconnect/destroy.
      */
+    /**
+     * A beacon (a peer's periodic tick, or its request) just showed its
+     * sender ahead of us. Until phase 1d nothing happened with that: a peer
+     * whose last update was lost (no later message to open a sequence gap
+     * against), or whose request was answered by a responder that was
+     * itself behind, waited for its OWN next periodic beacon - up to
+     * syncInterval, up to idleBackoffMaxMs with idle backoff on. Now we
+     * check again after a grace and, if still behind that state, ask through
+     * the resync coordinator (coalesced, backed off, rate-limited).
+     *
+     * The grace is what keeps this quiet during typing: at Matrix latency
+     * almost every receiver of a periodic beacon is "behind" by a keystroke
+     * that is still in flight (jitter +-140 ms); max(gapGraceMs, 2 x minRTT)
+     * later it has arrived and the check finds nothing to do. A lost
+     * keystroke that opened a sequence gap is already being requested by the
+     * gap check - the outstanding response wait tells us so, and we stay
+     * quiet. One timer, the newest state vector: a later beacon that shows us
+     * behind by more replaces the reference, the timer keeps running.
+     */
+    _scheduleBehindCheck(remoteSv) {
+        this._behindSv = remoteSv;
+        if (this._behindCheckTimer !== undefined)
+            return;
+        const rtt = this._rttMinMs();
+        const delay = Math.max(this._gapGraceMs, rtt === null ? 0 : 2 * rtt);
+        this._behindCheckTimer = setTimeout(() => {
+            this._behindCheckTimer = undefined;
+            const sv = this._behindSv;
+            this._behindSv = null;
+            if (sv === null || this._destroying || !this.transport.isConnected)
+                return;
+            // A request of ours is outstanding: it is being answered or retried.
+            if (this._responseWaitTimer !== undefined)
+                return;
+            const remote = Y.decodeStateVector(sv);
+            const local = Y.decodeStateVector(Y.encodeStateVector(this.doc));
+            for (const [client, clock] of remote) {
+                if ((local.get(client) ?? 0) < clock) {
+                    this._requestResync();
+                    return;
+                }
+            }
+        }, delay);
+    }
+    /** Design E: after a reply or push, pending structs mean the sender had the same hole - arm the grace check. */
+    _checkPendingAfterReply() {
+        if (this.doc.store.pendingStructs !== null ||
+            this.doc.store.pendingDs !== null) {
+            this._schedulePendingCheck();
+        }
+    }
     _schedulePendingCheck() {
         if (this._pendingCheckTimer !== undefined)
             return;

@@ -130,6 +130,8 @@ export declare class GenericProvider extends Observable<string> {
     private _responseSeen;
     private _responseWaitFlags;
     private _pendingCheckTimer?;
+    private _behindCheckTimer?;
+    private _behindSv;
     private _rttSamples;
     private _requestSentAt;
     private _confirmed;
@@ -670,6 +672,28 @@ export declare class GenericProvider extends Observable<string> {
      * still missing. One timer; a check scheduled while one is pending is
      * absorbed. Cleared on disconnect/destroy.
      */
+    /**
+     * A beacon (a peer's periodic tick, or its request) just showed its
+     * sender ahead of us. Until phase 1d nothing happened with that: a peer
+     * whose last update was lost (no later message to open a sequence gap
+     * against), or whose request was answered by a responder that was
+     * itself behind, waited for its OWN next periodic beacon - up to
+     * syncInterval, up to idleBackoffMaxMs with idle backoff on. Now we
+     * check again after a grace and, if still behind that state, ask through
+     * the resync coordinator (coalesced, backed off, rate-limited).
+     *
+     * The grace is what keeps this quiet during typing: at Matrix latency
+     * almost every receiver of a periodic beacon is "behind" by a keystroke
+     * that is still in flight (jitter +-140 ms); max(gapGraceMs, 2 x minRTT)
+     * later it has arrived and the check finds nothing to do. A lost
+     * keystroke that opened a sequence gap is already being requested by the
+     * gap check - the outstanding response wait tells us so, and we stay
+     * quiet. One timer, the newest state vector: a later beacon that shows us
+     * behind by more replaces the reference, the timer keeps running.
+     */
+    private _scheduleBehindCheck;
+    /** Design E: after a reply or push, pending structs mean the sender had the same hole - arm the grace check. */
+    private _checkPendingAfterReply;
     private _schedulePendingCheck;
     /**
      * Return the update payload of a SyncStep2/Update sync sub-message

@@ -122,3 +122,71 @@ Matrix homeserver, Nostr relay and Supabase project, and Supabase binary
 receipt across two browsers — `npm run dev:matrix` / `dev:nostr` /
 `dev:supabase` with a document above 64 KB (Matrix, Nostr) / 200 KB
 (Supabase) are the checks to run.
+
+### Nostr, tested against public relays (2026-09-06, evening)
+
+There was no `test/nostr` playground (the `dev:nostr` script pointed at a
+missing file), so the provider was exercised from Node against real
+relays first (`nostr-tools` 2.25.2, three `GenericProvider` peers), then
+given a playground (`test/nostr/`, nostr-tools browser bundle from
+jsDelivr) and a README with the relay table.
+
+**Three findings, all fixed in this commit:**
+
+1. **The subscription never delivered on strict relays.** `subscribeMany`
+   was called with `[filter]`; nostr-tools ≥ 2.11 takes one filter object,
+   so the REQ went out as `["REQ", id, [ {…} ]]` — relay.primal.net,
+   nostr.oxtr.dev, relay.snort.social and others answered "provided filter
+   is not an object" and delivered nothing; damus and nos.lol accepted the
+   malformed REQ silently and delivered nothing either. The first
+   end-to-end run received zero messages on four relays. Now one object.
+2. **Compression cannot cross a transport that strips the CRC32 header.**
+   With `preferredCompressMinBytes` in force, the first message above 2 KB
+   arrived as a frame whose compression flag had been cut off with the
+   "header" and re-wrapped, and the receiver's inflate failed (Z_DATA_ERROR);
+   the rejected writer promise of `DecompressionStream` then crashed the
+   Node process as an unhandled rejection. Nostr now carries the frame
+   untouched (its CRC helpers are deleted; 4 bytes per event); Ably and
+   Supabase, which strip the header and synthesize frames from persisted
+   snapshots, **lose the compression default again** — the option's doc
+   names them, making them frame-transparent is the follow-up if
+   compression there is wanted. The writer promises are caught in both
+   helpers, so a corrupt compressed frame is a resync, not a crash.
+3. **Kind 27370 is ephemeral.** NIP-01 puts 20000-29999 in the ephemeral
+   range; none of eight accepting relays returned a stored event, so
+   `historyWindowSecs` fetches nothing with the default kind (the research
+   doc's "27370 is regular today" was wrong). Documented on both options;
+   the default stays — a late joiner gets the document from a live peer in
+   about a second, and relays that block ephemeral kinds (wirednet) are
+   the minority.
+
+**Relays** (fresh key, 5-byte and 50,000-char events): damus 735 / 725 ms,
+nos.lol 191 / 208, nostr.mom 299 / 341, purplerelay 392 / 536, primal
+238 / 299, oxtr 287 / 360, snort 313 / 384, wellorder 818 / 1,142 all OK;
+offchain.pub and bitcoiner.social reject the large one ("not in our web
+of trust"); wirednet blocks the kind range; nostrplebs and nostr.wine
+require NIP-05 / payment; relay.nostr.band, relay.nostr.bg and
+nostr.fmt.wiz.biz time out. Default relays are now damus, nos.lol,
+nostr.mom (relay.nostr.band replaced).
+
+**End-to-end** (damus + nos.lol + nostr.mom + purplerelay, provider
+defaults: batch 150 ms, compression ≥ 2048 B): both peers synced after
+278 ms; small updates A→B 337 ms, B→A 242 ms; a 120,000-character
+incompressible insert → one wire message of 90,476 bytes → 120,636 base64
+chars → 3 events, received after 1,010 ms; a third peer joining
+afterwards has the document and all 3 presence states after 1,005 ms.
+
+**Playground in the browser** (`npm run dev:nostr`, two tabs, default
+relays): text typed in one tab appears in the other, both list the other
+user. The first run logged three "Failed to decompress" warnings per
+join in the receiving tab, before any relay event had arrived: the
+connect-time burst that `_setupBroadcastChannel()` publishes to the
+other tabs (SyncStep1, SyncStep2, awareness) went out **without the
+compression flag byte**, so with compression on the other tab read a
+CRC byte as the flag. Every BroadcastChannel publish now goes through
+`_bcPublish()`, which adds the flag exactly as `_send()` did; after
+that, no warning in either tab. (The status label in the playground
+header stays "Disconnected" - the shared `updateStatus()` helper writes
+to `#connection-status`, which every playground uses as the indicator
+element; the indicator colour and the log are right. Pre-existing,
+shared with the Supabase playground, not touched.)

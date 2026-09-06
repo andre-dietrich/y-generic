@@ -2,7 +2,7 @@
  * Nostr Transport Provider
  *
  * Serverless, decentralised synchronisation using the Nostr protocol.
- * Binary Yjs updates are base64-encoded and published as signed Nostr events
+ * Binary Yjs updates (the provider's frame, untouched) are base64-encoded and published as signed Nostr events
  * to one or more relays. Every connected client subscribes to the same room tag,
  * so updates fan out through all configured relays automatically.
  *
@@ -56,49 +56,6 @@ import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 const MAX_CONTENT_CHARS = 60000
 
 // ---------------------------------------------------------------------------
-// CRC32 translation helpers
-//
-// GenericProvider wraps every outgoing message as [CRC32 (4 bytes)][payload].
-// Nostr event content is plain text (base64), so we strip the CRC32 header
-// before encoding and re-add it after decoding so GenericProvider accepts the
-// incoming message.
-// ---------------------------------------------------------------------------
-
-const _CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let c = i
-    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[i] = c
-  }
-  return table
-})()
-
-function _crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++)
-    crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-/** Strip the 4-byte CRC32 header that GenericProvider prepends. */
-function stripCRC32Header(data: Uint8Array): Uint8Array {
-  return data.length >= 4 ? data.subarray(4) : data
-}
-
-/** Add a valid CRC32 header so GenericProvider accepts the message. */
-function addCRC32Header(data: Uint8Array): Uint8Array {
-  const crc = _crc32(data)
-  const wrapped = new Uint8Array(4 + data.length)
-  wrapped[0] = (crc >>> 24) & 0xff
-  wrapped[1] = (crc >>> 16) & 0xff
-  wrapped[2] = (crc >>> 8) & 0xff
-  wrapped[3] = crc & 0xff
-  wrapped.set(data, 4)
-  return wrapped
-}
-
-// ---------------------------------------------------------------------------
 // Base64 helpers (no Buffer/Node dependency)
 // ---------------------------------------------------------------------------
 
@@ -145,7 +102,7 @@ const DEFAULT_KIND = 27370
 const DEFAULT_RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
-  'wss://relay.nostr.band',
+  'wss://nostr.mom',
 ]
 
 // ---------------------------------------------------------------------------
@@ -198,9 +155,12 @@ export interface NostrTransportOptions {
    * @example import { SimplePool } from 'nostr-tools'
    */
   SimplePool: new () => {
+    // nostr-tools >= 2.11 takes ONE filter object here (older versions
+    // took an array; a relay that validates REQ strictly answers the
+    // array with "provided filter is not an object" and delivers nothing).
     subscribeMany(
       relays: string[],
-      filters: object[],
+      filter: object,
       handlers: {
         onevent?: (event: NostrEvent) => void
         oneose?: () => void
@@ -220,7 +180,12 @@ export interface NostrTransportOptions {
   secretKey?: Uint8Array
 
   /**
-   * Custom Nostr event kind to use for Yjs update events.
+   * Custom Nostr event kind to use for Yjs update events. 27370 is in the
+   * ephemeral range: relays fan it out without storing it, which is what
+   * sync and presence traffic wants (and what most public relays accept;
+   * a few block ephemeral kinds or unknown pubkeys, see the README). Use a
+   * regular kind (1000-9999) if `historyWindowSecs` catch-up matters more
+   * than not filling relays with document history.
    * @default 27370
    */
   eventKind?: number
@@ -238,7 +203,9 @@ export interface NostrConfig extends ConnectionConfig {
 
   /**
    * Nostr relay WebSocket URLs to connect to.
-   * @default ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.nostr.band']
+   * @default ['wss://relay.damus.io', 'wss://nos.lol', 'wss://nostr.mom'] -
+   * the three that accepted kind-27370 events of 50 KB fastest in the
+   * 2026-09-06 probe (see the README's relay table)
    */
   relays?: string[]
 
@@ -252,7 +219,11 @@ export interface NostrConfig extends ConnectionConfig {
   /**
    * How many seconds of stored relay events to fetch on connect.
    * Set to 0 to receive only real-time events (no catch-up).
-   * Increase for longer-lived documents that should survive peer restarts.
+   * Only meaningful with a regular (stored) `eventKind`: the default kind
+   * 27370 is in NIP-01's ephemeral range (20000-29999), which relays do
+   * not store - measured against 8 public relays, none returned a stored
+   * event - so with the default kind this window fetches nothing and a
+   * late joiner gets the document from a live peer's reply instead.
    * @default 86400 (24 hours)
    */
   historyWindowSecs?: number
@@ -366,7 +337,7 @@ export class NostrTransport implements Transport {
 
     // Subscribe to events matching our room. The subscription delivers both
     // stored (historical) events first, then real-time new events.
-    this.sub = this.pool.subscribeMany(this.relays, [filter], {
+    this.sub = this.pool.subscribeMany(this.relays, filter, {
       onevent: (event: NostrEvent) => {
         // Ignore events published by this client to avoid echo
         if (event.pubkey === this.pubkey) return
@@ -389,9 +360,11 @@ export class NostrTransport implements Transport {
             if (whole === null) return
             content = whole
           }
-          const raw = base64ToUint8Array(content)
-          const withHeader = addCRC32Header(raw)
-          this._deliver(withHeader)
+          // The frame goes through untouched (CRC32 wrapper, and the
+          // compression flag when compressionThresholdBytes is on): a
+          // transport that strips and re-adds the header cannot carry a
+          // compressed frame.
+          this._deliver(base64ToUint8Array(content))
         } catch (err) {
           console.warn('[NostrTransport] Failed to decode event content:', err)
         }
@@ -431,9 +404,7 @@ export class NostrTransport implements Transport {
       return
     }
 
-    // Strip the 4-byte CRC32 header added by GenericProvider before encoding
-    const raw = stripCRC32Header(data)
-    const base64 = uint8ArrayToBase64(raw)
+    const base64 = uint8ArrayToBase64(data)
     // Above the relays' event size cap: one event per chunk.
     const contents =
       base64.length > MAX_CONTENT_CHARS

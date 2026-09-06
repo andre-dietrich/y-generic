@@ -314,8 +314,13 @@ export declare class GenericProvider extends Observable<string> {
          * `0` disables compression entirely and keeps the wire format
          * byte-for-byte identical to before this option existed; `undefined`
          * takes the transport's `preferredCompressMinBytes` hint (2048 on
-         * Ably, PubNub, Matrix, Nostr, Supabase - transports that cap or
-         * bill message size), else disabled.
+         * PubNub, Matrix and Nostr, which carry the frame as opaque bytes),
+         * else disabled. NOT usable with a transport that strips the CRC32
+         * header or reads the message type at a fixed offset (Ably, Supabase,
+         * Gun today): the flag byte sits ahead of that header, so such a
+         * transport hands the receiver a frame it cannot parse - measured in
+         * the Nostr end-to-end test before that provider was made
+         * frame-transparent.
          * @default the transport's `preferredCompressMinBytes` hint, else undefined
          */
         compressionThresholdBytes?: number;
@@ -1014,6 +1019,19 @@ export declare class GenericProvider extends Observable<string> {
      * This ensures updates reach both local tabs and remote peers with corruption detection.
      */
     private _send;
+    /**
+     * Publish already-CRC32-wrapped bytes to the other tabs. BroadcastChannel
+     * is same-process - never worth compressing - but when
+     * compressionThresholdBytes is enabled every message still needs the
+     * leading flag byte _handleIncomingMessage() expects regardless of
+     * source, so this sends flag=0 in that case. The ONE place for every BC
+     * publish: the connect-time burst in _setupBroadcastChannel() used to
+     * publish without the flag, and with compression on (the transport
+     * hints made that a default) the other tab read a CRC byte as the flag
+     * and failed to inflate three messages per join (Nostr playground,
+     * 2026-09-06).
+     */
+    private _bcPublish;
     /**
      * Send already-CRC32-wrapped bytes to the network transport, compressing
      * first if compressionThresholdBytes is configured and this payload

@@ -146,9 +146,9 @@ export class AblyTransport {
         this.debug = false;
         this.messageBuffer = [];
         this.chunkBuffer = new Map();
-        // Compress a full-document push before it is base64-encoded and chunked
-        // (see Transport.preferredCompressMinBytes).
-        this.preferredCompressMinBytes = 2048;
+        // No preferredCompressMinBytes: this transport strips the CRC32 header
+        // and synthesizes frames from persisted snapshots, both of which assume
+        // the uncompressed frame layout (see compressionThresholdBytes).
         // Persistence
         this.persistentMode = false;
         this.persistDoc = null;

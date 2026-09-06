@@ -84,9 +84,8 @@ export class SupabaseTransport {
         this.options = options;
         this.supabase = null;
         this.channel = null;
-        // Broadcasts count against a per-project messages/s cap and one
-        // broadcast is N events: compress the big ones.
-        this.preferredCompressMinBytes = 2048;
+        // No preferredCompressMinBytes: send() strips the CRC32 header, which
+        // assumes the uncompressed frame layout (see compressionThresholdBytes).
         this.config = null;
         this.chunks = new ChunkAssembler();
         this._isConnected = false;

@@ -2,7 +2,7 @@
  * Nostr Transport Provider
  *
  * Serverless, decentralised synchronisation using the Nostr protocol.
- * Binary Yjs updates are base64-encoded and published as signed Nostr events
+ * Binary Yjs updates (the provider's frame, untouched) are base64-encoded and published as signed Nostr events
  * to one or more relays. Every connected client subscribes to the same room tag,
  * so updates fan out through all configured relays automatically.
  *
@@ -90,7 +90,7 @@ export interface NostrTransportOptions {
      * @example import { SimplePool } from 'nostr-tools'
      */
     SimplePool: new () => {
-        subscribeMany(relays: string[], filters: object[], handlers: {
+        subscribeMany(relays: string[], filter: object, handlers: {
             onevent?: (event: NostrEvent) => void;
             oneose?: () => void;
         }): {
@@ -108,7 +108,12 @@ export interface NostrTransportOptions {
      */
     secretKey?: Uint8Array;
     /**
-     * Custom Nostr event kind to use for Yjs update events.
+     * Custom Nostr event kind to use for Yjs update events. 27370 is in the
+     * ephemeral range: relays fan it out without storing it, which is what
+     * sync and presence traffic wants (and what most public relays accept;
+     * a few block ephemeral kinds or unknown pubkeys, see the README). Use a
+     * regular kind (1000-9999) if `historyWindowSecs` catch-up matters more
+     * than not filling relays with document history.
      * @default 27370
      */
     eventKind?: number;
@@ -123,7 +128,9 @@ export interface NostrConfig extends ConnectionConfig {
     room: string;
     /**
      * Nostr relay WebSocket URLs to connect to.
-     * @default ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.nostr.band']
+     * @default ['wss://relay.damus.io', 'wss://nos.lol', 'wss://nostr.mom'] -
+     * the three that accepted kind-27370 events of 50 KB fastest in the
+     * 2026-09-06 probe (see the README's relay table)
      */
     relays?: string[];
     /**
@@ -135,7 +142,11 @@ export interface NostrConfig extends ConnectionConfig {
     /**
      * How many seconds of stored relay events to fetch on connect.
      * Set to 0 to receive only real-time events (no catch-up).
-     * Increase for longer-lived documents that should survive peer restarts.
+     * Only meaningful with a regular (stored) `eventKind`: the default kind
+     * 27370 is in NIP-01's ephemeral range (20000-29999), which relays do
+     * not store - measured against 8 public relays, none returned a stored
+     * event - so with the default kind this window fetches nothing and a
+     * late joiner gets the document from a live peer's reply instead.
      * @default 86400 (24 hours)
      */
     historyWindowSecs?: number;

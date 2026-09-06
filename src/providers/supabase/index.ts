@@ -136,9 +136,8 @@ export interface SupabaseConfig extends ConnectionConfig {
 export class SupabaseTransport implements Transport {
   private supabase: any = null
   private channel: any = null
-  // Broadcasts count against a per-project messages/s cap and one
-  // broadcast is N events: compress the big ones.
-  readonly preferredCompressMinBytes = 2048
+  // No preferredCompressMinBytes: send() strips the CRC32 header, which
+  // assumes the uncompressed frame layout (see compressionThresholdBytes).
   private config: SupabaseConfig | null = null
   private messageCallback?: (data: Uint8Array) => void
   private chunks = new ChunkAssembler()

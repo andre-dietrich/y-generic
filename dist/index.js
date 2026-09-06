@@ -190,16 +190,19 @@ async function _readAllChunks(readable) {
 async function compressDeflateRaw(data) {
     const cs = new CompressionStream('deflate-raw');
     const writer = cs.writable.getWriter();
-    writer.write(data);
-    writer.close();
+    // The writer promises reject too when the stream errors; the reader side
+    // already surfaces that error, and an unhandled rejection here crashes
+    // Node (seen with a corrupt deflate stream in the Nostr end-to-end test).
+    writer.write(data).catch(() => { });
+    writer.close().catch(() => { });
     return _readAllChunks(cs.readable);
 }
 /** Inverse of compressDeflateRaw(). */
 async function decompressDeflateRaw(data) {
     const ds = new DecompressionStream('deflate-raw');
     const writer = ds.writable.getWriter();
-    writer.write(data);
-    writer.close();
+    writer.write(data).catch(() => { });
+    writer.close().catch(() => { });
     return _readAllChunks(ds.readable);
 }
 /**
@@ -2746,12 +2749,12 @@ export class GenericProvider extends Observable {
         const encoderSync = encoding.createEncoder();
         encoding.writeVarUint(encoderSync, MESSAGE_SYNC);
         syncProtocol.writeSyncStep1(encoderSync, this.doc);
-        bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)), this);
+        this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)));
         // Broadcast local state via BroadcastChannel (wrapped with CRC32)
         const encoderState = encoding.createEncoder();
         encoding.writeVarUint(encoderState, MESSAGE_SYNC);
         syncProtocol.writeSyncStep2(encoderState, this.doc);
-        bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoderState)), this);
+        this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderState)));
         // Broadcast local awareness state via BroadcastChannel (wrapped with CRC32)
         if (this.awareness.getLocalState() !== null) {
             const encoderAwareness = encoding.createEncoder();
@@ -2759,7 +2762,7 @@ export class GenericProvider extends Observable {
             encoding.writeVarUint8Array(encoderAwareness, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [
                 this.doc.clientID,
             ]));
-            bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)), this);
+            this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)));
         }
     }
     /**
@@ -2773,7 +2776,7 @@ export class GenericProvider extends Observable {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.awareness, [this.doc.clientID], new Map()));
-        bc.publish(this._bcChannel, wrapMessageWithChecksum(encoding.toUint8Array(encoder)), this);
+        this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoder)));
         // Unsubscribe from channel
         bc.unsubscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = false;
@@ -2839,23 +2842,31 @@ export class GenericProvider extends Observable {
     _send(data) {
         // Wrap message with CRC32 checksum
         const wrappedData = wrapMessageWithChecksum(data);
-        // Send via BroadcastChannel to other tabs first. BroadcastChannel is
-        // same-process (other tabs in this browser) - never worth compressing.
-        // When compressionThresholdBytes is enabled, every message still needs
-        // the same leading flag byte _handleIncomingMessage() expects
-        // regardless of source, so this always sends flag=0 (uncompressed) in
-        // that case rather than skipping the flag - see that option's doc
-        // comment.
-        if (this._bcConnected) {
-            bc.publish(this._bcChannel, this._compressionThresholdBytes
-                ? prefixCompressionFlag(0, wrappedData)
-                : wrappedData, this);
-        }
+        // Send via BroadcastChannel to other tabs first.
+        if (this._bcConnected)
+            this._bcPublish(wrappedData);
         // Send via network transport
         if (!this.transport.isConnected) {
             return;
         }
         this._sendToTransport(wrappedData);
+    }
+    /**
+     * Publish already-CRC32-wrapped bytes to the other tabs. BroadcastChannel
+     * is same-process - never worth compressing - but when
+     * compressionThresholdBytes is enabled every message still needs the
+     * leading flag byte _handleIncomingMessage() expects regardless of
+     * source, so this sends flag=0 in that case. The ONE place for every BC
+     * publish: the connect-time burst in _setupBroadcastChannel() used to
+     * publish without the flag, and with compression on (the transport
+     * hints made that a default) the other tab read a CRC byte as the flag
+     * and failed to inflate three messages per join (Nostr playground,
+     * 2026-09-06).
+     */
+    _bcPublish(wrappedData) {
+        bc.publish(this._bcChannel, this._compressionThresholdBytes
+            ? prefixCompressionFlag(0, wrappedData)
+            : wrappedData, this);
     }
     /**
      * Send already-CRC32-wrapped bytes to the network transport, compressing

@@ -210,8 +210,11 @@ async function _readAllChunks(
 async function compressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
   const cs = new CompressionStream('deflate-raw')
   const writer = cs.writable.getWriter()
-  writer.write(data as unknown as BufferSource)
-  writer.close()
+  // The writer promises reject too when the stream errors; the reader side
+  // already surfaces that error, and an unhandled rejection here crashes
+  // Node (seen with a corrupt deflate stream in the Nostr end-to-end test).
+  writer.write(data as unknown as BufferSource).catch(() => {})
+  writer.close().catch(() => {})
   return _readAllChunks(cs.readable)
 }
 
@@ -219,8 +222,8 @@ async function compressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
 async function decompressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
   const ds = new DecompressionStream('deflate-raw')
   const writer = ds.writable.getWriter()
-  writer.write(data as unknown as BufferSource)
-  writer.close()
+  writer.write(data as unknown as BufferSource).catch(() => {})
+  writer.close().catch(() => {})
   return _readAllChunks(ds.readable)
 }
 
@@ -754,8 +757,13 @@ export class GenericProvider extends Observable<string> {
        * `0` disables compression entirely and keeps the wire format
        * byte-for-byte identical to before this option existed; `undefined`
        * takes the transport's `preferredCompressMinBytes` hint (2048 on
-       * Ably, PubNub, Matrix, Nostr, Supabase - transports that cap or
-       * bill message size), else disabled.
+       * PubNub, Matrix and Nostr, which carry the frame as opaque bytes),
+       * else disabled. NOT usable with a transport that strips the CRC32
+       * header or reads the message type at a fixed offset (Ably, Supabase,
+       * Gun today): the flag byte sits ahead of that header, so such a
+       * transport hands the receiver a frame it cannot parse - measured in
+       * the Nostr end-to-end test before that provider was made
+       * frame-transparent.
        * @default the transport's `preferredCompressMinBytes` hint, else undefined
        */
       compressionThresholdBytes?: number
@@ -3350,21 +3358,13 @@ export class GenericProvider extends Observable<string> {
     const encoderSync = encoding.createEncoder()
     encoding.writeVarUint(encoderSync, MESSAGE_SYNC)
     syncProtocol.writeSyncStep1(encoderSync, this.doc)
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)),
-      this,
-    )
+    this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)))
 
     // Broadcast local state via BroadcastChannel (wrapped with CRC32)
     const encoderState = encoding.createEncoder()
     encoding.writeVarUint(encoderState, MESSAGE_SYNC)
     syncProtocol.writeSyncStep2(encoderState, this.doc)
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoderState)),
-      this,
-    )
+    this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderState)))
 
     // Broadcast local awareness state via BroadcastChannel (wrapped with CRC32)
     if (this.awareness.getLocalState() !== null) {
@@ -3376,11 +3376,7 @@ export class GenericProvider extends Observable<string> {
           this.doc.clientID,
         ]),
       )
-      bc.publish(
-        this._bcChannel,
-        wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)),
-        this,
-      )
+      this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)))
     }
   }
 
@@ -3403,11 +3399,7 @@ export class GenericProvider extends Observable<string> {
         new Map(),
       ),
     )
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
-      this,
-    )
+    this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoder)))
 
     // Unsubscribe from channel
     bc.unsubscribe(this._bcChannel, this._bcSubscriber)
@@ -3477,22 +3469,8 @@ export class GenericProvider extends Observable<string> {
     // Wrap message with CRC32 checksum
     const wrappedData = wrapMessageWithChecksum(data)
 
-    // Send via BroadcastChannel to other tabs first. BroadcastChannel is
-    // same-process (other tabs in this browser) - never worth compressing.
-    // When compressionThresholdBytes is enabled, every message still needs
-    // the same leading flag byte _handleIncomingMessage() expects
-    // regardless of source, so this always sends flag=0 (uncompressed) in
-    // that case rather than skipping the flag - see that option's doc
-    // comment.
-    if (this._bcConnected) {
-      bc.publish(
-        this._bcChannel,
-        this._compressionThresholdBytes
-          ? prefixCompressionFlag(0, wrappedData)
-          : wrappedData,
-        this,
-      )
-    }
+    // Send via BroadcastChannel to other tabs first.
+    if (this._bcConnected) this._bcPublish(wrappedData)
 
     // Send via network transport
     if (!this.transport.isConnected) {
@@ -3500,6 +3478,28 @@ export class GenericProvider extends Observable<string> {
     }
 
     this._sendToTransport(wrappedData)
+  }
+
+  /**
+   * Publish already-CRC32-wrapped bytes to the other tabs. BroadcastChannel
+   * is same-process - never worth compressing - but when
+   * compressionThresholdBytes is enabled every message still needs the
+   * leading flag byte _handleIncomingMessage() expects regardless of
+   * source, so this sends flag=0 in that case. The ONE place for every BC
+   * publish: the connect-time burst in _setupBroadcastChannel() used to
+   * publish without the flag, and with compression on (the transport
+   * hints made that a default) the other tab read a CRC byte as the flag
+   * and failed to inflate three messages per join (Nostr playground,
+   * 2026-09-06).
+   */
+  private _bcPublish(wrappedData: Uint8Array): void {
+    bc.publish(
+      this._bcChannel,
+      this._compressionThresholdBytes
+        ? prefixCompressionFlag(0, wrappedData)
+        : wrappedData,
+      this,
+    )
   }
 
   /**

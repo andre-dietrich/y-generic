@@ -147,7 +147,6 @@ export declare class AblyTransport implements Transport {
     private messageCallback?;
     private messageBuffer;
     private chunkBuffer;
-    readonly preferredCompressMinBytes = 2048;
     private persistentMode;
     private persistDoc;
     private persistDebounceMs;

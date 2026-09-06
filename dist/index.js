@@ -370,6 +370,8 @@ export class GenericProvider extends Observable {
         this._destroying = false;
         this._lastActivityTime = Date.now();
         this._lastPeriodicTickTime = Date.now();
+        this._equalBeaconsHeard = 0;
+        this._beaconForced = false;
         // BroadcastChannel state for cross-tab sync
         this._bcChannel = '';
         this._bcConnected = false;
@@ -529,6 +531,7 @@ export class GenericProvider extends Observable {
                 undefined;
         this._idleBackoffEnabled = options.idleBackoffEnabled ?? true;
         this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000;
+        this._trickleK = options.trickleK ?? 1;
         this._currentSyncIntervalMs = this._syncInterval;
         this._setupDocumentSync();
         this._setupAwarenessSync();
@@ -614,6 +617,8 @@ export class GenericProvider extends Observable {
                 this._currentSyncIntervalMs = this._syncInterval;
                 this._lastActivityTime = Date.now();
                 this._lastPeriodicTickTime = Date.now();
+                this._equalBeaconsHeard = 0;
+                this._beaconForced = false;
                 const scheduleNextPeriodicSync = (delayMs) => {
                     this._syncIntervalId = setTimeout(() => {
                         const tickTime = Date.now();
@@ -639,7 +644,15 @@ export class GenericProvider extends Observable {
                             // handler broadcasts. Measured in
                             // test/dummy/bench-idle-room.ts: the per-tick re-announce was
                             // ~40% of an idle room's deliveries.
-                            this._sendSyncStep1();
+                            // Trickle (round 5, item 3): silent if enough equal beacons
+                            // were overheard since the last tick - see _equalBeaconsHeard.
+                            const suppressed = this._trickleK > 0 &&
+                                !this._beaconForced &&
+                                this._equalBeaconsHeard >= this._trickleK;
+                            if (!suppressed)
+                                this._sendSyncStep1();
+                            this._equalBeaconsHeard = 0;
+                            this._beaconForced = false;
                         }
                         if (!this._destroying)
                             scheduleNextPeriodicSync();
@@ -1003,7 +1016,8 @@ export class GenericProvider extends Observable {
             this._currentSyncIntervalMs = this._syncInterval;
             // Phase 1e: at a random point inside the base interval, not a full
             // one (the phase-1d note): the loser's recovery chain starts with
-            // this beacon.
+            // this beacon - so Trickle never suppresses it (round 5, item 3).
+            this._beaconForced = true;
             this._periodicScheduler(Math.random() * this._syncInterval);
         }
     }
@@ -1040,6 +1054,7 @@ export class GenericProvider extends Observable {
     _setupDocumentSync() {
         this._updateHandler = (update, origin) => {
             this._dsHashCache = null;
+            this._equalBeaconsHeard = 0; // our digest changed - see the Trickle fields
             // Fires for BOTH local edits and remotely-applied updates (the latter
             // go through doc.transact with origin=this) - see _markActivity()'s
             // doc comment. Phase 1e: only a LOCAL edit counts as activity for
@@ -1369,6 +1384,14 @@ export class GenericProvider extends Observable {
                 }
                 if (scan.coversUs)
                     this._presenceCovered = true;
+                // Round 5, item 3: with Trickle, settled peers rarely beacon, so a
+                // joiner would learn them only from the few phase-winning beacons
+                // per interval. The relayed presence table names everyone - ids
+                // only, addresses stay beacon-learned (unicast needs a `from`).
+                for (const id of scan.present) {
+                    if (id !== this.doc.clientID)
+                        this._knownPeers.add(id);
+                }
                 awarenessProtocol.applyAwarenessUpdate(this.awareness, payload, this);
                 break;
             }
@@ -1585,7 +1608,9 @@ export class GenericProvider extends Observable {
         if (equal && !(flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM))) {
             // A peer's periodic/resync beacon in our state: it makes our pending
             // ack redundant, and - if that peer is confirmed - it answers our
-            // own outstanding join as well as any ack would.
+            // own outstanding join as well as any ack would. It also counts for
+            // Trickle: the room has just compared itself against our digest.
+            this._equalBeaconsHeard++;
             if (flags & DIGEST_FLAG_SETTLED) {
                 this._confirmed = true;
                 this._noteResponse(false);
@@ -2255,6 +2280,7 @@ export class GenericProvider extends Observable {
      */
     _scanAwarenessPayload(payload) {
         const removed = [];
+        const present = [];
         let coversUs = false;
         try {
             const d = decoding.createDecoder(payload);
@@ -2266,8 +2292,11 @@ export class GenericProvider extends Observable {
                 const state = JSON.parse(decoding.readVarString(d));
                 if (state === null)
                     removed.push(clientID);
-                else if (clientID === this.awareness.clientID && clock >= ourClock)
-                    coversUs = true;
+                else {
+                    present.push(clientID);
+                    if (clientID === this.awareness.clientID && clock >= ourClock)
+                        coversUs = true;
+                }
             }
         }
         catch {
@@ -2275,7 +2304,7 @@ export class GenericProvider extends Observable {
             // that deals with it (or throws); suppression is a pure optimization,
             // never worth failing the actual message handling over.
         }
-        return { removed, coversUs };
+        return { removed, present, coversUs };
     }
     /**
      * Drop a pending suppressed removal broadcast if it overlaps

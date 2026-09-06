@@ -554,3 +554,44 @@ replies (items 3 and 4). Gates: `bench-idle-room` part (b) lost delete
 5/5 converged (107-693 ms); `bench-sync-latency` one message per edit and
 unchanged convergence on all four profiles (40-46 ms push, 241 ms Gun,
 227 ms Matrix at `batchUpdates` 0).
+
+### Item 3 — Trickle beacons (commit 3)
+
+What changed in `src/index.ts`: `_equalBeaconsHeard` counts equal
+periodic beacons (the existing `equal` in `_handleDigest`, delete-set hash
+included) since the last tick; the tick stays silent when the count
+reaches `trickleK` (new option, default 1, 0 = off), then resets the
+count. The count also resets on every applied update (local or remote,
+the `_dsHashCache = null` line), and the beacon `_markActivity` re-arms
+after a local edit is never suppressed (`_beaconForced`) - the two rules
+from the review. Joiners now also learn peer ids from awareness payloads
+(`_scanAwarenessPayload().present` → `_knownPeers`), since settled peers
+rarely beacon any more.
+
+```
+SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1 SETTLE_MS=90000 OBSERVE_MS=60000 N_VALUES=20,50 \
+  node bench-dist/test/dummy/bench-idle-room.js
+N_VALUES=50 node bench-dist/test/dummy/bench-typing-census.js
+```
+
+| Scenario | before → after deliveries | request (beacons) | SyncStep2 | awareness |
+|---|---|---|---|---|
+| idle N=20 at the cap, 60 s | 1,900 → 1,539 (−19 %) | 380 → **19** | 0 | 1,520 (unchanged) |
+| idle N=50 at the cap, 60 s | 12,250 → 9,849 (−20 %) | 2,450 → **49** | 0 | 9,800 (unchanged) |
+| typing N=50 base cadence (item 1 build → item 3) | 6,321 → 3,724 (−41 %) | 3,381 → 1,176 | 490 → 98 | 2,450 |
+
+One beacon per minute room-wide in the idle room (the W(N) estimate of
+~3 was pessimistic: with the count reset at each tick, the first beacon of
+a window silences every peer whose window contains it). What is left of
+the idle room is the awareness renewal - item 2. In the base cadence
+during typing a quarter of the beacons still go out (transiently unequal
+digests), and their in-flight replies drop with them.
+
+Gates on the item-3 build: `bench-idle-room` lost delete 5/5;
+`bench-idle-backoff` recovery after backoff median 608 ms (phase 1e:
+546 ms; off: 244 ms), idle message count with backoff off 60 → 35 per 30
+buckets (the two peers now alternate); `bench-late-join` every cell 3/3
+converged on WebSocket and Matrix, 0 and 3 % loss; `bench-join-census`
+late join N=100 500 deliveries (phase 1e: 500), fresh burst N=100
+WebSocket 51,975 / Gun 51,282 (phase 1e: ~54k) - the join path never
+suppresses; `bench-packet-loss` every cell 3/3 converged at 0-10 % loss, N 5-50, WebSocket and Matrix profiles (Matrix 10 % N=50: 4,426 deliveries, inside the phase-1e range); `bench-corruption-storm` bounded and converged at every rate (N=10, 50 % corruption: 873 deliveries during the 3 s stream vs 792 at 0 %).

@@ -111,6 +111,9 @@ export declare class GenericProvider extends Observable<string> {
     private _lastActivityTime;
     private _lastPeriodicTickTime;
     private _periodicScheduler?;
+    private _trickleK;
+    private _equalBeaconsHeard;
+    private _beaconForced;
     private _bcChannel;
     private _bcConnected;
     private _bcSubscriber?;
@@ -330,6 +333,20 @@ export declare class GenericProvider extends Observable<string> {
          * @default the transport's `preferredCompressMinBytes` hint, else undefined
          */
         compressionThresholdBytes?: number;
+        /**
+         * Trickle redundancy constant (RFC 6206 §4.2) for the periodic
+         * beacon: the tick stays silent when at least this many periodic
+         * beacons with a digest equal to ours were overheard since the
+         * previous tick - the room has already compared itself against our
+         * exact state, so our beacon would add nothing. A settled idle room
+         * then sends ~3 beacons per interval in total instead of one per
+         * peer (round 5, item 3). 1 = fewest messages; 2 = one lost beacon
+         * does not silence a window; 0 = off (every tick beacons, as before
+         * round 5). JOIN/CONFIRM/resync requests and the beacon re-armed by a
+         * local edit are never suppressed.
+         * @default 1
+         */
+        trickleK?: number;
         /**
          * Back off the periodic-sync interval (see `syncInterval`) when the
          * room is idle, instead of ticking at a fixed cadence forever. After

@@ -414,7 +414,7 @@ export class GenericProvider extends Observable<string> {
   private _lastPeriodicTickTime: number = Date.now()
   // connect()'s periodic scheduler, kept so _markActivity() can re-arm a
   // backed-off timer at the base interval right away (phase 1d, design D).
-  private _periodicScheduler?: () => void
+  private _periodicScheduler?: (delayMs?: number) => void
 
   // BroadcastChannel state for cross-tab sync
   private _bcChannel: string = ''
@@ -755,10 +755,14 @@ export class GenericProvider extends Observable<string> {
        * Back off the periodic-sync interval (see `syncInterval`) when the
        * room is idle, instead of ticking at a fixed cadence forever. After
        * each periodic tick that saw no activity since the previous tick -
-       * no local or remote document change, no local or remote awareness
-       * change, no corrupted/rejected wire message - the interval DOUBLES
-       * (capped at `idleBackoffMaxMs`) for the next tick. Any activity
-       * resets it immediately back to `syncInterval`. Deliberately does NOT
+       * no LOCAL document edit, no corrupted/rejected wire message - the
+       * interval DOUBLES (capped at `idleBackoffMaxMs`) for the next tick.
+       * Local activity re-arms the tick at once, at a random point inside
+       * `syncInterval`. Remote updates and awareness changes do not count
+       * (phase 1e): a listener has nothing a beacon would announce, and the
+       * editor's own beacon heals a listener that lost the keystroke - so
+       * one typist no longer keeps every peer at the base cadence
+       * (N*(N-1) deliveries per interval). Deliberately does NOT
        * count the periodic tick's own routine SyncStep1/SyncStep2 exchange
        * as activity (see `_markActivity()`'s doc comment for why treating
        * that as activity would make this option a no-op - an earlier draft
@@ -920,7 +924,7 @@ export class GenericProvider extends Observable<string> {
         this._currentSyncIntervalMs = this._syncInterval
         this._lastActivityTime = Date.now()
         this._lastPeriodicTickTime = Date.now()
-        const scheduleNextPeriodicSync = () => {
+        const scheduleNextPeriodicSync = (delayMs?: number) => {
           this._syncIntervalId = setTimeout(() => {
             const tickTime = Date.now()
             if (this._idleBackoffEnabled) {
@@ -952,7 +956,7 @@ export class GenericProvider extends Observable<string> {
               this._sendSyncStep1()
             }
             if (!this._destroying) scheduleNextPeriodicSync()
-          }, this._jitteredSyncInterval())
+          }, delayMs ?? this._jitteredSyncInterval())
         }
         this._periodicScheduler = scheduleNextPeriodicSync
         scheduleNextPeriodicSync()
@@ -1361,11 +1365,9 @@ export class GenericProvider extends Observable<string> {
    * handler would ever see (it's rejected before decoding) - see the
    * explicit call in `_processWrappedMessage()`'s corruption branch.
    *
-   * Call sites: `_setupDocumentSync()`'s update handler (local or remote
-   * document content change), `_setupAwarenessSync()`'s update handler
-   * (local or remote awareness content change), and
-   * `_processWrappedMessage()`'s corrupted-message branch (wire noise, not
-   * silence).
+   * Call sites: `_setupDocumentSync()`'s update handler (LOCAL document
+   * edits only, since phase 1e) and `_processWrappedMessage()`'s
+   * corrupted-message branch (wire noise, not silence).
    */
   private _markActivity(): void {
     this._lastActivityTime = Date.now()
@@ -1384,7 +1386,10 @@ export class GenericProvider extends Observable<string> {
     ) {
       clearTimeout(this._syncIntervalId)
       this._currentSyncIntervalMs = this._syncInterval
-      this._periodicScheduler()
+      // Phase 1e: at a random point inside the base interval, not a full
+      // one (the phase-1d note): the loser's recovery chain starts with
+      // this beacon.
+      this._periodicScheduler(Math.random() * this._syncInterval)
     }
   }
 
@@ -1423,9 +1428,13 @@ export class GenericProvider extends Observable<string> {
       this._dsHashCache = null
       // Fires for BOTH local edits and remotely-applied updates (the latter
       // go through doc.transact with origin=this) - see _markActivity()'s
-      // doc comment for why this single hook covers "local or remote
-      // document change" for idleBackoffEnabled.
-      this._markActivity()
+      // doc comment. Phase 1e: only a LOCAL edit counts as activity for
+      // idle backoff - a listener has nothing a beacon would announce, and
+      // the typist's base-interval beacon heals any listener that lost the
+      // keystroke (phase 1d design A). Before this, one typist kept all N
+      // peers at the base cadence: N*(N-1) deliveries per interval against
+      // N-1 per keystroke.
+      if (origin !== this) this._markActivity()
 
       // Don't send updates that originated from this provider
       // This prevents infinite loops when receiving updates
@@ -1496,9 +1505,8 @@ export class GenericProvider extends Observable<string> {
       },
       origin: any,
     ) => {
-      // Fires for both local and remote-applied awareness changes - see
-      // _markActivity()'s doc comment.
-      this._markActivity()
+      // Not _markActivity(): awareness changes are not something a beacon
+      // announces (phase 1e; see the idleBackoffEnabled option).
 
       // Broadcast awareness changes, UNLESS they came from remote (this
       // comment described the intent since the very first commit, but the

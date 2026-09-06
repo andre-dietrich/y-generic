@@ -455,12 +455,14 @@ const provider = new GenericProvider(doc, transport, {
 For most production scenarios, the default 5-second interval provides good resilience without excessive traffic. For testing with simulated packet loss, use a shorter interval (e.g., 2 seconds).
 
 While a room is idle the interval doubles after each quiet tick, up to
-`idleBackoffMaxMs` (60 s by default); any document or awareness activity
-resets it to `syncInterval`. A peer that missed the last message before the
-room went quiet does not wait for its own backed-off tick: the next beacon
-from any peer that is ahead of it makes it ask for the difference (after a
-short grace for messages still in flight), so recovery stays within about
-one base interval. `idleBackoffEnabled: false` keeps the fixed cadence.
+`idleBackoffMaxMs` (60 s by default); a local edit resets it to
+`syncInterval` at once (remote updates and presence changes do not - a
+peer that only listens has nothing a beacon would announce, so one typist
+does not keep the whole room at the base cadence). A peer that missed the
+last message before the room went quiet does not wait for its own
+backed-off tick: the editor's next beacon, one base interval away at most,
+makes it ask for the difference (after a short grace for messages still in
+flight). `idleBackoffEnabled: false` keeps the fixed cadence.
 
 > **Wire compatibility.** All peers in a room must run the same version of
 > this library. Sync requests travel as a private digest message (state

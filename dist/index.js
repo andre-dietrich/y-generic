@@ -592,7 +592,7 @@ export class GenericProvider extends Observable {
                 this._currentSyncIntervalMs = this._syncInterval;
                 this._lastActivityTime = Date.now();
                 this._lastPeriodicTickTime = Date.now();
-                const scheduleNextPeriodicSync = () => {
+                const scheduleNextPeriodicSync = (delayMs) => {
                     this._syncIntervalId = setTimeout(() => {
                         const tickTime = Date.now();
                         if (this._idleBackoffEnabled) {
@@ -621,7 +621,7 @@ export class GenericProvider extends Observable {
                         }
                         if (!this._destroying)
                             scheduleNextPeriodicSync();
-                    }, this._jitteredSyncInterval());
+                    }, delayMs ?? this._jitteredSyncInterval());
                 };
                 this._periodicScheduler = scheduleNextPeriodicSync;
                 scheduleNextPeriodicSync();
@@ -975,11 +975,9 @@ export class GenericProvider extends Observable {
      * handler would ever see (it's rejected before decoding) - see the
      * explicit call in `_processWrappedMessage()`'s corruption branch.
      *
-     * Call sites: `_setupDocumentSync()`'s update handler (local or remote
-     * document content change), `_setupAwarenessSync()`'s update handler
-     * (local or remote awareness content change), and
-     * `_processWrappedMessage()`'s corrupted-message branch (wire noise, not
-     * silence).
+     * Call sites: `_setupDocumentSync()`'s update handler (LOCAL document
+     * edits only, since phase 1e) and `_processWrappedMessage()`'s
+     * corrupted-message branch (wire noise, not silence).
      */
     _markActivity() {
         this._lastActivityTime = Date.now();
@@ -996,7 +994,10 @@ export class GenericProvider extends Observable {
             this._periodicScheduler !== undefined) {
             clearTimeout(this._syncIntervalId);
             this._currentSyncIntervalMs = this._syncInterval;
-            this._periodicScheduler();
+            // Phase 1e: at a random point inside the base interval, not a full
+            // one (the phase-1d note): the loser's recovery chain starts with
+            // this beacon.
+            this._periodicScheduler(Math.random() * this._syncInterval);
         }
     }
     /** Cached delete-set hash - see computeDeleteSetHash(). */
@@ -1034,9 +1035,14 @@ export class GenericProvider extends Observable {
             this._dsHashCache = null;
             // Fires for BOTH local edits and remotely-applied updates (the latter
             // go through doc.transact with origin=this) - see _markActivity()'s
-            // doc comment for why this single hook covers "local or remote
-            // document change" for idleBackoffEnabled.
-            this._markActivity();
+            // doc comment. Phase 1e: only a LOCAL edit counts as activity for
+            // idle backoff - a listener has nothing a beacon would announce, and
+            // the typist's base-interval beacon heals any listener that lost the
+            // keystroke (phase 1d design A). Before this, one typist kept all N
+            // peers at the base cadence: N*(N-1) deliveries per interval against
+            // N-1 per keystroke.
+            if (origin !== this)
+                this._markActivity();
             // Don't send updates that originated from this provider
             // This prevents infinite loops when receiving updates
             if (origin !== this) {
@@ -1093,9 +1099,8 @@ export class GenericProvider extends Observable {
      */
     _setupAwarenessSync() {
         this._awarenessUpdateHandler = ({ added, updated, removed, }, origin) => {
-            // Fires for both local and remote-applied awareness changes - see
-            // _markActivity()'s doc comment.
-            this._markActivity();
+            // Not _markActivity(): awareness changes are not something a beacon
+            // announces (phase 1e; see the idleBackoffEnabled option).
             // Broadcast awareness changes, UNLESS they came from remote (this
             // comment described the intent since the very first commit, but the
             // actual origin check was never implemented until now - confirmed by

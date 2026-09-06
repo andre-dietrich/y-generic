@@ -319,10 +319,14 @@ export declare class GenericProvider extends Observable<string> {
          * Back off the periodic-sync interval (see `syncInterval`) when the
          * room is idle, instead of ticking at a fixed cadence forever. After
          * each periodic tick that saw no activity since the previous tick -
-         * no local or remote document change, no local or remote awareness
-         * change, no corrupted/rejected wire message - the interval DOUBLES
-         * (capped at `idleBackoffMaxMs`) for the next tick. Any activity
-         * resets it immediately back to `syncInterval`. Deliberately does NOT
+         * no LOCAL document edit, no corrupted/rejected wire message - the
+         * interval DOUBLES (capped at `idleBackoffMaxMs`) for the next tick.
+         * Local activity re-arms the tick at once, at a random point inside
+         * `syncInterval`. Remote updates and awareness changes do not count
+         * (phase 1e): a listener has nothing a beacon would announce, and the
+         * editor's own beacon heals a listener that lost the keystroke - so
+         * one typist no longer keeps every peer at the base cadence
+         * (N*(N-1) deliveries per interval). Deliberately does NOT
          * count the periodic tick's own routine SyncStep1/SyncStep2 exchange
          * as activity (see `_markActivity()`'s doc comment for why treating
          * that as activity would make this option a no-op - an earlier draft
@@ -469,11 +473,9 @@ export declare class GenericProvider extends Observable<string> {
      * handler would ever see (it's rejected before decoding) - see the
      * explicit call in `_processWrappedMessage()`'s corruption branch.
      *
-     * Call sites: `_setupDocumentSync()`'s update handler (local or remote
-     * document content change), `_setupAwarenessSync()`'s update handler
-     * (local or remote awareness content change), and
-     * `_processWrappedMessage()`'s corrupted-message branch (wire noise, not
-     * silence).
+     * Call sites: `_setupDocumentSync()`'s update handler (LOCAL document
+     * edits only, since phase 1e) and `_processWrappedMessage()`'s
+     * corrupted-message branch (wire noise, not silence).
      */
     private _markActivity;
     /** Cached delete-set hash - see computeDeleteSetHash(). */

@@ -156,6 +156,7 @@ export declare class GenericProvider extends Observable<string> {
     private _batchUpdates;
     private _pendingUpdate;
     private _batchTimeoutId?;
+    private _flushScheduled;
     private _awarenessInterval;
     private _pendingAwarenessClients;
     private _awarenessTimeoutId?;
@@ -188,7 +189,12 @@ export declare class GenericProvider extends Observable<string> {
         /**
          * Batch (debounce) document updates to reduce network traffic.
          * Updates are collected and sent after this delay in milliseconds.
-         * Set to 0 to send updates immediately (no batching).
+         * 0 sends at the end of the current task (a microtask: no timer, no
+         * measurable delay) - the transactions one input event produces
+         * leave as one message, together with the cursor awareness the
+         * editor binding sets in the same task (round 5, item 1; measured in
+         * test/dummy/bench-typing-census.ts). Before round 5, 0 sent
+         * synchronously from inside the Y.Doc 'update' event.
          * Recommended: 50-200ms for good balance between latency and efficiency.
          * @default the transport's `preferredBatchMs` hint if it declares one,
          * otherwise 0 (disabled - immediate transmission)
@@ -505,10 +511,18 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _setupDocumentSync;
     /**
-     * Batch/debounce updates to reduce network traffic.
-     * Merges multiple updates and sends after delay.
+     * Merge a local update into the pending batch and schedule its flush:
+     * after `batchUpdates` ms (debounced) when that is > 0, otherwise at the
+     * end of the current task via queueMicrotask - see `_pendingUpdate`.
      */
     private _batchUpdate;
+    /**
+     * Send the pending update batch as one wire message, carrying any
+     * awareness change the throttle is holding (see _takePendingAwareness).
+     * Shared by the microtask flush, the timed flush, and the
+     * disconnect()/destroy() flush.
+     */
+    private _flushPendingUpdate;
     /**
      * Setup automatic awareness synchronization.
      * Listens to awareness changes and broadcasts them.
@@ -913,8 +927,10 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _encodePush;
     /**
-     * Send a document update to the transport.
-     * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
+     * Send a document update to the transport, with whatever awareness change
+     * the throttle is holding folded into the same wire message (round 5,
+     * item 1). If verifyUpdates is enabled, the update carries a sequence
+     * number and document hash for ordering and desync detection.
      */
     private _sendUpdate;
     /**
@@ -932,6 +948,25 @@ export declare class GenericProvider extends Observable<string> {
      * Multiple rapid updates are batched together.
      */
     private _broadcastAwareness;
+    /**
+     * Round 5, item 1: the awareness change the throttle is holding rides
+     * along with a wire message that is leaving anyway. Returns the encoded
+     * awareness sub-message (or nothing) and commits the throttle state
+     * exactly as the timer's own flush would. A piggybacked broadcast costs
+     * no message, only its payload bytes, so it goes out early instead of as
+     * its own message up to `_awarenessInterval` later. Measured in
+     * test/dummy/bench-typing-census.ts: a keystroke in an editor binding is
+     * a text insert plus a cursor update - two broadcasts per keystroke
+     * before this, one after. Broadcast paths only: `_sendDirect` and the
+     * BroadcastChannel-only publishes never call this.
+     */
+    private _takePendingAwareness;
+    /**
+     * The counterpart for the timed batch: a `batchUpdates > 0` batch that is
+     * still waiting rides along with an awareness flush (Matrix: both
+     * default to 2 s, so a typist's cursor and text leave as one PUT).
+     */
+    private _takePendingUpdate;
     /**
      * Encode an awareness update, without sending it. Extracted from the old
      * `_sendAwarenessNow()` so `_tryImmediateAwarenessMessage()` can fold it

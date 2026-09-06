@@ -489,9 +489,19 @@ export class GenericProvider extends Observable {
         // positives from mere network reordering. See _trackRemoteSeq().
         this._remoteSeqInfo = new Map();
         this._gapCheckTimers = new Map();
-        // Update batching/debouncing
-        this._batchUpdates = 0; // milliseconds delay (0 = disabled)
+        // Update batching/debouncing. `_batchUpdates` 0 (the default) no longer
+        // means a synchronous send from inside the Y.Doc 'update' event: the
+        // update is merged into `_pendingUpdate` and flushed at the end of the
+        // current task (a microtask - no timer, no measurable delay), so that
+        // (a) the several transactions an editor binding can emit for one input
+        // event leave as one message and (b) the cursor awareness the binding
+        // sets right after the text change in the same task rides along in the
+        // same wire message (round 5, item 1 - see _flushPendingUpdate()).
+        // `_batchTimeoutId` is set only for the timed (`batchUpdates > 0`) flush;
+        // `_flushScheduled` covers both.
+        this._batchUpdates = 0; // milliseconds delay (0 = end of current task)
         this._pendingUpdate = null;
+        this._flushScheduled = false;
         // Awareness throttling - prevents awareness from flooding document sync
         this._awarenessInterval = 100; // ms between awareness broadcasts
         this._pendingAwarenessClients = new Set();
@@ -731,16 +741,9 @@ export class GenericProvider extends Observable {
         // (rather than flushing it through a transport that's about to go
         // down) is safe.
         this._cancelPendingAwarenessRemoval();
-        // Flush any pending batched updates before disconnecting
-        if (this._batchTimeoutId !== undefined) {
-            clearTimeout(this._batchTimeoutId);
-            this._batchTimeoutId = undefined;
-            // Send pending update if transport is still connected
-            if (this._pendingUpdate && this.transport.isConnected) {
-                this._sendUpdate(this._pendingUpdate);
-            }
-            this._pendingUpdate = null;
-        }
+        // Flush any pending batched updates before disconnecting (sent only if
+        // the transport is still connected; dropped otherwise, as before)
+        this._flushPendingUpdate();
         // Flush pending awareness updates before disconnecting
         if (this._awarenessTimeoutId !== undefined) {
             clearTimeout(this._awarenessTimeoutId);
@@ -788,15 +791,7 @@ export class GenericProvider extends Observable {
         // (disconnect() will also do this, but be explicit)
         this._cancelPendingAwarenessRemoval();
         // Flush any pending batched updates before destroying
-        if (this._batchTimeoutId !== undefined) {
-            clearTimeout(this._batchTimeoutId);
-            this._batchTimeoutId = undefined;
-            // Send pending update if transport is still connected
-            if (this._pendingUpdate && this.transport.isConnected) {
-                this._sendUpdate(this._pendingUpdate);
-            }
-            this._pendingUpdate = null;
-        }
+        this._flushPendingUpdate();
         this.disconnect();
         // Remove document update listener
         if (this._updateHandler) {
@@ -1058,21 +1053,15 @@ export class GenericProvider extends Observable {
             // Don't send updates that originated from this provider
             // This prevents infinite loops when receiving updates
             if (origin !== this) {
-                if (this._batchUpdates > 0) {
-                    // Batch mode: merge updates and debounce
-                    this._batchUpdate(update);
-                }
-                else {
-                    // Immediate mode: send right away
-                    this._sendUpdate(update);
-                }
+                this._batchUpdate(update);
             }
         };
         this.doc.on('update', this._updateHandler);
     }
     /**
-     * Batch/debounce updates to reduce network traffic.
-     * Merges multiple updates and sends after delay.
+     * Merge a local update into the pending batch and schedule its flush:
+     * after `batchUpdates` ms (debounced) when that is > 0, otherwise at the
+     * end of the current task via queueMicrotask - see `_pendingUpdate`.
      */
     _batchUpdate(update) {
         // Merge with pending update if exists
@@ -1092,18 +1081,38 @@ export class GenericProvider extends Observable {
         else {
             this._pendingUpdate = update;
         }
-        // Clear existing timeout
+        if (this._batchUpdates > 0) {
+            // Debounce: restart the timer on every update.
+            if (this._batchTimeoutId !== undefined)
+                clearTimeout(this._batchTimeoutId);
+            this._batchTimeoutId = setTimeout(() => {
+                this._batchTimeoutId = undefined;
+                this._flushPendingUpdate();
+            }, this._batchUpdates);
+            this._flushScheduled = true;
+            return;
+        }
+        if (this._flushScheduled)
+            return;
+        this._flushScheduled = true;
+        queueMicrotask(() => this._flushPendingUpdate());
+    }
+    /**
+     * Send the pending update batch as one wire message, carrying any
+     * awareness change the throttle is holding (see _takePendingAwareness).
+     * Shared by the microtask flush, the timed flush, and the
+     * disconnect()/destroy() flush.
+     */
+    _flushPendingUpdate() {
+        this._flushScheduled = false;
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
-        }
-        // Set new timeout to send after delay
-        this._batchTimeoutId = setTimeout(() => {
-            if (this._pendingUpdate) {
-                this._sendUpdate(this._pendingUpdate);
-                this._pendingUpdate = null;
-            }
             this._batchTimeoutId = undefined;
-        }, this._batchUpdates);
+        }
+        const update = this._pendingUpdate;
+        this._pendingUpdate = null;
+        if (update && this.transport.isConnected)
+            this._sendUpdate(update);
     }
     /**
      * Setup automatic awareness synchronization.
@@ -2573,11 +2582,13 @@ export class GenericProvider extends Observable {
         return encoding.toUint8Array(encoder);
     }
     /**
-     * Send a document update to the transport.
-     * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
+     * Send a document update to the transport, with whatever awareness change
+     * the throttle is holding folded into the same wire message (round 5,
+     * item 1). If verifyUpdates is enabled, the update carries a sequence
+     * number and document hash for ordering and desync detection.
      */
     _sendUpdate(update) {
-        this._send(this._encodeUpdate(update));
+        this._sendBatch([this._encodeUpdate(update), ...this._takePendingAwareness()]);
     }
     /**
      * Send awareness update to the transport.
@@ -2644,13 +2655,53 @@ export class GenericProvider extends Observable {
         this._awarenessTimeoutId = setTimeout(() => {
             this._awarenessTimeoutId = undefined;
             this._lastAwarenessTime = Date.now();
-            // Send all pending clients in one message
+            // Send all pending clients in one message - and a pending timed
+            // update batch (`batchUpdates > 0`) with them, update first.
             const clientsToSend = Array.from(this._pendingAwarenessClients);
             this._pendingAwarenessClients.clear();
             if (clientsToSend.length > 0) {
-                this._sendAwarenessNow(clientsToSend);
+                this._sendBatch([...this._takePendingUpdate(), this._encodeAwareness(clientsToSend)]);
             }
         }, delay);
+    }
+    /**
+     * Round 5, item 1: the awareness change the throttle is holding rides
+     * along with a wire message that is leaving anyway. Returns the encoded
+     * awareness sub-message (or nothing) and commits the throttle state
+     * exactly as the timer's own flush would. A piggybacked broadcast costs
+     * no message, only its payload bytes, so it goes out early instead of as
+     * its own message up to `_awarenessInterval` later. Measured in
+     * test/dummy/bench-typing-census.ts: a keystroke in an editor binding is
+     * a text insert plus a cursor update - two broadcasts per keystroke
+     * before this, one after. Broadcast paths only: `_sendDirect` and the
+     * BroadcastChannel-only publishes never call this.
+     */
+    _takePendingAwareness() {
+        if (this._awarenessTimeoutId === undefined)
+            return [];
+        clearTimeout(this._awarenessTimeoutId);
+        this._awarenessTimeoutId = undefined;
+        const clients = Array.from(this._pendingAwarenessClients);
+        this._pendingAwarenessClients.clear();
+        if (clients.length === 0)
+            return [];
+        this._lastAwarenessTime = Date.now();
+        return [this._encodeAwareness(clients)];
+    }
+    /**
+     * The counterpart for the timed batch: a `batchUpdates > 0` batch that is
+     * still waiting rides along with an awareness flush (Matrix: both
+     * default to 2 s, so a typist's cursor and text leave as one PUT).
+     */
+    _takePendingUpdate() {
+        if (this._batchTimeoutId === undefined || !this._pendingUpdate)
+            return [];
+        clearTimeout(this._batchTimeoutId);
+        this._batchTimeoutId = undefined;
+        this._flushScheduled = false;
+        const update = this._pendingUpdate;
+        this._pendingUpdate = null;
+        return [this._encodeUpdate(update)];
     }
     /**
      * Encode an awareness update, without sending it. Extracted from the old

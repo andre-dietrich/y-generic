@@ -32,7 +32,10 @@ import { GenericProvider, computeDeleteSetHash } from '../../src/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
 import { sleep, silenced } from './bench-user-scaling'
 
-const SYNC_INTERVAL_MS = 1000
+// Override with SYNC_INTERVAL_MS=<ms> (e.g. 5000, the provider default) to
+// measure the steady state of an idle room with the real cadence - with
+// IDLE_BACKOFF=1 and SETTLE_MS=90000 the backoff has reached its 60 s cap.
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 1000)
 const LATENCY = 20
 const JITTER = 0.25
 // Override with SETTLE_MS=<ms> to measure a room that has been quiet longer
@@ -45,8 +48,9 @@ const OBSERVE_MS = Number(process.env.OBSERVE_MS ?? 10000)
 // IDLE_BACKOFF=1 enables GenericProvider's opt-in idle backoff (round 3,
 // default off) for the peers under test - the phase-1c decision numbers.
 const IDLE_BACKOFF = process.env.IDLE_BACKOFF === '1'
-const N_VALUES = [5, 20, 50]
-const LOST_DELETE_CAP_MS = 5000
+// Override with N_VALUES=20,50 to run a subset.
+const N_VALUES = (process.env.N_VALUES ?? '5,20,50').split(',').map(Number)
+const LOST_DELETE_CAP_MS = Math.max(5000, 2 * SYNC_INTERVAL_MS + 1000)
 const LOST_DELETE_SAMPLES = 5
 
 const MESSAGE_SYNC = 0
@@ -55,18 +59,18 @@ const MESSAGE_SYNC_VERIFIED = 3
 const MESSAGE_BATCH = 4
 const MESSAGE_SYNC_DIGEST = 5
 
-type Cls = 'request' | 'syncStep2' | 'update' | 'awareness' | 'other'
-const CLASSES: Cls[] = ['request', 'syncStep2', 'update', 'awareness', 'other']
-type Census = Record<Cls, { count: number; bytes: number }>
+export type Cls = 'request' | 'syncStep2' | 'update' | 'awareness' | 'other'
+export const CLASSES: Cls[] = ['request', 'syncStep2', 'update', 'awareness', 'other']
+export type Census = Record<Cls, { count: number; bytes: number }>
 
-function newCensus(): Census {
+export function newCensus(): Census {
   const c = {} as Census
   for (const k of CLASSES) c[k] = { count: 0, bytes: 0 }
   return c
 }
 
 /** Classify one CRC32-stripped message; recurses into MESSAGE_BATCH. */
-function classifyOne(msg: Uint8Array, census: Census, mult: number): void {
+export function classifyOne(msg: Uint8Array, census: Census, mult: number): void {
   const decoder = decoding.createDecoder(msg)
   const msgType = decoding.readVarUint(decoder)
   if (msgType === MESSAGE_BATCH) {
@@ -99,10 +103,11 @@ function classifyOne(msg: Uint8Array, census: Census, mult: number): void {
  * `counting` is on, and swallow exactly one broadcast from `dropNextFrom`
  * (part b's lost delete).
  */
-function shadowHub(hub: DummyHub) {
+export function shadowHub(hub: DummyHub) {
   const state = {
     counting: false,
     deliveries: 0,
+    sends: 0,
     census: newCensus(),
     dropNextFrom: null as DummyTransport | null,
     dropped: newCensus(),
@@ -122,6 +127,7 @@ function shadowHub(hub: DummyHub) {
     if (state.counting) {
       const recipients = Math.max(0, hub.getRoomSize(room) - 1)
       state.deliveries += recipients
+      state.sends += 1
       if (data.length >= 5) classifyOne(data.subarray(4), state.census, recipients)
     }
     return original(room, data, sender, options)
@@ -136,6 +142,7 @@ function shadowHub(hub: DummyHub) {
   ) => {
     if (state.counting) {
       state.deliveries += 1
+      state.sends += 1
       if (data.length >= 5) classifyOne(data.subarray(4), state.census, 1)
     }
     return originalUnicast(room, targetId, data, sender, options)
@@ -200,12 +207,12 @@ async function runCensus(N: number): Promise<void> {
     hub.clear()
 
     const secs = OBSERVE_MS / 1000
-    const requestFloor = (N * (N - 1) * OBSERVE_MS) / SYNC_INTERVAL_MS
+    const requestFloor = (N * (N - 1) * OBSERVE_MS) / (IDLE_BACKOFF ? 60000 : SYNC_INTERVAL_MS)
     const awarenessFloor = (N * (N - 1) * OBSERVE_MS) / 15000
     console.log(
-      `CENSUS N=${N} converged=${converged} deliveries=${shadow.deliveries} ` +
+      `CENSUS N=${N} converged=${converged} deliveries=${shadow.deliveries} sends=${shadow.sends} ` +
         `perSec=${(shadow.deliveries / secs).toFixed(0)} perSecPerPeer=${(shadow.deliveries / secs / N).toFixed(1)} ` +
-        `requestFloor=${requestFloor.toFixed(0)} awarenessFloor=${awarenessFloor.toFixed(0)}`,
+        `requestFloor=${requestFloor.toFixed(0)}${IDLE_BACKOFF ? '(at the 60 s cap)' : ''} awarenessFloor=${awarenessFloor.toFixed(0)}`,
     )
     for (const k of CLASSES) {
       const c = shadow.census[k]
@@ -275,10 +282,13 @@ async function runLostDelete(sample: number): Promise<boolean> {
     const warnsAtDrop = { ...warns }
 
     // Drop A's very next broadcast - with batchUpdates=0 the delete below
-    // is sent synchronously from inside the doc 'update' event, so no
-    // timer (beacon, awareness) can interleave between these two lines.
+    // is flushed at the end of the current task (a microtask since round
+    // 5; synchronously before), so no timer (beacon, awareness) can
+    // interleave before it. sleep(0) lets that microtask run before the
+    // check.
     shadow.dropNextFrom = a.transport as DummyTransport
     docA.getText('t').delete(0, 6)
+    await sleep(0)
     const dropped = shadow.dropNextFrom === null
 
     shadow.counting = true
@@ -375,7 +385,9 @@ async function main() {
   process.exit(allOk && hashOk ? 0 : 1)
 }
 
-main().catch((err) => {
-  console.error(err)
-  process.exit(1)
-})
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err)
+    process.exit(1)
+  })
+}

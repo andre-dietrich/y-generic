@@ -903,3 +903,34 @@ packet-loss and late-join.
 Still open from the phase-1c list: the orphaned subdoc work
 (`test/dummy/bench-subdocs.ts`); next lever for idle traffic: the 15 s
 awareness renewal, which is the floor once beacons are backed off.
+
+**Status (2026-09-06, evening): phase 1e** — see
+`2026-09-06-join-cost-design.md`. The peer-count-proportional terms of
+the join path on *relay* transports, which phase 1c's unicast path never
+touched. A probe of one late joiner into a settled room (now
+`test/dummy/bench-join-census.ts`) put presence at 82 % of a join at
+N=100 — every peer broadcast its own state — and a fresh-room join burst
+counted until quiet at 95k deliveries against the 19k the join-burst
+bench reported (it stopped at "all synced", before the three CONFIRM
+retries of an unsettled room). Shipped: one peer per 2 s bucket relays
+the whole awareness table to a joiner and peers whose state it carried
+stay silent (late join N=100: 11,600-13,400 → 500 deliveries, joiner
+sees all presence in 33 ms); a fresh room confirms itself after two
+rounds instead of three (fresh burst N=100: 80k → 54k); the relay-mode
+reply delay follows the responder rank of phase 1c's unicast
+self-selection instead of a uniform draw (SyncStep2 sends per late join
+13-31 → 1-3); idle backoff resets on local edits only, and re-arms at a
+random point inside the base interval (one typist no longer keeps N
+peers at the base cadence; recovery after backoff median 747 → 546 ms).
+Two things the gates caught: acks must keep the uniform window (ranked,
+rank 0 fired per requester and a burst's acks tripled), and an ack and a
+SyncStep2 must never flush each other — N JOIN waits expiring in the same
+millisecond during a lossy burst turned every type change into an
+immediate broadcast (~650 replies in 200 ms at N=50, 5 % loss; never in
+the baseline only because it had converged before the CONFIRMs arrived).
+With that flush gone the ranked delay showed its real price — a silent
+low rank (pending structs) costs the requester a slot — so the slot is
+half a window: Matrix 5 %-loss fan-out median convergence 1.05 → ~1.8 s
+for ~30 → ~3 replies per request; the uniform window is the one-line
+revert. Still open: bytes (compression default, item 7 hints, item 9
+awareness delta), subdocs (`bench-subdocs.ts`, still untracked).

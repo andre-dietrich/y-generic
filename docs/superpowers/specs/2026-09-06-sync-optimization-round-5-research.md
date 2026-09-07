@@ -19,10 +19,16 @@ Research **and implementation** (branch `round-5`, from `main` @
 bd77eb9, 2026-09-06/07): André asked for the plan to be executed with a
 before/after benchmark for every change. Shipped: items 1, 2, 3, 5, 7, 8
 and the lost-delete ask-back found by item 2's gate (seven commits after
-the doc/bench commit). Measured and not shipped: item 4. Waiting for the
-decisions listed under "Decisions for André": items 6, 9, 10, plus
-`onPeerDisconnect` for Ably and Matrix (the signal exists, untested
-backends) and the lease length on transports without a leave signal.
+the doc/bench commit). Measured and not shipped: item 4. Decided on 2026-09-07 (see the end of "Results"): a 120 s lease in the
+Gun/Nostr/WebSocket playgrounds; Supabase and Ably leave signals shipped
+and verified live; PubNub's stays opt-in (`presence: true`) until the
+keyset has the Presence add-on. Parked by André's decision, documented
+here and not planned: Matrix `onPeerDisconnect` (the signal exists in the
+`/sync` membership events; Matrix is not in use), item 6 (the hidden-tab
+flap cannot occur with a lease above the 60 s throttled renewal period),
+item 10 (leader tab, multi-tab use is not common). Item 9 (adaptive
+awareness throttle) waits for a browser measurement of how much
+cursor-only traffic a non-typing LiaScript reader produces.
 Merged to `main` on 2026-09-07 (fast-forward, 931f808). Supabase
 `onPeerDisconnect` (presence key as peer id, `leave` events, sender id in
 the broadcast event name) followed the same morning and was verified

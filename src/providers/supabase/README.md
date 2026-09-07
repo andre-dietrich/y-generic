@@ -183,3 +183,20 @@ interface SupabaseConfig {
 ## License
 
 MIT
+
+## Presence: departures without a timeout
+
+Every peer tracks itself in the channel's presence set under a random
+id and sends its broadcasts as event `m:<id>`, so receivers know who a
+frame came from. A presence `leave` (clean unsubscribe, closed tab, or
+the server's timeout after a dead connection) reaches every subscriber
+and is passed to `GenericProvider` as `onPeerDisconnect`: the departed
+peer's cursor and name disappear at once instead of after the 30 s
+awareness timeout, and the awareness lease defaults to 5 minutes - the
+presence renewal every peer otherwise broadcasts every 15 s (80 % of an
+idle room's messages once the sync beacons have backed off) stops.
+Presence join/leave events count as Realtime messages, one per
+subscriber per event.
+
+Same-version rule, as for the binary frames: an older peer listens for
+event `message` only and never sees `m:<id>` frames.

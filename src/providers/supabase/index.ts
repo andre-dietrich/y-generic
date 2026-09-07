@@ -161,7 +161,16 @@ export class SupabaseTransport implements Transport {
   // No preferredCompressMinBytes: send() strips the CRC32 header, which
   // assumes the uncompressed frame layout (see compressionThresholdBytes).
   private config: SupabaseConfig | null = null
-  private messageCallback?: (data: Uint8Array) => void
+  private messageCallback?: (data: Uint8Array, from?: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
+  // Our id on the channel: the presence key we track under, and the suffix
+  // of the broadcast event name (`m:<id>`) every message goes out with, so
+  // receivers get it as `from`. Round 5, item 2: with a leave signal
+  // GenericProvider drops a departed peer's presence at once and stretches
+  // the awareness lease to 5 minutes - the 15 s renewal broadcasts, 80 % of
+  // an idle room's messages, stop. Same-version rule: an older peer listens
+  // for event 'message' only and never sees these frames.
+  private peerId: string = Math.random().toString(36).slice(2, 10)
   private chunks = new ChunkAssembler()
   private _isConnected: boolean = false
   private debug: boolean = false
@@ -220,12 +229,30 @@ export class SupabaseTransport implements Transport {
 
     this.log('Connecting to room:', this.roomId)
 
-    // Create and subscribe to channel
-    this.channel = this.supabase.channel(this.roomId)
+    // Create and subscribe to channel; our presence key is our peer id.
+    this.channel = this.supabase.channel(this.roomId, {
+      config: { presence: { key: this.peerId } },
+    })
 
-    // Listen for messages
-    this.channel.on('broadcast', { event: 'message' }, (payload: any) => {
-      this.handleMessage(payload.payload)
+    // Listen for messages: `m:<peerId>` from a current peer (the id becomes
+    // `from`), 'message' from an older one.
+    this.channel.on('broadcast', { event: '*' }, (msg: any) => {
+      const event = typeof msg?.event === 'string' ? msg.event : ''
+      const from = event.startsWith('m:') ? event.slice(2) : undefined
+      if (from === this.peerId) return
+      if (from === undefined && event !== 'message') return
+      this.handleMessage(msg.payload, from)
+    })
+
+    // Presence: a peer's channel went away (clean unsubscribe, closed tab,
+    // or the server's timeout after a dead connection). Delivered to every
+    // subscriber, so GenericProvider handles it without a broadcast burst.
+    this.channel.on('presence', { event: 'leave' }, (event: any) => {
+      const key = event?.key
+      if (typeof key === 'string' && key !== this.peerId) {
+        this.log('Peer left:', key)
+        this._peerDisconnectCallback?.(key)
+      }
     })
 
     // Subscribe to channel
@@ -239,6 +266,11 @@ export class SupabaseTransport implements Transport {
         if (status === 'SUBSCRIBED') {
           this._isConnected = true
           this.log('Connected to Supabase channel')
+          // Join the presence set under our key; the promise resolves with
+          // 'ok' or an error status, neither blocks the connect.
+          Promise.resolve(this.channel?.track({ joined_at: Date.now() })).catch(
+            (error: unknown) => this.log('presence track failed:', error),
+          )
           resolve()
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
           reject(new Error(`Supabase subscription failed: ${status}`))
@@ -294,7 +326,7 @@ export class SupabaseTransport implements Transport {
       // Binary broadcast: no base64 (33 % smaller on the wire)
       this.channel.send({
         type: 'broadcast',
-        event: 'message',
+        event: 'm:' + this.peerId,
         payload: payload.buffer.slice(
           payload.byteOffset,
           payload.byteOffset + payload.byteLength,
@@ -306,11 +338,11 @@ export class SupabaseTransport implements Transport {
     // Too large for one broadcast: base64 chunks through the JSON path
     const base64 = this.uint8ArrayToBase64(payload)
     for (const chunk of splitChunks(base64, MAX_CHUNK_CHARS)) {
-      this.channel.send({ type: 'broadcast', event: 'message', payload: chunk })
+      this.channel.send({ type: 'broadcast', event: 'm:' + this.peerId, payload: chunk })
     }
   }
 
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     this.messageCallback = callback
     // State loaded from the table before GenericProvider registered this
     // callback (connect() resolves first): deliver it now, one microtask
@@ -322,6 +354,17 @@ export class SupabaseTransport implements Transport {
     }
     return () => {
       this.messageCallback = undefined
+    }
+  }
+
+  /**
+   * Transport.onPeerDisconnect: Supabase presence 'leave' for the channel.
+   * Peer ids are presence keys, the same id `onMessage` passes as `from`.
+   */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
     }
   }
 
@@ -397,7 +440,7 @@ export class SupabaseTransport implements Transport {
   // Private methods
   // ---------------------------------------------------------------------------
 
-  private handleMessage(payload: any): void {
+  private handleMessage(payload: any, from?: string): void {
     if (!this.messageCallback) return
 
     try {
@@ -419,7 +462,7 @@ export class SupabaseTransport implements Transport {
       // Add CRC32 header for GenericProvider
       const wrapped = addCRC32Header(data)
 
-      this.messageCallback(wrapped)
+      this.messageCallback(wrapped, from)
     } catch (error) {
       this.log('Error handling message:', error)
     }

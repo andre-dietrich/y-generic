@@ -21,9 +21,12 @@ before/after benchmark for every change. Shipped: items 1, 2, 3, 5, 7, 8
 and the lost-delete ask-back found by item 2's gate (seven commits after
 the doc/bench commit). Measured and not shipped: item 4. Waiting for the
 decisions listed under "Decisions for André": items 6, 9, 10, plus
-`onPeerDisconnect` for Ably, Supabase and Matrix (the signal exists,
-untested backends) and the lease length on transports without a leave
-signal. The "Results" section at the end records each item with the exact
+`onPeerDisconnect` for Ably and Matrix (the signal exists, untested
+backends) and the lease length on transports without a leave signal.
+Merged to `main` on 2026-09-07 (fast-forward, 931f808). Supabase
+`onPeerDisconnect` (presence key as peer id, `leave` events, sender id in
+the broadcast event name) followed on branch `supabase-presence` for
+André's live test. The "Results" section at the end records each item with the exact
 commands; the summary table is at its end.
 
 Method as in rounds 1-4: read `src/index.ts` end to end (3,584 lines at

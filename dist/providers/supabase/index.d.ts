@@ -80,6 +80,8 @@ export declare class SupabaseTransport implements Transport {
     private channel;
     private config;
     private messageCallback?;
+    private _peerDisconnectCallback?;
+    private peerId;
     private chunks;
     private _isConnected;
     private debug;
@@ -97,7 +99,12 @@ export declare class SupabaseTransport implements Transport {
     connect(config: SupabaseConfig): Promise<void>;
     disconnect(): Promise<void>;
     send(data: Uint8Array): void;
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
+    /**
+     * Transport.onPeerDisconnect: Supabase presence 'leave' for the channel.
+     * Peer ids are presence keys, the same id `onMessage` passes as `from`.
+     */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
      * Deliver the stored state as a MESSAGE_SYNC_PUSH frame - the provider
      * applies it like a peer's full-state push: no hash check, no `synced`

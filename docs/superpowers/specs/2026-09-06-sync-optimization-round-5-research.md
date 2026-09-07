@@ -28,8 +28,10 @@ Merged to `main` on 2026-09-07 (fast-forward, 931f808). Supabase
 the broadcast event name) followed the same morning and was verified
 against André's project (`test/supabase/live-presence.mjs`: `from` seen,
 0 awareness sends in an idle minute, a closed channel dropped after
-1.2 s); Ably and Matrix remain the untested backends with an unused leave
-signal. The "Results" section at the end records each item with the exact
+1.2 s); Ably followed at 07:05 (`presence.subscribe('leave')`, the publisher's
+clientId as `from`; `test/ably/live-presence.mjs` against André's app:
+`from` seen, 0 awareness sends in an idle minute, a leaving peer dropped
+after 36 ms). Matrix remains the one backend with an unused leave signal. The "Results" section at the end records each item with the exact
 commands; the summary table is at its end.
 
 Method as in rounds 1-4: read `src/index.ts` end to end (3,584 lines at

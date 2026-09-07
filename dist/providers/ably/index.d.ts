@@ -53,6 +53,10 @@ interface AblyPresenceLike {
     get(): Promise<Array<{
         clientId: string;
     }>>;
+    subscribe(action: string, callback: (member: {
+        clientId?: string;
+        action?: string;
+    }) => void): Promise<void> | void;
 }
 interface AblyChannelLike {
     subscribe(callback: (message: {
@@ -145,6 +149,7 @@ export declare class AblyTransport implements Transport {
     private _isConnected;
     private debug;
     private messageCallback?;
+    private _peerDisconnectCallback?;
     private messageBuffer;
     private chunkBuffer;
     private persistentMode;
@@ -164,7 +169,7 @@ export declare class AblyTransport implements Transport {
     send(data: Uint8Array): void;
     /** Peek the message type byte from CRC32-wrapped data (byte 4, after the 4-byte CRC32 header). */
     private peekMessageType;
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
     /** Get the clientIds of other peers currently present on the channel. */
     getPresence(): Promise<string[]>;
     /** Schedule a debounced snapshot write. Called on every non-awareness send(). */
@@ -187,6 +192,11 @@ export declare class AblyTransport implements Transport {
     private handleChunkedMessage;
     private handleMessage;
     private deliver;
+    /**
+     * Transport.onPeerDisconnect: Ably presence 'leave' on the channel. Peer
+     * ids are Ably clientIds, the same `from` onMessage passes.
+     */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     private log;
 }
 export {};

@@ -255,9 +255,24 @@ export class AblyTransport {
             // hash-mismatch resync check for no reason.
             if (message.clientId === this.clientId)
                 return;
-            this.handleMessage(message.data);
+            // The publisher's clientId is the peer id GenericProvider learns as
+            // `from` - the same id a presence leave reports (onPeerDisconnect).
+            this.handleMessage(message.data, message.clientId);
         });
         await this.channel.presence.enter();
+        // Presence leave: a clean leave, or Ably's own removal after a dropped
+        // connection's TTL. Delivered to every subscriber, so GenericProvider
+        // drops the member's awareness without a broadcast burst and lets the
+        // awareness lease default to 5 min (round 5, item 2). The client was
+        // already a presence member (enter/leave above); this subscribes to the
+        // events it ignored before.
+        await this.channel.presence.subscribe('leave', (member) => {
+            const id = member?.clientId;
+            if (typeof id === 'string' && id !== this.clientId) {
+                this.log('Peer left:', id);
+                this._peerDisconnectCallback?.(id);
+            }
+        });
         // Persistence: load any existing snapshot. Unlike Gun, there's no
         // "clear stale snapshot on non-persistent connect" step here — a plain
         // channel (no OBJECT_* modes) never attaches LiveObjects at all, so a
@@ -334,8 +349,8 @@ export class AblyTransport {
     onMessage(callback) {
         this.messageCallback = callback;
         if (this.messageBuffer.length > 0) {
-            for (const data of this.messageBuffer) {
-                callback(data);
+            for (const { data, from } of this.messageBuffer) {
+                callback(data, from);
             }
             this.messageBuffer = [];
         }
@@ -476,7 +491,7 @@ export class AblyTransport {
             });
         });
     }
-    handleChunkedMessage(message) {
+    handleChunkedMessage(message, from) {
         const { id, index, total, data } = message;
         if (!this.chunkBuffer.has(id)) {
             this.chunkBuffer.set(id, new Map());
@@ -498,34 +513,44 @@ export class AblyTransport {
         this.chunkBuffer.delete(id);
         try {
             const raw = base64ToUint8(base64Data);
-            this.deliver(addCRC32Header(raw));
+            this.deliver(addCRC32Header(raw), from);
         }
         catch (error) {
             this.log('Error reassembling chunked message:', error);
         }
     }
-    handleMessage(data) {
+    handleMessage(data, from) {
         try {
             if (data && typeof data === 'object' && data.chunked) {
-                this.handleChunkedMessage(data);
+                this.handleChunkedMessage(data, from);
                 return;
             }
             if (typeof data !== 'string')
                 return;
             const raw = base64ToUint8(data);
-            this.deliver(addCRC32Header(raw));
+            this.deliver(addCRC32Header(raw), from);
         }
         catch (error) {
             this.log('Error handling message:', error);
         }
     }
-    deliver(data) {
+    deliver(data, from) {
         if (this.messageCallback) {
-            this.messageCallback(data);
+            this.messageCallback(data, from);
         }
         else {
-            this.messageBuffer.push(data);
+            this.messageBuffer.push({ data, from });
         }
+    }
+    /**
+     * Transport.onPeerDisconnect: Ably presence 'leave' on the channel. Peer
+     * ids are Ably clientIds, the same `from` onMessage passes.
+     */
+    onPeerDisconnect(callback) {
+        this._peerDisconnectCallback = callback;
+        return () => {
+            this._peerDisconnectCallback = undefined;
+        };
     }
     log(...args) {
         if (this.debug) {

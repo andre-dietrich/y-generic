@@ -151,6 +151,10 @@ interface AblyPresenceLike {
   enter(data?: any): Promise<void>
   leave(data?: any): Promise<void>
   get(): Promise<Array<{ clientId: string }>>
+  subscribe(
+    action: string,
+    callback: (member: { clientId?: string; action?: string }) => void,
+  ): Promise<void> | void
 }
 
 interface AblyChannelLike {
@@ -246,8 +250,9 @@ export class AblyTransport implements Transport {
   private channelName: string = ''
   private _isConnected: boolean = false
   private debug: boolean = false
-  private messageCallback?: (data: Uint8Array) => void
-  private messageBuffer: Uint8Array[] = []
+  private messageCallback?: (data: Uint8Array, from?: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
+  private messageBuffer: Array<{ data: Uint8Array; from?: string }> = []
   private chunkBuffer: Map<string, Map<number, string>> = new Map()
   // No preferredCompressMinBytes: this transport strips the CRC32 header
   // and synthesizes frames from persisted snapshots, both of which assume
@@ -377,9 +382,24 @@ export class AblyTransport implements Transport {
       // computed a moment before our own newer local edits) trips the
       // hash-mismatch resync check for no reason.
       if (message.clientId === this.clientId) return
-      this.handleMessage(message.data)
+      // The publisher's clientId is the peer id GenericProvider learns as
+      // `from` - the same id a presence leave reports (onPeerDisconnect).
+      this.handleMessage(message.data, message.clientId)
     })
     await this.channel.presence.enter()
+    // Presence leave: a clean leave, or Ably's own removal after a dropped
+    // connection's TTL. Delivered to every subscriber, so GenericProvider
+    // drops the member's awareness without a broadcast burst and lets the
+    // awareness lease default to 5 min (round 5, item 2). The client was
+    // already a presence member (enter/leave above); this subscribes to the
+    // events it ignored before.
+    await this.channel.presence.subscribe('leave', (member) => {
+      const id = member?.clientId
+      if (typeof id === 'string' && id !== this.clientId) {
+        this.log('Peer left:', id)
+        this._peerDisconnectCallback?.(id)
+      }
+    })
 
     // Persistence: load any existing snapshot. Unlike Gun, there's no
     // "clear stale snapshot on non-persistent connect" step here — a plain
@@ -462,12 +482,12 @@ export class AblyTransport implements Transport {
     return data.length < 5 ? -1 : data[4]
   }
 
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     this.messageCallback = callback
 
     if (this.messageBuffer.length > 0) {
-      for (const data of this.messageBuffer) {
-        callback(data)
+      for (const { data, from } of this.messageBuffer) {
+        callback(data, from)
       }
       this.messageBuffer = []
     }
@@ -634,12 +654,15 @@ export class AblyTransport implements Transport {
     })
   }
 
-  private handleChunkedMessage(message: {
-    id: string
-    index: number
-    total: number
-    data: string
-  }): void {
+  private handleChunkedMessage(
+    message: {
+      id: string
+      index: number
+      total: number
+      data: string
+    },
+    from?: string,
+  ): void {
     const { id, index, total, data } = message
 
     if (!this.chunkBuffer.has(id)) {
@@ -664,32 +687,43 @@ export class AblyTransport implements Transport {
 
     try {
       const raw = base64ToUint8(base64Data)
-      this.deliver(addCRC32Header(raw))
+      this.deliver(addCRC32Header(raw), from)
     } catch (error) {
       this.log('Error reassembling chunked message:', error)
     }
   }
 
-  private handleMessage(data: any): void {
+  private handleMessage(data: any, from?: string): void {
     try {
       if (data && typeof data === 'object' && data.chunked) {
-        this.handleChunkedMessage(data)
+        this.handleChunkedMessage(data, from)
         return
       }
       if (typeof data !== 'string') return
 
       const raw = base64ToUint8(data)
-      this.deliver(addCRC32Header(raw))
+      this.deliver(addCRC32Header(raw), from)
     } catch (error) {
       this.log('Error handling message:', error)
     }
   }
 
-  private deliver(data: Uint8Array): void {
+  private deliver(data: Uint8Array, from?: string): void {
     if (this.messageCallback) {
-      this.messageCallback(data)
+      this.messageCallback(data, from)
     } else {
-      this.messageBuffer.push(data)
+      this.messageBuffer.push({ data, from })
+    }
+  }
+
+  /**
+   * Transport.onPeerDisconnect: Ably presence 'leave' on the channel. Peer
+   * ids are Ably clientIds, the same `from` onMessage passes.
+   */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
     }
   }
 

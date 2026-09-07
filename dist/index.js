@@ -448,17 +448,22 @@ export class GenericProvider extends Observable {
         this._requestSentAt = 0;
         // See DIGEST_FLAG_SETTLED. Reset on connect (a re-joining peer is a joiner).
         this._confirmed = false;
-        // ClientIDs we have heard from directly (beacon and verified-update
-        // senders). The reply-suppression gate ("is there someone else who could
+        // ClientIDs we have heard from (beacon and verified-update senders, and
+        // the ids a relayed presence table names), each with the time we last
+        // heard it. The reply-suppression gate ("is there someone else who could
         // answer?") used awareness alone, and in a join burst the awareness
         // messages trail the beacons - so the gate was still closed exactly when
         // 49 requests arrived at once, and every one got an immediate reply
-        // (phase-1b design, item 3). Cleared on disconnect.
-        this._knownPeers = new Set();
+        // (phase-1b design, item 3). Cleared on disconnect, pruned by the lease
+        // sweep after a lease of silence (round 7, item 3: on a relay transport a
+        // reload's old clientID never says goodbye, and every one of them counted
+        // in _peerCount() forever).
+        this._knownPeers = new Map();
         // Transport address (the `from` of Transport.onMessage) per remote
         // clientID, learned from beacons and verified updates; lets replies, acks
         // and presence responses go to the requester alone when the transport
-        // has sendTo (phase-1c design, item B). Cleared on disconnect.
+        // has sendTo (phase-1c design, item B). Cleared on disconnect, pruned
+        // with _knownPeers.
         this._peerAddress = new Map();
         // Requesters whose JOIN presence request the pending presence-response
         // timer covers (see _schedulePresenceResponse).
@@ -1158,6 +1163,21 @@ export class GenericProvider extends Observable {
                     awarenessProtocol.removeAwarenessStates(this.awareness, remove, 'timeout');
                 }
             }
+            // Round 7, item 3: forget peers not heard from for a lease. A live
+            // peer is heard at least every lease/2 through its presence renewal
+            // (every receiver scans it, above at MESSAGE_AWARENESS); a pruned
+            // peer that speaks again is simply learned again. Measured before
+            // this: 30 reloads in a 20-peer relay room left 49 known peers for
+            // good, and every cursor moved at a 50-peer room's 'auto' interval
+            // (test/dummy/bench-reload-phantoms.ts). awareness.meta is left to
+            // y-protocols: it holds the clock a late message is checked against.
+            for (const [id, heardAt] of this._knownPeers) {
+                if (lease <= now - heardAt) {
+                    this._knownPeers.delete(id);
+                    this._peerAddress.delete(id);
+                    this._remoteSeqInfo.delete(id);
+                }
+            }
             // Re-arm only while connected: a disconnect() from inside a listener
             // above has just cleared the timer, and must stay cleared.
             if (!this._destroying && this._status.state === 'connected')
@@ -1594,9 +1614,10 @@ export class GenericProvider extends Observable {
                 // joiner would learn them only from the few phase-winning beacons
                 // per interval. The relayed presence table names everyone - ids
                 // only, addresses stay beacon-learned (unicast needs a `from`).
+                const heardAt = Date.now();
                 for (const id of scan.present) {
                     if (id !== this.doc.clientID)
-                        this._knownPeers.add(id);
+                        this._knownPeers.set(id, heardAt);
                 }
                 awarenessProtocol.applyAwarenessUpdate(this.awareness, payload, this);
                 break;
@@ -1627,7 +1648,7 @@ export class GenericProvider extends Observable {
                 // Track for gap detection only — does NOT gate whether we apply
                 // the update below (see _trackRemoteSeq() for why).
                 this._trackRemoteSeq(senderClientID, seqNum);
-                this._knownPeers.add(senderClientID);
+                this._knownPeers.set(senderClientID, Date.now());
                 if (from !== undefined)
                     this._peerAddress.set(senderClientID, from);
                 this._touchPeer(senderClientID);
@@ -1763,7 +1784,7 @@ export class GenericProvider extends Observable {
         decoding.readVarUint(decoder); // DIGEST_VERSION - append-only, nothing to branch on yet
         const flags = decoding.readVarUint(decoder);
         const senderClientID = decoding.readVarUint(decoder);
-        this._knownPeers.add(senderClientID);
+        this._knownPeers.set(senderClientID, Date.now());
         if (from !== undefined)
             this._peerAddress.set(senderClientID, from);
         this._touchPeer(senderClientID);
@@ -2186,7 +2207,7 @@ export class GenericProvider extends Observable {
         const rank = (id) => (Math.imul(requester ^ bucket, 0x9e3779b1) ^ Math.imul(id, 0x85ebca6b)) >>> 0;
         const mine = rank(this.doc.clientID);
         let better = 0;
-        for (const id of this._knownPeers) {
+        for (const id of this._knownPeers.keys()) {
             if (id === requester || id === this.doc.clientID)
                 continue;
             if (rank(id) < mine && ++better >= cap)

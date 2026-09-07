@@ -363,3 +363,47 @@ after:  lifecycle M=20: Timeout handles after construct=0  after disconnect()=0 
 Part 1 is unchanged on this build (49 known peers two leases after the
 reloads) - that is item 3. The round-6 gates are run once on the item-3
 build, which contains both changes; see there.
+
+### Item 3 — phantom peers pruned by the lease (commit 4)
+
+What changed in `src/index.ts`: `_knownPeers` is a `Map<clientID,
+lastHeardMs>`, set where the `Set` was added (the awareness scan, the
+verified-update sender, the digest sender; `_responderRank` iterates
+`.keys()`); the sweep tick - which runs on every provider since item 2 -
+deletes ids not heard for a lease from `_knownPeers`, `_peerAddress` and
+`_remoteSeqInfo`. `awareness.meta` is untouched (the review rules above).
+Two benches that read `_knownPeers.size` whitebox had their cast updated.
+
+```
+node --expose-gc bench-dist/test/dummy/bench-reload-phantoms.js
+before: after 2 leases:   knownPeers=49 peerAddress=49 remoteSeqInfo=31 presence=20 peerCount=50 (live 20) autoAwarenessInterval=1000ms
+after:  after 30 reloads: knownPeers=42 peerAddress=42 remoteSeqInfo=30 presence=35 peerCount=43 (live 20) autoAwarenessInterval=860ms
+        after 2 leases:   knownPeers=19 peerAddress=19 remoteSeqInfo=19 presence=20 peerCount=20 (live 20) autoAwarenessInterval=400ms
+```
+
+Right after the last reload the tables still hold the reloads of the last
+lease (42, not 49: the earliest are already gone); two leases later the
+observer knows exactly the 19 others, and the cursors move at the 20-peer
+interval again.
+
+Gates on this build (items 2 + 3 together), round-6 invocations; the
+comparison is the round-6 doc's number unless a fresh sample on 206fe7a
+(the build before item 2) is named:
+
+| Gate | Result |
+|---|---|
+| `bench-idle-room` steady state, N=20 / 50 | 23 /s / 149 /s (round 6: 23 / 153); lost delete 5/5; HASHPROPS PASS |
+| `bench-typing-census` N=20 / 50, three runs | 1.30-1.36 / 1.46-1.50 sends per keystroke (round 6: 1.26 / 1.64 - the base cadence's beacons and acks move by a few sends per run) |
+| `bench-movers-census` `AWARENESS_INTERVAL=auto`, N=20 / 50 | 500 /s, lag p50 94 ms / 549 /s, p50 84 ms (round 6: 498 / 549) |
+| `bench-periodic-awareness` | 4/4 PASS |
+| `bench-awareness-removal-burst`, timeout sweep / peer events | 1 removal broadcast per N, detect 30.0-30.4 s / 1-5 broadcasts, detect 6-7 ms (as in round 5) |
+| `bench-late-join` | 16/16 cells converged, 0 mismatch, 0 rate-limited, 0 gaps |
+| `bench-join-census` | late joiner identical (250 / 500 / 250 / 600 deliveries); fresh burst inside the run-to-run spread - two samples each: 206fe7a N=100 push 52,470 and 59,499 deliveries (ack sends 31 and 102), this build 55,539 and 53,460 (62 and 41). The prune cannot fire inside a 20 s window at a 30 s lease. |
+| `bench-mesh-join-burst` | debounce below uncoalesced in every scenario, allSynced |
+| `bench-reconnect-cycling` | 0 spurious gaps |
+| `bench-rejoin-blank-doc` | 10/10 in both variants |
+| `bench-asymmetric-join` | 8/8 at every N |
+| `bench-packet-loss` | every cell converged on both profiles |
+| `bench-corruption-storm` | bounded, converged |
+| `bench-sync-latency` | one message per edit on the push profiles; a second one in some Gun/Matrix cells on both builds (206fe7a: the Gun verify-off cells; this build: other cells) - the profile's own jitter |
+| `npm run build` | clean |

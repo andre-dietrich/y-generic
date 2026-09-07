@@ -337,7 +337,7 @@ async function runOnce(
             `waitAttempts=${q._responseWaitAttempts} resyncTimer=${q._pendingResyncTimeoutId !== undefined} ` +
             `resyncAttempts=${q._resyncAttemptCount} reqBudget=${(q._syncRequestTimes as number[]).length} ` +
             `replyBudget=${(q._syncReplyTimes as number[]).length} synced=${p.synced} confirmed=${q._confirmed} ` +
-            `knownPeers=${(q._knownPeers as Set<number>).size} addresses=${(q._peerAddress as Map<number, string>).size}`,
+            `knownPeers=${(q._knownPeers as Map<number, number>).size} addresses=${(q._peerAddress as Map<number, string>).size}`,
         )
       })
     }

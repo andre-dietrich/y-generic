@@ -200,3 +200,7 @@ subscriber per event.
 
 Same-version rule, as for the binary frames: an older peer listens for
 event `message` only and never sees `m:<id>` frames.
+
+Verified against a live project on 2026-09-07 (`test/supabase/live-presence.mjs`):
+two Node peers, one idle minute with no awareness sends, and a peer whose
+channel closed was dropped by the other after 1.2 s.

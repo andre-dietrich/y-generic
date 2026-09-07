@@ -25,8 +25,11 @@ decisions listed under "Decisions for André": items 6, 9, 10, plus
 backends) and the lease length on transports without a leave signal.
 Merged to `main` on 2026-09-07 (fast-forward, 931f808). Supabase
 `onPeerDisconnect` (presence key as peer id, `leave` events, sender id in
-the broadcast event name) followed on branch `supabase-presence` for
-André's live test. The "Results" section at the end records each item with the exact
+the broadcast event name) followed the same morning and was verified
+against André's project (`test/supabase/live-presence.mjs`: `from` seen,
+0 awareness sends in an idle minute, a closed channel dropped after
+1.2 s); Ably and Matrix remain the untested backends with an unused leave
+signal. The "Results" section at the end records each item with the exact
 commands; the summary table is at its end.
 
 Method as in rounds 1-4: read `src/index.ts` end to end (3,584 lines at

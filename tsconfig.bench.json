@@ -36,6 +36,10 @@
     "test/dummy/bench-typing-census.ts",
     "test/dummy/bench-reconnect-push.ts",
     "test/dummy/bench-movers-census.ts",
+    "test/dummy/bench-reload-phantoms.ts",
+    "test/dummy/bench-ws-reconnect-storm.ts",
+    "test/dummy/bench-gun-awareness-replay.ts",
+    "test/dummy/bench-persist-log.ts",
     "test/providers/check-chunking.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]

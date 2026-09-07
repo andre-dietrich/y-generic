@@ -31,7 +31,8 @@ mostly gated behind optional peer dependencies.
    ```
    npx tsc -p tsconfig.bench.json && node bench-dist/test/dummy/bench-sync-latency.js
    ```
-   Each bench file's header comment has its exact run command. These exist to reproduce and
+   Each bench file's header comment has its exact run command (a few need extras named
+   there: `node --expose-gc`, `npm install --no-save fake-indexeddb`). These exist to reproduce and
    quantify specific protocol issues (sync latency across simulated network profiles, message
    count vs. user-count scaling, packet-loss/corruption storms, late-join/asymmetric-join
    behavior) — read the file's own header before changing it, they encode the scenario being
@@ -96,10 +97,11 @@ when a bench script's `DummyHub`/`DummyTransport` behavior itself needs to chang
 doc `docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md` explains what's
 protocol-under-test vs. what's test-infrastructure-only cost).
 
-`peerjs` and `simple-peer` are true mesh P2P transports and rely on `onPeerConnect` firing
-per newly-joined remote peer to push a `syncNow()` to that peer — be aware this can produce
-an O(N²) burst of full-state broadcasts when N peers join a mesh in a short window (see the
-same design doc).
+`peerjs`, `simple-peer` and `trystero` are true mesh P2P transports: `onPeerConnect` fires per
+newly-joined remote peer and, since round 5, the provider answers each with one unicast digest
+beacon (`_schedulePeerConnectSync`, debounced 50 ms) instead of a full-state `syncNow()`
+broadcast — the O(N²) full-state burst the dummy benchmark design doc describes is history;
+`test/dummy/bench-mesh-join-burst.ts` is the gate.
 
 ### Design docs
 

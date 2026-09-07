@@ -430,3 +430,25 @@ retries, then ~3 per second at the cap); on the relay's return the 30
 clients arrive spread over 12.5 s instead of in one instant, median 5.2 s -
 the price of the 10 s cap, taken over y-websocket's 2.5 s for the ~4x
 quieter outage (Decisions, 1).
+
+### Item 5 — Gun: stale presence slots skipped, own slot nulled on leave (commit 6)
+
+What changed in `src/providers/gun/index.ts`: `AWARENESS_MAX_AGE_MS`
+(5 min); `setupAwarenessListener()` returns early for a slot whose
+`timestamp` is older; `disconnect()` `put(null)`s the own slot before
+dropping the room node. README: a paragraph on presence slots.
+
+```
+node bench-dist/test/dummy/bench-gun-awareness-replay.js      (50 stale, 5 recent, 5 live)
+before: joiner: awareness frames delivered=66 presence entries=61 (self + 5 live + 55 phantoms) knownPeers=60
+        slots in the graph after one graceful leave: 61
+after:  joiner: awareness frames delivered=11 presence entries=11 (self + 5 live + 5 phantoms) knownPeers=10
+        slots in the graph after one graceful leave: 60
+```
+
+The 50 hour-old slots still arrive from the relay - the transport drops
+them on receipt, so 11 frames reach the provider instead of 66; the five
+two-minute-old ones are inside the bound and stay for one lease; the graph
+holds 60 slots after the join and the leave (60 old + the joiner − the
+leaver) instead of 61. Cooperative GC of the skipped slots stays parked
+(Decisions, 2).

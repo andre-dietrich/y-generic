@@ -86,6 +86,13 @@ uses 120 s - and the backed-off beacons), the cost of a reconnect (no
 full-state push since round 5), and how long a silently departed peer
 lingers (until the lease).
 
+Presence lives in one Gun slot per connection under the room's
+`awareness` node, and the relay keeps every slot ever written. A joiner
+therefore receives all of them, but ignores any older than five minutes
+(a live slot is rewritten every lease/2), and a clean `disconnect()`
+nulls its own slot - so a joiner no longer inherits one phantom presence
+per connection the room ever had (`test/dummy/bench-gun-awareness-replay.ts`).
+
 ### A local relay for a classroom (LAN)
 
 Gun's own relay is one file in the package; it needs Node and nothing

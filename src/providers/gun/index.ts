@@ -82,6 +82,16 @@ function addCRC32Header(data: Uint8Array): Uint8Array {
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0
 const MESSAGE_AWARENESS = 1
+
+// A presence slot older than this is ignored on receipt: the relay keeps
+// every slot ever written and `.map().on()` replays all of them to a
+// joiner, so without a bound a joiner inherited one phantom presence per
+// connection the room ever had (round 7, item 5; measured 55 phantoms for
+// 60 slots in test/dummy/bench-gun-awareness-replay.ts). A live slot is
+// rewritten every lease/2 (at most 150 s at the playgrounds' 120 s lease),
+// so 5 min is never reached by one; a bound the size of the lease would
+// make a peer whose clock runs a minute or two off invisible to everyone.
+const AWARENESS_MAX_AGE_MS = 5 * 60_000
 // MESSAGE_PUBSUB = 2 (not needed for routing)
 // MESSAGE_SYNC_VERIFIED = 3 (treated same as MESSAGE_SYNC)
 
@@ -560,6 +570,12 @@ export class GunTransport implements Transport {
     // Flush any pending updates
     this.flushBatch()
 
+    // Take our presence slot with us; a crashed tab's slot ages out at the
+    // receivers instead (AWARENESS_MAX_AGE_MS).
+    if (this.ownAwarenessId && this.roomNode) {
+      this.roomNode.get('awareness').get(this.ownAwarenessId).put(null)
+    }
+
     // Remove listeners
     if (this.updateListener) {
       // Gun doesn't have a clear off() method for map listeners
@@ -688,6 +704,13 @@ export class GunTransport implements Transport {
 
         // Skip our own awareness updates
         if (awareness.id === this.lastAwarenessId) return
+        // Skip the presence of connections long gone (see AWARENESS_MAX_AGE_MS)
+        if (
+          typeof awareness.timestamp === 'number' &&
+          Date.now() - awareness.timestamp > AWARENESS_MAX_AGE_MS
+        ) {
+          return
+        }
 
         try {
           let payload = awareness.data

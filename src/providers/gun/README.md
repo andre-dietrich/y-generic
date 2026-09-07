@@ -91,6 +91,10 @@ itself after a crash (Node cluster), and stores what it relays in
 `./radata/` - delete that folder for a clean slate. Clients use
 `http://<LAN address>:8765/gun` (`hostname -I` or `ip addr` shows the
 address; open the port in the firewall, e.g. `sudo ufw allow 8765/tcp`).
+The scheme and the `/gun` path matter: Gun turns `http://` into `ws://`
+itself and a bare `host:8765` never connects; the transport fills in
+`http://` and `/gun` when they are missing (`https://` only if the relay
+has a certificate).
 `PORT=8765`, `PEERS=https://other-relay/gun` and `HTTPS_KEY`/`HTTPS_CERT`
 are the environment knobs. A page served over **https** cannot open a
 plain-http websocket (mixed content): serve the course over http on the

@@ -163,10 +163,22 @@ export class GunTransport {
             radisk: false, // Disable radisk
             ...this.options.gunOptions,
         };
-        // Add peers if specified
+        // Add peers if specified. Gun wants full URLs ending in the relay's
+        // path (`http://host:8765/gun`; it turns http(s) into ws(s) itself) -
+        // a bare `host:8765` never connects and Gun says nothing. Fill in what
+        // is missing: http:// (https:// only if the relay has a certificate),
+        // and /gun when there is no path.
         if (this.options.peers.length > 0) {
-            gunConfig.peers = this.options.peers;
-            this.log('📡 Connecting to peers:', this.options.peers);
+            const peers = this.options.peers.map((peer) => {
+                let url = peer.trim();
+                if (!/^(https?|wss?):\/\//i.test(url))
+                    url = 'http://' + url;
+                if (/^(https?|wss?):\/\/[^/]+\/?$/i.test(url))
+                    url = url.replace(/\/?$/, '/gun');
+                return url;
+            });
+            gunConfig.peers = peers;
+            this.log('📡 Connecting to peers:', peers);
         }
         this.gun = new this.options.gun(gunConfig);
         // Navigate to room node

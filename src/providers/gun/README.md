@@ -43,6 +43,34 @@ const provider = new GenericProvider(doc, transport)
 await provider.connect({ room: 'my-room' })
 ```
 
+### Local relay for tests
+
+```
+npm install --no-save gun
+node node_modules/gun/examples/http.js 8767      # a relay from the same gun version, http://localhost:8767/gun
+npx tsc -p tsconfig.bench.json
+GUN_PEER=http://localhost:8767/gun node test/gun/live-relay.mjs   # or without GUN_PEER: the script starts its own relay
+```
+
+The relay must speak the client's Gun version. The docker image
+`gundb/gun` ships Gun 0.2020.520; against it a 0.2020.1241 client (the
+CDN's `gun.js`, and `npm install gun`) receives data that existed before it
+subscribed but never a live write - a second read after the write still
+shows the old value (measured 2026-09-07). Gun relays also share their
+peer lists, so a stale relay in the mesh poisons every path through it.
+
+`connect()` resolves only after the first relay has said `hi` (3 s
+timeout for a local-only instance): a put made before the websocket is up
+is stored by the relay but not pushed to peers already subscribed, and
+GenericProvider sends its join batch the moment `connect()` resolves.
+
+`test/gun/live-relay.mjs` runs two Node peers through the relay and
+reports convergence, the idle cost of a minute (Gun has no leave signal,
+so what remains are the presence renewals of the lease - the playground
+uses 120 s - and the backed-off beacons), the cost of a reconnect (no
+full-state push since round 5), and how long a silently departed peer
+lingers (until the lease).
+
 ### With Relay Servers
 
 For cross-device synchronization, use public Gun relays:

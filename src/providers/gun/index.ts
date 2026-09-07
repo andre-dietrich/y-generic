@@ -322,6 +322,38 @@ export class GunTransport implements Transport {
     this.setupUpdateListener()
     this.setupAwarenessListener()
 
+    // Wait for the first relay to say hi before anything is written: a put
+    // made before the websocket is up is stored by the relay but not pushed
+    // to peers already subscribed (measured 2026-09-07 with two Node peers
+    // on gun's own examples/http.js relay: the joiner's JOIN batch and
+    // presence, written ~10 ms before 'hi', never reached the settled
+    // peer; every later write did). GenericProvider sends its connect
+    // batch the moment connect() resolves, so resolve after 'hi' - or after
+    // a short timeout for a relay that is down or a local-only instance.
+    if (this.options.peers.length > 0) {
+      await new Promise<void>((resolve) => {
+        let done = false
+        const finish = () => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          resolve()
+        }
+        const timer = setTimeout(() => {
+          this.log('⏱️ No relay said hi within 3 s, continuing')
+          finish()
+        }, 3000)
+        try {
+          this.gun.on('hi', (peer: any) => {
+            this.log('🤝 Relay connected:', peer?.url ?? peer?.id ?? '?')
+            finish()
+          })
+        } catch {
+          finish()
+        }
+      })
+    }
+
     this._connected = true
 
     // Persistence: load existing snapshot or clear it for a fresh session

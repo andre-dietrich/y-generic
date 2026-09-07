@@ -911,3 +911,41 @@ AWARENESS_TIMEOUT_MS=120000 SETTLE_MS=90000 N_VALUES=50 node bench-dist/test/dum
 | a killed tab's presence lingers up to | 30 s | 2 min (clean closes still announced at once) |
 
 Lost delete (`bench-idle-room` part b) 5/5 with the long lease.
+
+### Gun, live (2026-09-07): relay version, connect timing, browser check
+
+Asked to test against a local `gundb/gun` docker relay. Three findings,
+none of them round-5 behaviour, one a fix:
+
+- **The docker image is too old.** `gundb/gun` ships Gun 0.2020.520; a
+  0.2020.1241 client (the CDN `gun.js`, `npm install gun`) receives data
+  that existed before it subscribed but never a live write (raw two-process
+  probe: a second read after the write still showed the old slot). Gun
+  relays also share their peer lists, so one stale relay in the mesh
+  poisons the paths through it. A relay from the installed gun
+  (`node_modules/gun/examples/http.js 8767`) propagates at once.
+- **Writes before the relay's `hi` are not pushed to existing
+  subscribers.** The transport marked itself connected right after
+  `new Gun(...)`, and GenericProvider's join batch went out ~10 ms before
+  the websocket was up: stored by the relay, never pushed to the settled
+  peer. `connect()` now waits for the first `hi` (3 s timeout for a
+  local-only instance), after the listeners that make Gun dial its peers.
+  In Node, writes within ~100 ms after `hi` still showed the same loss;
+  in the browser the join exchange worked.
+- **Two Gun instances in one Node process share a store** and talk past
+  the relay; the live test forks one process per peer
+  (`test/gun/live-relay.mjs`, which also starts its own relay).
+
+Browser check (Gun playground via Parcel, two isolated tabs, relay
+`examples/http.js`, lease 120 s): presence in both directions within
+seconds of the second join; text typed in A appeared in B and vice versa;
+each keystroke left A as one 40-byte frame (update + cursor, item 1) on
+top of the transport's own 100 ms debounce; no provider warnings. After
+closing B, A still listed it 75 s later (the `beforeunload` broadcast does
+not get through Gun's socket during unload; the 120 s lease is the bound,
+as documented). Node, two processes: reconnect of a settled peer 1-4
+sends, 38-151 bytes, no full push (item 5).
+
+Also fixed: five playgrounds read `event.synced` from the provider's
+`'synced'` event, which carries a boolean - their sync badge never left
+"Syncing…".

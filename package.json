@@ -1,6 +1,6 @@
 {
   "name": "genericprovider",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
   "author": "André Dietrich",
@@ -16,24 +16,24 @@
       "default": "./dist/lib.js"
     },
     "./providers/dummy": {
-      "types": "./dist/providers/dummy.d.ts",
-      "default": "./dist/providers/dummy.js"
+      "types": "./dist/providers/dummy/index.d.ts",
+      "default": "./dist/providers/dummy/index.js"
     },
     "./providers/simple-peer": {
-      "types": "./dist/providers/simple-peer.d.ts",
-      "default": "./dist/providers/simple-peer.js"
+      "types": "./dist/providers/simple-peer/index.d.ts",
+      "default": "./dist/providers/simple-peer/index.js"
     },
     "./providers/peerjs": {
-      "types": "./dist/providers/peerjs.d.ts",
-      "default": "./dist/providers/peerjs.js"
+      "types": "./dist/providers/peerjs/index.d.ts",
+      "default": "./dist/providers/peerjs/index.js"
     },
     "./providers/indexeddb": {
-      "types": "./dist/providers/indexeddb.d.ts",
-      "default": "./dist/providers/indexeddb.js"
+      "types": "./dist/providers/indexeddb/index.d.ts",
+      "default": "./dist/providers/indexeddb/index.js"
     },
     "./providers/gun": {
-      "types": "./dist/providers/gun.d.ts",
-      "default": "./dist/providers/gun.js"
+      "types": "./dist/providers/gun/index.d.ts",
+      "default": "./dist/providers/gun/index.js"
     },
     "./providers/trystero": {
       "types": "./dist/providers/trystero/index.d.ts",
@@ -68,19 +68,19 @@
     "dist"
   ],
   "scripts": {
-    "dev:dummy": "npx parcel serve test/dummy/index.html --open --port 3011",
-    "dev:edge-cases": "npx parcel serve test/dummy/edge-cases.html --open --port 3012",
-    "dev:simple-peer": "npx parcel serve test/simple-peer/index.html --open --port 3002",
-    "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
-    "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
-    "dev:gun": "npx parcel serve test/gun/index.html --open --port 3005",
-    "dev:trystero": "npx parcel serve test/trystero/index.html --open --port 3006",
-    "dev:pubnub": "npx parcel serve test/pubnub/index.html --open --port 3007",
-    "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
-    "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
-    "dev:supabase": "npx parcel serve test/supabase/index.html --open --port 3010",
-    "dev:nostr": "npx parcel serve test/nostr/index.html --open --port 3013",
-    "dev:ably": "npx parcel serve test/ably/index.html --open --port 3014",
+    "dev:dummy": "npx parcel serve --dist-dir .parcel-dev test/dummy/index.html --open --port 3011",
+    "dev:edge-cases": "npx parcel serve --dist-dir .parcel-dev test/dummy/edge-cases.html --open --port 3012",
+    "dev:simple-peer": "npx parcel serve --dist-dir .parcel-dev test/simple-peer/index.html --open --port 3002",
+    "dev:peerjs": "npx parcel serve --dist-dir .parcel-dev test/peerjs/index.html --open --port 3003",
+    "dev:indexeddb": "npx parcel serve --dist-dir .parcel-dev test/indexeddb/index.html --open --port 3004",
+    "dev:gun": "npx parcel serve --dist-dir .parcel-dev test/gun/index.html --open --port 3005",
+    "dev:trystero": "npx parcel serve --dist-dir .parcel-dev test/trystero/index.html --open --port 3006",
+    "dev:pubnub": "npx parcel serve --dist-dir .parcel-dev test/pubnub/index.html --open --port 3007",
+    "dev:websocket": "npx parcel serve --dist-dir .parcel-dev test/websocket/index.html --open --port 3008",
+    "dev:matrix": "npx parcel serve --dist-dir .parcel-dev test/matrix/index.html --open --port 3009",
+    "dev:supabase": "npx parcel serve --dist-dir .parcel-dev test/supabase/index.html --open --port 3010",
+    "dev:nostr": "npx parcel serve --dist-dir .parcel-dev test/nostr/index.html --open --port 3013",
+    "dev:ably": "npx parcel serve --dist-dir .parcel-dev test/ably/index.html --open --port 3014",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc",
     "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",

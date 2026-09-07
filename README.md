@@ -422,6 +422,31 @@ async send(data: Uint8Array): Promise<void> {
 }
 ```
 
+### Persistence Transports
+
+A transport that stores what it is given (IndexedDB, a Dexie table) is
+handed every frame the provider sends - presence, beacons and requests
+included. Store only the document: `extractDocUpdates(frame)` returns the
+Yjs updates a frame carries (none for presence, beacons and requests), and
+`frameDocUpdate(update)` wraps a stored (merged) update as the SyncStep2
+the provider applies on load - `synced` fires, nothing is sent back.
+`providers/indexeddb` is the reference; `connect({ waitFor })` pairs it
+with a network provider on the same document.
+
+```typescript
+import { extractDocUpdates, frameDocUpdate } from 'genericprovider'
+import * as Y from 'yjs'
+
+send(frame: Uint8Array) {
+  const updates = extractDocUpdates(frame)
+  if (updates.length > 0) this.rows.push(Y.mergeUpdates(updates))
+}
+onMessage(callback) {
+  if (this.rows.length > 0) callback(frameDocUpdate(Y.mergeUpdates(this.rows)))
+  return () => {}
+}
+```
+
 ### Error Handling
 
 ```typescript

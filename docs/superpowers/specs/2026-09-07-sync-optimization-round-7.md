@@ -5,9 +5,33 @@
 Research **and implementation** on branch `round-7` from `main` @ 377485d
 (v1.4.0, 2026-09-07). André asked for the full round: this document with
 its baseline, four new benches, all six items with before/after numbers,
-version 1.5.0. Per-item results are appended in "Results" as the commits
-land. No wire-format change in this round - peers running v1.4.0 and v1.5.0
-share a room without trouble (unlike round 5).
+version 1.5.0. **All six items shipped** (one commit each, results below),
+plus two findings made on the way: the package's `exports` map pointed
+five subpaths (`dummy`, `simple-peer`, `peerjs`, `indexeddb`, `gun`) at
+`dist/providers/<name>.js` while the build emits
+`dist/providers/<name>/index.js` - `import ... from
+'genericprovider/providers/gun'` could not resolve (LiaScript imports the
+`dist/` path directly, which is why nobody noticed); and every `npm run
+dev:*` script wrote Parcel's bundle into the tracked `dist/` directory.
+Both fixed in the version commit. No wire-format change in this round -
+peers running v1.4.0 and v1.5.0 share a room without trouble (unlike
+round 5).
+
+Summary, baseline (`main` @ 377485d) → this branch:
+
+| Item | Bench | Before | After |
+|---|---|---|---|
+| 2 sweep lifecycle | `bench-reload-phantoms` part 2 | 20 timers before connect(), 20 after disconnect(), 20 providers uncollectable | 0 / 0 / 0 |
+| 3 phantom peers | `bench-reload-phantoms` part 1 | 49 known peers, `'auto'` interval 1,000 ms, two leases after 30 reloads in a 20-peer room | 19, 400 ms |
+| 4 WebSocket backoff | `bench-ws-reconnect-storm` | 900 attempts/min, all 30 clients back in the same instant | 244/min (−73 %), back over 0.9-13.4 s |
+| 5 Gun presence slots | `bench-gun-awareness-replay` | 66 frames, 55 phantoms for a joiner; leaver's slot stays | 11 frames, 5 phantoms; slot gone |
+| 6 IndexedDB log | `bench-persist-log` | 124.7 KB / 1,015 rows per 1,000 keystrokes; a phantom after reload; `compact()` empties the document | 9.7 KB (−92 %); no phantom; document intact; v1.4.0 logs load |
+| 1 `y-provider` | - | in `dependencies` | gone |
+
+Browser check of item 6 (Chrome, `npm run dev:indexeddb`, fresh profile):
+61 characters typed → 62 rows; reload → content restored, `synced`
+fired, 2 rows (the merged 561 B state and the connect push); Compact → 1
+row, content intact; reload again → content intact, `synced`, 2 rows.
 
 ## Context
 

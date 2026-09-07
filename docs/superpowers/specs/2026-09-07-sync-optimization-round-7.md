@@ -452,3 +452,43 @@ two-minute-old ones are inside the bound and stay for one lease; the graph
 holds 60 slots after the join and the leave (60 old + the joiner − the
 leaver) instead of 61. Cooperative GC of the skipped slots stays parked
 (Decisions, 2).
+
+### Item 6 — persistence: `extractDocUpdates()` / `frameDocUpdate()` in the core, the IndexedDB transport rebuilt on them (commit 7)
+
+What changed: `src/index.ts` exports `extractDocUpdates(frame)` - the Yjs
+updates a CRC-wrapped frame carries (MESSAGE_SYNC_VERIFIED / MESSAGE_SYNC
+Update and SyncStep2, MESSAGE_SYNC_PUSH, recursing into MESSAGE_BATCH;
+nothing for awareness, pub/sub, digests and SyncStep1; `[]` for anything
+it cannot parse) - and `frameDocUpdate(update)`, a CRC-wrapped
+MESSAGE_SYNC SyncStep2 frame (applied, `synced` fires, nothing is sent
+back); `src/lib.ts` re-exports both. `src/providers/indexeddb/index.ts`:
+`send()` stores one raw update per frame that carries any (`raw: true`
+rows); `loadUpdates()` and `compact()` share `mergeStore()`, one readwrite
+transaction that reads every row, merges, and writes the result back as
+one row (rows in the old whole-frame format are parsed with
+`extractDocUpdates`, rows without document state are dropped);
+`autoCompact` defaults to on. README and header rewritten.
+
+```
+node bench-dist/test/dummy/bench-persist-log.js               (1,000 keystrokes with a cursor change each)
+before: session 1: 1015 rows, 124.7 KB (128 B per keystroke, 126 B per row)
+        session 2 (reload): load=58ms content=equal rows after load=1017 (124.8 KB) presence entries=2 knownPeers=1
+        compact(): 101 rows (12.2 KB); session 3 (reload): content=DIFFERENT (0 vs 1000 chars)
+after:  legacy log: 24 v1.4.0 frames stored -> load=9ms content=equal rows after load=2 (199 B) presence entries=1 knownPeers=0
+        session 1: 3 rows, 9.7 KB (10 B per keystroke, 3299 B per row)
+        session 2 (reload): load=24ms content=equal rows after load=2 (10.6 KB) presence entries=1 knownPeers=0
+        compact(): 1 rows (9.6 KB); session 3 (reload): content=equal
+```
+
+124.7 KB → 9.7 KB for the same 1,000 characters (−92 %: no cursor JSON
+per row, and Yjs folds consecutive inserts of one client into one struct
+when rows are merged - auto-compaction ran twice during the session); the
+reload holds no presence and no peer of the previous session; `compact()`
+keeps the document. The two rows after a load are the merged state and
+the connect-time full push GenericProvider sends from a fresh provider
+(`_confirmedSv` null); the next load merges them again, so the log never
+holds more than one document plus one push between loads. A log written
+by v1.4.0 (whole frames; the bench's new part 0 writes one with v1.4.0's
+schema) loads unchanged and is rewritten in the new format on that load.
+Note for the benches: `npm install`/`uninstall` prunes the `--no-save`
+package, reinstall `fake-indexeddb` afterwards.

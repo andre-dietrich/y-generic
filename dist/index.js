@@ -272,6 +272,76 @@ export function computeDeleteSetHash(doc) {
     return computeCRC32(encoding.toUint8Array(encoder));
 }
 /**
+ * The Yjs updates a CRC-wrapped frame (as handed to `Transport.send`)
+ * carries: the update of a MESSAGE_SYNC_VERIFIED or MESSAGE_SYNC
+ * Update/SyncStep2 message, the whole document of a MESSAGE_SYNC_PUSH,
+ * each such sub-message of a MESSAGE_BATCH - and nothing for awareness,
+ * pub/sub, digest beacons and SyncStep1 requests, which carry no document
+ * state. For persistence transports (`providers/indexeddb`, LiaScript's
+ * Dexie cache): store only what this returns, and only this. Storing whole
+ * frames and replaying them on the next load resurrects the previous
+ * session's clientID as a phantom peer (its presence, its beacons - which
+ * the provider then answers into the store, multiplying rows) and keeps
+ * ~10x the bytes (a keystroke's frame carries its cursor). A frame this
+ * cannot parse yields `[]`, never a partial read. Frames of a provider with
+ * `compressionThresholdBytes` set (a leading flag byte) are not supported.
+ * Round 7, item 6; measured in test/dummy/bench-persist-log.ts.
+ */
+export function extractDocUpdates(frame) {
+    const updates = [];
+    const walk = (message) => {
+        const decoder = decoding.createDecoder(message);
+        const type = decoding.readVarUint(decoder);
+        switch (type) {
+            case MESSAGE_BATCH:
+                while (decoding.hasContent(decoder))
+                    walk(decoding.readVarUint8Array(decoder));
+                break;
+            case MESSAGE_SYNC_VERIFIED:
+            case MESSAGE_SYNC: {
+                if (type === MESSAGE_SYNC_VERIFIED) {
+                    decoding.readVarUint(decoder); // sequence number
+                    decoding.readVarUint(decoder); // sender clientID
+                }
+                const sub = decoding.readVarUint(decoder);
+                if (sub === syncProtocol.messageYjsSyncStep2 ||
+                    sub === syncProtocol.messageYjsUpdate) {
+                    updates.push(decoding.readVarUint8Array(decoder));
+                }
+                break;
+            }
+            case MESSAGE_SYNC_PUSH:
+                updates.push(decoding.readVarUint8Array(decoder));
+                break;
+            default:
+                break;
+        }
+    };
+    try {
+        if (frame.length > 4)
+            walk(frame.subarray(4));
+    }
+    catch {
+        return [];
+    }
+    return updates;
+}
+/**
+ * The counterpart of `extractDocUpdates()` for the load path of a
+ * persistence transport: wraps one (merged) update as a CRC-wrapped
+ * MESSAGE_SYNC SyncStep2 frame. Handed to the `onMessage` callback, the
+ * provider applies it as the answer to its own request - `synced` fires,
+ * nothing is sent back - exactly what a local copy is: the peer that had
+ * our document.
+ */
+export function frameDocUpdate(update) {
+    const encoder = encoding.createEncoder();
+    encoding.writeVarUint(encoder, MESSAGE_SYNC);
+    encoding.writeVarUint(encoder, syncProtocol.messageYjsSyncStep2);
+    encoding.writeVarUint8Array(encoder, update);
+    return wrapMessageWithChecksum(encoding.toUint8Array(encoder));
+}
+/**
  * PubSub channel for real-time messaging alongside Yjs.
  * Allows sending ephemeral messages that don't need CRDT properties.
  */

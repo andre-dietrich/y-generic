@@ -30,6 +30,7 @@
  * ```
  */
 export { GenericProvider, PubSubChannel } from './index';
+export { extractDocUpdates, frameDocUpdate } from './index';
 export type { Transport, ConnectionConfig, ConnectionStatus } from './transport';
 export { SyncHealthMonitor, computeDocumentHash } from './sync-monitor';
 export type { DesyncDetails } from './sync-monitor';

@@ -6,12 +6,19 @@
  * for persistence across browser sessions.
  *
  * Features:
- * - Automatic persistence of all document updates
- * - Efficient storage and retrieval
- * - Optional compaction to reduce storage size
+ * - Persists the document's updates as they happen - and nothing else: the
+ *   provider's presence, beacons and requests are not stored (round 7,
+ *   item 6: stored and replayed, they resurrected the previous session as a
+ *   phantom peer and cost ~10x the bytes)
+ * - Loads the stored updates as one merged update and trims the log to
+ *   that one row (every load appends a full-document push otherwise)
+ * - Lossless compaction (merge), on by default
  * - Works offline (no network required)
- * - Automatic cleanup of old updates
  * - Supports multiple documents/rooms
+ * - Pairs with a network provider on the same document through
+ *   `connect({ waitFor })` (see ConnectionConfig.waitFor)
+ * - Not for a provider with `compressionThresholdBytes` set: the frame
+ *   parser expects the plain CRC-wrapped frame
  *
  * @example
  * ```typescript
@@ -31,15 +38,25 @@
  *
  * @example
  * ```typescript
- * // With automatic compaction every 100 updates
- * const transport = new IndexedDBTransport({
- *   compactThreshold: 100,
- *   autoCompact: true
- * })
+ * // Compact (merge the rows into one) every 100 updates instead of 500
+ * const transport = new IndexedDBTransport({ compactThreshold: 100 })
  * ```
  */
 
+import * as Y from 'yjs'
 import type { Transport, ConnectionConfig } from '../../transport'
+import { extractDocUpdates, frameDocUpdate } from '../../index'
+
+/**
+ * One row of the `updates` store. Rows written before round 7 hold a whole
+ * provider frame (CRC-wrapped, any message type) and no `raw` flag; rows
+ * since hold one Yjs update. The loader reads both.
+ */
+interface UpdateRow {
+  update: Uint8Array
+  timestamp: number
+  raw?: boolean
+}
 
 /**
  * Configuration options for IndexedDB transport.
@@ -58,15 +75,16 @@ export interface IndexedDBTransportOptions {
   version?: number
 
   /**
-   * Automatically compact storage when update count reaches this threshold.
-   * Set to 0 to disable auto-compaction.
-   * @default 0 (disabled)
+   * Compact (merge every row into one) when the row count reaches this
+   * threshold; 0 = use `maxUpdates`.
+   * @default 0
    */
   compactThreshold?: number
 
   /**
-   * Enable automatic compaction.
-   * @default false
+   * Compact automatically at the threshold. Lossless since round 7 (it used
+   * to delete the oldest 90 % of rows - the document), hence on by default.
+   * @default true
    */
   autoCompact?: boolean
 
@@ -77,8 +95,7 @@ export interface IndexedDBTransportOptions {
   debug?: boolean
 
   /**
-   * Maximum number of updates to store before compaction is required.
-   * Prevents unbounded growth of the update log.
+   * Row count at which auto-compaction runs when `compactThreshold` is 0.
    * @default 500
    */
   maxUpdates?: number
@@ -109,7 +126,7 @@ export class IndexedDBTransport implements Transport {
       prefix: options.prefix ?? 'yjs',
       version: options.version ?? 1,
       compactThreshold: options.compactThreshold ?? 0,
-      autoCompact: options.autoCompact ?? false,
+      autoCompact: options.autoCompact ?? true,
       debug: options.debug ?? false,
       maxUpdates: options.maxUpdates ?? 500,
       storeName: options.storeName ?? 'updates',
@@ -229,7 +246,12 @@ export class IndexedDBTransport implements Transport {
   }
 
   /**
-   * Send (store) an update to IndexedDB.
+   * Store what the frame carries of the document - one row per frame that
+   * carries anything. Presence, beacons and requests are the provider's
+   * conversation with the room, and this transport is not the room: stored
+   * and replayed on the next load they resurrected the previous session's
+   * clientID as a phantom peer and were answered into the store again
+   * (round 7, item 6; test/dummy/bench-persist-log.ts).
    */
   send(data: Uint8Array): void {
     if (!this.db) {
@@ -242,6 +264,10 @@ export class IndexedDBTransport implements Transport {
       return
     }
 
+    const updates = extractDocUpdates(data)
+    if (updates.length === 0) return
+    const update = updates.length === 1 ? updates[0].slice() : Y.mergeUpdates(updates)
+
     try {
       const transaction = this.db.transaction(
         [this.options.storeName],
@@ -249,11 +275,7 @@ export class IndexedDBTransport implements Transport {
       )
       const store = transaction.objectStore(this.options.storeName)
 
-      // Store update with timestamp
-      const record = {
-        update: data,
-        timestamp: Date.now(),
-      }
+      const record: UpdateRow = { update, timestamp: Date.now(), raw: true }
 
       const request = store.add(record)
 
@@ -296,7 +318,12 @@ export class IndexedDBTransport implements Transport {
   }
 
   /**
-   * Load all stored updates from database.
+   * Load the stored document: every row merged into one update, handed to
+   * the provider as one SyncStep2 (`frameDocUpdate`: applied, `synced`
+   * fires, nothing is sent back) and written back as that one row. Every
+   * page load appends a full-document push (GenericProvider's connect), so
+   * without the trim the log grew by one document per load - y-indexeddb
+   * trims the same way at its PREFERRED_TRIM_SIZE.
    */
   private async loadUpdates(): Promise<void> {
     if (!this.db || !this.messageCallback) {
@@ -305,40 +332,67 @@ export class IndexedDBTransport implements Transport {
 
     this.isLoading = true
     this.log('Loading updates from database...')
+    let merged: Uint8Array | null
+    try {
+      merged = await this.mergeStore()
+    } finally {
+      // Off before the delivery: an edit made from a `synced` handler must
+      // be stored, and the loaded state itself never comes back through
+      // send() (the provider applies it under its own origin).
+      this.isLoading = false
+    }
+    this.log(merged === null ? 'Nothing stored' : `Loaded ${merged.length} bytes`)
+    if (merged !== null) this.messageCallback?.(frameDocUpdate(merged))
+  }
 
+  /**
+   * The stored document as one update: every row read, merged and - when
+   * there was more than one, or one in the pre-round-7 frame format -
+   * written back as one row, all in one readwrite transaction (a
+   * concurrent send() queues behind it, so nothing added meanwhile can be
+   * cleared away). Rows that carry no document state (old presence or
+   * beacon frames) are dropped. Null for an empty store. Shared by
+   * loadUpdates() and compact().
+   */
+  private mergeStore(): Promise<Uint8Array | null> {
     return new Promise((resolve, reject) => {
       const transaction = this.db!.transaction(
         [this.options.storeName],
-        'readonly',
+        'readwrite',
       )
       const store = transaction.objectStore(this.options.storeName)
+      let merged: Uint8Array | null = null
+
       const request = store.getAll()
-
       request.onsuccess = () => {
-        const records = request.result as Array<{
-          update: Uint8Array
-          timestamp: number
-        }>
-
-        this.log(`Loaded ${records.length} updates`)
-        this.updateCount = records.length
-
-        // Apply all updates
-        records.forEach((record) => {
-          this.messageCallback?.(record.update)
-        })
-
-        this.isLoading = false
-        resolve()
+        const rows = request.result as UpdateRow[]
+        const updates = rows.flatMap((row) =>
+          row.raw ? [row.update] : extractDocUpdates(row.update),
+        )
+        if (updates.length === 0) {
+          if (rows.length > 0) store.clear()
+          this.updateCount = 0
+          return
+        }
+        merged = updates.length === 1 ? updates[0].slice() : Y.mergeUpdates(updates)
+        if (rows.length > 1 || !rows[0].raw) {
+          store.clear()
+          const row: UpdateRow = { update: merged, timestamp: Date.now(), raw: true }
+          store.add(row)
+        }
+        this.updateCount = 1
       }
 
-      request.onerror = () => {
-        this.isLoading = false
+      transaction.oncomplete = () => resolve(merged)
+      transaction.onerror = () => {
         const error = new Error(
-          `Failed to load updates: ${request.error?.message}`,
+          `Failed to read updates: ${transaction.error?.message ?? 'unknown error'}`,
         )
         this.log('Error loading updates:', error)
         reject(error)
+      }
+      transaction.onabort = () => {
+        reject(new Error('Reading updates was aborted'))
       }
     })
   }
@@ -359,65 +413,17 @@ export class IndexedDBTransport implements Transport {
   }
 
   /**
-   * Compact the database by merging updates.
-   * This reduces storage size by consolidating the update history.
+   * Merge every stored row into one. Lossless - it used to delete the
+   * oldest 90 % of rows, i.e. the document (round 7, item 6).
    */
   async compact(): Promise<void> {
     if (!this.db) {
       throw new Error('Database not connected')
     }
 
-    this.log('Starting compaction...')
-
-    // Get document state from the provider
-    // Note: This requires the provider to expose the document
-    // For now, we'll just clear old updates and keep recent ones
-
-    return new Promise((resolve, reject) => {
-      const transaction = this.db!.transaction(
-        [this.options.storeName],
-        'readwrite',
-      )
-      const store = transaction.objectStore(this.options.storeName)
-
-      // Get all keys
-      const getAllKeysRequest = store.getAllKeys()
-
-      getAllKeysRequest.onsuccess = () => {
-        const keys = getAllKeysRequest.result
-
-        if (keys.length <= 1) {
-          this.log('No compaction needed')
-          resolve()
-          return
-        }
-
-        // Keep only the most recent 10% of updates
-        const keepCount = Math.max(1, Math.floor(keys.length * 0.1))
-        const deleteKeys = keys.slice(0, keys.length - keepCount)
-
-        this.log(`Compacting: deleting ${deleteKeys.length} old updates`)
-
-        let deleted = 0
-        deleteKeys.forEach((key) => {
-          const deleteRequest = store.delete(key)
-          deleteRequest.onsuccess = () => {
-            deleted++
-            if (deleted === deleteKeys.length) {
-              this.updateCount = keepCount
-              this.log('Compaction complete, remaining updates:', keepCount)
-              resolve()
-            }
-          }
-        })
-      }
-
-      getAllKeysRequest.onerror = () => {
-        const error = new Error('Failed to get keys for compaction')
-        this.log('Compaction error:', error)
-        reject(error)
-      }
-    })
+    this.log('Compacting...')
+    await this.mergeStore()
+    this.log('Compaction complete, rows:', this.updateCount)
   }
 
   /**

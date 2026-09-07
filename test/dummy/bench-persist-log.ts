@@ -37,6 +37,7 @@ try {
 
 import * as Y from 'yjs'
 import { GenericProvider } from '../../src/index'
+import type { Transport } from '../../src/transport'
 import { IndexedDBTransport } from '../../src/providers/indexeddb/index'
 import { sleep, silenced } from './bench-user-scaling'
 
@@ -77,8 +78,75 @@ function census(transport: IndexedDBTransport): Promise<{ rows: number; bytes: n
   })
 }
 
+/**
+ * Part 0: a log written by v1.4.0 - every frame the provider sent, stored
+ * whole, no `raw` flag - must still load. The frames are captured from a
+ * provider on a recording transport (20 keystrokes with cursor changes,
+ * presence, a beacon) and written the way v1.4.0's send() wrote them.
+ */
+async function legacyLog(): Promise<void> {
+  const room = `bench-persist-legacy-${Math.random().toString(36).slice(2)}`
+  const frames: Uint8Array[] = []
+  const recorder: Transport = {
+    isConnected: true,
+    async connect() {},
+    disconnect() {},
+    send(data: Uint8Array) {
+      frames.push(data.slice())
+    },
+    onMessage() {
+      return () => {}
+    },
+  }
+  const doc = new Y.Doc()
+  const writer = new GenericProvider(doc, recorder, { syncInterval: 1000, disableBc: true, batchUpdates: 0 })
+  await writer.connect({ room })
+  writer.awareness.setLocalState({ user: { name: 'v1.4.0' }, cursor: null })
+  for (let k = 0; k < 20; k++) {
+    doc.getText('t').insert(k, 'b')
+    writer.awareness.setLocalStateField('cursor', { k })
+    await sleep(10)
+  }
+  await sleep(1200)
+  const expected = doc.getText('t').toString()
+  writer.destroy()
+
+  // v1.4.0's schema and rows: { update: <whole frame>, timestamp }
+  await new Promise<void>((resolve, reject) => {
+    const req = indexedDB.open(`yjs-${room}`, 1)
+    req.onupgradeneeded = () => {
+      const db = req.result
+      db.createObjectStore('updates', { autoIncrement: true }).createIndex('timestamp', 'timestamp', { unique: false })
+      db.createObjectStore('metadata')
+    }
+    req.onerror = () => reject(req.error)
+    req.onsuccess = () => {
+      const db = req.result
+      const tx = db.transaction(['updates'], 'readwrite')
+      const store = tx.objectStore('updates')
+      for (const frame of frames) store.add({ update: frame, timestamp: Date.now() })
+      tx.oncomplete = () => {
+        db.close()
+        resolve()
+      }
+      tx.onerror = () => reject(tx.error)
+    }
+  })
+
+  const s = await open(room)
+  await sleep(300)
+  const c = await census(s.transport)
+  const text = s.doc.getText('t').toString()
+  console.log(
+    `legacy log: ${frames.length} v1.4.0 frames stored -> load=${s.loadMs}ms content=${text === expected ? 'equal' : 'DIFFERENT (' + text.length + ' vs ' + expected.length + ' chars)'} ` +
+      `rows after load=${c.rows} (${c.bytes} B) presence entries=${s.provider.awareness.getStates().size} knownPeers=${(s.provider as any)._knownPeers.size}`,
+  )
+  s.provider.destroy()
+}
+
 async function main() {
   console.log(`persist log: keystrokes=${KEYSTROKES} gap=${GAP_MS}ms\n`)
+  await silenced(legacyLog)
   await silenced(async () => {
     const room = `bench-persist-${Math.random().toString(36).slice(2)}`
 

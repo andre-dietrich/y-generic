@@ -31,6 +31,9 @@
  */
 
 export { GenericProvider, PubSubChannel } from './index'
+// For persistence transports (see providers/indexeddb): what a frame carries
+// of the document, and how to hand a stored state back (round 7, item 6).
+export { extractDocUpdates, frameDocUpdate } from './index'
 export type { Transport, ConnectionConfig, ConnectionStatus } from './transport'
 
 // Optional monitoring utilities (for advanced diagnostics)

@@ -917,13 +917,16 @@ Lost delete (`bench-idle-room` part b) 5/5 with the long lease.
 Asked to test against a local `gundb/gun` docker relay. Three findings,
 none of them round-5 behaviour, one a fix:
 
-- **The docker image is too old.** `gundb/gun` ships Gun 0.2020.520; a
-  0.2020.1241 client (the CDN `gun.js`, `npm install gun`) receives data
-  that existed before it subscribed but never a live write (raw two-process
-  probe: a second read after the write still showed the old slot). Gun
-  relays also share their peer lists, so one stale relay in the mesh
-  poisons the paths through it. A relay from the installed gun
-  (`node_modules/gun/examples/http.js 8767`) propagates at once.
+- **The docker image degrades under churn.** `gundb/gun` (built 2021,
+  Gun 0.2020.520) propagates live writes when freshly started - with a
+  0.2020.520 and a 0.2020.1241 client alike - but after two transport
+  sessions had connected and disconnected, a new subscriber received only
+  what existed before it subscribed and no live write any more (raw
+  two-process probe; a second read after the write still showed the old
+  slot). The same churn against a relay from the installed 0.2020.1241
+  (`node_modules/gun/examples/http.js`) changed nothing. Gun relays also
+  share their peer lists, so one stale relay in the mesh poisons the paths
+  through it.
 - **Writes before the relay's `hi` are not pushed to existing
   subscribers.** The transport marked itself connected right after
   `new Gun(...)`, and GenericProvider's join batch went out ~10 ms before

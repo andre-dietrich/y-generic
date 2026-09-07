@@ -52,12 +52,16 @@ npx tsc -p tsconfig.bench.json
 GUN_PEER=http://localhost:8767/gun node test/gun/live-relay.mjs   # or without GUN_PEER: the script starts its own relay
 ```
 
-The relay must speak the client's Gun version. The docker image
-`gundb/gun` ships Gun 0.2020.520; against it a 0.2020.1241 client (the
-CDN's `gun.js`, and `npm install gun`) receives data that existed before it
-subscribed but never a live write - a second read after the write still
-shows the old value (measured 2026-09-07). Gun relays also share their
-peer lists, so a stale relay in the mesh poisons every path through it.
+Use a relay of the current Gun version. The docker image `gundb/gun`
+(built 2021, Gun 0.2020.520) works when freshly started, but after a few
+client sessions it stops pushing live writes to new subscribers: they
+receive what existed before they subscribed and nothing written after,
+and a second read still shows the old value (measured 2026-09-07 with a
+0.2020.520 and a 0.2020.1241 client alike; a relay from the installed
+0.2020.1241 kept working through the same connect/disconnect churn). A
+restart clears it until the next churn - in a classroom, that is every
+page reload. Gun relays also share their peer lists, so a stale relay in
+the mesh poisons every path through it.
 
 `connect()` resolves only after the first relay has said `hi` (3 s
 timeout for a local-only instance): a put made before the websocket is up
@@ -93,8 +97,8 @@ plain-http websocket (mixed content): serve the course over http on the
 LAN as well, or give the relay a certificate through `HTTPS_KEY`/`HTTPS_CERT`.
 
 The same with docker, pinned to the client's version (the `gundb/gun`
-image is Gun 0.2020.520 and does not deliver live writes to current
-clients - see below):
+image is Gun 0.2020.520 and stops delivering live writes after a few
+client sessions - see below):
 
 ```
 docker run -d --name gun-relay -p 8765:8765 -v gun-data:/srv -w /srv node:22-alpine \

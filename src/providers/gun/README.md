@@ -52,16 +52,27 @@ npx tsc -p tsconfig.bench.json
 GUN_PEER=http://localhost:8767/gun node test/gun/live-relay.mjs   # or without GUN_PEER: the script starts its own relay
 ```
 
-Use a relay of the current Gun version. The docker image `gundb/gun`
-(built 2021, Gun 0.2020.520) works when freshly started, but after a few
-client sessions it stops pushing live writes to new subscribers: they
-receive what existed before they subscribed and nothing written after,
-and a second read still shows the old value (measured 2026-09-07 with a
-0.2020.520 and a 0.2020.1241 client alike; a relay from the installed
-0.2020.1241 kept working through the same connect/disconnect churn). A
-restart clears it until the next churn - in a classroom, that is every
-page reload. Gun relays also share their peer lists, so a stale relay in
-the mesh poisons every path through it.
+Three things decide whether a relay delivers live writes at all - each
+measured 2026-09-07 with two Node peers; in every failing case the
+subscriber receives what existed before it subscribed and nothing written
+afterwards, with no error anywhere:
+
+- **Reach it by an IPv4 address.** `localhost` resolves to the IPv6 `::1`
+  on current systems, and over that loopback Gun's live writes are lost;
+  `127.0.0.1` and the LAN address work. This also caught the transport's
+  own tests until they used the LAN address.
+- **No docker port mapping.** Behind `-p 8765:8765` (bridge + docker-proxy)
+  live writes are lost too; `--network host` (Linux) or a relay run
+  natively works. `test/gun/relay.sh` does the former.
+- **One relay per LAN.** Every Gun relay multicasts on 233.255.255.255:8765
+  and meshes with the others it finds (they also share peer lists); with
+  two relays reachable, propagation became erratic. The script's relay
+  runs with multicast and AXE off.
+
+The `gundb/gun` docker image (2021, Gun 0.2020.520) was inconsistent in
+these tests, but it was always behind port mapping and reached by
+`localhost`, so its version is not established as a cause; pinning the
+clients' 0.2020.1241 costs nothing.
 
 `connect()` resolves only after the first relay has said `hi` (3 s
 timeout for a local-only instance): a put made before the websocket is up
@@ -94,20 +105,15 @@ address; open the port in the firewall, e.g. `sudo ufw allow 8765/tcp`).
 The scheme and the `/gun` path matter: Gun turns `http://` into `ws://`
 itself and a bare `host:8765` never connects; the transport fills in
 `http://` and `/gun` when they are missing (`https://` only if the relay
-has a certificate).
+has a certificate). Use the IPv4 address, not `localhost` - see below.
 `PORT=8765`, `PEERS=https://other-relay/gun` and `HTTPS_KEY`/`HTTPS_CERT`
 are the environment knobs. A page served over **https** cannot open a
 plain-http websocket (mixed content): serve the course over http on the
 LAN as well, or give the relay a certificate through `HTTPS_KEY`/`HTTPS_CERT`.
 
-The same with docker, pinned to the client's version (the `gundb/gun`
-image is Gun 0.2020.520 and stops delivering live writes after a few
-client sessions - see below):
-
-```
-docker run -d --name gun-relay -p 8765:8765 -v gun-data:/srv -w /srv node:22-alpine \
-  sh -c "npm install gun@0.2020.1241 >/dev/null && node node_modules/gun/examples/http.js 8765"
-```
+The same with docker: `test/gun/relay.sh` (Linux; `MODE=https` for a
+self-signed certificate) starts the pinned version with host networking,
+multicast and AXE off, and prints the address to enter.
 
 ### With Relay Servers
 

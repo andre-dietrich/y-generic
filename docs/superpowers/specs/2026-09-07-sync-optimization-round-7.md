@@ -407,3 +407,26 @@ comparison is the round-6 doc's number unless a fresh sample on 206fe7a
 | `bench-corruption-storm` | bounded, converged |
 | `bench-sync-latency` | one message per edit on the push profiles; a second one in some Gun/Matrix cells on both builds (206fe7a: the Gun verify-off cells; this build: other cells) - the profile's own jitter |
 | `npm run build` | clean |
+
+### Item 4 — WebSocket: exponential backoff with jitter (commit 5)
+
+What changed in `src/providers/websocket/index.ts`: `attemptReconnect()`
+waits `min(maxReconnectDelay, reconnectDelay × 2^(attempt−1)) × (0.5..1.5)`;
+`maxReconnectDelay` is a new connect option (default 10 s);
+`reconnectAttempts` already reset on open. README updated.
+
+```
+node bench-dist/test/dummy/bench-ws-reconnect-storm.js        (30 clients, 60 s outage)
+before: outage: 900 connection attempts in 60s = 900/min, 30.0 per client
+           per 10s bucket: 150 150 150 150 150 150
+        recovery: 30/30 clients back, reconnect time after the server returned min=418ms p50=418ms max=418ms
+after:  outage: 244 connection attempts in 60s = 244/min, 8.1 per client
+           per 10s bucket: 91 32 30 34 24 33
+        recovery: 30/30 clients back, reconnect time after the server returned min=893ms p50=5232ms max=13350ms
+```
+
+−73 % attempts during the outage (the first bucket holds the 2 s and 4 s
+retries, then ~3 per second at the cap); on the relay's return the 30
+clients arrive spread over 12.5 s instead of in one instant, median 5.2 s -
+the price of the 10 s cap, taken over y-websocket's 2.5 s for the ~4x
+quieter outage (Decisions, 1).

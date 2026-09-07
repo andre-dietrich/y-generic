@@ -31,7 +31,15 @@ against André's project (`test/supabase/live-presence.mjs`: `from` seen,
 1.2 s); Ably followed at 07:05 (`presence.subscribe('leave')`, the publisher's
 clientId as `from`; `test/ably/live-presence.mjs` against André's app:
 `from` seen, 0 awareness sends in an idle minute, a leaving peer dropped
-after 36 ms). Matrix remains the one backend with an unused leave signal. The "Results" section at the end records each item with the exact
+after 36 ms). PubNub was tested against André's keyset the same morning: `from` and
+the idle minute hold, but the keyset has no Presence add-on, so no
+presence event ever arrives (raw-SDK probe: no `join`, empty `hereNow`)
+and the leave went undetected. The PubNub leave path is therefore opt-in
+now (`new PubNubTransport({ presence: true })`, with a `hereNow` check
+that warns when the keyset does not list the client); without it the
+transport does not implement `onPeerDisconnect` and the 30 s lease
+stays, as before round 5. Matrix remains the one backend with an unused
+leave signal. The "Results" section at the end records each item with the exact
 commands; the summary table is at its end.
 
 Method as in rounds 1-4: read `src/index.ts` end to end (3,584 lines at

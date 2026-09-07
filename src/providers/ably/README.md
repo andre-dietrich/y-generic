@@ -154,7 +154,14 @@ Get list of connected peer client IDs.
 
 1. **Channel Creation**: Room name (optionally password-hashed) is used directly as the Ably channel name
 2. **Message Format**: Yjs updates are base64-encoded and published as channel messages
-3. **Presence**: Automatic tracking of connected users via Ably's presence set
+3. **Presence**: Automatic tracking of connected users via Ably's presence set.
+   A presence `leave` is passed to `GenericProvider` as `onPeerDisconnect` and
+   every message carries the publisher's `clientId` as `from`: a departed
+   peer's cursor disappears at once (36 ms in the live test,
+   `test/ably/live-presence.mjs`) instead of after the 30 s awareness
+   timeout, and the awareness lease defaults to 5 minutes, so the 15 s
+   presence renewals stop. Ably removes an abruptly dropped connection from
+   presence after its connection TTL.
 4. **Chunking**: Messages above ~55 KB (base64-encoded) are split into chunks and reassembled on receipt
 5. **Echo Suppression**: `echoMessages: false` prevents a client from receiving its own publishes
 

@@ -44,6 +44,8 @@ const doc = new Y.Doc()
 
 // Create PubNub transport
 const transport = new PubNubTransport()
+// or, with the Presence add-on enabled on the keyset (admin portal):
+// const transport = new PubNubTransport({ presence: true })
 
 // Create provider
 const provider = new GenericProvider(doc, transport)
@@ -115,7 +117,18 @@ Get list of connected peer UUIDs.
 
 1. **Channel Creation**: Room name is base64-encoded to create a PubNub channel
 2. **Message Format**: Yjs updates are converted to base64 strings for transmission
-3. **Presence**: Automatic tracking of connected users via PubNub presence
+3. **Presence**: Automatic tracking of connected users via PubNub presence.
+   With `new PubNubTransport({ presence: true })` a presence `leave` or
+   `timeout` is passed to `GenericProvider` as `onPeerDisconnect` and every
+   message carries the publisher uuid as `from`: a departed peer's cursor
+   disappears at once instead of after the 30 s awareness timeout, and the
+   awareness lease defaults to 5 minutes, so the 15 s presence renewals
+   stop. This needs the **Presence add-on enabled on the keyset** in the
+   PubNub admin portal - without it no presence event ever arrives (the
+   transport warns after connecting if `hereNow` does not list it) and
+   departures would only be noticed after the long lease, which is why it
+   is opt-in. Presence events count as transactions.
+   `test/pubnub/live-presence.mjs` is the live check.
 4. **Encryption**: Optional AES encryption is handled by PubNub SDK
 5. **Reliability**: Messages are delivered through PubNub's edge network
 

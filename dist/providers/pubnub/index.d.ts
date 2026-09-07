@@ -43,9 +43,34 @@ export interface PubNubConfig extends ConnectionConfig {
  * const provider = new GenericProvider(doc, transport)
  * ```
  */
+/** Constructor options for PubNubTransport. */
+export interface PubNubTransportOptions {
+    /**
+     * Use PubNub Presence for departures: the transport then implements
+     * `onPeerDisconnect` (presence `leave`/`timeout` events) and
+     * GenericProvider drops a departed peer's awareness at once and lets the
+     * awareness lease default to 5 minutes instead of 30 s, which removes
+     * the 15 s presence renewal broadcasts. Requires the Presence add-on to
+     * be enabled on the keyset (PubNub admin portal) - without it no
+     * presence event ever arrives, so departures would only be noticed after
+     * the long lease; the transport checks `hereNow` after subscribing and
+     * warns if the keyset does not list it. Presence events count as PubNub
+     * transactions. @default false
+     */
+    presence?: boolean;
+}
 export declare class PubNubTransport implements Transport {
     private pubnub;
     private channel;
+    private readonly presenceEnabled;
+    /**
+     * Transport.onPeerDisconnect - present only with `presence: true` (see
+     * PubNubTransportOptions), so GenericProvider keeps the 30 s awareness
+     * lease on a keyset without Presence. Peer ids are publisher uuids, the
+     * same `from` onMessage passes.
+     */
+    readonly onPeerDisconnect?: (callback: (peerId: string) => void) => () => void;
+    constructor(options?: PubNubTransportOptions);
     private uuid;
     private messageCallback?;
     private _peerDisconnectCallback?;
@@ -82,11 +107,12 @@ export declare class PubNubTransport implements Transport {
      */
     onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
     /**
-     * Transport.onPeerDisconnect: PubNub presence leave/timeout events for
-     * the channel (the subscription already runs withPresence). Peer ids are
-     * publisher uuids, the same `from` onMessage passes.
+     * With `presence: true`: after subscribing, check that the keyset lists us
+     * in hereNow - a keyset without the Presence add-on never emits presence
+     * events, and GenericProvider would then trust a leave signal that never
+     * comes (departures noticed only after the 5-minute lease).
      */
-    onPeerDisconnect(callback: (peerId: string) => void): () => void;
+    private verifyPresence;
     /**
      * Get presence information (list of peers)
      */

@@ -111,9 +111,17 @@ are the environment knobs. A page served over **https** cannot open a
 plain-http websocket (mixed content): serve the course over http on the
 LAN as well, or give the relay a certificate through `HTTPS_KEY`/`HTTPS_CERT`.
 
-The same with docker: `test/gun/relay.sh` (Linux; `MODE=https` for a
-self-signed certificate) starts the pinned version with host networking,
-multicast and AXE off, and prints the address to enter.
+The same with docker: the image `liascript/gundb` (built from
+`Docker/gun/`: gun pinned to the clients' version, multicast and AXE off,
+the container detects its LAN address itself and, with `MODE=https`,
+generates a self-signed certificate for it on first start) - run it with
+`test/gun/relay.sh` (Linux; `MODE=https`), or directly:
+
+```
+docker run -d --name gun-relay --network host -v gun-relay-data:/srv liascript/gundb
+docker run -d --name gun-relay --network host -v gun-relay-data:/srv -e MODE=https liascript/gundb
+docker logs gun-relay        # prints the address to enter
+```
 
 ### With Relay Servers
 

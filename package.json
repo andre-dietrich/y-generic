@@ -101,7 +101,6 @@
   "dependencies": {
     "lib0": "^0.2.98",
     "y-protocols": "^1.0.6",
-    "y-provider": "^0.10.3-canary.2",
     "yjs": "^13.6.29"
   },
   "peerDependencies": {
@@ -131,8 +130,8 @@
     "events": "^3.3.0",
     "parcel": "^2.16.4",
     "process": "^0.11.10",
-    "quill-cursors": "^4.0.4",
     "quill": "^2.0.3",
+    "quill-cursors": "^4.0.4",
     "typescript": "^5.0.0",
     "y-quill": "^1.0.0",
     "y-webrtc": "^10.3.0",

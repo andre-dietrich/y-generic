@@ -1,6 +1,6 @@
 {
   "name": "genericprovider",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
   "author": "André Dietrich",

@@ -13,6 +13,9 @@
  * - Optional password to obfuscate the room tag (SHA-256)
  * - Configurable history window to catch up on missed updates
  * - Automatic deduplication (events from self are ignored)
+ * - Optional persistent mode: durable full-document snapshots via NIP-01
+ *   addressable events, so a late joiner can catch up with no live peer
+ *   and no relay-side history needed (see README.md)
  *
  * @example
  * ```typescript
@@ -48,12 +51,65 @@
  * ```
  */
 
+import * as Y from 'yjs'
+import * as encoding from 'lib0/encoding'
 import type { Transport, ConnectionConfig } from '../../transport'
 import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 
 // Common relays (strfry default) cap an event at 64 KiB; content is the
 // base64 payload, tags and signature add a few hundred bytes.
 const MAX_CONTENT_CHARS = 60000
+
+// GenericProvider's frame type for a full-state push (see src/index.ts) -
+// not exported from core, mirrored here the same way supabase/index.ts does.
+const MESSAGE_SYNC_PUSH = 6
+
+// ---------------------------------------------------------------------------
+// CRC32 helper (GenericProvider wraps every frame with a CRC32 header;
+// see supabase/index.ts's identical helper)
+// ---------------------------------------------------------------------------
+
+const _CRC32_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let i = 0; i < 256; i++) {
+    let c = i
+    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    table[i] = c
+  }
+  return table
+})()
+
+function _crc32(data: Uint8Array): number {
+  let crc = 0xffffffff
+  for (let i = 0; i < data.length; i++) crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+/**
+ * Wrap a message the way GenericProvider expects to receive one from this
+ * transport: a leading uncompressed(0) flag byte, then the usual CRC32
+ * header. The flag byte is only part of the wire format when
+ * compressionThresholdBytes is active on the receiving GenericProvider -
+ * which, for this transport, is the case by default, since
+ * `preferredCompressMinBytes` (declared below) becomes that default unless
+ * a caller explicitly passes `compressionThresholdBytes: 0`. Persistent
+ * mode's synthetic snapshot frame doesn't go through GenericProvider's own
+ * send-side encoding (unlike the live channel's frames, which arrive with
+ * this flag already baked in), so it has to add it by hand - this bit the
+ * exact bug supabase/index.ts's persistence flags too (see that file's
+ * comment on not setting `preferredCompressMinBytes`), just guaranteed to
+ * be hit here since this transport always hints compression.
+ */
+function wrapFrame(data: Uint8Array): Uint8Array {
+  const crc = _crc32(data)
+  const wrapped = new Uint8Array(5 + data.length)
+  wrapped[1] = (crc >>> 24) & 0xff
+  wrapped[2] = (crc >>> 16) & 0xff
+  wrapped[3] = (crc >>> 8) & 0xff
+  wrapped[4] = crc & 0xff
+  wrapped.set(data, 5)
+  return wrapped
+}
 
 // ---------------------------------------------------------------------------
 // Base64 helpers (no Buffer/Node dependency)
@@ -104,6 +160,24 @@ const DEFAULT_RELAYS = [
   'wss://nos.lol',
   'wss://nostr.mom',
 ]
+
+// ---------------------------------------------------------------------------
+// Persistent mode: durable Yjs snapshots via NIP-01 addressable events
+// (kind 30000-39999 - a relay keeps only the latest event per (kind,
+// pubkey, `d` tag), unlike the ephemeral live-update kind above, which
+// relays are free to drop entirely). See README.md's "Persistent mode".
+// ---------------------------------------------------------------------------
+
+// An addressable-range kind, arbitrary but documented - not reserved by any
+// well-known NIP as of this writing.
+const DEFAULT_PERSISTENT_KIND = 30078
+
+// A snapshot bigger than this many chunks is skipped (a warning is logged)
+// rather than published incomplete - see README.md for the size this bounds
+// (MAX_SNAPSHOT_CHUNKS * MAX_CONTENT_CHARS base64 chars) and the upgrade
+// path (a two-phase fetch that learns the real total instead of guessing
+// a fixed candidate range).
+const MAX_SNAPSHOT_CHUNKS = 20
 
 // ---------------------------------------------------------------------------
 // Types
@@ -228,6 +302,36 @@ export interface NostrConfig extends ConnectionConfig {
    */
   historyWindowSecs?: number
 
+  /**
+   * Publish periodic full-document snapshots as NIP-01 addressable events
+   * (see `persistentKind`) so a late joiner can catch up from a relay's
+   * durable storage alone, even with no live peer online and even across a
+   * relay restart (unlike the default ephemeral live-update kind, which
+   * relays are not expected to store). Requires `doc`.
+   * @default false
+   */
+  persistent?: boolean
+
+  /**
+   * The Y.Doc to snapshot. Required when `persistent` is true - the
+   * transport reads its state directly (`doc.on('update', ...)`) rather
+   * than inspecting outgoing wire frames, since compression (see
+   * `NostrTransport.preferredCompressMinBytes`) would shift the frame's
+   * message-type byte to an unpredictable offset.
+   */
+  doc?: Y.Doc
+
+  /**
+   * Nostr event kind used for persistent snapshots. Must be in NIP-01's
+   * addressable range (30000-39999) for relay replace-on-write semantics
+   * to apply.
+   * @default 30078
+   */
+  persistentKind?: number
+
+  /** Debounce between a document change and the next snapshot publish. */
+  persistDebounceMs?: number
+
   /** Enable debug logging (overrides constructor option). */
   debug?: boolean
 }
@@ -268,6 +372,18 @@ export class NostrTransport implements Transport {
   private pubkey: string = ''
   private roomTag: string = ''
   private readonly eventKind: number
+
+  // Persistent mode (see NostrConfig.persistent)
+  private persistentMode = false
+  private doc: Y.Doc | null = null
+  private persistentKind = DEFAULT_PERSISTENT_KIND
+  private persistDebounceMs = 2000
+  private persistTimer?: ReturnType<typeof setTimeout>
+  private isPublishingSnapshot = false
+  private publishPending = false
+  private snapshotSub: { close(): void } | null = null
+  private snapshotChunks = new ChunkAssembler()
+  private _onDocUpdate = (): void => this._queueSnapshotPublish()
 
   constructor(opts: NostrTransportOptions) {
     this.opts = opts
@@ -378,6 +494,48 @@ export class NostrTransport implements Transport {
 
     this._connected = true
 
+    // Persistent mode: fetch the durable snapshot (if any) and start
+    // publishing new ones on doc changes. Additive to the live subscription
+    // above, never a replacement for it.
+    this.persistentMode = config.persistent ?? false
+    if (this.persistentMode) {
+      if (!config.doc) {
+        throw new Error('NostrTransport: config.doc is required when persistent is true')
+      }
+      this.doc = config.doc
+      this.persistentKind = config.persistentKind ?? DEFAULT_PERSISTENT_KIND
+      this.persistDebounceMs = config.persistDebounceMs ?? 2000
+
+      const snapshotDTags = Array.from(
+        { length: MAX_SNAPSHOT_CHUNKS },
+        (_, i) => `${this.roomTag}#${i}`,
+      )
+      this.snapshotSub = this.pool.subscribeMany(
+        this.relays,
+        { kinds: [this.persistentKind], '#d': snapshotDTags },
+        {
+          onevent: (event: NostrEvent) => {
+            try {
+              const parsed = JSON.parse(event.content)
+              if (!isChunk(parsed)) return
+              const whole = this.snapshotChunks.push(parsed)
+              if (whole === null) return
+              const update = base64ToUint8Array(whole)
+              const enc = encoding.createEncoder()
+              encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
+              encoding.writeVarUint8Array(enc, update)
+              this._deliver(wrapFrame(encoding.toUint8Array(enc)))
+              if (debug) console.log('[NostrTransport] Applied persisted snapshot,', update.length, 'bytes')
+            } catch (err) {
+              console.warn('[NostrTransport] Failed to decode snapshot event:', err)
+            }
+          },
+        },
+      )
+
+      this.doc.on('update', this._onDocUpdate)
+    }
+
     if (debug) {
       console.log('[NostrTransport] Connected, pubkey:', this.pubkey)
     }
@@ -388,6 +546,22 @@ export class NostrTransport implements Transport {
       this.sub.close()
       this.sub = null
     }
+
+    if (this.snapshotSub) {
+      this.snapshotSub.close()
+      this.snapshotSub = null
+    }
+    if (this.doc) {
+      this.doc.off('update', this._onDocUpdate)
+      this.doc = null
+    }
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = undefined
+    }
+    this.persistentMode = false
+    this.publishPending = false
+    this.snapshotChunks.clear()
 
     if (this.pool) {
       this.pool.close(this.relays)
@@ -425,6 +599,62 @@ export class NostrTransport implements Transport {
 
       // Publish to all relays; ignore individual relay errors
       await Promise.allSettled(this.pool.publish(this.relays, event))
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistent mode: publish the doc as one or more addressable events
+  // ---------------------------------------------------------------------------
+
+  private _queueSnapshotPublish(): void {
+    if (this.persistTimer) clearTimeout(this.persistTimer)
+    this.persistTimer = setTimeout(() => this._publishSnapshot(), this.persistDebounceMs)
+  }
+
+  /**
+   * Publish the whole doc as one snapshot, always through the chunk
+   * envelope (even a single part) - see README.md's "Persistent mode" for
+   * why: it keeps exactly one addressing scheme (`${roomTag}#${index}`)
+   * regardless of how many parts a given snapshot needs, so an older
+   * differently-sized snapshot's slots are always overwritten rather than
+   * left stale alongside a newer one under a different address.
+   */
+  private async _publishSnapshot(): Promise<void> {
+    if (!this.pool || !this.doc) return
+    if (this.isPublishingSnapshot) {
+      this.publishPending = true
+      return
+    }
+    this.isPublishingSnapshot = true
+    this.publishPending = false
+    try {
+      const base64 = uint8ArrayToBase64(Y.encodeStateAsUpdate(this.doc))
+      const parts = splitChunks(base64, MAX_CONTENT_CHARS)
+      if (parts.length > MAX_SNAPSHOT_CHUNKS) {
+        console.warn(
+          `[NostrTransport] Snapshot needs ${parts.length} chunks, more than MAX_SNAPSHOT_CHUNKS ` +
+            `(${MAX_SNAPSHOT_CHUNKS}); skipping this publish. The live update channel still keeps ` +
+            'connected peers in sync; the next smaller snapshot will catch late joiners up again.',
+        )
+        return
+      }
+      for (const part of parts) {
+        const event = this.opts.finalizeEvent(
+          {
+            kind: this.persistentKind,
+            created_at: Math.floor(Date.now() / 1000),
+            tags: [['d', `${this.roomTag}#${part.index}`]],
+            content: JSON.stringify(part),
+          },
+          this.secretKey,
+        )
+        await Promise.allSettled(this.pool.publish(this.relays, event))
+      }
+    } catch (err) {
+      console.warn('[NostrTransport] Failed to publish snapshot:', err)
+    } finally {
+      this.isPublishingSnapshot = false
+      if (this.publishPending) this._queueSnapshotPublish()
     }
   }
 

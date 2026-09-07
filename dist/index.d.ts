@@ -542,13 +542,17 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _markActivity;
     /**
-     * Replace y-protocols' awareness sweep (awareness.js `_checkInterval`:
-     * renew at outdatedTimeout/2, remove at outdatedTimeout, every
-     * outdatedTimeout/10) with the same loop at `_awarenessTimeoutMs`, the
-     * period jittered so a room that joined together does not renew in one
-     * burst (measured: all 49 listeners of a 50-peer room renewed inside the
-     * same 10 s window). Only when we created the instance - see
-     * `_ownsAwareness`.
+     * The lease sweep: y-protocols' own (awareness.js `_checkInterval`: renew
+     * at outdatedTimeout/2, remove at outdatedTimeout, every
+     * outdatedTimeout/10) replaced by the same loop at `_awarenessTimeoutMs`,
+     * the period jittered so a room that joined together does not renew in
+     * one burst (measured: all 49 listeners of a 50-peer room renewed inside
+     * the same 10 s window). The renew/remove half runs only on an awareness
+     * we created (`_ownsAwareness`); the peer-table prune (round 7, item 3)
+     * runs regardless. Armed by connect(), cleared by disconnect() - round 7,
+     * item 2: started from the constructor it outlived disconnect(), ticking
+     * ~20 times a minute and keeping the dropped provider reachable
+     * (test/dummy/bench-reload-phantoms.ts, part 2).
      */
     private _startAwarenessSweep;
     /**

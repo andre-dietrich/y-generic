@@ -334,3 +334,32 @@ written by v1.4.0.
 
 Appended per commit, in order. Every number: `npx tsc -p tsconfig.bench.json`
 then the command given, on the build named.
+
+### Item 1 — `y-provider` removed (commit 2)
+
+`npm uninstall y-provider`: `package.json` and the lock file only; nothing
+in `src/` or `test/` imported it.
+
+### Item 2 — the sweep is armed in `connect()` and cleared in `disconnect()` (commit 3)
+
+What changed in `src/index.ts`: the constructor only silences y-protocols'
+own `_checkInterval` (still `_ownsAwareness`-gated); `_startAwarenessSweep()`
+is called from `connect()` once the transport is up, refuses to double-arm,
+gates the renew/remove half on `_ownsAwareness` (the peer-table prune of
+item 3 runs for an app-supplied awareness too), and re-arms only while the
+status is `connected` (a `disconnect()` from inside a listener stays a
+disconnect); `disconnect()` clears the timer next to `_syncIntervalId`.
+`bench-reload-phantoms` part 2 gained an allocation scrub before its GC:
+the last-disconnected provider lingers in a transient V8 slot until fresh
+allocations overwrite it (measured: exactly one survivor, always the last
+one, gone after any later activity - not a reference anyone holds).
+
+```
+node --expose-gc bench-dist/test/dummy/bench-reload-phantoms.js
+before: lifecycle M=20: Timeout handles after construct=20 after disconnect()=20 sweep timers armed after disconnect()=20 providers alive after GC=20
+after:  lifecycle M=20: Timeout handles after construct=0  after disconnect()=0  sweep timers armed after disconnect()=0  providers alive after GC=0
+```
+
+Part 1 is unchanged on this build (49 known peers two leases after the
+reloads) - that is item 3. The round-6 gates are run once on the item-3
+build, which contains both changes; see there.

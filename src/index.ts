@@ -961,7 +961,14 @@ export class GenericProvider extends Observable<string> {
     this._awarenessTimeoutMs =
       options.awarenessTimeoutMs ??
       (typeof transport.onPeerDisconnect === 'function' ? 300000 : 30000)
-    if (this._ownsAwareness) this._startAwarenessSweep()
+    // Silence y-protocols' own 3 s sweep on an awareness we created - the
+    // lease sweep that replaces it is armed in connect() and cleared in
+    // disconnect() (round 7, item 2: it used to start here and outlive
+    // disconnect(), keeping a dropped provider alive through its timer).
+    if (this._ownsAwareness) {
+      const aw = this.awareness as unknown as { _checkInterval?: ReturnType<typeof setInterval> }
+      if (aw._checkInterval !== undefined) clearInterval(aw._checkInterval)
+    }
     this._currentSyncIntervalMs = this._syncInterval
 
     this._setupDocumentSync()
@@ -1036,6 +1043,7 @@ export class GenericProvider extends Observable<string> {
       await this.transport.connect(config)
 
       this._setStatus({ state: 'connected' })
+      this._startAwarenessSweep()
 
       // Seed the round-trip estimate from the transport's hint (see
       // Transport.expectedRttMs); the minimum-of-8 rule lets real samples
@@ -1163,6 +1171,11 @@ export class GenericProvider extends Observable<string> {
       this._syncIntervalId = undefined
     }
     this._periodicScheduler = undefined
+    // Stop the awareness lease sweep (armed in connect(); round 7, item 2).
+    if (this._awarenessSweepId !== undefined) {
+      clearTimeout(this._awarenessSweepId)
+      this._awarenessSweepId = undefined
+    }
 
     // Reset resync escalation tracking
     this._resyncAttemptCount = 0
@@ -1583,46 +1596,54 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Replace y-protocols' awareness sweep (awareness.js `_checkInterval`:
-   * renew at outdatedTimeout/2, remove at outdatedTimeout, every
-   * outdatedTimeout/10) with the same loop at `_awarenessTimeoutMs`, the
-   * period jittered so a room that joined together does not renew in one
-   * burst (measured: all 49 listeners of a 50-peer room renewed inside the
-   * same 10 s window). Only when we created the instance - see
-   * `_ownsAwareness`.
+   * The lease sweep: y-protocols' own (awareness.js `_checkInterval`: renew
+   * at outdatedTimeout/2, remove at outdatedTimeout, every
+   * outdatedTimeout/10) replaced by the same loop at `_awarenessTimeoutMs`,
+   * the period jittered so a room that joined together does not renew in
+   * one burst (measured: all 49 listeners of a 50-peer room renewed inside
+   * the same 10 s window). The renew/remove half runs only on an awareness
+   * we created (`_ownsAwareness`); the peer-table prune (round 7, item 3)
+   * runs regardless. Armed by connect(), cleared by disconnect() - round 7,
+   * item 2: started from the constructor it outlived disconnect(), ticking
+   * ~20 times a minute and keeping the dropped provider reachable
+   * (test/dummy/bench-reload-phantoms.ts, part 2).
    */
   private _startAwarenessSweep(): void {
-    const aw = this.awareness as unknown as { _checkInterval?: ReturnType<typeof setInterval> }
-    if (aw._checkInterval !== undefined) clearInterval(aw._checkInterval)
+    if (this._awarenessSweepId !== undefined) return
     const lease = this._awarenessTimeoutMs
     const arm = () => {
       this._awarenessSweepId = setTimeout(tick, (lease / 10) * (0.8 + Math.random() * 0.4))
     }
     const tick = () => {
       const now = Date.now()
-      const mine = this.awareness.meta.get(this.doc.clientID)
-      if (
-        this.awareness.getLocalState() !== null &&
-        mine !== undefined &&
-        lease / 2 <= now - mine.lastUpdated
-      ) {
-        this.awareness.setLocalState(this.awareness.getLocalState()) // renew: bumps the clock
-        this._broadcastAwareness([this.doc.clientID]) // 'change' does not fire for an equal state (item 8)
-      }
-      const remove: number[] = []
-      this.awareness.meta.forEach((meta, clientID) => {
+      if (this._ownsAwareness) {
+        const mine = this.awareness.meta.get(this.doc.clientID)
         if (
-          clientID !== this.doc.clientID &&
-          lease <= now - meta.lastUpdated &&
-          this.awareness.getStates().has(clientID)
+          this.awareness.getLocalState() !== null &&
+          mine !== undefined &&
+          lease / 2 <= now - mine.lastUpdated
         ) {
-          remove.push(clientID)
+          this.awareness.setLocalState(this.awareness.getLocalState()) // renew: bumps the clock
+          this._broadcastAwareness([this.doc.clientID]) // 'change' does not fire for an equal state (item 8)
         }
-      })
-      if (remove.length > 0) {
-        awarenessProtocol.removeAwarenessStates(this.awareness, remove, 'timeout')
+        const remove: number[] = []
+        this.awareness.meta.forEach((meta, clientID) => {
+          if (
+            clientID !== this.doc.clientID &&
+            lease <= now - meta.lastUpdated &&
+            this.awareness.getStates().has(clientID)
+          ) {
+            remove.push(clientID)
+          }
+        })
+        if (remove.length > 0) {
+          awarenessProtocol.removeAwarenessStates(this.awareness, remove, 'timeout')
+        }
       }
-      if (!this._destroying) arm()
+      // Re-arm only while connected: a disconnect() from inside a listener
+      // above has just cleared the timer, and must stay cleared.
+      if (!this._destroying && this._status.state === 'connected') arm()
+      else this._awarenessSweepId = undefined
     }
     arm()
   }

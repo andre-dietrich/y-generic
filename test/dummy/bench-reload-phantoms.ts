@@ -147,9 +147,16 @@ async function part2(): Promise<void> {
     const gc = (globalThis as any).gc
     let survivors = -1
     if (typeof gc === 'function') {
-      gc()
-      await sleep(50)
-      gc()
+      // The last-disconnected provider lingers in a transient V8 slot until
+      // fresh allocations overwrite it (measured: exactly one survivor, always
+      // the last one, gone after any later activity) - scrub, then collect.
+      let scrub: unknown[] | null = []
+      for (let i = 0; i < 20000; i++) scrub.push({ i, s: 'x'.repeat(50) })
+      scrub = null
+      for (let i = 0; i < 3; i++) {
+        gc()
+        await sleep(30)
+      }
       survivors = refs.filter((r) => r.deref() !== undefined).length
     }
     console.log(

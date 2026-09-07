@@ -44,6 +44,10 @@ const PEER_EVENTS = process.env.DUMMY_PEER_EVENTS === '1'
 // item 8 every such call was a broadcast (y-protocols emits 'update' for
 // every setLocalState); now only a changed state is.
 const SAME_CURSOR = process.env.SAME_CURSOR === '1'
+// AWARENESS_TIMEOUT_MS=<ms>: the presence lease for the peers under test (see bench-idle-room).
+const AWARENESS_TIMEOUT_MS = process.env.AWARENESS_TIMEOUT_MS
+  ? Number(process.env.AWARENESS_TIMEOUT_MS)
+  : undefined
 const LATENCY = 20
 const JITTER = 0.25
 
@@ -68,6 +72,7 @@ async function run(N: number): Promise<void> {
         verifyUpdates: true,
         syncInterval: 5000,
         disableBc: true,
+        awarenessTimeoutMs: AWARENESS_TIMEOUT_MS,
       })
       docs.push(doc)
       providers.push(provider)
@@ -114,7 +119,7 @@ async function run(N: number): Promise<void> {
 
 async function main() {
   console.log(
-    `typing census: latency=${LATENCY}ms±${JITTER * 100}% typists=${TYPISTS} gap=${GAP_MS}ms duration=${DURATION_MS}ms settle=${SETTLE_MS}ms unicast=${process.env.DUMMY_UNICAST === '1'} peerEvents=${PEER_EVENTS}\n`,
+    `typing census: latency=${LATENCY}ms±${JITTER * 100}% typists=${TYPISTS} gap=${GAP_MS}ms duration=${DURATION_MS}ms settle=${SETTLE_MS}ms unicast=${process.env.DUMMY_UNICAST === '1'} peerEvents=${PEER_EVENTS} awarenessTimeout=${AWARENESS_TIMEOUT_MS ?? 'default'}\n`,
   )
   for (const N of N_VALUES) await run(N)
   process.exit(0)

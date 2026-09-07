@@ -179,6 +179,16 @@ interface Transport {
   whose backend rate-limits sends per user (Matrix sets 2000 against
   Synapse's default 0.2 messages/s).
 
+On a transport without `onPeerDisconnect` (Gun, Nostr, a plain WebSocket
+relay) every peer still re-announces its presence every half lease so the
+others do not drop it - with the default 30 s lease that is most of what
+an idle room sends once the beacons have backed off. Setting
+`awarenessTimeoutMs: 120000` in the app (the Gun, Nostr and WebSocket
+playgrounds do) cuts those renewals by three quarters; the price is a
+cursor that lingers up to 2 minutes after a tab is killed (clean closes
+are still announced at once). Every peer of a room must use the same
+value.
+
 When a persistence provider (IndexedDB) shares the document, pass its
 connect() promise as `connect({ room, waitFor })`: the first beacon then
 says what is already on disk, the load is not re-broadcast, and the room

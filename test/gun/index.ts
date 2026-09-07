@@ -110,7 +110,15 @@ async function initWithConfig(config: {
   })
 
   // Create provider
-  const provider = new GenericProvider(doc, transport)
+  // Presence lease (round 5): this transport cannot report departures, so
+  // peers renew their presence every lease/2; 120 s instead of y-protocols'
+  // 30 s cuts those renewals by three quarters (80 % of an idle room's
+  // messages once the beacons have backed off) at the price of a cursor that
+  // lingers up to 2 min after a tab is killed. Clean closes are still
+  // announced at once. Every peer of a room must use the same value.
+  const provider = new GenericProvider(doc, transport, {
+    awarenessTimeoutMs: 120000,
+  })
 
   // Listen to status changes
   provider.on('status', (event: any) => {

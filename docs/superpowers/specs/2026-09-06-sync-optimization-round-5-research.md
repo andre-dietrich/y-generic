@@ -884,3 +884,24 @@ keystroke itself (one broadcast per keystroke, N-1 deliveries) and the
 cursor-only traffic of non-typing peers (decision 5, item 9).
 
 Final gates on `dc26ed8`: `bench-packet-loss` every cell converged on both profiles; `bench-corruption-storm` bounded and converged; `bench-idle-backoff` recovery median 244 ms off / 510 ms on (phase 1e: 546 ms); `bench-late-join` all cells converged in relay and unicast mode; `bench-join-census` unicast late join N=100 403, fresh burst N=100 45,867 WebSocket / 39,628 Gun; `bench-sync-latency` one message per edit on all profiles; `bench-join-after-burst` all four variants PASS; plus, on the same build, `bench-periodic-awareness`, `bench-awareness-echo`, `bench-awareness-removal-burst`, `bench-idle-room` lost delete, `bench-rejoin-blank-doc`, `bench-asymmetric-join`, `bench-reconnect-cycling`, `bench-mesh-join-burst` - all green.
+
+### Decision 1, taken 2026-09-07: a 120 s lease on transports without a leave signal
+
+André chose 120 s for the Gun, Nostr and WebSocket playgrounds
+(`awarenessTimeoutMs: 120000`, set in the app; the library default stays
+30 s). Both census benches take `AWARENESS_TIMEOUT_MS`.
+
+```
+SYNC_INTERVAL_MS=5000 IDLE_BACKOFF=1 SETTLE_MS=90000 OBSERVE_MS=120000 N_VALUES=50 \
+  [AWARENESS_TIMEOUT_MS=120000] node bench-dist/test/dummy/bench-idle-room.js
+AWARENESS_TIMEOUT_MS=120000 SETTLE_MS=90000 N_VALUES=50 node bench-dist/test/dummy/bench-typing-census.js
+```
+
+| N=50, relay, at the 60 s cap | lease 30 s | lease 120 s |
+|---|---|---|
+| idle, deliveries per 120 s | 17,493 (146 /s) | **4,606** (38 /s, −74 %) |
+| of which renewals / beacons | 17,395 / 98 | 4,508 / 98 |
+| typing steady state, sends per keystroke | 1.56 | **1.06** (renewals once per 60 s per peer: ~0.16 per keystroke long-run; one landed in this window) |
+| a killed tab's presence lingers up to | 30 s | 2 min (clean closes still announced at once) |
+
+Lost delete (`bench-idle-room` part b) 5/5 with the long lease.

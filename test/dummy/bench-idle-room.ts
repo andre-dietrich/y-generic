@@ -54,6 +54,13 @@ const IDLE_BACKOFF = process.env.IDLE_BACKOFF === '1'
 // 5 min instead of y-protocols' 30 s (round 5, item 2), so the 15 s
 // renewals disappear from the census.
 const PEER_EVENTS = process.env.DUMMY_PEER_EVENTS === '1'
+// AWARENESS_TIMEOUT_MS=<ms>: the presence lease (GenericProvider's
+// awarenessTimeoutMs) for the peers under test - the lever on relay
+// transports without a leave signal, where the renewals every lease/2 are
+// what remains of an idle room after Trickle.
+const AWARENESS_TIMEOUT_MS = process.env.AWARENESS_TIMEOUT_MS
+  ? Number(process.env.AWARENESS_TIMEOUT_MS)
+  : undefined
 // Override with N_VALUES=20,50 to run a subset.
 const N_VALUES = (process.env.N_VALUES ?? '5,20,50').split(',').map(Number)
 const LOST_DELETE_CAP_MS = Math.max(5000, 2 * SYNC_INTERVAL_MS + 1000)
@@ -170,6 +177,7 @@ function makeProvider(hub: DummyHub, doc: Y.Doc, id: number | string): GenericPr
     syncInterval: SYNC_INTERVAL_MS,
     disableBc: true,
     idleBackoffEnabled: IDLE_BACKOFF,
+    awarenessTimeoutMs: AWARENESS_TIMEOUT_MS,
   })
   provider.awareness.setLocalStateField('user', { id })
   return provider
@@ -215,7 +223,7 @@ async function runCensus(N: number): Promise<void> {
 
     const secs = OBSERVE_MS / 1000
     const requestFloor = (N * (N - 1) * OBSERVE_MS) / (IDLE_BACKOFF ? 60000 : SYNC_INTERVAL_MS)
-    const awarenessFloor = (N * (N - 1) * OBSERVE_MS) / 15000
+    const awarenessFloor = (N * (N - 1) * OBSERVE_MS) / ((AWARENESS_TIMEOUT_MS ?? 30000) / 2)
     console.log(
       `CENSUS N=${N} converged=${converged} deliveries=${shadow.deliveries} sends=${shadow.sends} ` +
         `perSec=${(shadow.deliveries / secs).toFixed(0)} perSecPerPeer=${(shadow.deliveries / secs / N).toFixed(1)} ` +
@@ -380,7 +388,7 @@ async function main() {
   if (!hashOk) process.exitCode = 1
 
   console.log(
-    `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms idleBackoff=${IDLE_BACKOFF} peerEvents=${PEER_EVENTS}\n`,
+    `(a) idle census: syncInterval=${SYNC_INTERVAL_MS}ms latency=${LATENCY}ms±${JITTER * 100}% settle=${SETTLE_MS}ms observe=${OBSERVE_MS}ms idleBackoff=${IDLE_BACKOFF} peerEvents=${PEER_EVENTS} awarenessTimeout=${AWARENESS_TIMEOUT_MS ?? 'default'}\n`,
   )
   if (!process.env.SKIP_CENSUS) for (const N of N_VALUES) await runCensus(N)
   console.log(`\n(b) lost delete-only update, 2 peers, ${LOST_DELETE_SAMPLES} samples (cap ${LOST_DELETE_CAP_MS}ms):\n`)

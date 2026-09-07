@@ -165,6 +165,7 @@ export declare class GenericProvider extends Observable<string> {
     private _batchTimeoutId?;
     private _flushScheduled;
     private _awarenessInterval;
+    private static readonly AWARENESS_AUTO_MS_PER_PEER;
     private _pendingAwarenessClients;
     private _awarenessTimeoutId?;
     private _lastAwarenessTime;
@@ -223,9 +224,15 @@ export declare class GenericProvider extends Observable<string> {
          * Awareness updates (cursors, presence) are batched and sent at this interval.
          * Set to 0 for immediate transmission (not recommended for high-frequency updates).
          * This prevents awareness from flooding document sync on limited transports.
+         * `'auto'` (round 6, item 9) scales the interval with room size instead
+         * of a fixed value: `max(transport hint ?? 100, 20 * peerCount)` ms -
+         * cursor-only traffic (no typing) is rate * (N-1) per mover and
+         * otherwise unbounded by room size. A latency trade (slower cursors in
+         * large rooms for fewer messages), so opt-in only; see
+         * docs/superpowers/specs/2026-09-07-sync-optimization-round-6.md.
          * @default the transport's `preferredAwarenessMs` hint if it declares one, else 100
          */
-        awarenessInterval?: number;
+        awarenessInterval?: number | 'auto';
         /**
          * Max number of sync requests (digest beacons and syncNow() pushes
          * combined) this provider will send within `syncRequestWindowMs` -
@@ -697,6 +704,12 @@ export declare class GenericProvider extends Observable<string> {
      * heard plus ourselves. See `_knownPeers`.
      */
     private _peerCount;
+    /**
+     * Resolves `_awarenessInterval` to a concrete ms value: the configured
+     * fixed number, or (round 6, item 9) `max(transport hint ?? 100,
+     * AWARENESS_AUTO_MS_PER_PEER * peerCount)` when set to `'auto'`.
+     */
+    private _effectiveAwarenessInterval;
     private _replySuppressionMaxDelay;
     /**
      * Schedule a SyncStep2 reply after a short random delay instead of

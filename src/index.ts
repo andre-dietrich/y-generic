@@ -643,7 +643,9 @@ export class GenericProvider extends Observable<string> {
   private _flushScheduled: boolean = false
 
   // Awareness throttling - prevents awareness from flooding document sync
-  private _awarenessInterval: number = 100 // ms between awareness broadcasts
+  private _awarenessInterval: number | 'auto' = 100 // ms between awareness broadcasts, or 'auto' (round 6, item 9)
+  // ms of throttle added per known peer under `awarenessInterval: 'auto'`
+  private static readonly AWARENESS_AUTO_MS_PER_PEER = 20
   private _pendingAwarenessClients: Set<number> = new Set()
   private _awarenessTimeoutId?: ReturnType<typeof setTimeout>
   private _lastAwarenessTime: number = 0
@@ -724,9 +726,15 @@ export class GenericProvider extends Observable<string> {
        * Awareness updates (cursors, presence) are batched and sent at this interval.
        * Set to 0 for immediate transmission (not recommended for high-frequency updates).
        * This prevents awareness from flooding document sync on limited transports.
+       * `'auto'` (round 6, item 9) scales the interval with room size instead
+       * of a fixed value: `max(transport hint ?? 100, 20 * peerCount)` ms -
+       * cursor-only traffic (no typing) is rate * (N-1) per mover and
+       * otherwise unbounded by room size. A latency trade (slower cursors in
+       * large rooms for fewer messages), so opt-in only; see
+       * docs/superpowers/specs/2026-09-07-sync-optimization-round-6.md.
        * @default the transport's `preferredAwarenessMs` hint if it declares one, else 100
        */
-      awarenessInterval?: number
+      awarenessInterval?: number | 'auto'
       /**
        * Max number of sync requests (digest beacons and syncNow() pushes
        * combined) this provider will send within `syncRequestWindowMs` -
@@ -2506,6 +2514,20 @@ export class GenericProvider extends Observable<string> {
     return Math.max(this.awareness.getStates().size, this._knownPeers.size + 1)
   }
 
+  /**
+   * Resolves `_awarenessInterval` to a concrete ms value: the configured
+   * fixed number, or (round 6, item 9) `max(transport hint ?? 100,
+   * AWARENESS_AUTO_MS_PER_PEER * peerCount)` when set to `'auto'`.
+   */
+  private _effectiveAwarenessInterval(): number {
+    if (this._awarenessInterval !== 'auto') return this._awarenessInterval
+    const hint = this.transport.preferredAwarenessMs ?? 100
+    return Math.max(
+      hint,
+      GenericProvider.AWARENESS_AUTO_MS_PER_PEER * this._peerCount(),
+    )
+  }
+
   private _replySuppressionMaxDelay(): number {
     const peerCount = this._peerCount()
     const byRoomSize = Math.min(
@@ -3540,8 +3562,10 @@ export class GenericProvider extends Observable<string> {
   private _broadcastAwareness(clients: number[]): void {
     if (clients.length === 0) return
 
+    const interval = this._effectiveAwarenessInterval()
+
     // If throttling is disabled, send immediately
-    if (this._awarenessInterval <= 0) {
+    if (interval <= 0) {
       this._sendAwarenessNow(clients)
       return
     }
@@ -3559,7 +3583,7 @@ export class GenericProvider extends Observable<string> {
     // Calculate delay - respect minimum interval since last broadcast
     const now = Date.now()
     const timeSinceLastBroadcast = now - this._lastAwarenessTime
-    const delay = Math.max(0, this._awarenessInterval - timeSinceLastBroadcast)
+    const delay = Math.max(0, interval - timeSinceLastBroadcast)
 
     // Schedule the batched broadcast
     this._awarenessTimeoutId = setTimeout(() => {
@@ -3667,9 +3691,10 @@ export class GenericProvider extends Observable<string> {
     // immediate send here.
     if (this._awarenessTimeoutId !== undefined) return null
 
-    if (this._awarenessInterval > 0) {
+    const interval = this._effectiveAwarenessInterval()
+    if (interval > 0) {
       const timeSinceLastBroadcast = Date.now() - this._lastAwarenessTime
-      if (timeSinceLastBroadcast < this._awarenessInterval) return null
+      if (timeSinceLastBroadcast < interval) return null
     }
 
     // Merge with anything already pending (normally empty here since no

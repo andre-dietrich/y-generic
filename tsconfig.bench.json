@@ -35,6 +35,7 @@
     "test/dummy/bench-join-census.ts",
     "test/dummy/bench-typing-census.ts",
     "test/dummy/bench-reconnect-push.ts",
+    "test/dummy/bench-movers-census.ts",
     "test/providers/check-chunking.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]

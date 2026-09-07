@@ -525,7 +525,7 @@ export class GenericProvider extends Observable {
         this._pendingUpdate = null;
         this._flushScheduled = false;
         // Awareness throttling - prevents awareness from flooding document sync
-        this._awarenessInterval = 100; // ms between awareness broadcasts
+        this._awarenessInterval = 100; // ms between awareness broadcasts, or 'auto' (round 6, item 9)
         this._pendingAwarenessClients = new Set();
         this._lastAwarenessTime = 0;
         this.doc = doc;
@@ -1936,6 +1936,17 @@ export class GenericProvider extends Observable {
     _peerCount() {
         return Math.max(this.awareness.getStates().size, this._knownPeers.size + 1);
     }
+    /**
+     * Resolves `_awarenessInterval` to a concrete ms value: the configured
+     * fixed number, or (round 6, item 9) `max(transport hint ?? 100,
+     * AWARENESS_AUTO_MS_PER_PEER * peerCount)` when set to `'auto'`.
+     */
+    _effectiveAwarenessInterval() {
+        if (this._awarenessInterval !== 'auto')
+            return this._awarenessInterval;
+        const hint = this.transport.preferredAwarenessMs ?? 100;
+        return Math.max(hint, GenericProvider.AWARENESS_AUTO_MS_PER_PEER * this._peerCount());
+    }
     _replySuppressionMaxDelay() {
         const peerCount = this._peerCount();
         const byRoomSize = Math.min(200, this._syncReplySuppressionMs * Math.log2(Math.max(2, peerCount)));
@@ -2884,8 +2895,9 @@ export class GenericProvider extends Observable {
     _broadcastAwareness(clients) {
         if (clients.length === 0)
             return;
+        const interval = this._effectiveAwarenessInterval();
         // If throttling is disabled, send immediately
-        if (this._awarenessInterval <= 0) {
+        if (interval <= 0) {
             this._sendAwarenessNow(clients);
             return;
         }
@@ -2900,7 +2912,7 @@ export class GenericProvider extends Observable {
         // Calculate delay - respect minimum interval since last broadcast
         const now = Date.now();
         const timeSinceLastBroadcast = now - this._lastAwarenessTime;
-        const delay = Math.max(0, this._awarenessInterval - timeSinceLastBroadcast);
+        const delay = Math.max(0, interval - timeSinceLastBroadcast);
         // Schedule the batched broadcast
         this._awarenessTimeoutId = setTimeout(() => {
             this._awarenessTimeoutId = undefined;
@@ -3000,9 +3012,10 @@ export class GenericProvider extends Observable {
         // immediate send here.
         if (this._awarenessTimeoutId !== undefined)
             return null;
-        if (this._awarenessInterval > 0) {
+        const interval = this._effectiveAwarenessInterval();
+        if (interval > 0) {
             const timeSinceLastBroadcast = Date.now() - this._lastAwarenessTime;
-            if (timeSinceLastBroadcast < this._awarenessInterval)
+            if (timeSinceLastBroadcast < interval)
                 return null;
         }
         // Merge with anything already pending (normally empty here since no
@@ -3242,4 +3255,6 @@ export class GenericProvider extends Observable {
         return this._localSeqNum;
     }
 }
+// ms of throttle added per known peer under `awarenessInterval: 'auto'`
+GenericProvider.AWARENESS_AUTO_MS_PER_PEER = 20;
 //# sourceMappingURL=index.js.map

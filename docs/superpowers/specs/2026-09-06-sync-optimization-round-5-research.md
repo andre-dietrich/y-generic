@@ -504,7 +504,12 @@ typist): ~1,000 deliveries/s → ~275/s after items 1-4.
    on Matrix a win — acceptable as a default?
 4. **Multi-tab.** Is a course open in several tabs common enough for item
    10 to matter?
-5. **Adaptive awareness throttle** as a default or an opt-in `'auto'`.
+5. **Adaptive awareness throttle** as a default or an opt-in `'auto'`. Built
+   and measured in round 6 (2026-09-07,
+   `docs/superpowers/specs/2026-09-07-sync-optimization-round-6.md`) as
+   opt-in `awarenessInterval: 'auto'`; André chose
+   `AWARENESS_AUTO_MS_PER_PEER = 20` (more message-count reduction - the
+   measured lag cost of 10 vs. 20 was marginal). Decided, closed.
 
 
 ## Sources

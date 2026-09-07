@@ -71,6 +71,36 @@ uses 120 s - and the backed-off beacons), the cost of a reconnect (no
 full-state push since round 5), and how long a silently departed peer
 lingers (until the lease).
 
+### A local relay for a classroom (LAN)
+
+Gun's own relay is one file in the package; it needs Node and nothing
+else. On the teacher's machine (or any box in the room):
+
+```
+mkdir gun-relay && cd gun-relay
+npm init -y && npm install gun            # the same 0.2020.x line as the clients (the CDN gun.js is the latest)
+node node_modules/gun/examples/http.js 8765
+```
+
+It listens on every interface, answers websocket at `/gun`, restarts
+itself after a crash (Node cluster), and stores what it relays in
+`./radata/` - delete that folder for a clean slate. Clients use
+`http://<LAN address>:8765/gun` (`hostname -I` or `ip addr` shows the
+address; open the port in the firewall, e.g. `sudo ufw allow 8765/tcp`).
+`PORT=8765`, `PEERS=https://other-relay/gun` and `HTTPS_KEY`/`HTTPS_CERT`
+are the environment knobs. A page served over **https** cannot open a
+plain-http websocket (mixed content): serve the course over http on the
+LAN as well, or give the relay a certificate through `HTTPS_KEY`/`HTTPS_CERT`.
+
+The same with docker, pinned to the client's version (the `gundb/gun`
+image is Gun 0.2020.520 and does not deliver live writes to current
+clients - see below):
+
+```
+docker run -d --name gun-relay -p 8765:8765 -v gun-data:/srv -w /srv node:22-alpine \
+  sh -c "npm install gun@0.2020.1241 >/dev/null && node node_modules/gun/examples/http.js 8765"
+```
+
 ### With Relay Servers
 
 For cross-device synchronization, use public Gun relays:

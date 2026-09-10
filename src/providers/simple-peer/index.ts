@@ -153,9 +153,12 @@ const MAX_BUFFERED_AMOUNT = 16 * 1024
  * Message type markers for chunking protocol.
  * - 0x00: Complete message (no chunking, raw data)
  * - 0x01: Chunked message with header
+ * - 0x02: Consumer control frame — per-peer side-channel via sendControl()/
+ *   onControlFrame(), never reaches the provider pipe. Not chunked/encrypted.
  */
 const MSG_TYPE_COMPLETE = 0x00
 const MSG_TYPE_CHUNKED = 0x01
+const MSG_TYPE_CONTROL = 0x02
 
 /** Counter for generating unique message IDs */
 let messageIdCounter = 0
@@ -185,8 +188,15 @@ export class SimplePeerTransport implements Transport {
   private _connected: boolean = false
   private _room: string = ''
   private _callback?: (data: Uint8Array, from?: string) => void
-  private _peerConnectCallback?: (peerId: string) => void
-  private _peerDisconnectCallback?: (peerId: string) => void
+  // Sets, not single slots: the provider registers its own peer-connect and
+  // peer-disconnect listeners, and consumers (edrys' identity handshake)
+  // register alongside it. A single slot silently drops whichever registered
+  // second.
+  private _peerConnectCallbacks = new Set<(peerId: string) => void>()
+  private _peerDisconnectCallbacks = new Set<(peerId: string) => void>()
+  private _controlCallbacks = new Set<
+    (peerId: string, payload: Uint8Array) => void
+  >()
   private peerId: string
   private peers: Map<string, PeerConnection> = new Map()
   private signalingConns: WebSocket[] = []
@@ -499,17 +509,55 @@ export class SimplePeerTransport implements Transport {
    * Register callback for new peer data-channel connections.
    */
   onPeerConnect(callback: (peerId: string) => void): () => void {
-    this._peerConnectCallback = callback
+    this._peerConnectCallbacks.add(callback)
     return () => {
-      this._peerConnectCallback = undefined
+      this._peerConnectCallbacks.delete(callback)
     }
   }
 
   /** Transport.onPeerDisconnect: a peer's channel closed or errored (removePeer). */
   onPeerDisconnect(callback: (peerId: string) => void): () => void {
-    this._peerDisconnectCallback = callback
+    this._peerDisconnectCallbacks.add(callback)
     return () => {
-      this._peerDisconnectCallback = undefined
+      this._peerDisconnectCallbacks.delete(callback)
+    }
+  }
+
+  /** Transport.onControlFrame: out-of-band frames, never fed to the provider. */
+  onControlFrame(
+    callback: (peerId: string, payload: Uint8Array) => void,
+  ): () => void {
+    this._controlCallbacks.add(callback)
+    return () => {
+      this._controlCallbacks.delete(callback)
+    }
+  }
+
+  /**
+   * Tear down a single peer connection (e.g. to reject a peer that failed an
+   * out-of-band handshake). Fires onPeerDisconnect if the peer was connected.
+   */
+  disconnectPeer(peerId: string): void {
+    this.removePeer(peerId)
+  }
+
+  /**
+   * Send a control frame to a single peer. Not chunked or encrypted — keep
+   * payloads small (they must fit one DataChannel message).
+   */
+  sendControl(peerId: string, payload: Uint8Array): void {
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn || !peerConn.connected) {
+      this.log(`⚠️ sendControl: peer ${peerId} not connected — dropped`)
+      return
+    }
+    const msg = new Uint8Array(payload.length + 1)
+    msg[0] = MSG_TYPE_CONTROL
+    msg.set(payload, 1)
+    try {
+      peerConn.peer.send(msg)
+    } catch (error) {
+      this.log(`❌ sendControl failed to ${peerId}:`, (error as Error).message)
     }
   }
 
@@ -779,7 +827,7 @@ export class SimplePeerTransport implements Transport {
       this.log(
         `✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`,
       )
-      this._peerConnectCallback?.(remotePeerId)
+      this._peerConnectCallbacks.forEach((cb) => cb(remotePeerId))
     }
 
     // Handle connection
@@ -801,13 +849,23 @@ export class SimplePeerTransport implements Transport {
       // before 'connect' (seen on Chrome when the remote initiator sends immediately).
       onChannelOpen('data')
 
-      if (!this._callback) return
-
       try {
         const uint8Data = new Uint8Array(data)
         if (uint8Data.length === 0) return
 
         const msgType = uint8Data[0]
+
+        // Control frames are a consumer side-channel: they bypass the provider
+        // pipe entirely (no CRC, no decrypt, no Yjs decode) and are delivered
+        // even before the provider has registered its onMessage callback,
+        // since the identity handshake runs ahead of it.
+        if (msgType === MSG_TYPE_CONTROL) {
+          const payload = uint8Data.slice(1)
+          this._controlCallbacks.forEach((cb) => cb(remotePeerId, payload))
+          return
+        }
+
+        if (!this._callback) return
 
         if (msgType === MSG_TYPE_COMPLETE) {
           // Complete message, extract payload (skip type byte)
@@ -940,7 +998,7 @@ export class SimplePeerTransport implements Transport {
       this.log(
         `🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`,
       )
-      this._peerDisconnectCallback?.(peerId)
+      this._peerDisconnectCallbacks.forEach((cb) => cb(peerId))
     }
   }
 

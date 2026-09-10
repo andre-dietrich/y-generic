@@ -512,7 +512,20 @@ export class GenericProvider extends Observable<string> {
    * is handed to untrusted third-party modules. Separate wire type, separate
    * throttle, separate state - the two never mix.
    */
-  public readonly appAwareness: awarenessProtocol.Awareness
+  private _appAwareness?: awarenessProtocol.Awareness
+
+  get appAwareness(): awarenessProtocol.Awareness {
+    if (!this._appAwareness) {
+      // Created on first use, not in the constructor: every y-protocols
+      // Awareness starts its own setInterval that only destroy() clears, so
+      // an eagerly-built second instance cost one live timer per provider
+      // for the majority of consumers that never touch this channel
+      // (bench-reload-phantoms part 2 counts exactly that).
+      this._appAwareness = new awarenessProtocol.Awareness(this.doc)
+      this._attachAppAwareness(this._appAwareness)
+    }
+    return this._appAwareness
+  }
   public readonly pubsub: PubSubChannel
 
   private _status: ConnectionStatus = { state: 'disconnected' }
@@ -1104,8 +1117,10 @@ export class GenericProvider extends Observable<string> {
     this.transport = transport
     this.pubsub = new PubSubChannel(this)
     this.awareness = options.awareness || new awarenessProtocol.Awareness(doc)
-    this.appAwareness =
-      options.appAwareness || new awarenessProtocol.Awareness(doc)
+    // Only when supplied - otherwise the getter builds it on first use.
+    if (options.appAwareness) {
+      this._appAwareness = options.appAwareness
+    }
     this._syncInterval = options.syncInterval ?? 5000
     this._verifyUpdates = options.verifyUpdates ?? true
     this._batchUpdates =
@@ -1258,7 +1273,7 @@ export class GenericProvider extends Observable<string> {
 
       // The app channel has no equivalent path into syncNow()'s batch, so
       // its local state is announced here when there is any.
-      if (this.appAwareness.getLocalState() !== null) {
+      if (this._appAwareness?.getLocalState() != null) {
         this._broadcastAppAwareness([this.doc.clientID])
       }
 
@@ -1538,7 +1553,7 @@ export class GenericProvider extends Observable<string> {
       this._awarenessUpdateHandler = undefined
     }
     if (this._appAwarenessUpdateHandler) {
-      this.appAwareness.off('update', this._appAwarenessUpdateHandler)
+      this._appAwareness?.off('update', this._appAwarenessUpdateHandler)
       this._appAwarenessUpdateHandler = undefined
     }
     if (this._appAwarenessTimeoutId !== undefined) {
@@ -1557,7 +1572,8 @@ export class GenericProvider extends Observable<string> {
     }
 
     this.awareness.destroy()
-    this.appAwareness.destroy()
+    // Only if one was ever built - never construct one just to destroy it.
+    this._appAwareness?.destroy()
     super.destroy()
   }
 
@@ -2127,23 +2143,12 @@ export class GenericProvider extends Observable<string> {
       this._awarenessUpdateHandler,
     )
 
-    // App channel: same echo suppression (never re-broadcast what came off
-    // the wire), but none of the presence/removal handling above - this
-    // channel has no bearing on who the room thinks is present.
-    this._appAwarenessUpdateHandler = (
-      {
-        added,
-        updated,
-        removed,
-      }: { added: number[]; updated: number[]; removed: number[] },
-      origin: any,
-    ) => {
-      if (origin === this) return
-      const changedClients = [...added, ...updated, ...removed]
-      if (changedClients.length === 0) return
-      this._broadcastAppAwareness(changedClients)
+    // App channel: attached here only if one was supplied to the
+    // constructor; otherwise the getter attaches on first use. Reading
+    // `this.appAwareness` here would defeat the lazy construction.
+    if (this._appAwareness) {
+      this._attachAppAwareness(this._appAwareness)
     }
-    this.appAwareness.on('update', this._appAwarenessUpdateHandler)
 
     // Cleanup: mark as offline and disconnect BC when page unloads
     if (typeof window !== 'undefined') {
@@ -3938,6 +3943,30 @@ export class GenericProvider extends Observable<string> {
         this._sendBatch([...this._takePendingUpdate(), this._encodeAwareness(clientsToSend)])
       }
     }, delay)
+  }
+
+  /**
+   * Register the app channel's update listener. Same echo suppression as the
+   * core channel (never re-broadcast what came off the wire), but none of its
+   * presence/removal handling - this channel has no bearing on who the room
+   * thinks is present.
+   */
+  private _attachAppAwareness(aw: awarenessProtocol.Awareness): void {
+    if (this._appAwarenessUpdateHandler) return
+    this._appAwarenessUpdateHandler = (
+      {
+        added,
+        updated,
+        removed,
+      }: { added: number[]; updated: number[]; removed: number[] },
+      origin: any,
+    ) => {
+      if (origin === this) return
+      const changedClients = [...added, ...updated, ...removed]
+      if (changedClients.length === 0) return
+      this._broadcastAppAwareness(changedClients)
+    }
+    aw.on('update', this._appAwarenessUpdateHandler)
   }
 
   /**

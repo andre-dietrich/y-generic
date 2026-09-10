@@ -70,6 +70,18 @@ export declare class PubSubChannel extends Observable<string> {
      */
     publish(topic: string, message: any): void;
     /**
+     * Publish a message to a single target instead of broadcasting.
+     *
+     * On transports with `sendTo`, `target` is the peer's ID and delivery is
+     * direct. On transports without it, the message is broadcast with the
+     * target embedded and dropped by every provider whose `localId` differs.
+     *
+     * @param target - Recipient id (transport peerId, or a `localId`)
+     * @param topic - Topic name
+     * @param message - Any JSON-serializable data
+     */
+    publishTo(target: string, topic: string, message: any): void;
+    /**
      * Subscribe to messages on a topic.
      *
      * @param topic - Topic name to listen to (use '*' for all topics)
@@ -123,6 +135,15 @@ export declare class GenericProvider extends Observable<string> {
     readonly doc: Y.Doc;
     readonly transport: Transport;
     readonly awareness: awarenessProtocol.Awareness;
+    /**
+     * A second awareness instance for application/module state (cursors,
+     * per-module presence), isolated from `awareness`: the core one carries
+     * the room's own identity/presence and drives peer bookkeeping, this one
+     * is handed to untrusted third-party modules. Separate wire type, separate
+     * throttle, separate state - the two never mix.
+     */
+    private _appAwareness?;
+    get appAwareness(): awarenessProtocol.Awareness;
     readonly pubsub: PubSubChannel;
     private _status;
     private _synced;
@@ -187,6 +208,9 @@ export declare class GenericProvider extends Observable<string> {
     private _seqWindowSize;
     private _gapGraceMs;
     private _batchUpdates;
+    private _excludeOrigins;
+    private _localId?;
+    private _syncMode;
     private _pendingUpdate;
     private _batchTimeoutId?;
     private _flushScheduled;
@@ -195,6 +219,10 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingAwarenessClients;
     private _awarenessTimeoutId?;
     private _lastAwarenessTime;
+    private _pendingAppAwarenessClients;
+    private _appAwarenessTimeoutId?;
+    private _lastAppAwarenessTime;
+    private _appAwarenessUpdateHandler?;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
     private _awarenessTimeoutMs;
@@ -211,6 +239,11 @@ export declare class GenericProvider extends Observable<string> {
      */
     constructor(doc: Y.Doc, transport: Transport, options?: {
         awareness?: awarenessProtocol.Awareness;
+        /**
+         * Awareness instance for the application/module channel. Defaults to a
+         * fresh instance on the same doc. See `GenericProvider.appAwareness`.
+         */
+        appAwareness?: awarenessProtocol.Awareness;
         /**
          * Interval in milliseconds for periodic sync retries.
          * Helps recover from packet loss. Set to 0 to disable.
@@ -271,6 +304,26 @@ export declare class GenericProvider extends Observable<string> {
          * @default 20
          */
         maxSyncRequestsPerWindow?: number;
+        /**
+         * Transaction origins whose updates should not be sent to peers.
+         * Updates from these origins stay local (never reach the transport).
+         * @default [] (no origins excluded)
+         */
+        excludeOrigins?: any[];
+        /**
+         * This provider's identity for targeted pubsub (publishTo).
+         * On transports without sendTo, targeted messages are broadcast and
+         * dropped by every provider whose localId differs.
+         */
+        localId?: string;
+        /**
+         * 'pull' never sends local state unasked: no connect-time push, no
+         * periodic push - the provider only answers requests and applies what
+         * it receives. For read-mostly replicas that must not write into the
+         * room.
+         * @default 'push-pull'
+         */
+        syncMode?: 'push-pull' | 'pull';
         /**
          * Rolling time window (ms) over which `maxSyncRequestsPerWindow` is
          * enforced.
@@ -1062,11 +1115,35 @@ export declare class GenericProvider extends Observable<string> {
      */
     _sendPubSub(topic: string, message: any): void;
     /**
+     * Send a pub/sub message to a single target.
+     *
+     * With `Transport.sendTo` the frame is unicast to that peer; without it the
+     * frame is broadcast with the target embedded and dropped on receipt by
+     * every provider whose `localId` differs.
+     */
+    _sendPubSubTo(target: string, topic: string, message: any): void;
+    /**
      * Broadcast awareness state for the specified clients.
      * Throttled to prevent awareness updates from flooding document sync.
      * Multiple rapid updates are batched together.
      */
     private _broadcastAwareness;
+    /**
+     * Register the app channel's update listener. Same echo suppression as the
+     * core channel (never re-broadcast what came off the wire), but none of its
+     * presence/removal handling - this channel has no bearing on who the room
+     * thinks is present.
+     */
+    private _attachAppAwareness;
+    /**
+     * Broadcast app-channel awareness. Mirrors `_broadcastAwareness()`'s
+     * throttle, against its own pending set and timer, and deliberately does
+     * NOT piggyback on the core sync batch: module cursor churn must not pull
+     * document or presence traffic onto its cadence (or vice versa).
+     */
+    private _broadcastAppAwareness;
+    /** Encode and send an app-channel awareness update immediately. */
+    private _sendAppAwarenessNow;
     /**
      * Round 5, item 1: the awareness change the throttle is holding rides
      * along with a wire message that is leaving anyway. Returns the encoded

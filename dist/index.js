@@ -64,6 +64,29 @@ const DIGEST_FLAG_SETTLED = 8;
 // empty joiner's push says nothing about the room's content). See
 // docs/superpowers/specs/2026-09-05-resync-cascade-design.md.
 const MESSAGE_SYNC_PUSH = 6;
+// Pub/sub message aimed at a single target: [target][topic][message]. Every
+// provider whose `localId` differs drops it. On transports with sendTo it is
+// unicast; elsewhere it is broadcast and filtered on receipt.
+//
+// NOTE: this was type 4 before the v1.5.0 merge, which upstream had taken for
+// MESSAGE_BATCH. Renumbered to 7 (the first free slot) - the two are not wire
+// compatible, so all peers of a room must run the same version, as the README
+// already requires.
+const MESSAGE_PUBSUB_TARGETED = 7;
+// A second, independent awareness channel for application/module state
+// (cursors, module presence), kept off MESSAGE_AWARENESS deliberately.
+//
+// Upstream's MESSAGE_AWARENESS receive path is now core presence machinery:
+// it feeds _knownPeers, sets _presenceCovered, and cancels pending removal
+// broadcasts. App awareness is written by untrusted third-party classroom
+// modules, so routing it through that path would let module cursor traffic
+// drive the room's peer bookkeeping - a module setting a state would mark
+// phantom peers present and suppress real removals. A separate type keeps
+// the two entirely disjoint: same throttle policy, no shared presence state.
+//
+// (Dev encoded this as a channel varint inside MESSAGE_AWARENESS, which was
+// safe when that path did nothing but applyAwarenessUpdate. It no longer is.)
+const MESSAGE_AWARENESS_APP = 8;
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -366,6 +389,20 @@ export class PubSubChannel extends Observable {
         this.provider._sendPubSub(topic, message);
     }
     /**
+     * Publish a message to a single target instead of broadcasting.
+     *
+     * On transports with `sendTo`, `target` is the peer's ID and delivery is
+     * direct. On transports without it, the message is broadcast with the
+     * target embedded and dropped by every provider whose `localId` differs.
+     *
+     * @param target - Recipient id (transport peerId, or a `localId`)
+     * @param topic - Topic name
+     * @param message - Any JSON-serializable data
+     */
+    publishTo(target, topic, message) {
+        this.provider._sendPubSubTo(target, topic, message);
+    }
+    /**
      * Subscribe to messages on a topic.
      *
      * @param topic - Topic name to listen to (use '*' for all topics)
@@ -426,6 +463,18 @@ export class PubSubChannel extends Observable {
  * ```
  */
 export class GenericProvider extends Observable {
+    get appAwareness() {
+        if (!this._appAwareness) {
+            // Created on first use, not in the constructor: every y-protocols
+            // Awareness starts its own setInterval that only destroy() clears, so
+            // an eagerly-built second instance cost one live timer per provider
+            // for the majority of consumers that never touch this channel
+            // (bench-reload-phantoms part 2 counts exactly that).
+            this._appAwareness = new awarenessProtocol.Awareness(this.doc);
+            this._attachAppAwareness(this._appAwareness);
+        }
+        return this._appAwareness;
+    }
     /**
      * Create a new generic provider.
      *
@@ -597,16 +646,29 @@ export class GenericProvider extends Observable {
         // `_batchTimeoutId` is set only for the timed (`batchUpdates > 0`) flush;
         // `_flushScheduled` covers both.
         this._batchUpdates = 0; // milliseconds delay (0 = end of current task)
+        // Origins whose updates are never sent to the transport (local-only txns).
+        this._excludeOrigins = new Set();
+        // 'pull' never pushes local state unasked - for read-mostly replicas that
+        // must not write into the room.
+        this._syncMode = 'push-pull';
         this._pendingUpdate = null;
         this._flushScheduled = false;
         // Awareness throttling - prevents awareness from flooding document sync
         this._awarenessInterval = 100; // ms between awareness broadcasts, or 'auto' (round 6, item 9)
         this._pendingAwarenessClients = new Set();
         this._lastAwarenessTime = 0;
+        // Independent throttle state for the app awareness channel, so module
+        // cursor churn never delays or coalesces with core presence.
+        this._pendingAppAwarenessClients = new Set();
+        this._lastAppAwarenessTime = 0;
         this.doc = doc;
         this.transport = transport;
         this.pubsub = new PubSubChannel(this);
         this.awareness = options.awareness || new awarenessProtocol.Awareness(doc);
+        // Only when supplied - otherwise the getter builds it on first use.
+        if (options.appAwareness) {
+            this._appAwareness = options.appAwareness;
+        }
         this._syncInterval = options.syncInterval ?? 5000;
         this._verifyUpdates = options.verifyUpdates ?? true;
         this._batchUpdates =
@@ -614,6 +676,9 @@ export class GenericProvider extends Observable {
         this._disableBc = options.disableBc ?? false;
         this._awarenessInterval =
             options.awarenessInterval ?? transport.preferredAwarenessMs ?? 100;
+        this._excludeOrigins = new Set(options.excludeOrigins ?? []);
+        this._localId = options.localId;
+        this._syncMode = options.syncMode ?? 'push-pull';
         this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20;
         this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000;
         this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30;
@@ -741,6 +806,11 @@ export class GenericProvider extends Observable {
             // (Local awareness goes out inside syncNow()'s batch, or via its
             // throttled fallback - a second broadcast here was a duplicate 100ms
             // later.)
+            // The app channel has no equivalent path into syncNow()'s batch, so
+            // its local state is announced here when there is any.
+            if (this._appAwareness?.getLocalState() != null) {
+                this._broadcastAppAwareness([this.doc.clientID]);
+            }
             // Start periodic sync to handle packet loss
             // Just request sync without sending full state (avoid redundant broadcasts)
             // _sendSyncStep1() already checks the shared rate limiter internally
@@ -919,6 +989,16 @@ export class GenericProvider extends Observable {
             }
         }
         this._pendingAwarenessClients.clear();
+        // Same for the app channel's independent throttle.
+        if (this._appAwarenessTimeoutId !== undefined) {
+            clearTimeout(this._appAwarenessTimeoutId);
+            this._appAwarenessTimeoutId = undefined;
+            if (this._pendingAppAwarenessClients.size > 0 &&
+                this.transport.isConnected) {
+                this._sendAppAwarenessNow(Array.from(this._pendingAppAwarenessClients));
+            }
+        }
+        this._pendingAppAwarenessClients.clear();
         // Disconnect BroadcastChannel
         this._disconnectBroadcastChannel();
         if (this._unsubscribeTransport) {
@@ -966,6 +1046,14 @@ export class GenericProvider extends Observable {
             this.awareness.off(this._ownsAwareness ? 'change' : 'update', this._awarenessUpdateHandler);
             this._awarenessUpdateHandler = undefined;
         }
+        if (this._appAwarenessUpdateHandler) {
+            this._appAwareness?.off('update', this._appAwarenessUpdateHandler);
+            this._appAwarenessUpdateHandler = undefined;
+        }
+        if (this._appAwarenessTimeoutId !== undefined) {
+            clearTimeout(this._appAwarenessTimeoutId);
+            this._appAwarenessTimeoutId = undefined;
+        }
         if (this._awarenessSweepId !== undefined) {
             clearTimeout(this._awarenessSweepId);
             this._awarenessSweepId = undefined;
@@ -976,6 +1064,8 @@ export class GenericProvider extends Observable {
             this._beforeUnloadHandler = undefined;
         }
         this.awareness.destroy();
+        // Only if one was ever built - never construct one just to destroy it.
+        this._appAwareness?.destroy();
         super.destroy();
     }
     /**
@@ -1107,7 +1197,12 @@ export class GenericProvider extends Observable {
         // too. Built inside buildExtra so it's only even attempted once a sync
         // rate-limit slot is confirmed reserved (see _trySyncPushPull's doc).
         let awarenessBatched = false;
-        const sent = this._trySyncPushPull(true, () => {
+        const sent = this._trySyncPushPull(
+        // 'pull': send the beacon but never the full-state push. A relay or
+        // server holds authoritative state and we adopt it rather than pushing
+        // a competing local copy on every (re)connect. Peers that are actually
+        // behind us still ask, and we still answer - the beacon reconciles.
+        this._syncMode !== 'pull', () => {
             const msg = this._tryImmediateAwarenessMessage([this.doc.clientID]);
             if (msg) {
                 awarenessBatched = true;
@@ -1355,7 +1450,14 @@ export class GenericProvider extends Observable {
             // Don't send updates that originated from this provider (received
             // from the wire) or from the local load connect() is waiting for.
             if (origin !== this && !this._loading) {
+                // Local-only transaction origins (e.g. a rollback the peer must not
+                // replicate) never reach the transport.
+                if (this._excludeOrigins.has(origin))
+                    return;
                 this._markActivity();
+                // 'pull' replicas answer requests but never push unasked.
+                if (this._syncMode === 'pull')
+                    return;
                 this._batchUpdate(update);
             }
         };
@@ -1492,6 +1594,12 @@ export class GenericProvider extends Observable {
         // y-protocols' own sweep renews through 'update' only, so that case
         // keeps listening on 'update'.
         this.awareness.on(this._ownsAwareness ? 'change' : 'update', this._awarenessUpdateHandler);
+        // App channel: attached here only if one was supplied to the
+        // constructor; otherwise the getter attaches on first use. Reading
+        // `this.appAwareness` here would defeat the lazy construction.
+        if (this._appAwareness) {
+            this._attachAppAwareness(this._appAwareness);
+        }
         // Cleanup: mark as offline and disconnect BC when page unloads
         if (typeof window !== 'undefined') {
             this._beforeUnloadHandler = () => {
@@ -1707,6 +1815,31 @@ export class GenericProvider extends Observable {
                 }
                 catch (error) {
                     console.error('Error decoding pub/sub message:', error);
+                }
+                break;
+            }
+            case MESSAGE_AWARENESS_APP: {
+                // Deliberately none of the presence bookkeeping the core awareness
+                // case does (_knownPeers, _presenceCovered, removal cancellation):
+                // this channel is written by untrusted modules and must not be able
+                // to influence the room's view of who is present.
+                awarenessProtocol.applyAwarenessUpdate(this.appAwareness, decoding.readVarUint8Array(decoder), this);
+                break;
+            }
+            case MESSAGE_PUBSUB_TARGETED: {
+                const target = decoding.readVarString(decoder);
+                const topic = decoding.readVarString(decoder);
+                const payloadBytes = decoding.readVarUint8Array(decoder);
+                // Drop messages aimed at someone else (broadcast-and-filter path).
+                if (this._localId !== undefined && target !== this._localId) {
+                    break;
+                }
+                try {
+                    const message = JSON.parse(new TextDecoder().decode(payloadBytes));
+                    this.pubsub._handleMessage(topic, message);
+                }
+                catch (error) {
+                    console.error('Error decoding targeted pub/sub message:', error);
                 }
                 break;
             }
@@ -3001,6 +3134,45 @@ export class GenericProvider extends Observable {
         }
     }
     /**
+     * Send a pub/sub message to a single target.
+     *
+     * With `Transport.sendTo` the frame is unicast to that peer; without it the
+     * frame is broadcast with the target embedded and dropped on receipt by
+     * every provider whose `localId` differs.
+     */
+    _sendPubSubTo(target, topic, message) {
+        if (!this.transport.isConnected) {
+            console.warn('Cannot send targeted pub/sub message: not connected');
+            return;
+        }
+        try {
+            const encoder = encoding.createEncoder();
+            encoding.writeVarUint(encoder, MESSAGE_PUBSUB_TARGETED);
+            encoding.writeVarString(encoder, target);
+            encoding.writeVarString(encoder, topic);
+            const messageBytes = new TextEncoder().encode(JSON.stringify(message));
+            encoding.writeVarUint8Array(encoder, messageBytes);
+            const frame = encoding.toUint8Array(encoder);
+            if (this.transport.sendTo) {
+                // Direct delivery to the target peer.
+                const wrapped = wrapMessageWithChecksum(frame);
+                const result = this.transport.sendTo(target, wrapped);
+                if (result instanceof Promise) {
+                    result.catch((error) => {
+                        console.error('Error sending targeted pub/sub message:', error);
+                    });
+                }
+            }
+            else {
+                // Broadcast-and-filter: dropped by non-target providers on receive.
+                this._send(frame);
+            }
+        }
+        catch (error) {
+            console.error('Error sending targeted pub/sub message:', error);
+        }
+    }
+    /**
      * Broadcast awareness state for the specified clients.
      * Throttled to prevent awareness updates from flooding document sync.
      * Multiple rapid updates are batched together.
@@ -3038,6 +3210,63 @@ export class GenericProvider extends Observable {
                 this._sendBatch([...this._takePendingUpdate(), this._encodeAwareness(clientsToSend)]);
             }
         }, delay);
+    }
+    /**
+     * Register the app channel's update listener. Same echo suppression as the
+     * core channel (never re-broadcast what came off the wire), but none of its
+     * presence/removal handling - this channel has no bearing on who the room
+     * thinks is present.
+     */
+    _attachAppAwareness(aw) {
+        if (this._appAwarenessUpdateHandler)
+            return;
+        this._appAwarenessUpdateHandler = ({ added, updated, removed, }, origin) => {
+            if (origin === this)
+                return;
+            const changedClients = [...added, ...updated, ...removed];
+            if (changedClients.length === 0)
+                return;
+            this._broadcastAppAwareness(changedClients);
+        };
+        aw.on('update', this._appAwarenessUpdateHandler);
+    }
+    /**
+     * Broadcast app-channel awareness. Mirrors `_broadcastAwareness()`'s
+     * throttle, against its own pending set and timer, and deliberately does
+     * NOT piggyback on the core sync batch: module cursor churn must not pull
+     * document or presence traffic onto its cadence (or vice versa).
+     */
+    _broadcastAppAwareness(clients) {
+        if (clients.length === 0)
+            return;
+        const interval = this._effectiveAwarenessInterval();
+        if (interval <= 0) {
+            this._sendAppAwarenessNow(clients);
+            return;
+        }
+        for (const client of clients) {
+            this._pendingAppAwarenessClients.add(client);
+        }
+        if (this._appAwarenessTimeoutId !== undefined) {
+            return;
+        }
+        const delay = Math.max(0, interval - (Date.now() - this._lastAppAwarenessTime));
+        this._appAwarenessTimeoutId = setTimeout(() => {
+            this._appAwarenessTimeoutId = undefined;
+            this._lastAppAwarenessTime = Date.now();
+            const clientsToSend = Array.from(this._pendingAppAwarenessClients);
+            this._pendingAppAwarenessClients.clear();
+            if (clientsToSend.length > 0) {
+                this._sendAppAwarenessNow(clientsToSend);
+            }
+        }, delay);
+    }
+    /** Encode and send an app-channel awareness update immediately. */
+    _sendAppAwarenessNow(clients) {
+        const encoder = encoding.createEncoder();
+        encoding.writeVarUint(encoder, MESSAGE_AWARENESS_APP);
+        encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(this.appAwareness, clients));
+        this._send(encoding.toUint8Array(encoder));
     }
     /**
      * Round 5, item 1: the awareness change the throttle is holding rides

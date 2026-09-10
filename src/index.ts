@@ -78,6 +78,21 @@ const MESSAGE_SYNC_PUSH = 6
 // already requires.
 const MESSAGE_PUBSUB_TARGETED = 7
 
+// A second, independent awareness channel for application/module state
+// (cursors, module presence), kept off MESSAGE_AWARENESS deliberately.
+//
+// Upstream's MESSAGE_AWARENESS receive path is now core presence machinery:
+// it feeds _knownPeers, sets _presenceCovered, and cancels pending removal
+// broadcasts. App awareness is written by untrusted third-party classroom
+// modules, so routing it through that path would let module cursor traffic
+// drive the room's peer bookkeeping - a module setting a state would mark
+// phantom peers present and suppress real removals. A separate type keeps
+// the two entirely disjoint: same throttle policy, no shared presence state.
+//
+// (Dev encoded this as a channel varint inside MESSAGE_AWARENESS, which was
+// safe when that path did nothing but applyAwarenessUpdate. It no longer is.)
+const MESSAGE_AWARENESS_APP = 8
+
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -490,6 +505,14 @@ export class GenericProvider extends Observable<string> {
   public readonly doc: Y.Doc
   public readonly transport: Transport
   public readonly awareness: awarenessProtocol.Awareness
+  /**
+   * A second awareness instance for application/module state (cursors,
+   * per-module presence), isolated from `awareness`: the core one carries
+   * the room's own identity/presence and drives peer bookkeeping, this one
+   * is handed to untrusted third-party modules. Separate wire type, separate
+   * throttle, separate state - the two never mix.
+   */
+  public readonly appAwareness: awarenessProtocol.Awareness
   public readonly pubsub: PubSubChannel
 
   private _status: ConnectionStatus = { state: 'disconnected' }
@@ -762,6 +785,13 @@ export class GenericProvider extends Observable<string> {
   private _awarenessTimeoutId?: ReturnType<typeof setTimeout>
   private _lastAwarenessTime: number = 0
 
+  // Independent throttle state for the app awareness channel, so module
+  // cursor churn never delays or coalesces with core presence.
+  private _pendingAppAwarenessClients: Set<number> = new Set()
+  private _appAwarenessTimeoutId?: ReturnType<typeof setTimeout>
+  private _lastAppAwarenessTime: number = 0
+  private _appAwarenessUpdateHandler?: (changed: any, origin: any) => void
+
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
 
@@ -799,6 +829,11 @@ export class GenericProvider extends Observable<string> {
     transport: Transport,
     options: {
       awareness?: awarenessProtocol.Awareness
+      /**
+       * Awareness instance for the application/module channel. Defaults to a
+       * fresh instance on the same doc. See `GenericProvider.appAwareness`.
+       */
+      appAwareness?: awarenessProtocol.Awareness
       /**
        * Interval in milliseconds for periodic sync retries.
        * Helps recover from packet loss. Set to 0 to disable.
@@ -1069,6 +1104,8 @@ export class GenericProvider extends Observable<string> {
     this.transport = transport
     this.pubsub = new PubSubChannel(this)
     this.awareness = options.awareness || new awarenessProtocol.Awareness(doc)
+    this.appAwareness =
+      options.appAwareness || new awarenessProtocol.Awareness(doc)
     this._syncInterval = options.syncInterval ?? 5000
     this._verifyUpdates = options.verifyUpdates ?? true
     this._batchUpdates =
@@ -1218,6 +1255,12 @@ export class GenericProvider extends Observable<string> {
       // (Local awareness goes out inside syncNow()'s batch, or via its
       // throttled fallback - a second broadcast here was a duplicate 100ms
       // later.)
+
+      // The app channel has no equivalent path into syncNow()'s batch, so
+      // its local state is announced here when there is any.
+      if (this.appAwareness.getLocalState() !== null) {
+        this._broadcastAppAwareness([this.doc.clientID])
+      }
 
       // Start periodic sync to handle packet loss
       // Just request sync without sending full state (avoid redundant broadcasts)
@@ -1414,6 +1457,20 @@ export class GenericProvider extends Observable<string> {
     }
     this._pendingAwarenessClients.clear()
 
+    // Same for the app channel's independent throttle.
+    if (this._appAwarenessTimeoutId !== undefined) {
+      clearTimeout(this._appAwarenessTimeoutId)
+      this._appAwarenessTimeoutId = undefined
+
+      if (
+        this._pendingAppAwarenessClients.size > 0 &&
+        this.transport.isConnected
+      ) {
+        this._sendAppAwarenessNow(Array.from(this._pendingAppAwarenessClients))
+      }
+    }
+    this._pendingAppAwarenessClients.clear()
+
     // Disconnect BroadcastChannel
     this._disconnectBroadcastChannel()
 
@@ -1480,6 +1537,14 @@ export class GenericProvider extends Observable<string> {
       )
       this._awarenessUpdateHandler = undefined
     }
+    if (this._appAwarenessUpdateHandler) {
+      this.appAwareness.off('update', this._appAwarenessUpdateHandler)
+      this._appAwarenessUpdateHandler = undefined
+    }
+    if (this._appAwarenessTimeoutId !== undefined) {
+      clearTimeout(this._appAwarenessTimeoutId)
+      this._appAwarenessTimeoutId = undefined
+    }
     if (this._awarenessSweepId !== undefined) {
       clearTimeout(this._awarenessSweepId)
       this._awarenessSweepId = undefined
@@ -1492,6 +1557,7 @@ export class GenericProvider extends Observable<string> {
     }
 
     this.awareness.destroy()
+    this.appAwareness.destroy()
     super.destroy()
   }
 
@@ -2061,6 +2127,24 @@ export class GenericProvider extends Observable<string> {
       this._awarenessUpdateHandler,
     )
 
+    // App channel: same echo suppression (never re-broadcast what came off
+    // the wire), but none of the presence/removal handling above - this
+    // channel has no bearing on who the room thinks is present.
+    this._appAwarenessUpdateHandler = (
+      {
+        added,
+        updated,
+        removed,
+      }: { added: number[]; updated: number[]; removed: number[] },
+      origin: any,
+    ) => {
+      if (origin === this) return
+      const changedClients = [...added, ...updated, ...removed]
+      if (changedClients.length === 0) return
+      this._broadcastAppAwareness(changedClients)
+    }
+    this.appAwareness.on('update', this._appAwarenessUpdateHandler)
+
     // Cleanup: mark as offline and disconnect BC when page unloads
     if (typeof window !== 'undefined') {
       this._beforeUnloadHandler = () => {
@@ -2322,6 +2406,19 @@ export class GenericProvider extends Observable<string> {
         } catch (error) {
           console.error('Error decoding pub/sub message:', error)
         }
+        break
+      }
+
+      case MESSAGE_AWARENESS_APP: {
+        // Deliberately none of the presence bookkeeping the core awareness
+        // case does (_knownPeers, _presenceCovered, removal cancellation):
+        // this channel is written by untrusted modules and must not be able
+        // to influence the room's view of who is present.
+        awarenessProtocol.applyAwarenessUpdate(
+          this.appAwareness,
+          decoding.readVarUint8Array(decoder),
+          this, // origin
+        )
         break
       }
 
@@ -3841,6 +3938,59 @@ export class GenericProvider extends Observable<string> {
         this._sendBatch([...this._takePendingUpdate(), this._encodeAwareness(clientsToSend)])
       }
     }, delay)
+  }
+
+  /**
+   * Broadcast app-channel awareness. Mirrors `_broadcastAwareness()`'s
+   * throttle, against its own pending set and timer, and deliberately does
+   * NOT piggyback on the core sync batch: module cursor churn must not pull
+   * document or presence traffic onto its cadence (or vice versa).
+   */
+  private _broadcastAppAwareness(clients: number[]): void {
+    if (clients.length === 0) return
+
+    const interval = this._effectiveAwarenessInterval()
+
+    if (interval <= 0) {
+      this._sendAppAwarenessNow(clients)
+      return
+    }
+
+    for (const client of clients) {
+      this._pendingAppAwarenessClients.add(client)
+    }
+
+    if (this._appAwarenessTimeoutId !== undefined) {
+      return
+    }
+
+    const delay = Math.max(
+      0,
+      interval - (Date.now() - this._lastAppAwarenessTime),
+    )
+
+    this._appAwarenessTimeoutId = setTimeout(() => {
+      this._appAwarenessTimeoutId = undefined
+      this._lastAppAwarenessTime = Date.now()
+
+      const clientsToSend = Array.from(this._pendingAppAwarenessClients)
+      this._pendingAppAwarenessClients.clear()
+
+      if (clientsToSend.length > 0) {
+        this._sendAppAwarenessNow(clientsToSend)
+      }
+    }, delay)
+  }
+
+  /** Encode and send an app-channel awareness update immediately. */
+  private _sendAppAwarenessNow(clients: number[]): void {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS_APP)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(this.appAwareness, clients),
+    )
+    this._send(encoding.toUint8Array(encoder))
   }
 
   /**

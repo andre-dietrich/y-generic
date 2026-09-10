@@ -4,6 +4,14 @@
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
   "author": "André Dietrich",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andre-dietrich/y-generic.git"
+  },
+  "bugs": {
+    "url": "https://github.com/andre-dietrich/y-generic/issues"
+  },
+  "homepage": "https://github.com/andre-dietrich/y-generic#readme",
   "main": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
   "targets": {

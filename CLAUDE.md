@@ -124,3 +124,53 @@ current behavior.
 - `gun`, `simple-peer`, and `peerjs` are `peerDependencies` marked optional — don't add new
   transport dependencies as regular `dependencies`; follow this pattern (peer + optional) so
   the core package stays dependency-free for consumers who don't need that transport.
+
+## How edrys-Lite uses this library
+
+edrys-Lite (for now at `https://github.com/edrys-labs/edrys-Lite/tree/feat/y-generic`, consuming the published scoped fork
+`@edryslabs/genericprovider`) is the most demanding consumer and the reason several features
+here exist that a plain Yjs provider wouldn't have. Its usage lives in `src/ts/`: two adapters
+behind one internal API (`GenericWebrtcProviderAdapter` in `GenericProviderAdapter.ts`,
+`GenericWebsocketProviderAdapter`), plus `EdrysSimplePeerTransport`, a `SimplePeerTransport`
+subclass. Read those three files before changing anything below — none of it is decorative,
+and each item has a failure mode attached.
+
+- **`appAwareness`** — a second awareness instance on its own wire type (8), handed to
+  untrusted third-party classroom modules for cursors, while the core `awareness` carries
+  edrys' own identity and presence. The two must stay disjoint: the core `MESSAGE_AWARENESS`
+  receive path drives `_knownPeers`/`_presenceCovered` and cancels pending removal broadcasts,
+  so routing module traffic through it would let a module mark phantom peers present and
+  suppress real removals. Don't merge the channels, and don't give the app channel any of that
+  presence bookkeeping. It is built lazily (every y-protocols `Awareness` starts a
+  `setInterval` that only `destroy()` clears) — read `_appAwareness`, not the getter, in
+  teardown paths.
+- **`sendControl` / `onControlFrame` / `disconnectPeer`** (`MSG_TYPE_CONTROL`, 0x02 in
+  simple-peer) — a per-peer side-channel that bypasses the provider pipe entirely. edrys runs
+  a signed identity handshake over it (`CTRL_ID`/`CTRL_HANDSHAKE`) and disconnects peers that
+  fail or never complete it; those frames must not be CRC-verified, decrypted, or decoded as
+  Yjs data. They are dispatched *before* the `!this._callback` guard on purpose: the handshake
+  runs before the provider has registered `onMessage`, so the earlier ordering dropped them.
+- **Set-based `onPeerConnect`/`onPeerDisconnect` in simple-peer** — `EdrysSimplePeerTransport`
+  registers its own listeners while the provider independently registers its own. Single
+  callback slots silently drop whichever registered second; keep these as Sets.
+- **`localId` + `pubsub.publishTo`** (`MESSAGE_PUBSUB_TARGETED`, wire type 7) — direct
+  messages addressed by edrys userid rather than transport peer id. Unicast where the
+  transport implements `sendTo`, broadcast-and-filtered on `localId` otherwise.
+- **`excludeOrigins`** — both adapters pass `[REVERT_INVALID_ORIGIN]`, keeping local rollback
+  transactions off the wire.
+- **`syncMode: 'pull'` + `verifyUpdates: false`** — WebSocket adapter only, and a server
+  constraint rather than a preference: the edrys relay forwards opcodes 0/1/2/7 but drops
+  verified-sync (3), and a pull-only join adopts the server's authoritative document instead
+  of pushing a pre-seeded local copy (which broke signed-state revert on reload). That adapter
+  also detects leaves from a 5 s heartbeat carried in awareness, because WebSocket has no
+  per-peer disconnect to hang `Transport.onPeerDisconnect` on.
+
+**Wire type numbers are not free to renumber.** 0-6 are upstream, 7 is targeted pubsub, 8 is
+app awareness. Reusing one mis-decodes traffic silently rather than failing loudly — when
+upstream took 4 for `MESSAGE_BATCH`, the fork's targeted-pubsub 4 had to move to 7 to avoid
+exactly that. Every peer of a room must run the same version regardless, as the README says.
+
+Note the package identity split: this repo publishes as `genericprovider` upstream, while the
+edrys fork publishes as `@edryslabs/genericprovider`. That difference in `package.json` (name,
+plus `.github/workflows/publish-npm.yml`) is intentional and resolves toward the fork on every
+merge from upstream — it is not a merge artifact to clean up.

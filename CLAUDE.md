@@ -141,9 +141,16 @@ and each item has a failure mode attached.
   receive path drives `_knownPeers`/`_presenceCovered` and cancels pending removal broadcasts,
   so routing module traffic through it would let a module mark phantom peers present and
   suppress real removals. Don't merge the channels, and don't give the app channel any of that
-  presence bookkeeping. It is built lazily (every y-protocols `Awareness` starts a
-  `setInterval` that only `destroy()` clears) — read `_appAwareness`, not the getter, in
-  teardown paths.
+  presence bookkeeping. Having none is also why nothing replays this channel to a late joiner
+  on its own: `_announceAppAwareness()` must stay wired into all four paths where a peer newly
+  needs our state — `connect()`, `_schedulePeerConnectSync()` (mesh), `_schedulePresenceResponse()`
+  (broadcast, and *before* its `getLocalState() === null` return — a peer can hold a cursor with
+  no core state), and `_setupBroadcastChannel()` (other tabs). Dropping one silently kills module
+  cursors for the second peer to join, on that transport class only. It is also built lazily
+  (every y-protocols `Awareness` starts a `setInterval` only `destroy()` clears), so announce and
+  teardown paths read `_appAwareness`, never the getter — constructing one to announce it
+  re-introduces that timer. Gates: `test/dummy/repro-app-awareness-late-join.ts`, and
+  `bench-reload-phantoms`' lifecycle line at 0/0.
 - **`sendControl` / `onControlFrame` / `disconnectPeer`** (`MSG_TYPE_CONTROL`, 0x02 in
   simple-peer) — a per-peer side-channel that bypasses the provider pipe entirely. edrys runs
   a signed identity handshake over it (`CTRL_ID`/`CTRL_HANDSHAKE`) and disconnects peers that
@@ -153,6 +160,12 @@ and each item has a failure mode attached.
 - **Set-based `onPeerConnect`/`onPeerDisconnect` in simple-peer** — `EdrysSimplePeerTransport`
   registers its own listeners while the provider independently registers its own. Single
   callback slots silently drop whichever registered second; keep these as Sets.
+- **simple-peer `scheduleSignalingReconnect` / `signalingHealth` / `pruneStalePeer`** — two
+  silent failures. A dropped signaling socket that is never retried leaves peer discovery dead
+  while `isConnected` still reports true (a lifecycle flag, not a health check — that's
+  `signalingHealth`); and a peer left in `announcedPeers` with no live connection is deduped
+  forever, so it can never reconnect. In `disconnect()`, `_connected = false` must be set
+  *before* closing sockets — `ws.onclose` reads it to tell teardown from a dropped link.
 - **`localId` + `pubsub.publishTo`** (`MESSAGE_PUBSUB_TARGETED`, wire type 7) — direct
   messages addressed by edrys userid rather than transport peer id. Unicast where the
   transport implements `sendTo`, broadcast-and-filtered on `localId` otherwise.

@@ -40,6 +40,7 @@
     "test/dummy/bench-ws-reconnect-storm.ts",
     "test/dummy/bench-gun-awareness-replay.ts",
     "test/dummy/bench-persist-log.ts",
+    "test/dummy/repro-app-awareness-late-join.ts",
     "test/providers/check-chunking.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]

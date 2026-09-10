@@ -1134,6 +1134,16 @@ export declare class GenericProvider extends Observable<string> {
      * presence/removal handling - this channel has no bearing on who the room
      * thinks is present.
      */
+    /**
+     * Announce local app-channel state, if the channel is in use and has any.
+     *
+     * Reads the private field, never the getter: an announce must never be the
+     * thing that constructs the instance (that would re-introduce the eager
+     * timer the lazy getter exists to avoid). A provider whose modules never
+     * touch the channel therefore announces nothing, which is correct - there
+     * is no local state to announce.
+     */
+    private _announceAppAwareness;
     private _attachAppAwareness;
     /**
      * Broadcast app-channel awareness. Mirrors `_broadcastAwareness()`'s

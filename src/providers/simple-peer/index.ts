@@ -202,6 +202,13 @@ export class SimplePeerTransport implements Transport {
   private signalingConns: WebSocket[] = []
   private announcedPeers: Set<string> = new Set()
   private announceInterval?: ReturnType<typeof setInterval>
+  // Per-URL signaling reconnect state. Without these a dropped signaling
+  // socket was removed from signalingConns and never retried: peer discovery
+  // dies silently while isConnected still reports true (it is a lifecycle
+  // flag, not a health check - see signalingHealth).
+  private _reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
+    new Map()
+  private _reconnectAttempts: Map<string, number> = new Map()
 
   /**
    * Create a new SimplePeer transport.
@@ -328,6 +335,17 @@ export class SimplePeerTransport implements Transport {
       `🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`,
     )
 
+    // Cleared FIRST: ws.onclose calls scheduleSignalingReconnect(), which
+    // keys off this flag to tell a deliberate disconnect from a dropped
+    // link. Closing the sockets below while it was still true would arm a
+    // reconnect ramp for a transport that is going away.
+    this._connected = false
+
+    // Drop any reconnect already pending.
+    for (const timer of this._reconnectTimers.values()) clearTimeout(timer)
+    this._reconnectTimers.clear()
+    this._reconnectAttempts.clear()
+
     // Stop re-announce interval
     if (this.announceInterval) {
       clearInterval(this.announceInterval)
@@ -346,7 +364,6 @@ export class SimplePeerTransport implements Transport {
     }
     this.signalingConns = []
 
-    this._connected = false
     this.announcedPeers.clear()
   }
 
@@ -563,6 +580,11 @@ export class SimplePeerTransport implements Transport {
 
   /**
    * Check if connected.
+   *
+   * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
+   * a health check — it stays true with zero signaling servers, which is what
+   * makes BroadcastChannel-only mode work. For "can we still discover peers?"
+   * use `signalingHealth`.
    */
   get isConnected(): boolean {
     return this._connected
@@ -573,6 +595,69 @@ export class SimplePeerTransport implements Transport {
    */
   get connectedPeers(): number {
     return Array.from(this.peers.values()).filter((p) => p.connected).length
+  }
+
+  /**
+   * Signaling/discovery health, for diagnostics and monitoring.
+   *
+   * `isConnected` deliberately cannot express this: a transport whose signaling
+   * sockets have all dropped still reports connected, and peer discovery is
+   * silently dead until they come back.
+   */
+  get signalingHealth(): {
+    open: number
+    configured: number
+    reconnecting: number
+    peers: number
+    connectedPeers: number
+  } {
+    return {
+      open: this.signalingConns.filter((ws) => ws.readyState === 1).length,
+      configured: this.options.signaling.length,
+      reconnecting: this._reconnectTimers.size,
+      peers: this.peers.size,
+      connectedPeers: this.connectedPeers,
+    }
+  }
+
+  /**
+   * Reconnect to a signaling server after it drops, with exponential backoff.
+   *
+   * Mirrors lib0's WebsocketClient (what y-webrtc gets for free): delay grows
+   * as log10(attempts + 1) * 1200ms, capped at 30s. No-ops after an explicit
+   * disconnect(), and never stacks duplicate timers for the same URL.
+   */
+  private scheduleSignalingReconnect(url: string): void {
+    if (!this._connected) return // deliberate disconnect(), not a drop
+    if (this._reconnectTimers.has(url)) return // retry already pending
+
+    const attempts = (this._reconnectAttempts.get(url) ?? 0) + 1
+    this._reconnectAttempts.set(url, attempts)
+
+    const delay = Math.min(Math.log10(attempts + 1) * 1200, 30000)
+    this.log(
+      `🔄 Signaling reconnect #${attempts} for ${url} in ${Math.round(delay)}ms`,
+    )
+
+    this._reconnectTimers.set(
+      url,
+      setTimeout(() => {
+        this._reconnectTimers.delete(url)
+        if (!this._connected) return
+        this.connectSignaling(url).catch(() => {
+          // connectSignaling rejects on error/timeout; onclose schedules the
+          // next attempt, so swallow here to avoid an unhandled rejection.
+        })
+      }, delay),
+    )
+  }
+
+  // Forget a peer we announced but hold no live connection to, so its next
+  // re-announce can reconnect instead of being deduped forever (ghost peer).
+  private pruneStalePeer(peerId: string): void {
+    if (this.announcedPeers.has(peerId) && !this.peers.has(peerId)) {
+      this.announcedPeers.delete(peerId)
+    }
   }
 
   /**
@@ -609,6 +694,8 @@ export class SimplePeerTransport implements Transport {
         }
 
         this.signalingConns.push(ws)
+        // A successful open ends this URL's backoff ramp.
+        this._reconnectAttempts.delete(url)
 
         if (!resolved) {
           resolved = true
@@ -650,6 +737,9 @@ export class SimplePeerTransport implements Transport {
         if (index > -1) {
           this.signalingConns.splice(index, 1)
         }
+        // Retry unless this was a deliberate disconnect() - otherwise the
+        // room keeps its existing peers but can never discover new ones.
+        this.scheduleSignalingReconnect(url)
       }
 
       // Timeout after 10 seconds
@@ -676,6 +766,7 @@ export class SimplePeerTransport implements Transport {
         // This is an envelope, the actual message could be an announce or signal
         if (msg.from) {
           // Treat as announce if it's a publish from another peer
+          this.pruneStalePeer(msg.from)
           if (
             !this.peers.has(msg.from) &&
             this.peers.size < this.options.maxConns &&
@@ -717,6 +808,7 @@ export class SimplePeerTransport implements Transport {
           return
         }
         // Another peer announced - connect to them if we have capacity
+        this.pruneStalePeer(msg.from)
         if (
           !this.peers.has(msg.from) &&
           this.peers.size < this.options.maxConns &&

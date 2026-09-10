@@ -808,9 +808,7 @@ export class GenericProvider extends Observable {
             // later.)
             // The app channel has no equivalent path into syncNow()'s batch, so
             // its local state is announced here when there is any.
-            if (this._appAwareness?.getLocalState() != null) {
-                this._broadcastAppAwareness([this.doc.clientID]);
-            }
+            this._announceAppAwareness();
             // Start periodic sync to handle packet loss
             // Just request sync without sending full state (avoid redundant broadcasts)
             // _sendSyncStep1() already checks the shared rate limiter internally
@@ -1417,6 +1415,13 @@ export class GenericProvider extends Observable {
             this._pendingPeerConnectIds.clear();
             if (!this.transport.isConnected || this._destroying)
                 return;
+            // A newly-joined mesh peer has no app-channel state for us yet: the
+            // digest beacon below covers the document, and the core awareness
+            // channel re-broadcasts on its own, but nothing replays app awareness.
+            // Pre-merge this rode along as a second _broadcastAwareness() on the
+            // APP channel here; the digest-beacon rewrite dropped it, which is why
+            // cursors were invisible to whichever peer joined second.
+            this._announceAppAwareness();
             if (typeof this.transport.sendTo === 'function' && ids.length > 0) {
                 // Round 5, item 5: one plain beacon to each new peer, nothing to
                 // the rest of the mesh. Not rate-limited as a request: it answers
@@ -2135,6 +2140,14 @@ export class GenericProvider extends Observable {
             this._presencePending.clear();
             if (this._destroying || !this.transport.isConnected)
                 return;
+            // The app channel has no presence machinery of its own (deliberately -
+            // it must not drive _knownPeers), so it has nothing that would tell a
+            // joiner about existing cursors. A JOIN is the one signal that someone
+            // needs our state, so answer it on both channels. Sent on its own wire
+            // type and its own throttle; the relay/unicast fan-out optimisations
+            // below apply to core presence only, since the app table is typically
+            // a few cursors rather than the room's full census.
+            this._announceAppAwareness();
             if (this.awareness.getLocalState() === null)
                 return;
             // Every joiner covered by this timer is addressable: one unicast
@@ -3217,6 +3230,20 @@ export class GenericProvider extends Observable {
      * presence/removal handling - this channel has no bearing on who the room
      * thinks is present.
      */
+    /**
+     * Announce local app-channel state, if the channel is in use and has any.
+     *
+     * Reads the private field, never the getter: an announce must never be the
+     * thing that constructs the instance (that would re-introduce the eager
+     * timer the lazy getter exists to avoid). A provider whose modules never
+     * touch the channel therefore announces nothing, which is correct - there
+     * is no local state to announce.
+     */
+    _announceAppAwareness() {
+        if (this._appAwareness?.getLocalState() != null) {
+            this._broadcastAppAwareness([this.doc.clientID]);
+        }
+    }
     _attachAppAwareness(aw) {
         if (this._appAwarenessUpdateHandler)
             return;
@@ -3419,6 +3446,19 @@ export class GenericProvider extends Observable {
                 this.doc.clientID,
             ]));
             this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)));
+        }
+        // Same for the app channel: ongoing changes reach other tabs for free
+        // (_sendAppAwarenessNow goes through _send, which publishes to BC), but
+        // the connect-time announce does not - so without this a second tab saw
+        // the first tab's presence and never its cursors. Guarded on the private
+        // field, like every other announce: never construct the instance here.
+        if (this._appAwareness?.getLocalState() != null) {
+            const encoderApp = encoding.createEncoder();
+            encoding.writeVarUint(encoderApp, MESSAGE_AWARENESS_APP);
+            encoding.writeVarUint8Array(encoderApp, awarenessProtocol.encodeAwarenessUpdate(this._appAwareness, [
+                this.doc.clientID,
+            ]));
+            this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderApp)));
         }
     }
     /**

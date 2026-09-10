@@ -68,6 +68,16 @@ const DIGEST_FLAG_SETTLED = 8
 // docs/superpowers/specs/2026-09-05-resync-cascade-design.md.
 const MESSAGE_SYNC_PUSH = 6
 
+// Pub/sub message aimed at a single target: [target][topic][message]. Every
+// provider whose `localId` differs drops it. On transports with sendTo it is
+// unicast; elsewhere it is broadcast and filtered on receipt.
+//
+// NOTE: this was type 4 before the v1.5.0 merge, which upstream had taken for
+// MESSAGE_BATCH. Renumbered to 7 (the first free slot) - the two are not wire
+// compatible, so all peers of a room must run the same version, as the README
+// already requires.
+const MESSAGE_PUBSUB_TARGETED = 7
+
 /**
  * CRC32 lookup table for fast computation.
  * Generated once and reused for all CRC calculations.
@@ -396,6 +406,21 @@ export class PubSubChannel extends Observable<string> {
   }
 
   /**
+   * Publish a message to a single target instead of broadcasting.
+   *
+   * On transports with `sendTo`, `target` is the peer's ID and delivery is
+   * direct. On transports without it, the message is broadcast with the
+   * target embedded and dropped by every provider whose `localId` differs.
+   *
+   * @param target - Recipient id (transport peerId, or a `localId`)
+   * @param topic - Topic name
+   * @param message - Any JSON-serializable data
+   */
+  publishTo(target: string, topic: string, message: any): void {
+    this.provider._sendPubSubTo(target, topic, message)
+  }
+
+  /**
    * Subscribe to messages on a topic.
    *
    * @param topic - Topic name to listen to (use '*' for all topics)
@@ -714,6 +739,17 @@ export class GenericProvider extends Observable<string> {
   // `_batchTimeoutId` is set only for the timed (`batchUpdates > 0`) flush;
   // `_flushScheduled` covers both.
   private _batchUpdates: number = 0 // milliseconds delay (0 = end of current task)
+
+  // Origins whose updates are never sent to the transport (local-only txns).
+  private _excludeOrigins: Set<any> = new Set()
+
+  // This provider's identity, used to filter targeted pubsub messages.
+  private _localId?: string
+
+  // 'pull' never pushes local state unasked - for read-mostly replicas that
+  // must not write into the room.
+  private _syncMode: 'push-pull' | 'pull' = 'push-pull'
+
   private _pendingUpdate: Uint8Array | null = null
   private _batchTimeoutId?: ReturnType<typeof setTimeout>
   private _flushScheduled: boolean = false
@@ -823,6 +859,26 @@ export class GenericProvider extends Observable<string> {
        * @default 20
        */
       maxSyncRequestsPerWindow?: number
+      /**
+       * Transaction origins whose updates should not be sent to peers.
+       * Updates from these origins stay local (never reach the transport).
+       * @default [] (no origins excluded)
+       */
+      excludeOrigins?: any[]
+      /**
+       * This provider's identity for targeted pubsub (publishTo).
+       * On transports without sendTo, targeted messages are broadcast and
+       * dropped by every provider whose localId differs.
+       */
+      localId?: string
+      /**
+       * 'pull' never sends local state unasked: no connect-time push, no
+       * periodic push - the provider only answers requests and applies what
+       * it receives. For read-mostly replicas that must not write into the
+       * room.
+       * @default 'push-pull'
+       */
+      syncMode?: 'push-pull' | 'pull'
       /**
        * Rolling time window (ms) over which `maxSyncRequestsPerWindow` is
        * enforced.
@@ -1020,6 +1076,9 @@ export class GenericProvider extends Observable<string> {
     this._disableBc = options.disableBc ?? false
     this._awarenessInterval =
       options.awarenessInterval ?? transport.preferredAwarenessMs ?? 100
+    this._excludeOrigins = new Set(options.excludeOrigins ?? [])
+    this._localId = options.localId
+    this._syncMode = options.syncMode ?? 'push-pull'
     this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20
     this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000
     this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30
@@ -1578,7 +1637,11 @@ export class GenericProvider extends Observable<string> {
     // rate-limit slot is confirmed reserved (see _trySyncPushPull's doc).
     let awarenessBatched = false
     const sent = this._trySyncPushPull(
-      true,
+      // 'pull': send the beacon but never the full-state push. A relay or
+      // server holds authoritative state and we adopt it rather than pushing
+      // a competing local copy on every (re)connect. Peers that are actually
+      // behind us still ask, and we still answer - the beacon reconciles.
+      this._syncMode !== 'pull',
       () => {
         const msg = this._tryImmediateAwarenessMessage([this.doc.clientID])
         if (msg) {
@@ -1836,7 +1899,12 @@ export class GenericProvider extends Observable<string> {
       // Don't send updates that originated from this provider (received
       // from the wire) or from the local load connect() is waiting for.
       if (origin !== this && !this._loading) {
+        // Local-only transaction origins (e.g. a rollback the peer must not
+        // replicate) never reach the transport.
+        if (this._excludeOrigins.has(origin)) return
         this._markActivity()
+        // 'pull' replicas answer requests but never push unasked.
+        if (this._syncMode === 'pull') return
         this._batchUpdate(update)
       }
     }
@@ -2253,6 +2321,25 @@ export class GenericProvider extends Observable<string> {
           this.pubsub._handleMessage(topic, message)
         } catch (error) {
           console.error('Error decoding pub/sub message:', error)
+        }
+        break
+      }
+
+      case MESSAGE_PUBSUB_TARGETED: {
+        const target = decoding.readVarString(decoder)
+        const topic = decoding.readVarString(decoder)
+        const payloadBytes = decoding.readVarUint8Array(decoder)
+
+        // Drop messages aimed at someone else (broadcast-and-filter path).
+        if (this._localId !== undefined && target !== this._localId) {
+          break
+        }
+
+        try {
+          const message = JSON.parse(new TextDecoder().decode(payloadBytes))
+          this.pubsub._handleMessage(topic, message)
+        } catch (error) {
+          console.error('Error decoding targeted pub/sub message:', error)
         }
         break
       }
@@ -3664,6 +3751,48 @@ export class GenericProvider extends Observable<string> {
       this._send(encoding.toUint8Array(encoder))
     } catch (error) {
       console.error('Error sending pub/sub message:', error)
+    }
+  }
+
+  /**
+   * Send a pub/sub message to a single target.
+   *
+   * With `Transport.sendTo` the frame is unicast to that peer; without it the
+   * frame is broadcast with the target embedded and dropped on receipt by
+   * every provider whose `localId` differs.
+   */
+  _sendPubSubTo(target: string, topic: string, message: any): void {
+    if (!this.transport.isConnected) {
+      console.warn('Cannot send targeted pub/sub message: not connected')
+      return
+    }
+
+    try {
+      const encoder = encoding.createEncoder()
+      encoding.writeVarUint(encoder, MESSAGE_PUBSUB_TARGETED)
+      encoding.writeVarString(encoder, target)
+      encoding.writeVarString(encoder, topic)
+
+      const messageBytes = new TextEncoder().encode(JSON.stringify(message))
+      encoding.writeVarUint8Array(encoder, messageBytes)
+
+      const frame = encoding.toUint8Array(encoder)
+
+      if (this.transport.sendTo) {
+        // Direct delivery to the target peer.
+        const wrapped = wrapMessageWithChecksum(frame)
+        const result = this.transport.sendTo(target, wrapped)
+        if (result instanceof Promise) {
+          result.catch((error) => {
+            console.error('Error sending targeted pub/sub message:', error)
+          })
+        }
+      } else {
+        // Broadcast-and-filter: dropped by non-target providers on receive.
+        this._send(frame)
+      }
+    } catch (error) {
+      console.error('Error sending targeted pub/sub message:', error)
     }
   }
 

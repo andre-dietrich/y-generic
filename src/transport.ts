@@ -28,23 +28,29 @@ export interface Transport {
   send(data: Uint8Array): void | Promise<void>
 
   /**
-   * Optional: send binary data to a single peer instead of broadcasting.
-   * Only transports with a peer concept (e.g. WebRTC) can implement this.
-   * When absent, the provider falls back to broadcast-and-filter.
-   *
-   * @param peerId - Target peer's ID
-   * @param data - Binary data to send
-   */
-  sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
-
-  /**
    * Register a callback for incoming binary data.
    * The transport calls this callback whenever data is received.
    *
-   * @param callback - Function to call with received data
+   * @param callback - Function to call with received data. Transports that
+   * know which peer a message came from pass that peer's address as the
+   * second argument (the same id `sendTo` accepts); relays that only see a
+   * room call it with the data alone. GenericProvider remembers the address
+   * per remote clientID and, when `sendTo` exists, answers that peer's
+   * requests directly instead of broadcasting the reply to the room.
    * @returns Cleanup function to unregister the callback
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void
+
+  /**
+   * Optional: send binary data to ONE peer, identified by the address the
+   * transport passed as `from` to the onMessage callback. Mesh transports
+   * (peerjs, simple-peer, trystero) implement this with the peer's data
+   * channel; relays leave it undefined and every reply stays a broadcast,
+   * exactly as before this method existed. When present, SyncStep2 replies,
+   * acks and presence responses to a join go to the requester only: N-1
+   * deliveries per request become 1.
+   */
+  sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
 
   /**
    * Optional: register a callback that fires whenever a new peer data channel
@@ -57,41 +63,16 @@ export interface Transport {
   onPeerConnect?(callback: (peerId: string) => void): () => void
 
   /**
-   * Optional: register a callback that fires when a connected peer disconnects
-   * (channel close or error). Consumers use this for presence/leave tracking.
-   *
-   * @param callback - Function to call with the departed peer's ID
-   * @returns Cleanup function to unregister the callback
+   * Optional: the counterpart of onPeerConnect - fires when a peer's data
+   * channel closes (mesh transports) or the backend's presence service
+   * reports it gone (PubNub leave/timeout). The id is the one `onMessage`
+   * passed as `from` for that peer. GenericProvider then drops that peer's
+   * awareness state at once instead of after the awareness lease, forgets
+   * its address, and - since departures are reported by the transport -
+   * lets `awarenessTimeoutMs` default to a long safety net, which removes
+   * the 15 s awareness renewal broadcasts (round 5, item 2).
    */
   onPeerDisconnect?(callback: (peerId: string) => void): () => void
-
-  /**
-   * Optional: per-peer control side-channel that bypasses the provider pipe.
-   * For consumer-defined out-of-band exchanges (identity/auth handshakes) that
-   * must not be CRC-verified or decoded as Yjs/pubsub data. Only transports
-   * with a peer concept implement these.
-   *
-   * @param peerId - Target peer's ID
-   * @param payload - Small binary payload (not chunked/encrypted by the transport)
-   */
-  sendControl?(peerId: string, payload: Uint8Array): void
-
-  /**
-   * Optional: tear down a single peer connection (e.g. reject a peer that
-   * failed an out-of-band handshake). Only transports with a peer concept
-   * implement this.
-   *
-   * @param peerId - Peer to disconnect
-   */
-  disconnectPeer?(peerId: string): void
-
-  /**
-   * Optional: register a callback for incoming control frames.
-   *
-   * @param callback - Function called with (senderPeerId, payload)
-   * @returns Cleanup function to unregister the callback
-   */
-  onControlFrame?(callback: (peerId: string, payload: Uint8Array) => void): () => void
 
   /**
    * Check if the transport is currently connected.
@@ -109,6 +90,40 @@ export interface Transport {
    * without reducing round trips that were already cheap.
    */
   readonly preferredBatchMs?: number
+
+  /**
+   * Optional hint: the round-trip time class (ms) this transport expects -
+   * e.g. ~700 for a Matrix homeserver long-poll, ~500 for a Gun relay
+   * mesh, undefined for low-latency push transports. GenericProvider uses
+   * it to seed its round-trip estimate before the first measured sample
+   * arrives, so the first response wait after a join and the first reply
+   * suppression window already fit the transport instead of the
+   * low-latency defaults (measured before this hint: on a 350 ms profile a
+   * 100-peer join burst spent most of its traffic on retries fired before
+   * the first replies could have arrived). Replaced by measured samples as
+   * soon as they exist.
+   */
+  readonly expectedRttMs?: number
+
+  /**
+   * Optional hint: default for `compressionThresholdBytes` when the caller
+   * passes nothing. Transports that cap a single message (PubNub 32 KiB,
+   * Ably 64 KiB, Matrix 64 KiB, Nostr 64 KiB) or bill per delivered size
+   * (Ably, 5 KiB units) set this so a full-document push is compressed
+   * before it is chunked. Changes the transport's default wire format (a
+   * 1-byte flag on every message) - all peers of a room must run the same
+   * library version, as the README already requires. An explicit
+   * `compressionThresholdBytes: 0` still disables compression.
+   */
+  readonly preferredCompressMinBytes?: number
+
+  /**
+   * Optional hint: default for `awarenessInterval` (ms). A transport whose
+   * backend rate-limits sends per user (Synapse: 0.2 messages/s, burst 10
+   * by default) sets this well above the 100 ms default, so cursor traffic
+   * does not spend the burst within seconds.
+   */
+  readonly preferredAwarenessMs?: number
 }
 
 /**
@@ -121,6 +136,20 @@ export interface ConnectionConfig {
 
   /** Optional password for encrypted communication */
   password?: string
+
+  /**
+   * Optional: a promise GenericProvider.connect() awaits after the
+   * transport is connected and before it sends its first sync - typically
+   * the connect() promise of a persistence provider (IndexedDB) on the same
+   * document. Sent before the local copy is loaded, the first beacon
+   * carries an empty state vector and the room answers with the whole
+   * document although it is already on disk (round 5, item 7). While
+   * waiting, doc updates are treated as the load and not broadcast, and
+   * the loaded state then counts as confirmed by the room (no full-state
+   * push): the beacon reconciles both directions. Incoming messages are
+   * processed while waiting; a rejected promise is ignored.
+   */
+  waitFor?: Promise<unknown>
 
   /** Any other backend-specific configuration */
   [key: string]: any

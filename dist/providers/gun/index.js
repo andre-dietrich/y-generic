@@ -75,6 +75,15 @@ function addCRC32Header(data) {
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
+// A presence slot older than this is ignored on receipt: the relay keeps
+// every slot ever written and `.map().on()` replays all of them to a
+// joiner, so without a bound a joiner inherited one phantom presence per
+// connection the room ever had (round 7, item 5; measured 55 phantoms for
+// 60 slots in test/dummy/bench-gun-awareness-replay.ts). A live slot is
+// rewritten every lease/2 (at most 150 s at the playgrounds' 120 s lease),
+// so 5 min is never reached by one; a bound the size of the lease would
+// make a peer whose clock runs a minute or two off invisible to everyone.
+const AWARENESS_MAX_AGE_MS = 5 * 60000;
 /**
  * GunDB transport implementation.
  * Creates decentralized P2P connections using Gun graph database.
@@ -91,6 +100,8 @@ export class GunTransport {
      * @param options - Configuration options (must include gun constructor)
      */
     constructor(options) {
+        // Relay mesh with its own debounce/throttle: a few hundred ms round trip.
+        this.expectedRttMs = 500;
         this._connected = false;
         this._room = '';
         this.gun = null;
@@ -99,12 +110,12 @@ export class GunTransport {
         this.lastUpdateTime = 0;
         this.updateBatch = [];
         this.processedUpdates = new Set();
-        this.connectionTime = 0;
         this.pendingUpdates = new Map();
         this.updateSlot = 0;
         this.BUFFER_SIZE = 20; // Circular buffer size
         this.awarenessListener = null;
         this.lastAwarenessId = ''; // Track last awareness ID to avoid processing our own
+        this.ownAwarenessId = null; // Stable per-client slot key under the awareness node
         this.encryptionEnabled = false;
         // Persistence
         this.persistentMode = false;
@@ -114,6 +125,8 @@ export class GunTransport {
         this.savePending = false;
         /** Data loaded from Gun snapshot before onMessage callback is registered */
         this.pendingLoad = null;
+        /** True once loadSnapshot()'s initial Gun read has completed */
+        this.snapshotLoaded = false;
         if (!options.gun) {
             throw new Error('GunTransport requires the "gun" option. ' +
                 'Please provide the Gun constructor: ' +
@@ -146,7 +159,6 @@ export class GunTransport {
             throw new Error('Already connected');
         }
         this._room = config.room;
-        this.connectionTime = Date.now();
         this.persistentMode = config.persistent ?? false;
         this.persistDoc = config.doc ?? null;
         this.persistDebounceMs = config.persistDebounceMs ?? 2000;
@@ -160,10 +172,22 @@ export class GunTransport {
             radisk: false, // Disable radisk
             ...this.options.gunOptions,
         };
-        // Add peers if specified
+        // Add peers if specified. Gun wants full URLs ending in the relay's
+        // path (`http://host:8765/gun`; it turns http(s) into ws(s) itself) -
+        // a bare `host:8765` never connects and Gun says nothing. Fill in what
+        // is missing: http:// (https:// only if the relay has a certificate),
+        // and /gun when there is no path.
         if (this.options.peers.length > 0) {
-            gunConfig.peers = this.options.peers;
-            this.log('📡 Connecting to peers:', this.options.peers);
+            const peers = this.options.peers.map((peer) => {
+                let url = peer.trim();
+                if (!/^(https?|wss?):\/\//i.test(url))
+                    url = 'http://' + url;
+                if (/^(https?|wss?):\/\/[^/]+\/?$/i.test(url))
+                    url = url.replace(/\/?$/, '/gun');
+                return url;
+            });
+            gunConfig.peers = peers;
+            this.log('📡 Connecting to peers:', peers);
         }
         this.gun = new this.options.gun(gunConfig);
         // Navigate to room node
@@ -175,8 +199,42 @@ export class GunTransport {
         // Subscribe to updates from Gun (both doc sync and awareness)
         this.setupUpdateListener();
         this.setupAwarenessListener();
+        // Wait for the first relay to say hi before anything is written: a put
+        // made before the websocket is up is stored by the relay but not pushed
+        // to peers already subscribed (measured 2026-09-07 with two Node peers
+        // on gun's own examples/http.js relay: the joiner's JOIN batch and
+        // presence, written ~10 ms before 'hi', never reached the settled
+        // peer; every later write did). GenericProvider sends its connect
+        // batch the moment connect() resolves, so resolve after 'hi' - or after
+        // a short timeout for a relay that is down or a local-only instance.
+        if (this.options.peers.length > 0) {
+            await new Promise((resolve) => {
+                let done = false;
+                const finish = () => {
+                    if (done)
+                        return;
+                    done = true;
+                    clearTimeout(timer);
+                    resolve();
+                };
+                const timer = setTimeout(() => {
+                    this.log('⏱️ No relay said hi within 3 s, continuing');
+                    finish();
+                }, 3000);
+                try {
+                    this.gun.on('hi', (peer) => {
+                        this.log('🤝 Relay connected:', peer?.url ?? peer?.id ?? '?');
+                        finish();
+                    });
+                }
+                catch {
+                    finish();
+                }
+            });
+        }
         this._connected = true;
         // Persistence: load existing snapshot or clear it for a fresh session
+        this.snapshotLoaded = false;
         if (this.persistentMode) {
             this.loadSnapshot();
         }
@@ -232,10 +290,6 @@ export class GunTransport {
                 return;
             if (!update || !update.data)
                 return;
-            // Only process updates newer than our connection time
-            if (update.timestamp && update.timestamp < this.connectionTime) {
-                return;
-            }
             // Use sequence number for deduplication
             const sequence = update.sequence || Math.floor(update.timestamp / 100);
             const updateKey = `${updateId}-${sequence}`;
@@ -342,6 +396,11 @@ export class GunTransport {
         this.processPendingUpdates();
         // Flush any pending updates
         this.flushBatch();
+        // Take our presence slot with us; a crashed tab's slot ages out at the
+        // receivers instead (AWARENESS_MAX_AGE_MS).
+        if (this.ownAwarenessId && this.roomNode) {
+            this.roomNode.get('awareness').get(this.ownAwarenessId).put(null);
+        }
         // Remove listeners
         if (this.updateListener) {
             // Gun doesn't have a clear off() method for map listeners
@@ -359,6 +418,7 @@ export class GunTransport {
         this.persistentMode = false;
         this.persistDoc = null;
         this.pendingLoad = null;
+        this.snapshotLoaded = false;
         this.log('✅ Disconnected');
     }
     /**
@@ -407,9 +467,10 @@ export class GunTransport {
         return data[4];
     }
     /**
-     * Send awareness update to a separate volatile node.
-     * Awareness is ephemeral - only the latest state matters.
-     * Each client writes to its own awareness slot to avoid overwrites.
+     * Send awareness update to a per-client slot under the awareness node.
+     * Awareness is ephemeral - only the latest state per client matters.
+     * Each client writes to its own slot (keyed by a stable per-connection id)
+     * so peers never overwrite each other's presence data.
      */
     async sendAwareness(data) {
         let payload = this.uint8ArrayToBase64(data);
@@ -417,12 +478,16 @@ export class GunTransport {
         if (this.encryptionEnabled) {
             payload = await this.encrypt(payload);
         }
-        const awarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+        // Generated once per connection and reused for every broadcast, so all
+        // of this client's updates land in the same slot instead of each
+        // clobbering a shared node.
+        if (!this.ownAwarenessId) {
+            this.ownAwarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+        }
+        const awarenessId = this.ownAwarenessId;
         // Track this ID so we don't process our own update
         this.lastAwarenessId = awarenessId;
-        // Write to a single volatile awareness node
-        // Each update overwrites the previous - awareness only needs latest state
-        this.roomNode.get('awareness').put({
+        this.roomNode.get('awareness').get(awarenessId).put({
             data: payload,
             id: awarenessId,
             timestamp: Date.now(),
@@ -432,18 +497,23 @@ export class GunTransport {
     }
     /**
      * Setup listener for awareness updates (separate from doc sync).
+     * Uses .map() so every existing per-client slot is replayed on subscribe
+     * (late joiners learn about already-present peers), not just the most
+     * recently written one.
      */
     setupAwarenessListener() {
         this.awarenessListener = this.roomNode
             .get('awareness')
+            .map()
             .on(async (awareness) => {
             if (!awareness || !awareness.data)
                 return;
             // Skip our own awareness updates
             if (awareness.id === this.lastAwarenessId)
                 return;
-            // Only process updates newer than our connection
-            if (awareness.timestamp && awareness.timestamp < this.connectionTime) {
+            // Skip the presence of connections long gone (see AWARENESS_MAX_AGE_MS)
+            if (typeof awareness.timestamp === 'number' &&
+                Date.now() - awareness.timestamp > AWARENESS_MAX_AGE_MS) {
                 return;
             }
             try {
@@ -598,6 +668,13 @@ export class GunTransport {
     async saveSnapshot() {
         if (!this.persistDoc || !this.persistentMode || !this.roomNode)
             return;
+        if (!this.snapshotLoaded) {
+            // The initial Gun read hasn't resolved yet — saving now could clobber
+            // the real persisted state with our still-unmerged local doc. Retry
+            // shortly instead of writing.
+            this.persistTimer = setTimeout(() => this.saveSnapshot(), 100);
+            return;
+        }
         if (this.isWritingToGun) {
             this.savePending = true;
             return;
@@ -639,11 +716,11 @@ export class GunTransport {
      */
     loadSnapshot() {
         this.roomNode.get('snapshot').once(async (snap) => {
-            if (!snap || !snap.data || snap.cleared) {
-                this.log('📭 No snapshot found in Gun');
-                return;
-            }
             try {
+                if (!snap || !snap.data || snap.cleared) {
+                    this.log('📭 No snapshot found in Gun');
+                    return;
+                }
                 let payload = snap.data;
                 if (snap.encrypted && this.encryptionEnabled) {
                     const decrypted = await this.decrypt(payload);
@@ -670,6 +747,11 @@ export class GunTransport {
             catch (error) {
                 this.log('❌ Error loading snapshot:', error);
                 console.warn('GunTransport: Failed to load snapshot:', error);
+            }
+            finally {
+                // Only now is it safe for saveSnapshot() to write — the local doc
+                // has had a chance to merge in whatever Gun had stored.
+                this.snapshotLoaded = true;
             }
         });
     }

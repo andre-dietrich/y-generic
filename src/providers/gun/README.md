@@ -43,6 +43,93 @@ const provider = new GenericProvider(doc, transport)
 await provider.connect({ room: 'my-room' })
 ```
 
+### Local relay for tests
+
+```
+npm install --no-save gun
+node node_modules/gun/examples/http.js 8767      # a relay from the same gun version, http://localhost:8767/gun
+npx tsc -p tsconfig.bench.json
+GUN_PEER=http://localhost:8767/gun node test/gun/live-relay.mjs   # or without GUN_PEER: the script starts its own relay
+```
+
+Three things decide whether a relay delivers live writes at all - each
+measured 2026-09-07 with two Node peers; in every failing case the
+subscriber receives what existed before it subscribed and nothing written
+afterwards, with no error anywhere:
+
+- **Reach it by an IPv4 address.** `localhost` resolves to the IPv6 `::1`
+  on current systems, and over that loopback Gun's live writes are lost;
+  `127.0.0.1` and the LAN address work. This also caught the transport's
+  own tests until they used the LAN address.
+- **No docker port mapping.** Behind `-p 8765:8765` (bridge + docker-proxy)
+  live writes are lost too; `--network host` (Linux) or a relay run
+  natively works. `test/gun/relay.sh` does the former.
+- **One relay per LAN.** Every Gun relay multicasts on 233.255.255.255:8765
+  and meshes with the others it finds (they also share peer lists); with
+  two relays reachable, propagation became erratic. The script's relay
+  runs with multicast and AXE off.
+
+The `gundb/gun` docker image (2021, Gun 0.2020.520) was inconsistent in
+these tests, but it was always behind port mapping and reached by
+`localhost`, so its version is not established as a cause; pinning the
+clients' 0.2020.1241 costs nothing.
+
+`connect()` resolves only after the first relay has said `hi` (3 s
+timeout for a local-only instance): a put made before the websocket is up
+is stored by the relay but not pushed to peers already subscribed, and
+GenericProvider sends its join batch the moment `connect()` resolves.
+
+`test/gun/live-relay.mjs` runs two Node peers through the relay and
+reports convergence, the idle cost of a minute (Gun has no leave signal,
+so what remains are the presence renewals of the lease - the playground
+uses 120 s - and the backed-off beacons), the cost of a reconnect (no
+full-state push since round 5), and how long a silently departed peer
+lingers (until the lease).
+
+Presence lives in one Gun slot per connection under the room's
+`awareness` node, and the relay keeps every slot ever written. A joiner
+therefore receives all of them, but ignores any older than five minutes
+(a live slot is rewritten every lease/2), and a clean `disconnect()`
+nulls its own slot - so a joiner no longer inherits one phantom presence
+per connection the room ever had (`test/dummy/bench-gun-awareness-replay.ts`).
+
+### A local relay for a classroom (LAN)
+
+Gun's own relay is one file in the package; it needs Node and nothing
+else. On the teacher's machine (or any box in the room):
+
+```
+mkdir gun-relay && cd gun-relay
+npm init -y && npm install gun            # the same 0.2020.x line as the clients (the CDN gun.js is the latest)
+node node_modules/gun/examples/http.js 8765
+```
+
+It listens on every interface, answers websocket at `/gun`, restarts
+itself after a crash (Node cluster), and stores what it relays in
+`./radata/` - delete that folder for a clean slate. Clients use
+`http://<LAN address>:8765/gun` (`hostname -I` or `ip addr` shows the
+address; open the port in the firewall, e.g. `sudo ufw allow 8765/tcp`).
+The scheme and the `/gun` path matter: Gun turns `http://` into `ws://`
+itself and a bare `host:8765` never connects; the transport fills in
+`http://` and `/gun` when they are missing (`https://` only if the relay
+has a certificate). Use the IPv4 address, not `localhost` - see below.
+`PORT=8765`, `PEERS=https://other-relay/gun` and `HTTPS_KEY`/`HTTPS_CERT`
+are the environment knobs. A page served over **https** cannot open a
+plain-http websocket (mixed content): serve the course over http on the
+LAN as well, or give the relay a certificate through `HTTPS_KEY`/`HTTPS_CERT`.
+
+The same with docker: the image `liascript/gundb` (built from
+`Docker/gun/`: gun pinned to the clients' version, multicast and AXE off,
+the container detects its LAN address itself and, with `MODE=https`,
+generates a self-signed certificate for it on first start) - run it with
+`test/gun/relay.sh` (Linux; `MODE=https`), or directly:
+
+```
+docker run -d --name gun-relay --network host -v gun-relay-data:/srv liascript/gundb
+docker run -d --name gun-relay --network host -v gun-relay-data:/srv -e MODE=https liascript/gundb
+docker logs gun-relay        # prints the address to enter
+```
+
 ### With Relay Servers
 
 For cross-device synchronization, use public Gun relays:

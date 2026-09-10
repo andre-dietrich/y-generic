@@ -1,4 +1,18 @@
+import * as Y from 'yjs'
+import * as encoding from 'lib0/encoding'
 import type { Transport, ConnectionConfig } from '../../transport'
+import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
+
+// GenericProvider's frame types this transport looks at (see src/index.ts).
+const MESSAGE_AWARENESS = 1
+const MESSAGE_SYNC_PUSH = 6
+
+// Realtime caps a broadcast at 256 KB on the free tier (3 MB above). Below
+// this the raw bytes go out as a binary payload (supabase-js >= 2.91.0 on
+// EVERY peer - an older client drops binary broadcasts silently); above
+// it, base64 chunks in the JSON path.
+const MAX_BINARY_BYTES = 200000
+const MAX_CHUNK_CHARS = 200000
 
 // ---------------------------------------------------------------------------
 // Constructor options
@@ -93,6 +107,22 @@ export interface SupabaseConfig extends ConnectionConfig {
   room: string
   /** Optional password to secure the room */
   password?: string
+  /**
+   * Persist the document in a table so a room survives its last peer
+   * leaving: the full state is loaded on connect and written (debounced)
+   * after every document update. Needs a table with columns `id TEXT
+   * PRIMARY KEY`, `content TEXT` (see the README for the SQL and the RLS
+   * policy the anon key needs). Not usable together with
+   * `compressionThresholdBytes` (this transport reads the frame's type
+   * byte at a fixed offset). @default false
+   */
+  persistent?: boolean
+  /** The Y.Doc to persist. Required when persistent is true. */
+  doc?: Y.Doc
+  /** Table name. @default 'yjs_documents' */
+  tableName?: string
+  /** Debounce delay in ms before a database write. @default 2000 */
+  persistDebounceMs?: number
   /** Enable debug logging */
   debug?: boolean
 }
@@ -128,11 +158,33 @@ export interface SupabaseConfig extends ConnectionConfig {
 export class SupabaseTransport implements Transport {
   private supabase: any = null
   private channel: any = null
+  // No preferredCompressMinBytes: send() strips the CRC32 header, which
+  // assumes the uncompressed frame layout (see compressionThresholdBytes).
   private config: SupabaseConfig | null = null
-  private messageCallback?: (data: Uint8Array) => void
+  private messageCallback?: (data: Uint8Array, from?: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
+  // Our id on the channel: the presence key we track under, and the suffix
+  // of the broadcast event name (`m:<id>`) every message goes out with, so
+  // receivers get it as `from`. Round 5, item 2: with a leave signal
+  // GenericProvider drops a departed peer's presence at once and stretches
+  // the awareness lease to 5 minutes - the 15 s renewal broadcasts, 80 % of
+  // an idle room's messages, stop. Same-version rule: an older peer listens
+  // for event 'message' only and never sees these frames.
+  private peerId: string = Math.random().toString(36).slice(2, 10)
+  private chunks = new ChunkAssembler()
   private _isConnected: boolean = false
   private debug: boolean = false
   private roomId: string = ''
+  // Persistence (see SupabaseConfig.persistent)
+  private persistentMode: boolean = false
+  private doc: Y.Doc | null = null
+  private tableName: string = 'yjs_documents'
+  private persistDebounceMs: number = 2000
+  private persistTimer?: ReturnType<typeof setTimeout>
+  private isWritingToDb: boolean = false
+  private savePending: boolean = false
+  // State loaded from the table before GenericProvider registered onMessage
+  private pendingLoad: Uint8Array | null = null
 
   constructor(private readonly options: SupabaseTransportOptions) {}
 
@@ -154,6 +206,16 @@ export class SupabaseTransport implements Transport {
       throw new Error('SupabaseTransport: room name is required')
     }
 
+    this.persistentMode = config.persistent ?? false
+    this.doc = config.doc ?? null
+    this.tableName = config.tableName ?? 'yjs_documents'
+    this.persistDebounceMs = config.persistDebounceMs ?? 2000
+    if (this.persistentMode && !this.doc) {
+      throw new Error(
+        'SupabaseTransport: a Y.Doc must be provided via config.doc when persistent is true',
+      )
+    }
+
     // Create Supabase client using the injected createClient function
     this.supabase = this.options.createClient(
       config.supabaseUrl,
@@ -167,12 +229,30 @@ export class SupabaseTransport implements Transport {
 
     this.log('Connecting to room:', this.roomId)
 
-    // Create and subscribe to channel
-    this.channel = this.supabase.channel(this.roomId)
+    // Create and subscribe to channel; our presence key is our peer id.
+    this.channel = this.supabase.channel(this.roomId, {
+      config: { presence: { key: this.peerId } },
+    })
 
-    // Listen for messages
-    this.channel.on('broadcast', { event: 'message' }, (payload: any) => {
-      this.handleMessage(payload.payload)
+    // Listen for messages: `m:<peerId>` from a current peer (the id becomes
+    // `from`), 'message' from an older one.
+    this.channel.on('broadcast', { event: '*' }, (msg: any) => {
+      const event = typeof msg?.event === 'string' ? msg.event : ''
+      const from = event.startsWith('m:') ? event.slice(2) : undefined
+      if (from === this.peerId) return
+      if (from === undefined && event !== 'message') return
+      this.handleMessage(msg.payload, from)
+    })
+
+    // Presence: a peer's channel went away (clean unsubscribe, closed tab,
+    // or the server's timeout after a dead connection). Delivered to every
+    // subscriber, so GenericProvider handles it without a broadcast burst.
+    this.channel.on('presence', { event: 'leave' }, (event: any) => {
+      const key = event?.key
+      if (typeof key === 'string' && key !== this.peerId) {
+        this.log('Peer left:', key)
+        this._peerDisconnectCallback?.(key)
+      }
     })
 
     // Subscribe to channel
@@ -186,16 +266,35 @@ export class SupabaseTransport implements Transport {
         if (status === 'SUBSCRIBED') {
           this._isConnected = true
           this.log('Connected to Supabase channel')
+          // Join the presence set under our key; the promise resolves with
+          // 'ok' or an error status, neither blocks the connect.
+          Promise.resolve(this.channel?.track({ joined_at: Date.now() })).catch(
+            (error: unknown) => this.log('presence track failed:', error),
+          )
           resolve()
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
           reject(new Error(`Supabase subscription failed: ${status}`))
         }
       })
     })
+
+    if (this.persistentMode) await this.loadFromDatabase()
   }
 
   async disconnect(): Promise<void> {
     this.log('Disconnecting...')
+
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = undefined
+    }
+    if (this.persistentMode && this.doc) {
+      try {
+        await this.saveToDatabase()
+      } catch (error) {
+        this.log('Error flushing to database on disconnect:', error)
+      }
+    }
 
     if (this.channel) {
       await this.channel.unsubscribe()
@@ -206,6 +305,7 @@ export class SupabaseTransport implements Transport {
     this.supabase = null
     this.config = null
     this.messageCallback = undefined
+    this.pendingLoad = null
   }
 
   send(data: Uint8Array): void {
@@ -217,21 +317,122 @@ export class SupabaseTransport implements Transport {
     // Strip CRC32 header before sending
     const payload = stripCRC32Header(data)
 
-    // Convert Uint8Array to base64 for JSON transport
-    const base64 = this.uint8ArrayToBase64(payload)
+    // Only document updates schedule a database write, not presence
+    if (this.persistentMode && payload[0] !== MESSAGE_AWARENESS) {
+      this.queuePersist()
+    }
 
-    // Broadcast to channel
-    this.channel.send({
-      type: 'broadcast',
-      event: 'message',
-      payload: base64,
-    })
+    if (payload.length <= MAX_BINARY_BYTES) {
+      // Binary broadcast: no base64 (33 % smaller on the wire)
+      this.channel.send({
+        type: 'broadcast',
+        event: 'm:' + this.peerId,
+        payload: payload.buffer.slice(
+          payload.byteOffset,
+          payload.byteOffset + payload.byteLength,
+        ),
+      })
+      return
+    }
+
+    // Too large for one broadcast: base64 chunks through the JSON path
+    const base64 = this.uint8ArrayToBase64(payload)
+    for (const chunk of splitChunks(base64, MAX_CHUNK_CHARS)) {
+      this.channel.send({ type: 'broadcast', event: 'm:' + this.peerId, payload: chunk })
+    }
   }
 
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     this.messageCallback = callback
+    // State loaded from the table before GenericProvider registered this
+    // callback (connect() resolves first): deliver it now, one microtask
+    // later so the provider has finished its own setup.
+    if (this.pendingLoad) {
+      const data = this.pendingLoad
+      this.pendingLoad = null
+      Promise.resolve().then(() => callback(data))
+    }
     return () => {
       this.messageCallback = undefined
+    }
+  }
+
+  /**
+   * Transport.onPeerDisconnect: Supabase presence 'leave' for the channel.
+   * Peer ids are presence keys, the same id `onMessage` passes as `from`.
+   */
+  onPeerDisconnect(callback: (peerId: string) => void): () => void {
+    this._peerDisconnectCallback = callback
+    return () => {
+      this._peerDisconnectCallback = undefined
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Persistence: one row per room, `content` = base64 of the full state
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Deliver the stored state as a MESSAGE_SYNC_PUSH frame - the provider
+   * applies it like a peer's full-state push: no hash check, no `synced`
+   * flip (a stored copy says nothing about who is online).
+   */
+  private async loadFromDatabase(): Promise<void> {
+    try {
+      const { data, error } = await this.supabase
+        .from(this.tableName)
+        .select('content')
+        .eq('id', this.roomId)
+        .maybeSingle()
+      if (error) throw error
+      if (!data?.content) {
+        this.log('No stored document for this room yet')
+        return
+      }
+      const update = this.base64ToUint8Array(data.content)
+      const enc = encoding.createEncoder()
+      encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
+      encoding.writeVarUint8Array(enc, update)
+      const frame = addCRC32Header(encoding.toUint8Array(enc))
+      if (this.messageCallback) this.messageCallback(frame)
+      else this.pendingLoad = frame
+      this.log('Loaded', update.length, 'bytes from the database')
+    } catch (error: any) {
+      this.log('Error loading from database:', error?.message ?? error)
+      console.warn('SupabaseTransport: failed to load from database:', error)
+    }
+  }
+
+  private queuePersist(): void {
+    if (this.persistTimer) clearTimeout(this.persistTimer)
+    this.persistTimer = setTimeout(() => this.saveToDatabase(), this.persistDebounceMs)
+  }
+
+  /** Upsert the full current state; a write that overlaps a change re-runs once. */
+  private async saveToDatabase(): Promise<void> {
+    if (!this.supabase || !this.persistentMode || !this.doc) return
+    if (this.isWritingToDb) {
+      this.savePending = true
+      return
+    }
+    this.isWritingToDb = true
+    this.savePending = false
+    try {
+      const state = Y.encodeStateAsUpdate(this.doc)
+      const { error } = await this.supabase.from(this.tableName).upsert({
+        id: this.roomId,
+        content: this.uint8ArrayToBase64(state),
+        updated_at: new Date().toISOString(),
+      })
+      if (error) throw error
+      this.log('Saved', state.length, 'bytes to the database')
+    } catch (error: any) {
+      this.log('Error saving to database:', error?.message ?? error)
+      console.warn('SupabaseTransport: failed to save to database, will retry:', error)
+      this.savePending = true
+    } finally {
+      this.isWritingToDb = false
+      if (this.savePending) setTimeout(() => this.saveToDatabase(), 1000)
     }
   }
 
@@ -239,20 +440,29 @@ export class SupabaseTransport implements Transport {
   // Private methods
   // ---------------------------------------------------------------------------
 
-  private handleMessage(payload: any): void {
+  private handleMessage(payload: any, from?: string): void {
     if (!this.messageCallback) return
 
     try {
-      // Convert base64 back to Uint8Array
-      const data =
-        typeof payload === 'string'
-          ? this.base64ToUint8Array(payload)
-          : new Uint8Array(0)
+      let data: Uint8Array
+      if (payload instanceof ArrayBuffer) {
+        data = new Uint8Array(payload)
+      } else if (ArrayBuffer.isView(payload)) {
+        data = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
+      } else if (typeof payload === 'string') {
+        data = this.base64ToUint8Array(payload) // an older sender
+      } else if (isChunk(payload)) {
+        const whole = this.chunks.push(payload)
+        if (whole === null) return
+        data = this.base64ToUint8Array(whole)
+      } else {
+        return
+      }
 
       // Add CRC32 header for GenericProvider
       const wrapped = addCRC32Header(data)
 
-      this.messageCallback(wrapped)
+      this.messageCallback(wrapped, from)
     } catch (error) {
       this.log('Error handling message:', error)
     }

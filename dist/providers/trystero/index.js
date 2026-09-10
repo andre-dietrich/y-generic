@@ -114,18 +114,21 @@ export class TrysteroTransport {
         receive((data, peerId) => {
             this.log(`Received update from ${peerId} (${data.byteLength} bytes)`);
             if (this._callback) {
-                // Convert ArrayBuffer to Uint8Array
-                this._callback(new Uint8Array(data));
+                // Convert ArrayBuffer to Uint8Array; peerId lets GenericProvider
+                // answer this peer directly via sendTo()
+                this._callback(new Uint8Array(data), peerId);
             }
         });
         // Track peers
         this.room.onPeerJoin((peerId) => {
             this.peers.add(peerId);
             this.log(`Peer joined: ${peerId} (${this.peers.size} total)`);
+            this._peerConnectCallback?.(peerId);
         });
         this.room.onPeerLeave((peerId) => {
             this.peers.delete(peerId);
             this.log(`Peer left: ${peerId} (${this.peers.size} remaining)`);
+            this._peerDisconnectCallback?.(peerId);
         });
         this._connected = true;
         this.log(`✅ Connected to room: ${room}`);
@@ -154,12 +157,44 @@ export class TrysteroTransport {
         this.log(`Sending update (${data.byteLength} bytes) to ${this.peers.size} peers`);
         await this.sendUpdate(data, null);
     }
+    /**
+     * Transport.sendTo: deliver to one peer (Trystero's action send accepts
+     * a target peer id). Used by GenericProvider for replies, acks and
+     * presence responses.
+     */
+    async sendTo(peerId, data) {
+        if (!this._connected || !this.sendUpdate)
+            return;
+        if (!this.peers.has(peerId))
+            return;
+        await this.sendUpdate(data, peerId);
+    }
     onMessage(callback) {
         this._callback = callback;
         this.log('Message callback registered');
         return () => {
             this._callback = undefined;
             this.log('Message callback unregistered');
+        };
+    }
+    /**
+     * Register callback for new peer data-channel connections. Lets
+     * GenericProvider push our current doc/awareness state to a peer as
+     * soon as their channel opens, instead of only at our own connect()
+     * time (which fires before any mesh connection exists) or the next
+     * periodic sync tick.
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        return () => {
+            this._peerConnectCallback = undefined;
+        };
+    }
+    /** Transport.onPeerDisconnect: Trystero's onPeerLeave, the same peer id. */
+    onPeerDisconnect(callback) {
+        this._peerDisconnectCallback = callback;
+        return () => {
+            this._peerDisconnectCallback = undefined;
         };
     }
     /**

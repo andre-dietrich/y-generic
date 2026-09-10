@@ -44,6 +44,8 @@ interface RunResult {
   cpuMs: number
   messages: number
   bytes: number
+  /** fan-out only: deliveries counted at the moment every doc converged (the pre-phase-1b metric) */
+  atConvergence?: number
 }
 
 export function sleep(ms: number): Promise<void> {
@@ -69,6 +71,19 @@ export function instrumentHub(hub: DummyHub) {
     messages += recipients
     bytes += recipients * data.length
     return original(room, data, sender, options)
+  }
+  // A unicast (DUMMY_UNICAST=1) is one delivery.
+  const originalUnicast = hub.unicast.bind(hub)
+  ;(hub as unknown as { unicast: typeof hub.unicast }).unicast = (
+    room: string,
+    targetId: string,
+    data: Uint8Array,
+    sender: DummyTransport,
+    options?: { latency?: number; dropRate?: number; jitter?: number },
+  ) => {
+    messages += 1
+    bytes += data.length
+    return originalUnicast(room, targetId, data, sender, options)
   }
   return {
     get messages() {
@@ -103,6 +118,7 @@ export function makeProviders(
   profile: Profile,
   N: number,
   dropRate: number = 0,
+  syncInterval: number = 0,
 ): { docs: Y.Doc[]; providers: GenericProvider[] } {
   const docs: Y.Doc[] = []
   const providers: GenericProvider[] = []
@@ -113,11 +129,17 @@ export function makeProviders(
       latency: profile.latency,
       jitter: profile.jitter,
       dropRate,
+      // DUMMY_UNICAST=1 models a mesh transport with Transport.sendTo
+      // (phase-1c design, item B); default = broadcast relay, as always.
+      unicast: process.env.DUMMY_UNICAST === '1',
     })
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
       verifyUpdates: true,
-      syncInterval: 0,
+      // 0 (default) isolates join/resync mechanics from the periodic beacon;
+      // bench-packet-loss passes a real interval, because recovery from a
+      // lost LAST update has no trigger but the periodic beacon by design.
+      syncInterval,
     })
     // Bump local awareness state past the library's genesis clock (0) -
     // every real consumer app does this for presence/cursors, and it's a
@@ -132,6 +154,33 @@ export function makeProviders(
   return { docs, providers }
 }
 
+/**
+ * Keep counting until the room has been quiet for quietMs (cap capMs): the
+ * hash-mismatch/resync cascade under jitter runs on for seconds AFTER every
+ * doc has the content (research doc item 13) - counting only to convergence
+ * hid ~95% of it on the Gun/Matrix profiles at N=100 (9,405 at convergence
+ * vs ~199,000 until quiet). Phase 1e: the join burst uses it too - a fresh
+ * room's CONFIRM retries (1/2/4 s) all fall after "all synced".
+ */
+export async function untilQuiet(
+  stats: { readonly messages: number },
+  quietMs: number,
+  capMs: number,
+): Promise<void> {
+  const tailStart = Date.now()
+  let lastCount = stats.messages
+  let quietSince = Date.now()
+  while (Date.now() - tailStart < capMs) {
+    await sleep(50)
+    if (stats.messages !== lastCount) {
+      lastCount = stats.messages
+      quietSince = Date.now()
+    } else if (Date.now() - quietSince >= quietMs) {
+      break
+    }
+  }
+}
+
 async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
   return silenced(async () => {
     const room = `bench-fanout-${Math.random().toString(36).slice(2)}`
@@ -140,7 +189,12 @@ async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
     const { docs, providers } = makeProviders(hub, profile, N)
 
     await Promise.all(providers.map((p) => p.connect({ room })))
-    await sleep(profile.latency * 3 + 100)
+    // Default: edit right after the join burst, while every peer's
+    // 20-per-10s sync budget is still mostly spent on join replies. Override
+    // with SETTLE_MS=<ms> (e.g. 12000) for a fresh budget - on the
+    // high-latency profiles the two regimes differ by ~20x at N=100, see
+    // docs/superpowers/specs/2026-09-05-digest-beacon-design.md (Task 3c).
+    await sleep(Number(process.env.SETTLE_MS ?? profile.latency * 3 + 100))
 
     // Reset counters - only count messages caused by the edit burst below.
     const preExisting = { messages: stats.messages, bytes: stats.bytes }
@@ -167,12 +221,16 @@ async function runFanOut(N: number, profile: Profile): Promise<RunResult> {
     const totalMs = Date.now() - start
     const cpuAfter = process.cpuUsage(cpuBefore)
     const cpuMs = (cpuAfter.user + cpuAfter.system) / 1000
+    const atConvergence = stats.messages - preExisting.messages
+
+    await untilQuiet(stats, 1000, 10000)
 
     const result: RunResult = {
       totalMs,
       cpuMs,
       messages: stats.messages - preExisting.messages,
       bytes: stats.bytes - preExisting.bytes,
+      atConvergence,
     }
 
     for (const p of providers) p.destroy()
@@ -201,10 +259,13 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
       }
       await sleep(5)
     }
-    // Short settle window for trailing awareness/sync replies to land.
-    await sleep(profile.latency * 2 + 50)
-
     const totalMs = Date.now() - start
+    const atConvergence = stats.messages
+    // Phase 1e: count until 1 s of quiet (was: latency*2+50 ms after all
+    // synced). A fresh room's CONFIRM retries come at 1/2/4 s (x RTT), so
+    // this still stops in the first retry gap; the full tail is what
+    // bench-join-census.ts (b) counts (3 s quiet: 19k vs 92k at N=100).
+    await untilQuiet(stats, 1000, 15000)
     const cpuAfter = process.cpuUsage(cpuBefore)
     const cpuMs = (cpuAfter.user + cpuAfter.system) / 1000
 
@@ -213,6 +274,7 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
       cpuMs,
       messages: stats.messages,
       bytes: stats.bytes,
+      atConvergence,
     }
 
     for (const p of providers) p.destroy()
@@ -223,16 +285,18 @@ async function runJoinBurst(N: number, profile: Profile): Promise<RunResult> {
 }
 
 function printRow(N: number, r: RunResult): void {
+  const tail = r.atConvergence === undefined ? '' : ` | ${String(r.atConvergence).padStart(8)}`
   console.log(
-    `${String(N).padStart(5)} | ${String(r.totalMs).padStart(7)} | ${r.cpuMs.toFixed(1).padStart(6)} | ${String(r.messages).padStart(8)} | ${String(r.bytes).padStart(9)}`,
+    `${String(N).padStart(5)} | ${String(r.totalMs).padStart(7)} | ${r.cpuMs.toFixed(1).padStart(6)} | ${String(r.messages).padStart(8)} | ${String(r.bytes).padStart(9)}${tail}`,
   )
 }
 
 async function main() {
   console.log('=== Fan-out cost (steady-state broadcast of a 10-edit burst) ===')
+  console.log('"messages"/"bytes" = deliveries until the room is quiet for 1s (cap 10s); "atConv" = deliveries at the moment every doc converged.')
   for (const profile of PROFILES) {
     console.log(`\n-- Profile: ${profile.name} (latency=${profile.latency}ms, jitter=${profile.jitter}) --`)
-    console.log('users | totalMs |  cpuMs | messages |     bytes')
+    console.log('users | totalMs |  cpuMs | messages |     bytes |   atConv')
     for (const N of USER_COUNTS) {
       const r = await runFanOut(N, profile)
       printRow(N, r)
@@ -242,7 +306,7 @@ async function main() {
   console.log('\n=== Join-burst cost (N clients connecting concurrently) ===')
   for (const profile of PROFILES) {
     console.log(`\n-- Profile: ${profile.name} (latency=${profile.latency}ms, jitter=${profile.jitter}) --`)
-    console.log('users | totalMs |  cpuMs | messages |     bytes')
+    console.log('users | totalMs |  cpuMs | messages |     bytes |   atConv')
     for (const N of USER_COUNTS) {
       const r = await runJoinBurst(N, profile)
       printRow(N, r)

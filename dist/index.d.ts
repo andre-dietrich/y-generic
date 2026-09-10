@@ -3,6 +3,53 @@ import * as awarenessProtocol from 'y-protocols/awareness';
 import { Observable } from 'lib0/observable';
 import type { Transport, ConnectionConfig, ConnectionStatus } from './transport';
 /**
+ * Cheap, peer-deterministic hash of the document's delete set - the half of
+ * a Yjs document's identity that the state vector does NOT cover (yjs
+ * INTERNALS.md: "deletions are tracked in the DeleteSet, and do not update
+ * the state vector"). Two docs that differ only by a lost delete-only
+ * update have identical state vectors, so `computeDocHash` can never
+ * detect that divergence; this hash can, at heartbeat granularity (see
+ * `_encodeSyncStep1()` / `_handleDigest()`).
+ *
+ * Cost: `Y.createDeleteSetFromStructStore` walks every struct (Yjs keeps no
+ * incremental delete set), so this is O(items) - fine once per heartbeat
+ * (every empty SyncStep2 already did this exact walk inside
+ * `encodeStateAsUpdate`), NOT fine per update; hence the cache in
+ * `_deleteSetHash()`. Per-client runs come out already sorted and merged;
+ * the only per-peer non-determinism is `Map` insertion order, fixed by
+ * sorting client IDs before hashing.
+ *
+ * Exported for the property check in test/dummy/bench-idle-room.ts.
+ * @internal
+ */
+export declare function computeDeleteSetHash(doc: Y.Doc): number;
+/**
+ * The Yjs updates a CRC-wrapped frame (as handed to `Transport.send`)
+ * carries: the update of a MESSAGE_SYNC_VERIFIED or MESSAGE_SYNC
+ * Update/SyncStep2 message, the whole document of a MESSAGE_SYNC_PUSH,
+ * each such sub-message of a MESSAGE_BATCH - and nothing for awareness,
+ * pub/sub, digest beacons and SyncStep1 requests, which carry no document
+ * state. For persistence transports (`providers/indexeddb`, LiaScript's
+ * Dexie cache): store only what this returns, and only this. Storing whole
+ * frames and replaying them on the next load resurrects the previous
+ * session's clientID as a phantom peer (its presence, its beacons - which
+ * the provider then answers into the store, multiplying rows) and keeps
+ * ~10x the bytes (a keystroke's frame carries its cursor). A frame this
+ * cannot parse yields `[]`, never a partial read. Frames of a provider with
+ * `compressionThresholdBytes` set (a leading flag byte) are not supported.
+ * Round 7, item 6; measured in test/dummy/bench-persist-log.ts.
+ */
+export declare function extractDocUpdates(frame: Uint8Array): Uint8Array[];
+/**
+ * The counterpart of `extractDocUpdates()` for the load path of a
+ * persistence transport: wraps one (merged) update as a CRC-wrapped
+ * MESSAGE_SYNC SyncStep2 frame. Handed to the `onMessage` callback, the
+ * provider applies it as the answer to its own request - `synced` fires,
+ * nothing is sent back - exactly what a local copy is: the peer that had
+ * our document.
+ */
+export declare function frameDocUpdate(update: Uint8Array): Uint8Array;
+/**
  * PubSub channel for real-time messaging alongside Yjs.
  * Allows sending ephemeral messages that don't need CRDT properties.
  */
@@ -22,18 +69,6 @@ export declare class PubSubChannel extends Observable<string> {
      * ```
      */
     publish(topic: string, message: any): void;
-    /**
-     * Publish a message to a single target instead of broadcasting.
-     *
-     * On transports with `sendTo`, `target` is the peer's ID and delivery is
-     * direct. On transports without it, the message is broadcast with the
-     * target embedded and dropped by every provider whose `localId` differs.
-     *
-     * @param target - Recipient id (transport peerId, or a `localId`)
-     * @param topic - Topic name
-     * @param message - Any JSON-serializable data
-     */
-    publishTo(target: string, topic: string, message: any): void;
     /**
      * Subscribe to messages on a topic.
      *
@@ -88,7 +123,6 @@ export declare class GenericProvider extends Observable<string> {
     readonly doc: Y.Doc;
     readonly transport: Transport;
     readonly awareness: awarenessProtocol.Awareness;
-    readonly appAwareness: awarenessProtocol.Awareness;
     readonly pubsub: PubSubChannel;
     private _status;
     private _synced;
@@ -97,6 +131,15 @@ export declare class GenericProvider extends Observable<string> {
     private _syncIntervalId?;
     private _verifyUpdates;
     private _disableBc;
+    private _idleBackoffEnabled;
+    private _idleBackoffMaxMs;
+    private _currentSyncIntervalMs;
+    private _lastActivityTime;
+    private _lastPeriodicTickTime;
+    private _periodicScheduler?;
+    private _trickleK;
+    private _equalBeaconsHeard;
+    private _beaconForced;
     private _bcChannel;
     private _bcConnected;
     private _bcSubscriber?;
@@ -104,11 +147,40 @@ export declare class GenericProvider extends Observable<string> {
     private _lastResyncAttemptTime;
     private _pendingResyncTimeoutId?;
     private _syncRequestTimes;
+    private _syncReplyTimes;
     private _maxSyncRequestsPerWindow;
     private _syncRequestWindowMs;
     private _pendingSyncReply;
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
+    private _pendingSyncReplyIsAck;
+    private _pendingSyncReplyTargetSv;
+    private _responseWaitTimer?;
+    private _responseWaitAttempts;
+    private _responseSeen;
+    private _equalUnsettledSeen;
+    private _responseWaitFlags;
+    private _pendingCheckTimer?;
+    private _behindCheckTimer?;
+    private _behindSv;
+    private _rttSamples;
+    private _requestSentAt;
+    private _confirmed;
+    private _knownPeers;
+    private _peerAddress;
+    private _presencePending;
+    private _presenceCovered;
+    private _presenceResponseTimer?;
+    private _pendingAwarenessRemoval;
+    private _pendingAwarenessRemovalTimeoutId?;
+    private _peerConnectDebounceMs;
+    private _pendingPeerConnectSyncTimeoutId?;
+    private _pendingPeerConnectIds;
+    private _confirmedSv;
+    private _confirmedDsHash;
+    private _loading;
+    private _compressionThresholdBytes?;
+    private _dsHashCache;
     private _localSeqNum;
     private _remoteSeqInfo;
     private _gapCheckTimers;
@@ -117,19 +189,17 @@ export declare class GenericProvider extends Observable<string> {
     private _batchUpdates;
     private _pendingUpdate;
     private _batchTimeoutId?;
+    private _flushScheduled;
     private _awarenessInterval;
+    private static readonly AWARENESS_AUTO_MS_PER_PEER;
     private _pendingAwarenessClients;
     private _awarenessTimeoutId?;
     private _lastAwarenessTime;
-    private _pendingAppAwarenessClients;
-    private _appAwarenessTimeoutId?;
-    private _lastAppAwarenessTime;
-    private _excludeOrigins;
-    private _localId?;
-    private _syncMode;
     private _updateHandler?;
     private _awarenessUpdateHandler?;
-    private _appAwarenessUpdateHandler?;
+    private _awarenessTimeoutMs;
+    private _awarenessSweepId?;
+    private _ownsAwareness;
     private _unsubscribeTransport?;
     private _beforeUnloadHandler?;
     /**
@@ -141,7 +211,6 @@ export declare class GenericProvider extends Observable<string> {
      */
     constructor(doc: Y.Doc, transport: Transport, options?: {
         awareness?: awarenessProtocol.Awareness;
-        appAwareness?: awarenessProtocol.Awareness;
         /**
          * Interval in milliseconds for periodic sync retries.
          * Helps recover from packet loss. Set to 0 to disable.
@@ -157,7 +226,12 @@ export declare class GenericProvider extends Observable<string> {
         /**
          * Batch (debounce) document updates to reduce network traffic.
          * Updates are collected and sent after this delay in milliseconds.
-         * Set to 0 to send updates immediately (no batching).
+         * 0 sends at the end of the current task (a microtask: no timer, no
+         * measurable delay) - the transactions one input event produces
+         * leave as one message, together with the cursor awareness the
+         * editor binding sets in the same task (round 5, item 1; measured in
+         * test/dummy/bench-typing-census.ts). Before round 5, 0 sent
+         * synchronously from inside the Y.Doc 'update' event.
          * Recommended: 50-200ms for good balance between latency and efficiency.
          * @default the transport's `preferredBatchMs` hint if it declares one,
          * otherwise 0 (disabled - immediate transmission)
@@ -176,36 +250,20 @@ export declare class GenericProvider extends Observable<string> {
          * Awareness updates (cursors, presence) are batched and sent at this interval.
          * Set to 0 for immediate transmission (not recommended for high-frequency updates).
          * This prevents awareness from flooding document sync on limited transports.
-         * @default 100 (100ms between awareness broadcasts)
+         * `'auto'` (round 6, item 9) scales the interval with room size instead
+         * of a fixed value: `max(transport hint ?? 100, 20 * peerCount)` ms -
+         * cursor-only traffic (no typing) is rate * (N-1) per mover and
+         * otherwise unbounded by room size. A latency trade (slower cursors in
+         * large rooms for fewer messages), so opt-in only; see
+         * docs/superpowers/specs/2026-09-07-sync-optimization-round-6.md.
+         * @default the transport's `preferredAwarenessMs` hint if it declares one, else 100
          */
-        awarenessInterval?: number;
+        awarenessInterval?: number | 'auto';
         /**
-         * Transaction origins whose updates should not be sent to peers.
-         * Updates from these origins stay local (never reach the transport).
-         * @default [] (no origins excluded)
-         */
-        excludeOrigins?: any[];
-        /**
-         * This provider's identity for targeted pubsub (publishTo).
-         * On transports without sendTo, targeted messages are broadcast and
-         * dropped unless their target matches this id.
-         */
-        localId?: string;
-        /**
-         * Connect-time sync strategy.
-         * - 'push-pull' (default): push full local state to peers, then request
-         *   remote state. Correct for P2P transports where there is no
-         *   authoritative peer to pull from (e.g. offline edits must be pushed).
-         * - 'pull': only request remote state on connect (SyncStep1), never push
-         *   full local state. Use with relay/server transports (e.g. y-websocket)
-         *   where the server holds authoritative state and a reconnecting client
-         *   should adopt it rather than push a competing local copy.
-         * @default 'push-pull'
-         */
-        syncMode?: 'push-pull' | 'pull';
-        /**
-         * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
-         * combined) this provider will send within `syncRequestWindowMs`.
+         * Max number of sync requests (digest beacons and syncNow() pushes
+         * combined) this provider will send within `syncRequestWindowMs` -
+         * and, as a separate budget of the same size, max number of sync
+         * replies (SyncStep2, acks) it will send in that window.
          * Protects against self-inflicted resync storms (e.g. many hash
          * mismatches firing in a short window under packet loss). Raise this
          * if legitimate resyncs are being throttled under heavy loss; lower
@@ -220,14 +278,30 @@ export declare class GenericProvider extends Observable<string> {
          */
         syncRequestWindowMs?: number;
         /**
-         * Max random delay (ms) before replying to a SyncStep1 request, used
-         * to let other peers' replies pre-empt a redundant one (NACK-style
-         * suppression). Only engages once at least 2 other peers are known via
-         * awareness. Larger values suppress more redundant traffic in large
-         * rooms at the cost of higher requester-perceived latency.
+         * Base max random delay (ms) before replying to a SyncStep1 request,
+         * used to let other peers' replies pre-empt a redundant one
+         * (NACK-style suppression). Only engages once at least 2 other peers
+         * are known via awareness. The actual max delay scales up from this
+         * base with room size (see `_replySuppressionMaxDelay()`) - a larger
+         * room has more repliers racing within the same window, so it's given
+         * more time for the "someone already answered" signal to be overheard
+         * before more repliers commit. This option is the small-room baseline
+         * and the growth-rate multiplier's unit, not a hard cap (see the
+         * `200`ms cap in `_replySuppressionMaxDelay()`).
          * @default 30
          */
         syncReplySuppressionMs?: number;
+        /**
+         * Debounce window (ms) for coalescing onPeerConnect-triggered
+         * syncNow() calls. Mesh transports (peerjs, simple-peer) fire
+         * onPeerConnect once per newly-connected remote peer; without
+         * coalescing, N peers joining within a short window each
+         * independently trigger a full-state broadcast to everyone already
+         * connected - an O(N^2) burst. A burst of onPeerConnect events within
+         * this window collapses into a single syncNow() call.
+         * @default 50
+         */
+        peerConnectDebounceMs?: number;
         /**
          * Grace period (ms) after detecting a suspected sequence-number gap
          * before requesting a resync. Tolerates mere network reordering
@@ -244,6 +318,141 @@ export declare class GenericProvider extends Observable<string> {
          * @default 64
          */
         seqWindowSize?: number;
+        /**
+         * Minimum payload size (bytes, measured on the CRC32-wrapped bytes
+         * about to be sent) above which a message is compressed
+         * (`deflate-raw`, via the standard CompressionStream/
+         * DecompressionStream Web API) before being handed to the network
+         * transport. Below this size, messages are sent byte-for-byte as they
+         * are today.
+         *
+         * Measured on synthetic Yjs docs (test/dummy/bench-compression-ratio.ts):
+         * a single-keystroke update (~20 bytes) actually gets BIGGER under
+         * gzip (fixed ~18-byte header/trailer) and is break-even at best under
+         * deflate-raw - not worth the async round trip through the
+         * Compression Streams API for a handful of bytes saved. A clean
+         * ~3.3KB doc compresses ~17x; a ~45KB doc with heavy edit-history
+         * churn (tombstones from insert/delete cycles) still compresses ~8x.
+         * 2048 is chosen so ordinary typing traffic (tens to a few hundred
+         * bytes per update - the majority of real-world traffic per this
+         * project's prior benchmark rounds) NEVER crosses it and is completely
+         * unaffected, while a full-document push/reply large enough to matter
+         * (and, on chunking transports like PubNub/Ably, large enough to
+         * multiply into several wire messages) reliably compresses down well
+         * below its own pre-compression size.
+         *
+         * `deflate-raw` (not `gzip`) is used deliberately: gzip's fixed
+         * header/trailer overhead makes it a net loss for anything under
+         * roughly 200 bytes (measured), while deflate-raw has ~0 fixed
+         * overhead and compresses at least as well for every size measured.
+         *
+         * IMPORTANT - wire-format compatibility: this project has no
+         * versioned wire-protocol negotiation. Enabling this (any truthy
+         * value) changes the wire format for EVERY message this instance
+         * sends: a 1-byte compressed/uncompressed flag is prepended ahead of
+         * the existing CRC32 wrapper on every message, compressed or not, so
+         * the receiving side can unambiguously tell them apart. A peer NOT
+         * running this option (or running an older version of this library)
+         * will misinterpret that leading flag byte as the start of the CRC32
+         * wrapper and reject every message as corrupted. All peers in a room
+         * must set this the same way (all enabled, or all disabled) for the
+         * room to function. This is a real, deliberate tradeoff - not a
+         * detail - which is why this defaults to fully disabled rather than
+         * auto-enabling above some size unconditionally.
+         *
+         * `0` disables compression entirely and keeps the wire format
+         * byte-for-byte identical to before this option existed; `undefined`
+         * takes the transport's `preferredCompressMinBytes` hint (2048 on
+         * PubNub, Matrix and Nostr, which carry the frame as opaque bytes),
+         * else disabled. NOT usable with a transport that strips the CRC32
+         * header or reads the message type at a fixed offset (Ably, Supabase,
+         * Gun today): the flag byte sits ahead of that header, so such a
+         * transport hands the receiver a frame it cannot parse - measured in
+         * the Nostr end-to-end test before that provider was made
+         * frame-transparent.
+         * @default the transport's `preferredCompressMinBytes` hint, else undefined
+         */
+        compressionThresholdBytes?: number;
+        /**
+         * Awareness lease (ms): a peer whose presence has not been refreshed
+         * for this long is removed; our own state is re-announced after half
+         * of it without any digest, update or ack from us. Replaces
+         * y-protocols/awareness's fixed 30 s / 15 s when the provider created
+         * the Awareness instance (an `awareness` passed in keeps y-protocols'
+         * own sweep and constants). Every peer of a room must use the same
+         * value: a removal is authoritative, so the shortest lease in the room
+         * decides for everyone and a longer-lease peer would flap. Longer =
+         * fewer renewal broadcasts (N(N-1) per lease/2), but a crashed peer's
+         * presence lingers up to this long on transports without a leave
+         * signal.
+         * @default 300000 when the transport implements `onPeerDisconnect`
+         * (departures are reported, the lease is only a safety net), else
+         * 30000 (y-protocols' value)
+         */
+        awarenessTimeoutMs?: number;
+        /**
+         * Trickle redundancy constant (RFC 6206 §4.2) for the periodic
+         * beacon: the tick stays silent when at least this many periodic
+         * beacons with a digest equal to ours were overheard since the
+         * previous tick - the room has already compared itself against our
+         * exact state, so our beacon would add nothing. A settled idle room
+         * then sends ~3 beacons per interval in total instead of one per
+         * peer (round 5, item 3). 1 = fewest messages; 2 = one lost beacon
+         * does not silence a window; 0 = off (every tick beacons, as before
+         * round 5). JOIN/CONFIRM/resync requests and the beacon re-armed by a
+         * local edit are never suppressed.
+         * @default 1
+         */
+        trickleK?: number;
+        /**
+         * Back off the periodic-sync interval (see `syncInterval`) when the
+         * room is idle, instead of ticking at a fixed cadence forever. After
+         * each periodic tick that saw no activity since the previous tick -
+         * no LOCAL document edit, no corrupted/rejected wire message - the
+         * interval DOUBLES (capped at `idleBackoffMaxMs`) for the next tick.
+         * Local activity re-arms the tick at once, at a random point inside
+         * `syncInterval`. Remote updates and awareness changes do not count
+         * (phase 1e): a listener has nothing a beacon would announce, and the
+         * editor's own beacon heals a listener that lost the keystroke - so
+         * one typist no longer keeps every peer at the base cadence
+         * (N*(N-1) deliveries per interval). Deliberately does NOT
+         * count the periodic tick's own routine SyncStep1/SyncStep2 exchange
+         * as activity (see `_markActivity()`'s doc comment for why treating
+         * that as activity would make this option a no-op - an earlier draft
+         * of this feature made exactly that mistake, caught by this option's
+         * own bench script). Still composes with the existing +/-20% jitter
+         * (`_jitteredSyncInterval()`) at whatever the current backed-off value
+         * is.
+         *
+         * The tradeoff this used to carry - a message dropped right before
+         * the room went quiet was caught only by the loser's OWN next tick,
+         * up to `idleBackoffMaxMs` away - is gone since phase 1d: the sender
+         * of that message had activity, so its interval is at the base, and
+         * its next beacon shows the loser it is behind; the loser asks after a
+         * short grace (`_scheduleBehindCheck`). Measured in
+         * test/dummy/bench-idle-backoff.ts (300 ms base / 2.4 s cap so the
+         * effect fits a short run): recovery median 1,741 ms with the old
+         * rule, see the phase-1d design doc's "After Task 4" for the number
+         * with this one. What remains is the cadence of a fully idle room:
+         * one beacon per peer per `idleBackoffMaxMs` instead of per
+         * `syncInterval`. Off restores the fixed cadence.
+         * @default true
+         */
+        idleBackoffEnabled?: boolean;
+        /**
+         * Ceiling (ms) for the backed-off periodic-sync interval when
+         * `idleBackoffEnabled` is true. Doubling from a 5000ms base reaches
+         * this in 4 idle ticks (5s/10s/20s/40s/60s). 60000 is chosen so the
+         * worst-case loss-recovery latency this trades away stays the same
+         * order of magnitude as `y-protocols/awareness`'s own built-in
+         * peer-removal timeout (30s, halved from its 60s+ `_checkInterval`
+         * sweep window) rather than growing unbounded - a room silent long
+         * enough to be fully backed off is, on this timescale, already close
+         * to "everyone's gone idle/timed out" territory anyway. Ignored when
+         * `idleBackoffEnabled` is false.
+         * @default 60000
+         */
+        idleBackoffMaxMs?: number;
     });
     /**
      * Connect to the backend and start syncing.
@@ -278,10 +487,131 @@ export declare class GenericProvider extends Observable<string> {
      */
     get synced(): boolean;
     /**
+     * Push local state + request remote state, gated by the shared rate
+     * limiter. Returns whether it actually reserved a slot and sent anything
+     * - `false` means the caller was rate-limited right now. Extracted out of
+     * `syncNow()` so `_requestResync()`'s scheduled retry (see below) can tell
+     * the difference between "sent" and "silently skipped" and react to it,
+     * instead of assuming a resync always succeeds once it fires.
+     *
+     * @param push - whether to also broadcast full local document state.
+     * `_requestResync()`'s retry passes `false` (pull-only is enough for a
+     * resync trigger - see its call site).
+     * @param buildExtra - optional callback, invoked ONLY once a rate-limit
+     * slot is actually reserved (so it never runs, and never mutates
+     * whatever state it touches, on a call that ends up rate-limited),
+     * returning additional already-encoded sub-messages to fold into the SAME
+     * batched wire send as the push/pull messages below - e.g. an awareness
+     * update that's ready to go out "now" anyway (see
+     * `_tryImmediateAwarenessMessage()`). Pure wire-framing: whether a caller
+     * passes this never changes whether/when the push+pull half itself sends,
+     * only how many separate `transport.send()`/`bc.publish()` calls it costs.
+     * @param flags - digest beacon flags: DIGEST_FLAG_JOIN from syncNow(), 0
+     * from the peer-connect debounce and the resync retry (see _syncNow()).
+     */
+    private _trySyncPushPull;
+    /**
      * Force an immediate sync with remote peers.
      * Useful after network interruptions or to manually trigger re-sync.
+     * Sends the beacon with DIGEST_FLAG_JOIN: peers answer with their
+     * presence and, if our state already matches theirs, with an ack beacon
+     * so `synced` flips without a data round trip.
      */
     syncNow(): void;
+    /**
+     * syncNow() body. `flags` = 0 for callers that must NOT request presence:
+     * `_schedulePeerConnectSync()` (mesh transports already re-broadcast
+     * presence to a newcomer via their own onPeerConnect -> syncNow()).
+     */
+    private _syncNow;
+    /**
+     * Compute the next periodic-sync delay, jittered by ~+/-20% around
+     * `_currentSyncIntervalMs` (== `_syncInterval` unless `idleBackoffEnabled`
+     * has backed it off - see that option's doc comment). Re-jittered fresh
+     * each tick (not computed once per connect()) so a room's peers - which
+     * commonly all connect() within a short window of each other - drift
+     * apart over time instead of staying loosely synchronized. Extracted to
+     * its own method purely so benchmarks can shadow it to compare against
+     * the unjittered baseline.
+     */
+    private _jitteredSyncInterval;
+    /**
+     * Record that "activity" happened right now, for `idleBackoffEnabled`'s
+     * benefit. Cheap (one timestamp write) and called unconditionally
+     * regardless of whether idle backoff is enabled, so there's no behavioral
+     * branch to keep in sync - the backoff decision in connect()'s periodic
+     * tick is the only place that actually reads this.
+     *
+     * Call sites are deliberately NOT "any inbound wire message" - an earlier
+     * version of this hooked `_handleIncomingMessage()` unconditionally, which
+     * made the periodic tick's OWN SyncStep1 request and the SyncStep2 reply
+     * answering it (empty payload - nothing to sync) each count as "activity",
+     * permanently resetting the backoff on every single tick and making the
+     * whole feature a no-op (caught by this bench script's own first run: ON
+     * and OFF produced statistically indistinguishable message counts). Both
+     * Yjs's `doc.emit('update', ...)` and y-protocols' `awareness.emit('update', ...)`
+     * already only fire when something with actual content changed
+     * (`hasContent`/non-empty added+updated+removed - confirmed by reading
+     * yjs's `Transaction.js` and y-protocols' `awareness.js` directly), so
+     * hooking THOSE instead is exactly "local or remote document/awareness
+     * change" with no extra filtering needed - a no-op SyncStep2 reply, a
+     * digest beacon, or a duplicate/no-change awareness re-announce (e.g. a
+     * JOIN-triggered presence response that changed nothing) never reaches
+     * these handlers. A corrupted (CRC32
+     * mismatch) message is real evidence of wire activity that neither
+     * handler would ever see (it's rejected before decoding) - see the
+     * explicit call in `_processWrappedMessage()`'s corruption branch.
+     *
+     * Call sites: `_setupDocumentSync()`'s update handler (LOCAL document
+     * edits only, since phase 1e) and `_processWrappedMessage()`'s
+     * corrupted-message branch (wire noise, not silence).
+     */
+    private _markActivity;
+    /**
+     * The lease sweep: y-protocols' own (awareness.js `_checkInterval`: renew
+     * at outdatedTimeout/2, remove at outdatedTimeout, every
+     * outdatedTimeout/10) replaced by the same loop at `_awarenessTimeoutMs`,
+     * the period jittered so a room that joined together does not renew in
+     * one burst (measured: all 49 listeners of a 50-peer room renewed inside
+     * the same 10 s window). The renew/remove half runs only on an awareness
+     * we created (`_ownsAwareness`); the peer-table prune (round 7, item 3)
+     * runs regardless. Armed by connect(), cleared by disconnect() - round 7,
+     * item 2: started from the constructor it outlived disconnect(), ticking
+     * ~20 times a minute and keeping the dropped provider reachable
+     * (test/dummy/bench-reload-phantoms.ts, part 2).
+     */
+    private _startAwarenessSweep;
+    /**
+     * A digest, verified update or ack from `clientID` (or one we are about
+     * to send, for our own id) is proof of presence: refresh the lease the
+     * sweep above checks. Only for ids with a state - a departed peer's
+     * `meta` entry survives its removal (y-protocols keeps it for the clock)
+     * and must not be revived by a late message.
+     */
+    private _touchPeer;
+    /**
+     * Transport.onPeerDisconnect: the peer at `peerId` is gone. Forget its
+     * address and id, drop its awareness state with origin 'peer-left': the
+     * broadcast goes through the same suppression as a timeout removal, but
+     * with a long window - every peer gets the leave signal in the same
+     * millisecond, and at the reply window (~170 ms at N=50) 28 of 49
+     * survivors broadcast before the first broadcast could be overheard
+     * (bench-awareness-removal-burst, DUMMY_PEER_EVENTS=1). One broadcast
+     * room-wide is still worth having: it corrects a joiner that received
+     * this peer in a relayed presence table but had no channel to it yet.
+     */
+    private _handlePeerLeave;
+    /** Cached delete-set hash - see computeDeleteSetHash(). */
+    private _deleteSetHash;
+    /**
+     * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
+     * events within `_peerConnectDebounceMs` collapses into one call instead
+     * of one per event - without this, N peers joining a mesh in a short
+     * window each independently broadcast full state to everyone already
+     * connected (O(N^2) traffic), since onPeerConnect fires once per
+     * newly-opened peer connection with no coalescing of its own.
+     */
+    private _schedulePeerConnectSync;
     /**
      * Setup automatic document synchronization.
      * Listens to document updates and sends them to the transport.
@@ -289,21 +619,128 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _setupDocumentSync;
     /**
-     * Batch/debounce updates to reduce network traffic.
-     * Merges multiple updates and sends after delay.
+     * Merge a local update into the pending batch and schedule its flush:
+     * after `batchUpdates` ms (debounced) when that is > 0, otherwise at the
+     * end of the current task via queueMicrotask - see `_pendingUpdate`.
      */
     private _batchUpdate;
+    /**
+     * Send the pending update batch as one wire message, carrying any
+     * awareness change the throttle is holding (see _takePendingAwareness).
+     * Shared by the microtask flush, the timed flush, and the
+     * disconnect()/destroy() flush.
+     */
+    private _flushPendingUpdate;
     /**
      * Setup automatic awareness synchronization.
      * Listens to awareness changes and broadcasts them.
      */
     private _setupAwarenessSync;
     /**
-     * Handle incoming messages from the transport.
-     * Verifies message integrity with CRC32 before processing.
-     * Corrupt messages are rejected immediately without attempting to decode.
+     * Handle incoming messages from the transport (or BroadcastChannel).
+     *
+     * When compressionThresholdBytes is disabled (the default), this is a
+     * fully synchronous fast path, byte-for-byte the same behavior as before
+     * that option existed: straight into _processWrappedMessage().
+     *
+     * When enabled, every message - from the network transport AND from
+     * BroadcastChannel (see _send()) - carries a leading compressed(1)/
+     * uncompressed(0) flag byte ahead of the usual CRC32 wrapper. Reading
+     * that flag and, if set, decompressing is inherently async (the
+     * Compression Streams API has no synchronous form), so this method
+     * dispatches to a promise chain instead of processing inline in that
+     * case. This means a large (compressed) message and a small (uncompressed
+     * or below-threshold) message that arrive back-to-back can finish
+     * processing out of arrival order - acceptable here because Yjs updates
+     * are idempotent/commutative (see MESSAGE_SYNC_VERIFIED's handling below)
+     * and because the compression threshold keeps this path almost entirely
+     * to large, full-state syncs, not the per-keystroke incremental updates
+     * that per-sender gap detection actually relies on ordering-sensitive
+     * heuristics for.
      */
     private _handleIncomingMessage;
+    /**
+     * Verify message integrity with CRC32 and decode. Corrupt messages are
+     * rejected immediately without attempting to decode. Operates on bytes
+     * that have already had any compression flag/decompression handled by
+     * _handleIncomingMessage() - this is the pre-compression-feature
+     * implementation, unchanged.
+     */
+    private _processWrappedMessage;
+    /**
+     * Decode and act on one already-integrity-verified, already-decompressed
+     * message. Split out of `_processWrappedMessage()` so `MESSAGE_BATCH`
+     * (see `_sendBatch()`) can recurse into this for each sub-message it
+     * unwraps, running the EXACT SAME per-message-type logic used for a
+     * top-level message rather than a parallel reimplementation. A thrown
+     * error partway through a batch's sub-messages aborts the REST of that
+     * batch (propagates up to `_processWrappedMessage()`'s catch) - same as
+     * a logic error aborting a single top-level message today, just now
+     * scoped to "the rest of this batch" instead of "this one message".
+     */
+    private _dispatchMessage;
+    /**
+     * Handle a digest beacon (MESSAGE_SYNC_DIGEST). Reply rule (design doc
+     * §3): SyncStep2 if the sender is behind us or its delete-set hash
+     * differs from ours (the SyncStep2 always carries our full delete set, so
+     * it also heals a lost delete on their side - and their beacon does the
+     * same for us, symmetrically, within one interval); our own beacon as an
+     * ack if the beacon is JOIN-flagged and states are equal; nothing
+     * otherwise - which is what removes the ~5-12 empty replies per heartbeat
+     * measured at N=50 in test/dummy/bench-idle-room.ts. "Sender is ahead of
+     * us" triggers no reply: our own next beacon fetches it. Nothing here
+     * removes a recovery path (the round-2 lesson in
+     * 2026-09-04-resync-message-reduction-design.md's addendum), only
+     * replies that carry no information.
+     *
+     * `synced`: a beacon we are not behind, with equal delete-set hash, is a
+     * stronger statement than the empty SyncStep2 it replaces ("you lack
+     * nothing I have"), so it marks us synced too - this is what keeps two
+     * fresh peers, or a whole concurrent join burst, converging to `synced`
+     * with no acks needing to survive the rate limiter.
+     */
+    private _handleDigest;
+    /**
+     * Answer a JOIN beacon's presence request once for all JOIN beacons that
+     * arrive within `clamp(2 * minRTT, 100, 500)` ms of the first - long
+     * enough to cover a join burst spread by latency, short enough that a
+     * lone joiner sees the room's presence within a few round trips.
+     */
+    private _schedulePresenceResponse;
+    /**
+     * Max random delay (ms) before replying to a SyncStep1 request, scaled by
+     * a room-size signal already available (`this.awareness.getStates().size`
+     * - the same signal read at the `>= 3` suppression gate). A fixed window
+     * (the pre-fix behavior: always `_syncReplySuppressionMs`) doesn't scale
+     * with room size, so a larger room has more independent repliers racing
+     * to answer the same request within the same window - more of them lose
+     * the race and get silently dropped by the `_sendSyncReply()` rate-limit
+     * backstop instead of never sending in the first place. Measured in
+     * test/dummy/bench-corruption-storm.ts: the SyncStep2/SyncStep1 ratio (
+     * ideally ~1 if suppression alone were sufficient) grew from ~1.1-1.3 at
+     * N=2 to ~4.5-5.9 at N=10 with the fixed 30ms window.
+     *
+     * `min(cap, base * log2(peerCount))` - log2 growth spreads replies over a
+     * wider window as the room grows without the delay exploding at very high
+     * N. Capped at 200ms: the slowest-profile round trip this project
+     * benchmarks against (Matrix, ~350ms one-way) already tolerates hundreds
+     * of ms of latency, so 200ms of extra requester-perceived delay stays
+     * well inside that budget while still giving a 100-peer room roughly
+     * 6-7x the base window instead of an unbounded one.
+     */
+    /**
+     * How many peers we believe are in the room: awareness states (includes
+     * ourselves) or, if larger, the distinct beacon/update senders we have
+     * heard plus ourselves. See `_knownPeers`.
+     */
+    private _peerCount;
+    /**
+     * Resolves `_awarenessInterval` to a concrete ms value: the configured
+     * fixed number, or (round 6, item 9) `max(transport hint ?? 100,
+     * AWARENESS_AUTO_MS_PER_PEER * peerCount)` when set to `'auto'`.
+     */
+    private _effectiveAwarenessInterval;
+    private _replySuppressionMaxDelay;
     /**
      * Schedule a SyncStep2 reply after a short random delay instead of
      * sending immediately. If another peer's reply is overheard in the
@@ -311,15 +748,199 @@ export declare class GenericProvider extends Observable<string> {
      * redundant - the requester likely already got what it needed.
      *
      * A reply that is already pending when this is called answers a
-     * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
-     * later by peer B's) - it must not be silently overwritten by the new
-     * one. Flush it immediately, then schedule the new reply fresh. The only
-     * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
-     * because we overheard someone else's SyncStep2 for the SAME request.
+     * *different* request (e.g. peer A's request, followed 5ms later by
+     * peer B's) - it must not be silently overwritten by the new one. Flush
+     * it immediately, then schedule the new reply fresh. The only sanctioned
+     * ways a reply gets dropped are `_cancelPendingSyncReply()` (we overheard
+     * someone else's SyncStep2 for the SAME request), `_cancelPendingAck()`,
+     * and the identical-bytes case below.
+     *
+     * Identical-bytes case (Task 3c in the design doc): K peers with the same
+     * state asking at once (K empty joiners in a burst) get K byte-identical
+     * SyncStep2s from us - the same full document K times, one flushed
+     * immediately per arriving request, each burning a rate-limit slot. If
+     * the new reply's bytes equal the pending reply's bytes, the pending one
+     * already answers this request too: keep it (same delay, same
+     * suppression) and drop the new one. Measured in
+     * test/dummy/bench-join-after-burst.ts.
      */
     private _scheduleSyncReply;
     /** Cancel a pending suppressed reply, if any. */
     private _cancelPendingSyncReply;
+    /**
+     * Cancel a pending reply only if it is a digest ack - see
+     * `_pendingSyncReplyIsAck`. Called from `_handleDigest()` on every
+     * overheard beacon whose digest equals ours.
+     */
+    private _cancelPendingAck;
+    /**
+     * Route a SyncStep2 (or digest-ack) reply through the redundancy
+     * suppression when there's genuine redundancy (>= 2 other known peers via
+     * awareness - below that there's no "someone else" to rely on), else send
+     * immediately. Both paths are rate-limited by `_sendSyncReply()`. Shared
+     * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
+     */
+    private _replyToSyncRequest;
+    /** Whether a reply to `clientID` can go over Transport.sendTo. */
+    private _canUnicast;
+    /**
+     * Responder self-selection for unicast replies: the three peers whose
+     * hash for this requester ranks lowest among the peers we know answer
+     * it. Every candidate ranks itself against the same known set, so the
+     * sets agree wherever the views agree, and the peer that ranks first in
+     * the true order always ranks first in its own view - the selection is
+     * never empty. A 2 s time bucket in the hash rotates the ranking, so
+     * three departed peers at the top only delay a reply until the
+     * requester's next attempt. Everyone answers in rooms of four or fewer.
+     * (A first cut chose each responder independently with probability 3/N;
+     * ~5 % of requests then selected nobody and waited for the 1 s retry.)
+     */
+    private _selectedResponder;
+    /**
+     * How many known peers rank below us for `requester` in the current 2 s
+     * bucket (counting stops at `cap`). Shared by unicast self-selection
+     * (rank < 3 answers) and, since phase 1e, the relay-mode reply delay
+     * (rank r waits r slots, see _replyDelay()).
+     */
+    private _responderRank;
+    /**
+     * Delay before a suppressible reply goes out (relay path). Phase 1e:
+     * ranked, not uniform. A uniform draw from [0, W] lets ~N * L / W
+     * repliers fire before the first reply is overheard (L = one-way
+     * latency): 10-27 SyncStep2 sends per request at N=100 in
+     * test/dummy/bench-join-census.ts, and the WebRTC join-burst cell's
+     * 16-34k spread. With the responder rank (the same hash the unicast
+     * self-selection uses) rank 0 answers at once and rank r waits r
+     * windows (W = _replySuppressionMaxDelay(), 1.5x the minimum round
+     * trip: with request arrival spread 2jL and reply flight L(1+j), rank 1
+     * has overheard rank 0 iff the slot is >= L(1+3j), which 3L(1-j) covers
+     * up to j~0.33). Ranks >= 8 add a random window on top so a room whose
+     * first eight ranked peers are all gone does not answer in one
+     * avalanche. Without an RTT sample or a requester id (legacy SyncStep1)
+     * the uniform window stays.
+     */
+    private _replyDelay;
+    /**
+     * Send one already-encoded message to a single peer over
+     * Transport.sendTo, with the same CRC32 wrapping and optional compression
+     * as a broadcast. Not mirrored to BroadcastChannel (a same-browser tab
+     * never appears as an addressable peer). Returns false if the peer's
+     * address is unknown or the transport cannot unicast.
+     */
+    private _sendDirect;
+    /**
+     * Re-check Yjs's pending-struct store after the gap grace period and
+     * request a resync (a beacon, see _requestResync) only if something is
+     * still missing. One timer; a check scheduled while one is pending is
+     * absorbed. Cleared on disconnect/destroy.
+     */
+    /**
+     * A beacon (a peer's periodic tick, or its request) just showed its
+     * sender ahead of us. Until phase 1d nothing happened with that: a peer
+     * whose last update was lost (no later message to open a sequence gap
+     * against), or whose request was answered by a responder that was
+     * itself behind, waited for its OWN next periodic beacon - up to
+     * syncInterval, up to idleBackoffMaxMs with idle backoff on. Now we
+     * check again after a grace and, if still behind that state, ask through
+     * the resync coordinator (coalesced, backed off, rate-limited).
+     *
+     * The grace is what keeps this quiet during typing: at Matrix latency
+     * almost every receiver of a periodic beacon is "behind" by a keystroke
+     * that is still in flight (jitter +-140 ms); max(gapGraceMs, 2 x minRTT)
+     * later it has arrived and the check finds nothing to do. A lost
+     * keystroke that opened a sequence gap is already being requested by the
+     * gap check - the outstanding response wait tells us so, and we stay
+     * quiet. One timer, the newest state vector: a later beacon that shows us
+     * behind by more replaces the reference, the timer keeps running.
+     */
+    private _scheduleBehindCheck;
+    /** Design E: after a reply or push, pending structs mean the sender had the same hole - arm the grace check. */
+    private _checkPendingAfterReply;
+    private _schedulePendingCheck;
+    /**
+     * Return the update payload of a SyncStep2/Update sync sub-message
+     * without advancing `decoder` (null for SyncStep1 or malformed input).
+     * y-protocols frames both as [subType varUint][update varUint8Array].
+     */
+    private _peekSyncUpdate;
+    /**
+     * Whether an update we just applied was already superseded here: every
+     * client it touches ends at a clock we were at or beyond BEFORE this
+     * update (i.e. it added nothing). Uses the update's own metadata
+     * (`Y.parseUpdateMeta`), O(clients in the update).
+     */
+    private _isLateUpdate;
+    /** Flip `synced` once and emit; idempotent. */
+    private _markSynced;
+    /**
+     * Wait for a response to the JOIN or resync beacon we just sent. If
+     * neither a SyncStep2 nor an equal ack/beacon arrives within 1s (then
+     * 2s, 4s), ask again - with a CONFIRM beacon after a JOIN (so an equal
+     * room acks), with a plain beacon after a resync (only peers ahead of us
+     * need to answer; an equal room's silence is the correct answer and its
+     * periodic beacons end the wait) - three times at most; after that the
+     * periodic beacon is the fallback, as before. Requester-side retry is how the protocol
+     * stays loss-tolerant now that reply suppression leaves ~1 reply per
+     * request; N-fold redundant replies were the old (accidental) way.
+     */
+    private _armResponseWait;
+    /**
+     * A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is
+     * answered. `sample` = it was a direct reply (SyncStep2/ack), so its
+     * timing is a round-trip sample; an equal periodic beacon from a settled
+     * peer also ends the wait but says nothing about latency.
+     */
+    private _noteResponse;
+    /** Minimum of the recent round-trip samples, or null before the first reply. */
+    private _rttMinMs;
+    /**
+     * Delay a pure timeout-removal awareness broadcast and drop it if
+     * another peer's broadcast of the SAME removal is overheard first (see
+     * the `origin === this` branch in `_setupAwarenessSync()`'s handler,
+     * which calls `_cancelPendingAwarenessRemovalIfOverlaps()`) - the exact
+     * same NACK-style suppression `_scheduleSyncReply()` already applies to
+     * SyncStep2 replies, reusing the same room-size-scaled delay
+     * (`_replySuppressionMaxDelay()`).
+     *
+     * A pending removal already queued when this is called is for a
+     * DIFFERENT departure (two peers timing out, or leaving, within the same
+     * window): since round 5 the ids are merged into the pending set and its
+     * timer kept - one broadcast carries both - instead of flushing the
+     * first as an unsuppressed broadcast (with the long leave window below a
+     * burst of departures would have flushed on every peer). An overheard
+     * broadcast trims only the ids it covers from the pending set
+     * (`_cancelPendingAwarenessRemovalIfOverlaps()`).
+     *
+     * Window: the reply-suppression window for timeouts (sweeps are spread
+     * over seconds anyway); for leaves reported by the transport - all
+     * survivors learn of them in the same millisecond - ten times that,
+     * at least a second, so the first broadcast is overheard before the
+     * rest fire. A departure is not urgent: every peer already dropped the
+     * state locally.
+     */
+    private _scheduleAwarenessRemoval;
+    /**
+     * Peek at an awareness-update payload (still in
+     * `awarenessProtocol.encodeAwarenessUpdate()`'s wire encoding) for
+     * clientIDs whose state is `null` (a removal), without applying it.
+     * y-protocols/awareness.js doesn't export a standalone decoder for this,
+     * only `applyAwarenessUpdate()` (which also mutates state) and
+     * `modifyAwarenessUpdate()` (which re-encodes) - so this mirrors the
+     * format by hand: varUint length, then per entry
+     * [varUint clientID][varUint clock][varString JSON state]. Used to cancel
+     * a pending suppressed removal (see `_scheduleAwarenessRemoval()`) at the
+     * wire-message level, before `applyAwarenessUpdate()` runs - see the
+     * `MESSAGE_AWARENESS` case's comment for why timing matters here.
+     */
+    private _scanAwarenessPayload;
+    /**
+     * Trim a pending suppressed removal broadcast by `removedClientIds` -
+     * someone else already broadcast those departures; what they did not
+     * cover stays queued.
+     */
+    private _cancelPendingAwarenessRemovalIfOverlaps;
+    /** Cancel a pending suppressed awareness-removal broadcast, if any. */
+    private _cancelPendingAwarenessRemoval;
     /**
      * Send a SyncStep2 reply, gated by the same shared per-peer budget as
      * SyncStep1 requests/syncNow() pushes (`_tryReserveSyncSlot()`).
@@ -385,36 +1006,61 @@ export declare class GenericProvider extends Observable<string> {
      * its own uncapped or separately-capped allowance.
      */
     private _tryReserveSyncSlot;
+    /** Same limiter, separate budget, for SyncStep2 replies and acks. */
+    private _tryReserveReplySlot;
+    private _tryReserveSlot;
     /**
-     * Encode and send a SyncStep1 message requesting missing updates.
-     * Does not check the rate limiter itself - callers must reserve a slot
-     * via `_tryReserveSyncSlot()` first.
+     * Encode the digest beacon that replaces SyncStep1 (see
+     * MESSAGE_SYNC_DIGEST). Still the one place every "request sync" path
+     * goes through (connect()'s syncNow(), the periodic tick,
+     * _requestResync()'s retry), so they all switched together.
      */
-    private _writeSyncStep1;
+    private _encodeSyncStep1;
     /**
-     * Send SyncStep1 message to request missing updates.
-     * This is sent when first connecting to sync with remote peers.
-     * Note: SyncStep1 is just a request and doesn't include hash verification.
-     * Rate limited to prevent spam.
+     * Encode an ack for a JOIN beacon: same framing as a beacon, DIGEST_FLAG_ACK
+     * set, and the JOINER's state vector + delete-set hash echoed back instead
+     * of ours (see DIGEST_FLAG_ACK for why it must never carry our own state).
+     */
+    private _encodeAck;
+    /**
+     * Send the periodic digest beacon. Rate limited to prevent spam. Returns
+     * whether it actually sent (false means rate-limited).
      */
     private _sendSyncStep1;
     /**
-     * Send a document update to the transport.
-     * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
+     * Encode a document update, without sending it. Extracted from the old
+     * `_sendUpdate()` so `_trySyncPushPull()` can fold the push half into a
+     * batched wire send (see `_sendBatch()`); `_sendUpdate()` below is the
+     * send-immediately form still used by every other update-emitting path
+     * (the doc-update handler, batch-flush, disconnect/destroy flush) since
+     * those aren't part of this batching effort's scope.
+     *
+     * NOTE: has a side effect (`_localSeqNum++`) - call exactly once per
+     * logical update, same as before.
+     */
+    private _encodeUpdate;
+    /**
+     * Encode a full-state push (see MESSAGE_SYNC_PUSH): the document as one
+     * update, deliberately without the hash and sequence number that
+     * `_encodeUpdate()` adds to incremental updates.
+     */
+    private _encodePush;
+    /**
+     * Send a document update to the transport, with whatever awareness change
+     * the throttle is holding folded into the same wire message (round 5,
+     * item 1). If verifyUpdates is enabled, the update carries a sequence
+     * number and document hash for ordering and desync detection.
      */
     private _sendUpdate;
+    /**
+     * Send awareness update to the transport.
+     */
+    private _sendAwarenessUpdate;
     /**
      * Send a pub/sub message.
      * Internal method called by PubSubChannel.
      */
     _sendPubSub(topic: string, message: any): void;
-    /**
-     * Send a targeted pub/sub message.
-     * Uses transport.sendTo when available (direct delivery), otherwise
-     * broadcasts a targeted frame that non-target providers drop.
-     * Internal method called by PubSubChannel.
-     */
-    _sendPubSubTo(target: string, topic: string, message: any): void;
     /**
      * Broadcast awareness state for the specified clients.
      * Throttled to prevent awareness updates from flooding document sync.
@@ -422,28 +1068,138 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _broadcastAwareness;
     /**
+     * Round 5, item 1: the awareness change the throttle is holding rides
+     * along with a wire message that is leaving anyway. Returns the encoded
+     * awareness sub-message (or nothing) and commits the throttle state
+     * exactly as the timer's own flush would. A piggybacked broadcast costs
+     * no message, only its payload bytes, so it goes out early instead of as
+     * its own message up to `_awarenessInterval` later. Measured in
+     * test/dummy/bench-typing-census.ts: a keystroke in an editor binding is
+     * a text insert plus a cursor update - two broadcasts per keystroke
+     * before this, one after. Broadcast paths only: `_sendDirect` and the
+     * BroadcastChannel-only publishes never call this.
+     */
+    private _takePendingAwareness;
+    /**
+     * The counterpart for the timed batch: a `batchUpdates > 0` batch that is
+     * still waiting rides along with an awareness flush (Matrix: both
+     * default to 2 s, so a typist's cursor and text leave as one PUT).
+     */
+    private _takePendingUpdate;
+    /**
+     * Encode an awareness update, without sending it. Extracted from the old
+     * `_sendAwarenessNow()` so `_tryImmediateAwarenessMessage()` can fold it
+     * into a batched wire send instead of always sending it as its own
+     * message.
+     */
+    private _encodeAwareness;
+    /**
      * Send awareness update immediately without throttling.
      */
     private _sendAwarenessNow;
+    /**
+     * Attempt to build an awareness broadcast message for immediate
+     * inclusion in the same wire send as a sync message a caller is about to
+     * send anyway (see `_trySyncPushPull`'s `buildExtra` parameter), instead
+     * of going through
+     * `_broadcastAwareness()`'s independent debounce.
+     *
+     * Only returns non-null when the throttle would have let an immediate
+     * send through anyway - i.e. no debounced broadcast is already pending
+     * AND (throttling is disabled, or at least `_awarenessInterval` ms have
+     * passed since the last broadcast) - so this never changes awareness
+     * throttle semantics, only whether the resulting message travels as its
+     * own wire send or bundled with a sync message that happens to be going
+     * out "now" too.
+     *
+     * Mutates the same state `_broadcastAwareness()`'s own immediate-send
+     * branches mutate (`_pendingAwarenessClients`, `_lastAwarenessTime`) -
+     * once this returns non-null, the state is already committed as "sent
+     * now", so the caller MUST actually send the returned message (bundled
+     * or standalone) rather than discarding it.
+     */
+    private _tryImmediateAwarenessMessage;
     /**
      * Setup BroadcastChannel for cross-tab communication.
      * Automatically disabled in non-browser environments.
      */
     private _setupBroadcastChannel;
     /**
-     * Encode and publish an awareness update for the local client to the BroadcastChannel.
-     */
-    private _publishAwarenessToBroadcastChannel;
-    /**
      * Disconnect from BroadcastChannel and mark local client as offline.
      */
     private _disconnectBroadcastChannel;
+    /**
+     * Send N already-encoded, already-typed sub-messages as ONE wire message
+     * instead of N separate `transport.send()`/`bc.publish()` calls, when
+     * there's more than one to send. Used at trigger points that
+     * conceptually produce a single event but historically sent multiple
+     * independent messages for it (sync push, sync pull, awareness) - see
+     * `_trySyncPushPull()` (connect-time push + digest beacon + awareness in
+     * one wire message).
+     *
+     * Design (see the task's framing requirements):
+     * - Each sub-message is length-prefixed with `writeVarUint8Array`,
+     *   consistent with how this codebase already frames variable-length
+     *   payloads elsewhere (e.g. MESSAGE_AWARENESS). On receipt,
+     *   `_dispatchMessage()`'s `MESSAGE_BATCH` case unwraps and re-dispatches
+     *   each one through the EXACT SAME per-message-type logic used for a
+     *   top-level message - no parallel reimplementation.
+     * - Sub-messages are NOT individually CRC32-wrapped here - the whole
+     *   batch envelope goes through the normal, single `_send()` pipeline
+     *   below, which wraps the WHOLE envelope in exactly one CRC32 checksum
+     *   (and, if `compressionThresholdBytes` is configured, one compression
+     *   pass) - built and computed exactly like any other outgoing message,
+     *   so this composes with the existing compression pipeline for free
+     *   rather than fighting it with a second, nested wrap/compress step.
+     *   The tradeoff: a single corrupted bit anywhere in a batched wire
+     *   message now invalidates every sub-message it carried, not just one -
+     *   per-sub-message CRC32s would avoid that, at the cost of ~4 extra
+     *   bytes per sub-message for a benefit that only matters under active
+     *   corruption. This tradeoff is exactly what
+     *   test/dummy/bench-corruption-storm.ts and bench-packet-loss.ts exist
+     *   to measure empirically, per this task's validation requirements,
+     *   rather than deciding it by design argument alone.
+     * - BroadcastChannel (cross-tab) traffic is NOT specially batched beyond
+     *   whatever `_send()` already does per call - same-tab-group cross-tab
+     *   traffic is local/cheap, and `_send()` already only issues one
+     *   `bc.publish()` per call regardless, so a batch of N sub-messages
+     *   already becomes exactly one `bc.publish()` call for free once routed
+     *   through here - no separate BC-specific batching logic needed.
+     */
+    private _sendBatch;
+    /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */
+    private _encodeBatch;
     /**
      * Send data through both BroadcastChannel (if connected) and transport.
      * All messages are wrapped with CRC32 checksum for integrity verification.
      * This ensures updates reach both local tabs and remote peers with corruption detection.
      */
     private _send;
+    /**
+     * Publish already-CRC32-wrapped bytes to the other tabs. BroadcastChannel
+     * is same-process - never worth compressing - but when
+     * compressionThresholdBytes is enabled every message still needs the
+     * leading flag byte _handleIncomingMessage() expects regardless of
+     * source, so this sends flag=0 in that case. The ONE place for every BC
+     * publish: the connect-time burst in _setupBroadcastChannel() used to
+     * publish without the flag, and with compression on (the transport
+     * hints made that a default) the other tab read a CRC byte as the flag
+     * and failed to inflate three messages per join (Nostr playground,
+     * 2026-09-06).
+     */
+    private _bcPublish;
+    /**
+     * Send already-CRC32-wrapped bytes to the network transport, compressing
+     * first if compressionThresholdBytes is configured and this payload
+     * clears it. See that option's doc comment for the size threshold
+     * reasoning and the wire-format compatibility tradeoff of enabling it.
+     */
+    private _sendToTransport;
+    /**
+     * Hand fully-framed bytes to transport.send() - or transport.sendTo() when
+     * a peer address is given - tolerating a sync or async result.
+     */
+    private _dispatchToTransport;
     /**
      * Update connection status and emit event.
      */

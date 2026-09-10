@@ -1,34 +1,5 @@
-/**
- * PubNub Transport for Yjs
- *
- * Provides real-time synchronization using PubNub's pub/sub infrastructure.
- *
- * Features:
- * - Global cloud infrastructure with low latency
- * - Built-in presence tracking
- * - Optional message encryption
- * - Optional message persistence
- * - Reliable message delivery
- *
- * @example
- * ```ts
- * import * as Y from 'yjs'
- * import { GenericProvider } from 'y-generic'
- * import { PubNubTransport } from 'y-generic/providers/pubnub'
- *
- * const doc = new Y.Doc()
- * const transport = new PubNubTransport({
- *   publishKey: 'pub-c-xxx',
- *   subscribeKey: 'sub-c-xxx',
- *   room: 'my-room',
- *   password: 'optional-encryption-key'
- * })
- *
- * const provider = new GenericProvider(doc, transport)
- * ```
- */
 export class PubNubTransport {
-    constructor() {
+    constructor(options = {}) {
         this.pubnub = null;
         this.channel = '';
         this.uuid = '';
@@ -37,8 +8,20 @@ export class PubNubTransport {
         this.debug = false;
         this.messageBuffer = []; // Buffer messages until callback is set
         this.chunkBuffer = new Map(); // Buffer for reassembling chunks
+        // Compress a full-document push before it is base64-encoded and chunked
+        // (see Transport.preferredCompressMinBytes).
+        this.preferredCompressMinBytes = 2048;
         // PubNub has a 32 KiB message limit. We use 30 KB for safety (after base64 encoding)
         this.MAX_MESSAGE_SIZE = 30000;
+        this.presenceEnabled = options.presence ?? false;
+        if (this.presenceEnabled) {
+            this.onPeerDisconnect = (callback) => {
+                this._peerDisconnectCallback = callback;
+                return () => {
+                    this._peerDisconnectCallback = undefined;
+                };
+            };
+        }
     }
     get isConnected() {
         return this._isConnected;
@@ -90,6 +73,8 @@ export class PubNubTransport {
                         this._isConnected = true;
                         clearTimeout(timeout);
                         this.log('✅ Connected to PubNub');
+                        if (this.presenceEnabled)
+                            this.verifyPresence();
                         resolve();
                     }
                     else if (statusEvent.category === 'PNNetworkDownCategory') {
@@ -118,9 +103,10 @@ export class PubNubTransport {
                                 ? this.base64ToUint8(event.message)
                                 : new Uint8Array(event.message);
                             this.log(`📨 Received ${data.length} bytes from ${event.publisher}`);
-                            // If callback is set, process immediately
+                            // If callback is set, process immediately (the publisher
+                            // uuid is the peer id onPeerDisconnect reports)
                             if (this.messageCallback) {
-                                this.messageCallback(data);
+                                this.messageCallback(data, event.publisher);
                             }
                             else {
                                 // Buffer message until callback is registered
@@ -135,12 +121,20 @@ export class PubNubTransport {
                 },
                 presence: (event) => {
                     this.log(`Presence: ${event.action}`, event);
+                    // PubNub presence (withPresence below): leave = clean unsubscribe,
+                    // timeout = heartbeat missed. Both mean the peer is gone.
+                    if ((event.action === 'leave' || event.action === 'timeout') &&
+                        event.uuid &&
+                        event.uuid !== this.uuid) {
+                        this._peerDisconnectCallback?.(event.uuid);
+                    }
                 },
             });
-            // Subscribe to channel
+            // Subscribe to channel (presence only when asked for - see
+            // PubNubTransportOptions.presence; it costs transactions)
             this.pubnub.subscribe({
                 channels: [this.channel],
-                withPresence: true,
+                withPresence: this.presenceEnabled,
             });
         });
     }
@@ -258,7 +252,7 @@ export class PubNubTransport {
                 const reassembledData = this.base64ToUint8(base64Data);
                 this.log(`✅ Message reassembled: ${reassembledData.length} bytes from ${publisher}`);
                 if (this.messageCallback) {
-                    this.messageCallback(reassembledData);
+                    this.messageCallback(reassembledData, publisher);
                 }
                 else {
                     this.messageBuffer.push(reassembledData);
@@ -285,6 +279,33 @@ export class PubNubTransport {
         return () => {
             this.messageCallback = undefined;
         };
+    }
+    /**
+     * With `presence: true`: after subscribing, check that the keyset lists us
+     * in hereNow - a keyset without the Presence add-on never emits presence
+     * events, and GenericProvider would then trust a leave signal that never
+     * comes (departures noticed only after the 5-minute lease).
+     */
+    verifyPresence() {
+        setTimeout(async () => {
+            if (!this.pubnub || !this._isConnected)
+                return;
+            try {
+                const response = await this.pubnub.hereNow({
+                    channels: [this.channel],
+                    includeUUIDs: true,
+                });
+                const occupants = response?.channels?.[this.channel]?.occupants ?? [];
+                if (!occupants.some((o) => o.uuid === this.uuid)) {
+                    console.warn('[PubNubTransport] presence: true, but the keyset does not list this client in hereNow - ' +
+                        'enable the Presence add-on for the keyset in the PubNub admin portal, or construct the transport without presence. ' +
+                        'Until then a departed peer is only removed after the awareness lease.');
+                }
+            }
+            catch (error) {
+                this.log('presence check failed:', error);
+            }
+        }, 3000);
     }
     /**
      * Get presence information (list of peers)

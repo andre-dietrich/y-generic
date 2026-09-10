@@ -56,7 +56,7 @@ export class DummyHub {
     string,
     Set<{
       transport: DummyTransport
-      callback: (data: Uint8Array) => void
+      callback: (data: Uint8Array, from?: string) => void
     }>
   > = new Map()
 
@@ -66,7 +66,7 @@ export class DummyHub {
   join(
     room: string,
     transport: DummyTransport,
-    callback: (data: Uint8Array) => void,
+    callback: (data: Uint8Array, from?: string) => void,
   ): void {
     if (!this.rooms.has(room)) {
       this.rooms.set(room, new Set())
@@ -88,6 +88,95 @@ export class DummyHub {
       }
       if (clients.size === 0) {
         this.rooms.delete(room)
+      }
+    }
+  }
+
+  private peerConnectSubs: Map<
+    string,
+    Set<{ transport: DummyTransport; callback: (peerId: string) => void }>
+  > = new Map()
+  private peerDisconnectSubs: Map<
+    string,
+    Set<{ transport: DummyTransport; callback: (peerId: string) => void }>
+  > = new Map()
+
+  /** Register a transport's onPeerDisconnect callback (see notifyLeave). */
+  registerPeerDisconnect(
+    room: string,
+    transport: DummyTransport,
+    callback: (peerId: string) => void,
+  ): void {
+    if (!this.peerDisconnectSubs.has(room)) {
+      this.peerDisconnectSubs.set(room, new Set())
+    }
+    this.peerDisconnectSubs.get(room)!.add({ transport, callback })
+  }
+
+  unregisterPeerDisconnect(room: string, transport: DummyTransport): void {
+    const subs = this.peerDisconnectSubs.get(room)
+    if (!subs) return
+    for (const entry of subs) {
+      if (entry.transport === transport) {
+        subs.delete(entry)
+        break
+      }
+    }
+  }
+
+  /**
+   * Simulate the leave notification a mesh transport's channel close (or a
+   * presence service) gives every other peer: called by DummyTransport
+   * when it leaves a room with `simulatePeerConnect` on.
+   */
+  notifyLeave(room: string, transport: DummyTransport): void {
+    const subs = this.peerDisconnectSubs.get(room)
+    if (!subs) return
+    for (const entry of subs) {
+      if (entry.transport !== transport) entry.callback(transport.id)
+    }
+  }
+
+  /**
+   * Register a transport's onPeerConnect callback and simulate the
+   * peer-discovery notifications a real mesh transport (peerjs,
+   * simple-peer) would fire: every OTHER already-registered transport in
+   * the room is notified about this new one, and this new transport is
+   * notified about every other one already registered - mirrors each side
+   * of a newly-opened data channel firing its own onPeerConnect. Test-only
+   * simulation: DummyTransport has no real peer-to-peer channels, this
+   * exists purely so GenericProvider's onPeerConnect handling (mesh-join
+   * burst coalescing) is exercisable via DummyTransport in benchmarks.
+   */
+  registerPeerConnect(
+    room: string,
+    transport: DummyTransport,
+    callback: (peerId: string) => void,
+  ): void {
+    if (!this.peerConnectSubs.has(room)) {
+      this.peerConnectSubs.set(room, new Set())
+    }
+    const subs = this.peerConnectSubs.get(room)!
+    const entry = { transport, callback }
+    subs.add(entry)
+
+    for (const other of subs) {
+      if (other.transport === transport) continue
+      other.callback(transport.id)
+      callback(other.transport.id)
+    }
+  }
+
+  /**
+   * Unregister a transport's onPeerConnect subscription from a room.
+   */
+  unregisterPeerConnect(room: string, transport: DummyTransport): void {
+    const subs = this.peerConnectSubs.get(room)
+    if (!subs) return
+    for (const entry of subs) {
+      if (entry.transport === transport) {
+        subs.delete(entry)
+        break
       }
     }
   }
@@ -130,18 +219,56 @@ export class DummyHub {
       if (actualDelay > 0) {
         setTimeout(() => {
           try {
-            client.callback(data)
+            client.callback(data, sender.id)
           } catch (error) {
             console.error('Error delivering message:', error)
           }
         }, actualDelay)
       } else {
         try {
-          client.callback(data)
+          client.callback(data, sender.id)
         } catch (error) {
           console.error('Error delivering message:', error)
         }
       }
+    }
+  }
+
+  /**
+   * Deliver a message to ONE client in a room (Transport.sendTo), with the
+   * same latency/jitter/drop model as broadcast(). Silently does nothing if
+   * the target has left. Used only by transports created with
+   * `unicast: true`.
+   */
+  unicast(
+    room: string,
+    targetId: string,
+    data: Uint8Array,
+    sender: DummyTransport,
+    options?: { latency?: number; dropRate?: number; jitter?: number },
+  ): void {
+    const clients = this.rooms.get(room)
+    if (!clients) return
+    for (const client of clients) {
+      if (client.transport.id !== targetId || client.transport === sender) continue
+      const dropRate = options?.dropRate ?? 0
+      if (dropRate > 0 && Math.random() < dropRate) return
+      const latency = options?.latency ?? 0
+      const jitter = options?.jitter ?? 0
+      let actualDelay = latency
+      if (latency > 0 && jitter > 0) {
+        actualDelay = latency * (1 - jitter) + Math.random() * (2 * latency * jitter)
+      }
+      const deliver = () => {
+        try {
+          client.callback(data, sender.id)
+        } catch (error) {
+          console.error('Error delivering message:', error)
+        }
+      }
+      if (actualDelay > 0) setTimeout(deliver, actualDelay)
+      else deliver()
+      return
     }
   }
 
@@ -231,19 +358,118 @@ export interface DummyTransportOptions {
    * @default false
    */
   autoConnect?: boolean
+
+  /**
+   * Simulate onPeerConnect notifications (mesh-style peer-discovery, as a
+   * real peerjs/simple-peer/trystero transport would fire). DummyTransport
+   * otherwise models a broadcast relay (like websocket/pubnub/gun/matrix,
+   * none of which implement onPeerConnect) - off by default so plain
+   * multi-peer benchmarks/usage aren't silently shifted onto the mesh code
+   * path in GenericProvider.connect(). Enable only when a test specifically
+   * wants to exercise onPeerConnect-triggered behavior (e.g.
+   * test/dummy/bench-mesh-join-burst.ts).
+   * @default false
+   */
+  simulatePeerConnect?: boolean
+
+  /**
+   * Model a transport that can address a single peer (Transport.sendTo,
+   * like peerjs/simple-peer/trystero): `sendTo` is present and delivers to
+   * one client via DummyHub.unicast(), and every delivery carries the
+   * sender's transport id as `from`. Off by default so plain benchmarks
+   * keep modelling a broadcast relay (websocket/pubnub/gun/matrix/...),
+   * on which GenericProvider's unicast paths never engage.
+   * @default false
+   */
+  unicast?: boolean
+
+  /**
+   * Simulate a chunking transport's hard per-message size limit (bytes),
+   * mirroring how PubNub (`src/providers/pubnub/index.ts`, ~30KB) and Ably
+   * (`src/providers/ably/index.ts`) split any `send()` payload larger than
+   * their wire limit into multiple messages, reassembled on the receiving
+   * side. DummyTransport otherwise has no size limit at all, so this
+   * scenario (a large sync payload silently becoming N wire messages) is
+   * completely unbenchmarkable without it - see
+   * docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
+   * item 1. Off by default (`undefined`) so every existing bench script's
+   * message counts are unaffected.
+   *
+   * When set, EVERY `send()` call is wrapped in a small chunk header
+   * (chunk id + index + total), even payloads that fit in a single chunk -
+   * this keeps the wire format unambiguous instead of guessing whether an
+   * incoming message is chunked. Both sides of a room must set this
+   * consistently (this is a same-process test simulation, not a real
+   * negotiated protocol).
+   * @default undefined (no chunking)
+   */
+  chunkSizeLimit?: number
 }
+
+/** Chunk header: [chunkId: uint32][index: uint16][total: uint16]. */
+const CHUNK_HEADER_SIZE = 8
 
 /**
  * Dummy transport implementation for testing and development.
  * Routes messages through a DummyHub instance.
  */
 export class DummyTransport implements Transport {
+  private static _idCounter = 0
+  /**
+   * Transport.expectedRttMs: a simulated transport that knows its latency
+   * class - twice the configured one-way latency, or undefined when no
+   * latency is simulated (matching push transports that leave it unset).
+   */
+  get expectedRttMs(): number | undefined {
+    const latency = this.options.latency ?? 0
+    return latency > 0 ? 2 * latency : undefined
+  }
+
+  /** Unique id for this transport instance, used by the onPeerConnect simulation. */
+  public readonly id: string = `dummy-${DummyTransport._idCounter++}`
+
   private hub?: DummyHub
   private explicitHub: boolean
   private options: DummyTransportOptions
   private _connected: boolean = false
   private _room: string = ''
-  private _callback?: (data: Uint8Array) => void
+  private _callback?: (data: Uint8Array, from?: string) => void
+
+  /**
+   * Transport.sendTo - present only when `unicast` is on (feature-detected
+   * by GenericProvider via `typeof transport.sendTo === 'function'`, so it
+   * must be genuinely absent otherwise, same pattern as onPeerConnect).
+   */
+  readonly sendTo?: (peerId: string, data: Uint8Array) => void
+  private _peerConnectCallback?: (peerId: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
+  /** Reassembly buffers for chunkSizeLimit mode, keyed by chunk id. */
+  private _chunkBuffers: Map<number, Map<number, Uint8Array>> = new Map()
+
+  /**
+   * Register callback for peer-connect notifications. Test-only simulation
+   * of what a real mesh transport (peerjs, simple-peer) does when a new
+   * data channel opens - see DummyHub.registerPeerConnect(). Assigned
+   * conditionally in the constructor (NOT a class method - see there for
+   * why): present only when `simulatePeerConnect` is on, so this property
+   * is genuinely absent (`undefined`), not merely a no-op function, on a
+   * plain DummyTransport. GenericProvider feature-detects onPeerConnect via
+   * `if (this.transport.onPeerConnect)` (matching the optional method on
+   * the `Transport` interface) - a class method satisfying that interface
+   * is ALWAYS present on every instance regardless of any constructor
+   * option, which previously defeated this feature-detection for every
+   * DummyTransport consumer (even non-mesh ones), silently registering an
+   * inert onPeerConnect subscription and, since GenericProvider gained
+   * onPeerConnect-conditional behavior elsewhere in its periodic-sync path,
+   * silently suppressing periodic awareness re-announce for plain
+   * DummyTransport usage too - a real bug, not just untidiness.
+   */
+  readonly onPeerDisconnect?: (
+    callback: (peerId: string) => void,
+  ) => () => void
+  readonly onPeerConnect?: (
+    callback: (peerId: string) => void,
+  ) => () => void
 
   /**
    * Create a new DummyTransport.
@@ -276,6 +502,51 @@ export class DummyTransport implements Transport {
       dropRate: options.dropRate ?? 0,
       jitter: options.jitter ?? 0,
       autoConnect: options.autoConnect ?? false,
+      simulatePeerConnect: options.simulatePeerConnect ?? false,
+      unicast: options.unicast ?? false,
+      chunkSizeLimit: options.chunkSizeLimit,
+    }
+
+    if (this.options.unicast) {
+      this.sendTo = (peerId: string, data: Uint8Array) => {
+        if (!this._connected || !this.hub) return
+        // Unicast is never chunked here - the chunk simulation models
+        // relay size limits, which is a broadcast-transport concern.
+        this.hub.unicast(this._room, peerId, data, this, {
+          latency: this.options.latency,
+          dropRate: this.options.dropRate,
+          jitter: this.options.jitter,
+        })
+      }
+    }
+
+    if (this.options.simulatePeerConnect) {
+      this.onPeerConnect = (callback: (peerId: string) => void) => {
+        this._peerConnectCallback = callback
+
+        if (this._connected && this._room && this.hub) {
+          this.hub.registerPeerConnect(this._room, this, callback)
+        }
+
+        return () => {
+          this._peerConnectCallback = undefined
+          if (this.hub) {
+            this.hub.unregisterPeerConnect(this._room, this)
+          }
+        }
+      }
+      // The counterpart: a transport that leaves the room tells every
+      // other subscribed transport, like a data channel closing.
+      this.onPeerDisconnect = (callback: (peerId: string) => void) => {
+        this._peerDisconnectCallback = callback
+        if (this._connected && this._room && this.hub) {
+          this.hub.registerPeerDisconnect(this._room, this, callback)
+        }
+        return () => {
+          this._peerDisconnectCallback = undefined
+          if (this.hub) this.hub.unregisterPeerDisconnect(this._room, this)
+        }
+      }
     }
   }
 
@@ -303,7 +574,22 @@ export class DummyTransport implements Transport {
     }
     // Otherwise, will join when onMessage() is called
 
+    // Mark connected before registering onPeerConnect: registerPeerConnect()
+    // synchronously fires callbacks (including this transport's own, about
+    // peers already in the room), and a real mesh transport only fires
+    // onPeerConnect once it considers its own channel open - so any
+    // consumer reacting to that notification (e.g. GenericProvider calling
+    // syncNow()) should see isConnected as true, matching real transports.
     this._connected = true
+
+    // Same deal for onPeerConnect - register with the hub now that the room
+    // is known, if a caller already subscribed before connect() resolved.
+    if (this._peerConnectCallback) {
+      this.hub.registerPeerConnect(this._room, this, this._peerConnectCallback)
+    }
+    if (this._peerDisconnectCallback) {
+      this.hub.registerPeerDisconnect(this._room, this, this._peerDisconnectCallback)
+    }
   }
 
   /**
@@ -314,6 +600,9 @@ export class DummyTransport implements Transport {
 
     if (this.hub) {
       this.hub.leave(this._room, this)
+      this.hub.unregisterPeerConnect(this._room, this)
+      if (this.options.simulatePeerConnect) this.hub.notifyLeave(this._room, this)
+      this.hub.unregisterPeerDisconnect(this._room, this)
     }
     this._connected = false
   }
@@ -330,6 +619,12 @@ export class DummyTransport implements Transport {
       return
     }
 
+    const limit = this.options.chunkSizeLimit
+    if (limit) {
+      this._sendChunked(data, limit)
+      return
+    }
+
     // Broadcast through hub
     this.hub.broadcast(this._room, data, this, {
       latency: this.options.latency,
@@ -339,14 +634,97 @@ export class DummyTransport implements Transport {
   }
 
   /**
+   * Split `data` into one or more hub-delivered chunks, each carrying a
+   * small [chunkId][index][total] header - mirrors (in spirit, not byte
+   * format) how PubNub/Ably split an oversized payload into multiple wire
+   * messages. Always chunks (even a payload that fits in one chunk, as a
+   * single total=1 "chunk") so the receiving side's framing is unambiguous
+   * regardless of payload size - see chunkSizeLimit's doc comment.
+   */
+  private _sendChunked(data: Uint8Array, limit: number): void {
+    const payloadSize = Math.max(1, limit - CHUNK_HEADER_SIZE)
+    const total = Math.max(1, Math.ceil(data.length / payloadSize))
+    const chunkId = Math.floor(Math.random() * 0xffffffff)
+
+    for (let i = 0; i < total; i++) {
+      const slice = data.subarray(i * payloadSize, (i + 1) * payloadSize)
+      const packed = new Uint8Array(CHUNK_HEADER_SIZE + slice.length)
+      const view = new DataView(packed.buffer)
+      view.setUint32(0, chunkId)
+      view.setUint16(4, i)
+      view.setUint16(6, total)
+      packed.set(slice, CHUNK_HEADER_SIZE)
+
+      this.hub!.broadcast(this._room, packed, this, {
+        latency: this.options.latency,
+        dropRate: this.options.dropRate,
+        jitter: this.options.jitter,
+      })
+    }
+  }
+
+  /**
+   * Reassemble a chunked message. Returns the complete payload once every
+   * chunk for its chunkId has arrived, or `undefined` while still waiting
+   * on more chunks (including the single-chunk total=1 case reassembling
+   * immediately).
+   */
+  private _reassembleChunk(packed: Uint8Array): Uint8Array | undefined {
+    const view = new DataView(
+      packed.buffer,
+      packed.byteOffset,
+      packed.byteLength,
+    )
+    const chunkId = view.getUint32(0)
+    const index = view.getUint16(4)
+    const total = view.getUint16(6)
+    const payload = packed.subarray(CHUNK_HEADER_SIZE)
+
+    if (total === 1) {
+      return payload
+    }
+
+    let buf = this._chunkBuffers.get(chunkId)
+    if (!buf) {
+      buf = new Map()
+      this._chunkBuffers.set(chunkId, buf)
+    }
+    buf.set(index, payload)
+    if (buf.size < total) {
+      return undefined
+    }
+
+    this._chunkBuffers.delete(chunkId)
+    const totalLength = Array.from(buf.values()).reduce(
+      (sum, c) => sum + c.length,
+      0,
+    )
+    const combined = new Uint8Array(totalLength)
+    let offset = 0
+    for (let i = 0; i < total; i++) {
+      const part = buf.get(i)!
+      combined.set(part, offset)
+      offset += part.length
+    }
+    return combined
+  }
+
+  /**
    * Register callback for incoming messages.
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void {
-    this._callback = callback
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
+    const limit = this.options.chunkSizeLimit
+    const wrappedCallback = limit
+      ? (packed: Uint8Array, from?: string) => {
+          const reassembled = this._reassembleChunk(packed)
+          if (reassembled) callback(reassembled, from)
+        }
+      : callback
+    this._callback = wrappedCallback
 
     // If already connected, register with hub now
     if (this._connected && this._room && this.hub) {
-      this.hub.join(this._room, this, callback)
+      this.hub.join(this._room, this, wrappedCallback)
     }
 
     // Return unsubscribe function

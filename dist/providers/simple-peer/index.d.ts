@@ -124,16 +124,13 @@ export declare class SimplePeerTransport implements Transport {
     private _connected;
     private _room;
     private _callback?;
-    private _peerConnectCallbacks;
-    private _peerDisconnectCallbacks;
-    private _controlCallbacks;
+    private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
     private peerId;
     private peers;
     private signalingConns;
     private announcedPeers;
     private announceInterval?;
-    private _reconnectAttempts;
-    private _reconnectTimers;
     /**
      * Create a new SimplePeer transport.
      *
@@ -154,10 +151,6 @@ export declare class SimplePeerTransport implements Transport {
      */
     send(data: Uint8Array): void;
     /**
-     * Send data to a single connected peer by ID (targeted delivery).
-     */
-    sendTo(peerId: string, data: Uint8Array): void;
-    /**
      * Send data to a single peer, chunking if necessary.
      * Uses flow control to avoid overwhelming the WebRTC buffer.
      */
@@ -170,66 +163,26 @@ export declare class SimplePeerTransport implements Transport {
     /**
      * Register callback for incoming messages.
      */
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
+    /**
+     * Transport.sendTo: deliver to one connected peer (the `from` id passed
+     * to onMessage), chunked and flow-controlled like a broadcast send.
+     */
+    sendTo(peerId: string, data: Uint8Array): void;
     /**
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
-    /**
-     * Register callback for peer disconnects (channel close or error). Only fires
-     * for peers that had reached the connected state.
-     */
+    /** Transport.onPeerDisconnect: a peer's channel closed or errored (removePeer). */
     onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
-     * Register callback for consumer control frames (MSG_TYPE_CONTROL).
-     * These bypass the provider pipe — use for per-peer handshakes/auth.
-     */
-    onControlFrame(callback: (peerId: string, payload: Uint8Array) => void): () => void;
-    /**
-     * Tear down a single peer connection (e.g. to reject a peer that failed an
-     * out-of-band handshake). Fires onPeerDisconnect if the peer was connected.
-     */
-    disconnectPeer(peerId: string): void;
-    /**
-     * Send a control frame to a single peer. Not chunked or encrypted — keep
-     * payloads small (they must fit one DataChannel message).
-     */
-    sendControl(peerId: string, payload: Uint8Array): void;
-    /**
      * Check if connected.
-     *
-     * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
-     * a health check — it stays true with zero signaling servers, which is what
-     * makes BroadcastChannel-only mode work. For "can we still discover peers?"
-     * use `signalingHealth`.
      */
     get isConnected(): boolean;
     /**
      * Get number of connected peers (for debugging).
      */
     get connectedPeers(): number;
-    /**
-     * Signaling/discovery health, for diagnostics and monitoring.
-     *
-     * `isConnected` deliberately cannot express this: a transport whose signaling
-     * sockets have all dropped still reports connected, and peer discovery is
-     * silently dead until they come back.
-     */
-    get signalingHealth(): {
-        open: number;
-        configured: number;
-        reconnecting: number;
-        peers: number;
-        connectedPeers: number;
-    };
-    /**
-     * Reconnect to a signaling server after it drops, with exponential backoff.
-     *
-     * Mirrors lib0's WebsocketClient (what y-webrtc gets for free): delay grows
-     * as log10(attempts + 1) * 1200ms, capped at 30s. No-ops after an explicit
-     * disconnect(), and never stacks duplicate timers for the same URL.
-     */
-    private scheduleSignalingReconnect;
     /**
      * Connect to a signaling server.
      */
@@ -254,7 +207,6 @@ export declare class SimplePeerTransport implements Transport {
      * Handle WebRTC signal from peer.
      */
     private handlePeerSignal;
-    private pruneStalePeer;
     /**
      * Remove and cleanup a peer connection.
      */

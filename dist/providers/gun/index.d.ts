@@ -144,6 +144,7 @@ export interface GunConnectionConfig extends ConnectionConfig {
  * would just stack a second debounce in front of this one for no benefit.
  */
 export declare class GunTransport implements Transport {
+    readonly expectedRttMs = 500;
     private options;
     private _connected;
     private _room;
@@ -155,13 +156,13 @@ export declare class GunTransport implements Transport {
     private updateBatch;
     private batchTimeout?;
     private processedUpdates;
-    private connectionTime;
     private throttleTimeout?;
     private pendingUpdates;
     private updateSlot;
     private readonly BUFFER_SIZE;
     private awarenessListener;
     private lastAwarenessId;
+    private ownAwarenessId;
     private encryptionEnabled;
     private persistentMode;
     private persistDoc;
@@ -171,6 +172,8 @@ export declare class GunTransport implements Transport {
     private savePending;
     /** Data loaded from Gun snapshot before onMessage callback is registered */
     private pendingLoad;
+    /** True once loadSnapshot()'s initial Gun read has completed */
+    private snapshotLoaded;
     /**
      * Create a new Gun transport.
      *
@@ -206,13 +209,17 @@ export declare class GunTransport implements Transport {
      */
     private peekMessageType;
     /**
-     * Send awareness update to a separate volatile node.
-     * Awareness is ephemeral - only the latest state matters.
-     * Each client writes to its own awareness slot to avoid overwrites.
+     * Send awareness update to a per-client slot under the awareness node.
+     * Awareness is ephemeral - only the latest state per client matters.
+     * Each client writes to its own slot (keyed by a stable per-connection id)
+     * so peers never overwrite each other's presence data.
      */
     private sendAwareness;
     /**
      * Setup listener for awareness updates (separate from doc sync).
+     * Uses .map() so every existing per-client slot is replayed on subscribe
+     * (late joiners learn about already-present peers), not just the most
+     * recently written one.
      */
     private setupAwarenessListener;
     /**

@@ -18,6 +18,7 @@ Explore 9 different transport implementations:
 - **PubNub** - Cloud pub/sub with global CDN
 - **WebSocket** - Standard client-server (y-websocket compatible)
 - **Matrix** - Federated communication protocol
+- **Ably** - Cloud pub/sub with global edge network
 
 ## Design Philosophy
 
@@ -129,14 +130,69 @@ interface Transport {
   
   // Data transmission
   send(data: Uint8Array): void | Promise<void>
-  onMessage(callback: (data: Uint8Array) => void): () => void
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void
   
   // Status
   readonly isConnected: boolean
+
+  // Optional - each one unlocks a cheaper code path when present
+  onPeerConnect?(callback: (peerId: string) => void): () => void
+  onPeerDisconnect?(callback: (peerId: string) => void): () => void
+  sendTo?(peerId: string, data: Uint8Array): void | Promise<void>
+  readonly preferredBatchMs?: number
+  readonly expectedRttMs?: number
+  readonly preferredCompressMinBytes?: number
+  readonly preferredAwarenessMs?: number
 }
 ```
 
-**That's it!** Just 4 methods + 1 property.
+**That's it!** Just 4 methods + 1 property. The optional members:
+
+- `onPeerConnect` - mesh transports fire it per newly opened peer channel so
+  the provider can send that peer a sync beacon right away (a full-state
+  push to every connection before round 5).
+- `onPeerDisconnect` - the counterpart: a peer's channel closed, or the
+  backend's presence service reports it gone (peerjs, simple-peer,
+  trystero, PubNub implement it). The provider drops that peer's presence
+  at once instead of after the awareness lease, and lets the lease default
+  to 5 minutes instead of 30 s - which removes the 15 s presence renewal
+  every peer otherwise broadcasts (80 % of an idle room's traffic once the
+  beacons have backed off).
+- `from` + `sendTo` - if your transport knows which peer a message came
+  from, pass that peer's id as the second callback argument and implement
+  `sendTo`. The provider then answers that peer's sync requests directly
+  (SyncStep2, acks, presence) instead of broadcasting the answer to the
+  room: about three unicast replies per join instead of every peer
+  answering everyone. Relays that only see a room leave both out and keep
+  today's broadcast behaviour.
+- `preferredBatchMs` - default `batchUpdates` for transports with a high
+  per-message cost (HTTP polling, internally debounced relays).
+- `expectedRttMs` - the round-trip time class you expect (e.g. 700 for a
+  Matrix homeserver). Seeds the provider's latency estimate so the first
+  join on a slow transport does not retry before the first replies can
+  have arrived; measured samples take over immediately.
+- `preferredCompressMinBytes` - default `compressionThresholdBytes` for
+  transports that cap or bill message size (Ably, PubNub, Matrix, Nostr,
+  Supabase set 2048): a full-document push is compressed before it is
+  chunked. Same-version-room rule applies, as for every wire change.
+- `preferredAwarenessMs` - default `awarenessInterval` for transports
+  whose backend rate-limits sends per user (Matrix sets 2000 against
+  Synapse's default 0.2 messages/s).
+
+On a transport without `onPeerDisconnect` (Gun, Nostr, a plain WebSocket
+relay) every peer still re-announces its presence every half lease so the
+others do not drop it - with the default 30 s lease that is most of what
+an idle room sends once the beacons have backed off. Setting
+`awarenessTimeoutMs: 120000` in the app (the Gun, Nostr and WebSocket
+playgrounds do) cuts those renewals by three quarters; the price is a
+cursor that lingers up to 2 minutes after a tab is killed (clean closes
+are still announced at once). Every peer of a room must use the same
+value.
+
+When a persistence provider (IndexedDB) shares the document, pass its
+connect() promise as `connect({ room, waitFor })`: the first beacon then
+says what is already on disk, the load is not re-broadcast, and the room
+answers with nothing instead of the whole document.
 
 ### GenericProvider Class
 
@@ -155,8 +211,12 @@ class GenericProvider extends Observable<string> {
   constructor(doc: Y.Doc, transport: Transport, options?: {
     awareness?: Awareness
     syncInterval?: number     // Auto-sync interval in ms (default: 5000, set 0 to disable)
+    idleBackoffEnabled?: boolean // Double the interval while the room is idle, up to idleBackoffMaxMs (default: true)
+    idleBackoffMaxMs?: number // Ceiling for the backed-off interval (default: 60000)
+    trickleK?: number         // Skip a periodic beacon when this many equal digests were overheard since the last one (default: 1, 0 = off)
+    awarenessTimeoutMs?: number // Presence lease; renew after half of it (default: 30000, or 300000 when the transport has onPeerDisconnect)
     verifyUpdates?: boolean   // Send hash with each update for fast desync detection (default: true)
-    batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = disabled, recommended: 50-200)
+    batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = end of the current task, recommended: 50-200)
   })
   
   connect(config: ConnectionConfig): Promise<void>
@@ -199,6 +259,10 @@ All changes to the Yjs document are automatically sent through your transport.
 
 ### ✅ Awareness Protocol
 Presence information (cursors, users online, etc.) is handled automatically.
+A joiner asks for the room's presence once; on a relay transport one peer
+answers with the whole awareness table (the others stay silent when that
+table carried their state), on a transport with `sendTo` each peer answers
+the joiner directly. Nobody re-announces presence on a timer.
 
 ### ✅ State Vector Sync
 Efficient synchronization using Yjs state vectors - only missing data is transmitted.
@@ -286,6 +350,12 @@ See `examples.ts` for complete implementations of:
 - **PubNubTransport**: Pub/sub messaging
 - **IndexedDBTransport**: Local persistence (acts as a "transport")
 
+When you combine a persistence provider with a network provider on the
+same `Y.Doc`, connect the persistence provider first and wait for its
+`synced` event before calling `connect()` on the network provider. The
+network provider's first request then carries your real state vector and
+the reply is only the tail you are missing, instead of the whole document.
+
 ## How It Works
 
 ```
@@ -349,6 +419,31 @@ Your `send()` method can return a Promise:
 ```typescript
 async send(data: Uint8Array): Promise<void> {
   await this.backend.publish(data)
+}
+```
+
+### Persistence Transports
+
+A transport that stores what it is given (IndexedDB, a Dexie table) is
+handed every frame the provider sends - presence, beacons and requests
+included. Store only the document: `extractDocUpdates(frame)` returns the
+Yjs updates a frame carries (none for presence, beacons and requests), and
+`frameDocUpdate(update)` wraps a stored (merged) update as the SyncStep2
+the provider applies on load - `synced` fires, nothing is sent back.
+`providers/indexeddb` is the reference; `connect({ waitFor })` pairs it
+with a network provider on the same document.
+
+```typescript
+import { extractDocUpdates, frameDocUpdate } from 'genericprovider'
+import * as Y from 'yjs'
+
+send(frame: Uint8Array) {
+  const updates = extractDocUpdates(frame)
+  if (updates.length > 0) this.rows.push(Y.mergeUpdates(updates))
+}
+onMessage(callback) {
+  if (this.rows.length > 0) callback(frameDocUpdate(Y.mergeUpdates(this.rows)))
+  return () => {}
 }
 ```
 
@@ -416,13 +511,42 @@ const provider = new GenericProvider(doc, transport, {
 - Yjs requires multi-step handshakes (SyncStep1 → SyncStep2 → Updates)
 - If any message is lost due to packet loss, sync stalls
 - Periodic retries ensure eventual consistency even on unreliable networks
-- Performance impact is minimal (only sends if there are changes)
+- Performance impact is minimal: each tick sends one small digest beacon
+  (state vector plus a hash of the delete set), and peers answer only when
+  the sender is actually missing something. A fully synced room exchanges
+  beacons and nothing else - and since round 5 a peer that overheard a
+  beacon with exactly its own digest since its last tick stays silent at
+  the next one (Trickle, RFC 6206; `trickleK`), so an idle room sends one
+  or two beacons per interval in total instead of one per peer.
 
 For most production scenarios, the default 5-second interval provides good resilience without excessive traffic. For testing with simulated packet loss, use a shorter interval (e.g., 2 seconds).
 
+While a room is idle the interval doubles after each quiet tick, up to
+`idleBackoffMaxMs` (60 s by default); a local edit resets it to
+`syncInterval` at once (remote updates and presence changes do not - a
+peer that only listens has nothing a beacon would announce, so one typist
+does not keep the whole room at the base cadence). A peer that missed the
+last message before the room went quiet does not wait for its own
+backed-off tick: the editor's next beacon, one base interval away at most,
+makes it ask for the difference (after a short grace for messages still in
+flight). `idleBackoffEnabled: false` keeps the fixed cadence.
+
+> **Wire compatibility.** All peers in a room must run the same version of
+> this library. Sync requests travel as a private digest message (state
+> vector + delete-set hash, with join/ack/confirm flags), the connect-time
+> full-state push has its own message type, and several messages are
+> batched into one envelope; an older peer drops all of them unread. This
+> has been the case since message batching landed and is not new to the
+> digest format.
+
 ### Update Batching (Debouncing)
 
-By default, every document change triggers an immediate network transmission. For performance optimization, you can enable **update batching** (also called **debouncing**):
+By default, every document change is sent at the end of the task that
+produced it (a microtask, no timer): the several Yjs transactions one
+input event can produce leave as one message, and the cursor update an
+editor binding sets right after the text change rides in the same wire
+message - one keystroke, one message. For further reduction you can
+enable **update batching** (also called **debouncing**):
 
 ```typescript
 // Default behavior - send updates immediately

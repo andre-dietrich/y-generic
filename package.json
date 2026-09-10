@@ -1,13 +1,9 @@
 {
   "name": "@edryslabs/genericprovider",
-  "version": "1.0.4",
+  "version": "1.5.1",
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
   "author": "André Dietrich",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/andre-dietrich/y-generic.git"
-  },
   "main": "./dist/lib.js",
   "types": "./dist/lib.d.ts",
   "targets": {
@@ -62,24 +58,29 @@
     "./providers/nostr": {
       "types": "./dist/providers/nostr/index.d.ts",
       "default": "./dist/providers/nostr/index.js"
+    },
+    "./providers/ably": {
+      "types": "./dist/providers/ably/index.d.ts",
+      "default": "./dist/providers/ably/index.js"
     }
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "dev:dummy": "npx parcel serve test/dummy/index.html --open --port 3011",
-    "dev:edge-cases": "npx parcel serve test/dummy/edge-cases.html --open --port 3012",
-    "dev:simple-peer": "npx parcel serve test/simple-peer/index.html --open --port 3002",
-    "dev:peerjs": "npx parcel serve test/peerjs/index.html --open --port 3003",
-    "dev:indexeddb": "npx parcel serve test/indexeddb/index.html --open --port 3004",
-    "dev:gun": "npx parcel serve test/gun/index.html --open --port 3005",
-    "dev:trystero": "npx parcel serve test/trystero/index.html --open --port 3006",
-    "dev:pubnub": "npx parcel serve test/pubnub/index.html --open --port 3007",
-    "dev:websocket": "npx parcel serve test/websocket/index.html --open --port 3008",
-    "dev:matrix": "npx parcel serve test/matrix/index.html --open --port 3009",
-    "dev:supabase": "npx parcel serve test/supabase/index.html --open --port 3010",
-    "dev:nostr": "npx parcel serve test/nostr/index.html --open --port 3013",
+    "dev:dummy": "npx parcel serve --dist-dir .parcel-dev test/dummy/index.html --open --port 3011",
+    "dev:edge-cases": "npx parcel serve --dist-dir .parcel-dev test/dummy/edge-cases.html --open --port 3012",
+    "dev:simple-peer": "npx parcel serve --dist-dir .parcel-dev test/simple-peer/index.html --open --port 3002",
+    "dev:peerjs": "npx parcel serve --dist-dir .parcel-dev test/peerjs/index.html --open --port 3003",
+    "dev:indexeddb": "npx parcel serve --dist-dir .parcel-dev test/indexeddb/index.html --open --port 3004",
+    "dev:gun": "npx parcel serve --dist-dir .parcel-dev test/gun/index.html --open --port 3005",
+    "dev:trystero": "npx parcel serve --dist-dir .parcel-dev test/trystero/index.html --open --port 3006",
+    "dev:pubnub": "npx parcel serve --dist-dir .parcel-dev test/pubnub/index.html --open --port 3007",
+    "dev:websocket": "npx parcel serve --dist-dir .parcel-dev test/websocket/index.html --open --port 3008",
+    "dev:matrix": "npx parcel serve --dist-dir .parcel-dev test/matrix/index.html --open --port 3009",
+    "dev:supabase": "npx parcel serve --dist-dir .parcel-dev test/supabase/index.html --open --port 3010",
+    "dev:nostr": "npx parcel serve --dist-dir .parcel-dev test/nostr/index.html --open --port 3013",
+    "dev:ably": "npx parcel serve --dist-dir .parcel-dev test/ably/index.html --open --port 3014",
     "test": "parcel test.html --open",
     "build": "rm -rf dist && tsc",
     "build:demo:index": "npx parcel build test/index.html --dist-dir demos --public-url ./ --no-source-maps",
@@ -91,22 +92,27 @@
     "build:demo:trystero": "npx parcel build test/trystero/index.html --dist-dir demos/trystero --public-url ./ --no-source-maps",
     "build:demo:pubnub": "npx parcel build test/pubnub/index.html --dist-dir demos/pubnub --public-url ./ --no-source-maps",
     "build:demo:websocket": "npx parcel build test/websocket/index.html --dist-dir demos/websocket --public-url ./ --no-source-maps",
+    "build:demo:matrix": "npx parcel build test/matrix/index.html --dist-dir demos/matrix --public-url ./ --no-source-maps",
     "build:demo:supabase": "npx parcel build test/supabase/index.html --dist-dir demos/supabase --public-url ./ --no-source-maps",
     "build:demo:nostr": "npx parcel build test/nostr/index.html --dist-dir demos/nostr --public-url ./ --no-source-maps",
-    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase && npm run build:demo:nostr"
+    "build:demo:ably": "npx parcel build test/ably/index.html --dist-dir demos/ably --public-url ./ --no-source-maps",
+    "build:demos": "rm -rf demos && npm run build:demo:index && npm run build:demo:dummy && npm run build:demo:simple-peer && npm run build:demo:peerjs && npm run build:demo:indexeddb && npm run build:demo:gun && npm run build:demo:trystero && npm run build:demo:pubnub && npm run build:demo:websocket && npm run build:demo:matrix && npm run build:demo:supabase && npm run build:demo:nostr && npm run build:demo:ably"
   },
   "dependencies": {
-    "y-provider": "^0.10.3-canary.2"
-  },
-  "peerDependencies": {
-    "gun": "^0.2020.1240",
     "lib0": "^0.2.98",
-    "peerjs": "^1.5.0",
-    "simple-peer": "^9.11.0",
     "y-protocols": "^1.0.6",
     "yjs": "^13.6.29"
   },
+  "peerDependencies": {
+    "ably": "^2.0.0",
+    "gun": "^0.2020.1240",
+    "peerjs": "^1.5.0",
+    "simple-peer": "^9.11.0"
+  },
   "peerDependenciesMeta": {
+    "ably": {
+      "optional": true
+    },
     "gun": {
       "optional": true
     },
@@ -122,16 +128,13 @@
     "@types/node": "^20.0.0",
     "buffer": "^6.0.3",
     "events": "^3.3.0",
-    "lib0": "^0.2.98",
     "parcel": "^2.16.4",
     "process": "^0.11.10",
-    "quill-cursors": "^4.0.4",
     "quill": "^2.0.3",
+    "quill-cursors": "^4.0.4",
     "typescript": "^5.0.0",
-    "y-protocols": "^1.0.6",
     "y-quill": "^1.0.0",
     "y-webrtc": "^10.3.0",
-    "y-websocket": "^3.0.0",
-    "yjs": "^13.6.29"
+    "y-websocket": "^3.0.0"
   }
 }

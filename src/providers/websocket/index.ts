@@ -51,8 +51,16 @@ export interface WebSocketConfig extends ConnectionConfig {
   serverUrl: string
   /** Enable automatic reconnection on disconnect (default: true) */
   autoReconnect?: boolean
-  /** Reconnection delay in milliseconds (default: 2000) */
+  /**
+   * Delay before the first reconnection attempt in milliseconds (default:
+   * 2000). Doubles per failed attempt, jittered by ±50 %, capped at
+   * `maxReconnectDelay` - a classroom of 30 browsers used to hit a
+   * restarting relay 15 times a second in lockstep and come back in the
+   * same instant (round 7, item 4; test/dummy/bench-ws-reconnect-storm.ts).
+   */
   reconnectDelay?: number
+  /** Cap on the reconnection delay in milliseconds (default: 10000) */
+  maxReconnectDelay?: number
   /** Maximum reconnection attempts (0 = infinite, default: 0) */
   maxReconnectAttempts?: number
   /** WebSocket protocols (optional) */
@@ -305,7 +313,15 @@ export class WebSocketTransport implements Transport {
     }
 
     this.reconnectAttempts++
-    const delay = this.config.reconnectDelay ?? 2000
+    // Exponential backoff with jitter: the jitter is what breaks the herd
+    // on the relay's return, the cap what keeps recovery quick (y-websocket
+    // caps at 2.5 s, Socket.IO at 5 s; 10 s cuts the storm ~4x for a mean
+    // recovery wait under 8 s).
+    const base = this.config.reconnectDelay ?? 2000
+    const cap = this.config.maxReconnectDelay ?? 10000
+    const delay = Math.round(
+      Math.min(cap, base * 2 ** (this.reconnectAttempts - 1)) * (0.5 + Math.random()),
+    )
 
     this.log(
       `🔄 Attempting reconnection #${this.reconnectAttempts} in ${delay}ms...`,

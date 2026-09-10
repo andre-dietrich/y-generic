@@ -82,6 +82,16 @@ function addCRC32Header(data: Uint8Array): Uint8Array {
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0
 const MESSAGE_AWARENESS = 1
+
+// A presence slot older than this is ignored on receipt: the relay keeps
+// every slot ever written and `.map().on()` replays all of them to a
+// joiner, so without a bound a joiner inherited one phantom presence per
+// connection the room ever had (round 7, item 5; measured 55 phantoms for
+// 60 slots in test/dummy/bench-gun-awareness-replay.ts). A live slot is
+// rewritten every lease/2 (at most 150 s at the playgrounds' 120 s lease),
+// so 5 min is never reached by one; a bound the size of the lease would
+// make a peer whose clock runs a minute or two off invisible to everyone.
+const AWARENESS_MAX_AGE_MS = 5 * 60_000
 // MESSAGE_PUBSUB = 2 (not needed for routing)
 // MESSAGE_SYNC_VERIFIED = 3 (treated same as MESSAGE_SYNC)
 
@@ -197,6 +207,8 @@ export interface GunConnectionConfig extends ConnectionConfig {
  * would just stack a second debounce in front of this one for no benefit.
  */
 export class GunTransport implements Transport {
+  // Relay mesh with its own debounce/throttle: a few hundred ms round trip.
+  readonly expectedRttMs = 500
   private options: Required<Omit<GunTransportOptions, 'password' | 'sea'>> & {
     password?: string
     sea?: any
@@ -211,13 +223,13 @@ export class GunTransport implements Transport {
   private updateBatch: Uint8Array[] = []
   private batchTimeout?: ReturnType<typeof setTimeout>
   private processedUpdates: Set<string> = new Set()
-  private connectionTime: number = 0
   private throttleTimeout?: ReturnType<typeof setTimeout>
   private pendingUpdates: Map<string, any> = new Map()
   private updateSlot: number = 0
   private readonly BUFFER_SIZE = 20 // Circular buffer size
   private awarenessListener: any = null
   private lastAwarenessId: string = '' // Track last awareness ID to avoid processing our own
+  private ownAwarenessId: string | null = null // Stable per-client slot key under the awareness node
   private encryptionEnabled: boolean = false
 
   // Persistence
@@ -229,6 +241,8 @@ export class GunTransport implements Transport {
   private savePending: boolean = false
   /** Data loaded from Gun snapshot before onMessage callback is registered */
   private pendingLoad: Uint8Array | null = null
+  /** True once loadSnapshot()'s initial Gun read has completed */
+  private snapshotLoaded: boolean = false
 
   /**
    * Create a new Gun transport.
@@ -277,7 +291,6 @@ export class GunTransport implements Transport {
     }
 
     this._room = config.room
-    this.connectionTime = Date.now()
 
     this.persistentMode = config.persistent ?? false
     this.persistDoc = config.doc ?? null
@@ -298,10 +311,20 @@ export class GunTransport implements Transport {
       ...this.options.gunOptions,
     }
 
-    // Add peers if specified
+    // Add peers if specified. Gun wants full URLs ending in the relay's
+    // path (`http://host:8765/gun`; it turns http(s) into ws(s) itself) -
+    // a bare `host:8765` never connects and Gun says nothing. Fill in what
+    // is missing: http:// (https:// only if the relay has a certificate),
+    // and /gun when there is no path.
     if (this.options.peers.length > 0) {
-      gunConfig.peers = this.options.peers
-      this.log('📡 Connecting to peers:', this.options.peers)
+      const peers = this.options.peers.map((peer) => {
+        let url = peer.trim()
+        if (!/^(https?|wss?):\/\//i.test(url)) url = 'http://' + url
+        if (/^(https?|wss?):\/\/[^/]+\/?$/i.test(url)) url = url.replace(/\/?$/, '/gun')
+        return url
+      })
+      gunConfig.peers = peers
+      this.log('📡 Connecting to peers:', peers)
     }
 
     this.gun = new this.options.gun(gunConfig)
@@ -319,9 +342,42 @@ export class GunTransport implements Transport {
     this.setupUpdateListener()
     this.setupAwarenessListener()
 
+    // Wait for the first relay to say hi before anything is written: a put
+    // made before the websocket is up is stored by the relay but not pushed
+    // to peers already subscribed (measured 2026-09-07 with two Node peers
+    // on gun's own examples/http.js relay: the joiner's JOIN batch and
+    // presence, written ~10 ms before 'hi', never reached the settled
+    // peer; every later write did). GenericProvider sends its connect
+    // batch the moment connect() resolves, so resolve after 'hi' - or after
+    // a short timeout for a relay that is down or a local-only instance.
+    if (this.options.peers.length > 0) {
+      await new Promise<void>((resolve) => {
+        let done = false
+        const finish = () => {
+          if (done) return
+          done = true
+          clearTimeout(timer)
+          resolve()
+        }
+        const timer = setTimeout(() => {
+          this.log('⏱️ No relay said hi within 3 s, continuing')
+          finish()
+        }, 3000)
+        try {
+          this.gun.on('hi', (peer: any) => {
+            this.log('🤝 Relay connected:', peer?.url ?? peer?.id ?? '?')
+            finish()
+          })
+        } catch {
+          finish()
+        }
+      })
+    }
+
     this._connected = true
 
     // Persistence: load existing snapshot or clear it for a fresh session
+    this.snapshotLoaded = false
     if (this.persistentMode) {
       this.loadSnapshot()
     } else {
@@ -383,11 +439,6 @@ export class GunTransport implements Transport {
         if (!hasLoadedInitial) return
 
         if (!update || !update.data) return
-
-        // Only process updates newer than our connection time
-        if (update.timestamp && update.timestamp < this.connectionTime) {
-          return
-        }
 
         // Use sequence number for deduplication
         const sequence = update.sequence || Math.floor(update.timestamp / 100)
@@ -519,6 +570,12 @@ export class GunTransport implements Transport {
     // Flush any pending updates
     this.flushBatch()
 
+    // Take our presence slot with us; a crashed tab's slot ages out at the
+    // receivers instead (AWARENESS_MAX_AGE_MS).
+    if (this.ownAwarenessId && this.roomNode) {
+      this.roomNode.get('awareness').get(this.ownAwarenessId).put(null)
+    }
+
     // Remove listeners
     if (this.updateListener) {
       // Gun doesn't have a clear off() method for map listeners
@@ -537,6 +594,7 @@ export class GunTransport implements Transport {
     this.persistentMode = false
     this.persistDoc = null
     this.pendingLoad = null
+    this.snapshotLoaded = false
 
     this.log('✅ Disconnected')
   }
@@ -594,9 +652,10 @@ export class GunTransport implements Transport {
   }
 
   /**
-   * Send awareness update to a separate volatile node.
-   * Awareness is ephemeral - only the latest state matters.
-   * Each client writes to its own awareness slot to avoid overwrites.
+   * Send awareness update to a per-client slot under the awareness node.
+   * Awareness is ephemeral - only the latest state per client matters.
+   * Each client writes to its own slot (keyed by a stable per-connection id)
+   * so peers never overwrite each other's presence data.
    */
   private async sendAwareness(data: Uint8Array): Promise<void> {
     let payload = this.uint8ArrayToBase64(data)
@@ -606,14 +665,18 @@ export class GunTransport implements Transport {
       payload = await this.encrypt(payload)
     }
 
-    const awarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
+    // Generated once per connection and reused for every broadcast, so all
+    // of this client's updates land in the same slot instead of each
+    // clobbering a shared node.
+    if (!this.ownAwarenessId) {
+      this.ownAwarenessId = `aware-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`
+    }
+    const awarenessId = this.ownAwarenessId
 
     // Track this ID so we don't process our own update
     this.lastAwarenessId = awarenessId
 
-    // Write to a single volatile awareness node
-    // Each update overwrites the previous - awareness only needs latest state
-    this.roomNode.get('awareness').put({
+    this.roomNode.get('awareness').get(awarenessId).put({
       data: payload,
       id: awarenessId,
       timestamp: Date.now(),
@@ -628,18 +691,24 @@ export class GunTransport implements Transport {
 
   /**
    * Setup listener for awareness updates (separate from doc sync).
+   * Uses .map() so every existing per-client slot is replayed on subscribe
+   * (late joiners learn about already-present peers), not just the most
+   * recently written one.
    */
   private setupAwarenessListener(): void {
     this.awarenessListener = this.roomNode
       .get('awareness')
+      .map()
       .on(async (awareness: any) => {
         if (!awareness || !awareness.data) return
 
         // Skip our own awareness updates
         if (awareness.id === this.lastAwarenessId) return
-
-        // Only process updates newer than our connection
-        if (awareness.timestamp && awareness.timestamp < this.connectionTime) {
+        // Skip the presence of connections long gone (see AWARENESS_MAX_AGE_MS)
+        if (
+          typeof awareness.timestamp === 'number' &&
+          Date.now() - awareness.timestamp > AWARENESS_MAX_AGE_MS
+        ) {
           return
         }
 
@@ -825,6 +894,14 @@ export class GunTransport implements Transport {
   private async saveSnapshot(): Promise<void> {
     if (!this.persistDoc || !this.persistentMode || !this.roomNode) return
 
+    if (!this.snapshotLoaded) {
+      // The initial Gun read hasn't resolved yet — saving now could clobber
+      // the real persisted state with our still-unmerged local doc. Retry
+      // shortly instead of writing.
+      this.persistTimer = setTimeout(() => this.saveSnapshot(), 100)
+      return
+    }
+
     if (this.isWritingToGun) {
       this.savePending = true
       return
@@ -873,12 +950,12 @@ export class GunTransport implements Transport {
    */
   private loadSnapshot(): void {
     this.roomNode.get('snapshot').once(async (snap: any) => {
-      if (!snap || !snap.data || snap.cleared) {
-        this.log('📭 No snapshot found in Gun')
-        return
-      }
-
       try {
+        if (!snap || !snap.data || snap.cleared) {
+          this.log('📭 No snapshot found in Gun')
+          return
+        }
+
         let payload = snap.data as string
         if (snap.encrypted && this.encryptionEnabled) {
           const decrypted = await this.decrypt(payload)
@@ -904,6 +981,10 @@ export class GunTransport implements Transport {
       } catch (error) {
         this.log('❌ Error loading snapshot:', error)
         console.warn('GunTransport: Failed to load snapshot:', error)
+      } finally {
+        // Only now is it safe for saveSnapshot() to write — the local doc
+        // has had a chance to merge in whatever Gun had stored.
+        this.snapshotLoaded = true
       }
     })
   }

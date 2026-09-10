@@ -43,12 +43,9 @@ const MAX_BUFFERED_AMOUNT = 16 * 1024;
  * Message type markers for chunking protocol.
  * - 0x00: Complete message (no chunking, raw data)
  * - 0x01: Chunked message with header
- * - 0x02: Consumer control frame — per-peer side-channel via sendControl()/
- *   onControlFrame(), never reaches the provider pipe. Not chunked/encrypted.
  */
 const MSG_TYPE_COMPLETE = 0x00;
 const MSG_TYPE_CHUNKED = 0x01;
-const MSG_TYPE_CONTROL = 0x02;
 /** Counter for generating unique message IDs */
 let messageIdCounter = 0;
 /**
@@ -64,16 +61,9 @@ export class SimplePeerTransport {
     constructor(options) {
         this._connected = false;
         this._room = '';
-        this._peerConnectCallbacks = new Set();
-        this._peerDisconnectCallbacks = new Set();
-        this._controlCallbacks = new Set();
         this.peers = new Map();
         this.signalingConns = [];
         this.announcedPeers = new Set();
-        // Signaling reconnect state, per URL: consecutive failures (for backoff) and
-        // the pending retry timer (so disconnect() can cancel it).
-        this._reconnectAttempts = new Map();
-        this._reconnectTimers = new Map();
         if (!options.peer) {
             throw new Error('SimplePeerTransport requires the "peer" option. ' +
                 'Please provide the simple-peer constructor: ' +
@@ -136,27 +126,18 @@ export class SimplePeerTransport {
         // This allows BroadcastChannel-only mode for same-browser tabs
         this._connected = true;
         this.log(`✅ Connected to room "${this._room}" — ${this.signalingConns.length}/${this.options.signaling.length} signaling server(s)`);
-        // Start periodic re-subscribe + re-announce to help late joiners discover us.
-        // Deliberately NOT gated on `peers.size < maxConns`: a full mesh must keep
-        // advertising, or peers that later drop out can never rediscover us.
+        // Start periodic re-announce to help late joiners discover us
         this.announceInterval = setInterval(() => {
-            if (this.signalingConns.length === 0)
-                return;
-            this.log('Re-announcing presence...');
-            for (const ws of this.signalingConns) {
-                // Re-subscribe every tick: a signaling server can silently drop a
-                // subscription while the socket stays open (ping/pong alive), which
-                // makes us invisible to newcomers with no other symptom. `subscribe`
-                // is otherwise only sent once, in onopen.
-                this.sendSignaling(ws, {
-                    type: 'subscribe',
-                    topics: [this._room],
-                });
-                this.sendSignaling(ws, {
-                    type: 'publish',
-                    topic: this._room,
-                    from: this.peerId,
-                });
+            if (this.peers.size < this.options.maxConns &&
+                this.signalingConns.length > 0) {
+                this.log('Re-announcing presence...');
+                for (const ws of this.signalingConns) {
+                    this.sendSignaling(ws, {
+                        type: 'publish',
+                        topic: this._room,
+                        from: this.peerId,
+                    });
+                }
             }
         }, 5000); // Re-announce every 5 seconds for better peer discovery
     }
@@ -167,21 +148,11 @@ export class SimplePeerTransport {
         if (!this._connected)
             return;
         this.log(`🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`);
-        // Clear BEFORE closing sockets: ws.close() fires onclose asynchronously,
-        // and scheduleSignalingReconnect() keys off this flag to tell a deliberate
-        // disconnect from a dropped connection.
-        this._connected = false;
         // Stop re-announce interval
         if (this.announceInterval) {
             clearInterval(this.announceInterval);
             this.announceInterval = undefined;
         }
-        // Cancel any pending signaling reconnects
-        for (const timer of this._reconnectTimers.values()) {
-            clearTimeout(timer);
-        }
-        this._reconnectTimers.clear();
-        this._reconnectAttempts.clear();
         // Close all peer connections
         for (const peerConn of this.peers.values()) {
             peerConn.peer.destroy();
@@ -192,6 +163,7 @@ export class SimplePeerTransport {
             ws.close();
         }
         this.signalingConns = [];
+        this._connected = false;
         this.announcedPeers.clear();
     }
     /**
@@ -227,29 +199,6 @@ export class SimplePeerTransport {
         else if (sentCount < this.peers.size) {
             const skipped = this.peers.size - sentCount;
             this.log(`📤 Sent ${data.length}B to ${sentCount}/${this.peers.size} peer(s) — ${skipped} not yet connected`);
-        }
-    }
-    /**
-     * Send data to a single connected peer by ID (targeted delivery).
-     */
-    sendTo(peerId, data) {
-        if (!this._connected) {
-            this.log('Not connected, cannot sendTo');
-            return;
-        }
-        const peerConn = this.peers.get(peerId);
-        if (!peerConn || !peerConn.connected) {
-            this.log(`⚠️ sendTo: peer ${peerId} not connected — ${data.length}B dropped`);
-            return;
-        }
-        const dataToSend = this.options.password
-            ? this.encrypt(data, this.options.password)
-            : data;
-        try {
-            this.sendToPeer(peerConn, dataToSend);
-        }
-        catch (error) {
-            this.log(`❌ sendTo failed to ${peerId}:`, error.message);
         }
     }
     /**
@@ -332,68 +281,43 @@ export class SimplePeerTransport {
         };
     }
     /**
+     * Transport.sendTo: deliver to one connected peer (the `from` id passed
+     * to onMessage), chunked and flow-controlled like a broadcast send.
+     */
+    sendTo(peerId, data) {
+        if (!this._connected)
+            return;
+        const peerConn = this.peers.get(peerId);
+        if (!peerConn || !peerConn.connected)
+            return;
+        const dataToSend = this.options.password
+            ? this.encrypt(data, this.options.password)
+            : data;
+        try {
+            this.sendToPeer(peerConn, dataToSend);
+        }
+        catch (error) {
+            this.log(`❌ sendTo failed for ${peerId}:`, error.message);
+        }
+    }
+    /**
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback) {
-        this._peerConnectCallbacks.add(callback);
+        this._peerConnectCallback = callback;
         return () => {
-            this._peerConnectCallbacks.delete(callback);
+            this._peerConnectCallback = undefined;
         };
     }
-    /**
-     * Register callback for peer disconnects (channel close or error). Only fires
-     * for peers that had reached the connected state.
-     */
+    /** Transport.onPeerDisconnect: a peer's channel closed or errored (removePeer). */
     onPeerDisconnect(callback) {
-        this._peerDisconnectCallbacks.add(callback);
+        this._peerDisconnectCallback = callback;
         return () => {
-            this._peerDisconnectCallbacks.delete(callback);
+            this._peerDisconnectCallback = undefined;
         };
-    }
-    /**
-     * Register callback for consumer control frames (MSG_TYPE_CONTROL).
-     * These bypass the provider pipe — use for per-peer handshakes/auth.
-     */
-    onControlFrame(callback) {
-        this._controlCallbacks.add(callback);
-        return () => {
-            this._controlCallbacks.delete(callback);
-        };
-    }
-    /**
-     * Tear down a single peer connection (e.g. to reject a peer that failed an
-     * out-of-band handshake). Fires onPeerDisconnect if the peer was connected.
-     */
-    disconnectPeer(peerId) {
-        this.removePeer(peerId);
-    }
-    /**
-     * Send a control frame to a single peer. Not chunked or encrypted — keep
-     * payloads small (they must fit one DataChannel message).
-     */
-    sendControl(peerId, payload) {
-        const peerConn = this.peers.get(peerId);
-        if (!peerConn || !peerConn.connected) {
-            this.log(`⚠️ sendControl: peer ${peerId} not connected — dropped`);
-            return;
-        }
-        const msg = new Uint8Array(payload.length + 1);
-        msg[0] = MSG_TYPE_CONTROL;
-        msg.set(payload, 1);
-        try {
-            peerConn.peer.send(msg);
-        }
-        catch (error) {
-            this.log(`❌ sendControl failed to ${peerId}:`, error.message);
-        }
     }
     /**
      * Check if connected.
-     *
-     * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
-     * a health check — it stays true with zero signaling servers, which is what
-     * makes BroadcastChannel-only mode work. For "can we still discover peers?"
-     * use `signalingHealth`.
      */
     get isConnected() {
         return this._connected;
@@ -405,48 +329,6 @@ export class SimplePeerTransport {
         return Array.from(this.peers.values()).filter((p) => p.connected).length;
     }
     /**
-     * Signaling/discovery health, for diagnostics and monitoring.
-     *
-     * `isConnected` deliberately cannot express this: a transport whose signaling
-     * sockets have all dropped still reports connected, and peer discovery is
-     * silently dead until they come back.
-     */
-    get signalingHealth() {
-        return {
-            open: this.signalingConns.filter((ws) => ws.readyState === 1).length,
-            configured: this.options.signaling.length,
-            reconnecting: this._reconnectTimers.size,
-            peers: this.peers.size,
-            connectedPeers: this.connectedPeers,
-        };
-    }
-    /**
-     * Reconnect to a signaling server after it drops, with exponential backoff.
-     *
-     * Mirrors lib0's WebsocketClient (what y-webrtc gets for free): delay grows
-     * as log10(attempts + 1) * 1200ms, capped at 30s. No-ops after an explicit
-     * disconnect(), and never stacks duplicate timers for the same URL.
-     */
-    scheduleSignalingReconnect(url) {
-        if (!this._connected)
-            return; // deliberate disconnect(), not a drop
-        if (this._reconnectTimers.has(url))
-            return; // retry already pending
-        const attempts = (this._reconnectAttempts.get(url) ?? 0) + 1;
-        this._reconnectAttempts.set(url, attempts);
-        const delay = Math.min(Math.log10(attempts + 1) * 1200, 30000);
-        this.log(`🔄 Signaling reconnect #${attempts} for ${url} in ${Math.round(delay)}ms`);
-        this._reconnectTimers.set(url, setTimeout(() => {
-            this._reconnectTimers.delete(url);
-            if (!this._connected)
-                return;
-            this.connectSignaling(url).catch(() => {
-                // connectSignaling rejects on error/timeout; onclose schedules the
-                // next attempt, so swallow here to avoid an unhandled rejection.
-            });
-        }, delay));
-    }
-    /**
      * Connect to a signaling server.
      */
     async connectSignaling(url) {
@@ -455,8 +337,6 @@ export class SimplePeerTransport {
             let resolved = false;
             ws.onopen = () => {
                 this.log(`🟢 Signaling connected: ${url}`);
-                // Reached a good state — restart backoff from zero for the next drop.
-                this._reconnectAttempts.delete(url);
                 // Subscribe to room
                 this.sendSignaling(ws, {
                     type: 'subscribe',
@@ -509,16 +389,6 @@ export class SimplePeerTransport {
                 if (index > -1) {
                     this.signalingConns.splice(index, 1);
                 }
-                // Without this, a single socket drop is terminal: the re-announce loop
-                // is gated on `signalingConns.length > 0`, so peer discovery stops
-                // forever while `isConnected` still reports true.
-                this.scheduleSignalingReconnect(url);
-                if (!resolved) {
-                    // Closed before ever opening — settle connect()'s promise so
-                    // Promise.allSettled() in connect() isn't left hanging.
-                    resolved = true;
-                    reject(new Error(`Signaling closed before open: ${url}`));
-                }
             };
             // Timeout after 10 seconds
             setTimeout(() => {
@@ -543,7 +413,6 @@ export class SimplePeerTransport {
                 // This is an envelope, the actual message could be an announce or signal
                 if (msg.from) {
                     // Treat as announce if it's a publish from another peer
-                    this.pruneStalePeer(msg.from);
                     if (!this.peers.has(msg.from) &&
                         this.peers.size < this.options.maxConns &&
                         !this.announcedPeers.has(msg.from)) {
@@ -578,7 +447,6 @@ export class SimplePeerTransport {
                     return;
                 }
                 // Another peer announced - connect to them if we have capacity
-                this.pruneStalePeer(msg.from);
                 if (!this.peers.has(msg.from) &&
                     this.peers.size < this.options.maxConns &&
                     !this.announcedPeers.has(msg.from)) {
@@ -668,8 +536,7 @@ export class SimplePeerTransport {
             peerConn.connected = true;
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`);
-            for (const cb of this._peerConnectCallbacks)
-                cb(remotePeerId);
+            this._peerConnectCallback?.(remotePeerId);
         };
         // Handle connection
         peer.on('connect', () => onChannelOpen('connect'));
@@ -687,26 +554,12 @@ export class SimplePeerTransport {
             // Data flowing proves the channel is open — handle the race where 'data' fires
             // before 'connect' (seen on Chrome when the remote initiator sends immediately).
             onChannelOpen('data');
-            let uint8Data;
-            try {
-                uint8Data = new Uint8Array(data);
-            }
-            catch (error) {
-                this.log('Error handling peer data:', error);
-                return;
-            }
-            if (uint8Data.length === 0)
-                return;
-            // Control frames bypass the provider pipe (identity/auth handshakes etc.)
-            if (uint8Data[0] === MSG_TYPE_CONTROL) {
-                const payload = uint8Data.slice(1);
-                for (const cb of this._controlCallbacks)
-                    cb(remotePeerId, payload);
-                return;
-            }
             if (!this._callback)
                 return;
             try {
+                const uint8Data = new Uint8Array(data);
+                if (uint8Data.length === 0)
+                    return;
                 const msgType = uint8Data[0];
                 if (msgType === MSG_TYPE_COMPLETE) {
                     // Complete message, extract payload (skip type byte)
@@ -714,7 +567,7 @@ export class SimplePeerTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(payload, this.options.password)
                         : payload;
-                    this._callback(decryptedData);
+                    this._callback(decryptedData, remotePeerId);
                 }
                 else if (msgType === MSG_TYPE_CHUNKED) {
                     // Chunked message - reassemble
@@ -751,7 +604,7 @@ export class SimplePeerTransport {
                         const decryptedData = this.options.password
                             ? this.decrypt(fullMessage, this.options.password)
                             : fullMessage;
-                        this._callback(decryptedData);
+                        this._callback(decryptedData, remotePeerId);
                         this.log(`📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`);
                     }
                 }
@@ -760,7 +613,7 @@ export class SimplePeerTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(uint8Data, this.options.password)
                         : uint8Data;
-                    this._callback(decryptedData);
+                    this._callback(decryptedData, remotePeerId);
                 }
             }
             catch (error) {
@@ -801,20 +654,12 @@ export class SimplePeerTransport {
             this.log(`❌ Could not create peer connection for signal from ${remotePeerId}`);
         }
     }
-    // Forget a peer we announced but hold no live connection to, so its next
-    // re-announce can reconnect instead of being deduped forever (ghost peer).
-    pruneStalePeer(peerId) {
-        if (this.announcedPeers.has(peerId) && !this.peers.has(peerId)) {
-            this.announcedPeers.delete(peerId);
-        }
-    }
     /**
      * Remove and cleanup a peer connection.
      */
     removePeer(peerId) {
         const peerConn = this.peers.get(peerId);
         if (peerConn) {
-            const wasConnected = peerConn.connected;
             try {
                 peerConn.peer.destroy();
             }
@@ -823,11 +668,9 @@ export class SimplePeerTransport {
             }
             this.peers.delete(peerId);
             this.announcedPeers.delete(peerId);
-            if (wasConnected)
-                for (const cb of this._peerDisconnectCallbacks)
-                    cb(peerId);
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`);
+            this._peerDisconnectCallback?.(peerId);
         }
     }
     /**

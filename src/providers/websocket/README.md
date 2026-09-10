@@ -79,7 +79,8 @@ await provider.connect({
   serverUrl: 'ws://localhost:1234',
   room: 'my-room',
   autoReconnect: true,        // Enable auto-reconnect (default: true)
-  reconnectDelay: 2000,       // Wait 2s before reconnecting (default: 2000)
+  reconnectDelay: 2000,       // First retry after 2s, then 4s, 8s ... (default: 2000)
+  maxReconnectDelay: 10000,   // ... capped at 10s, each ±50% jitter (default: 10000)
   maxReconnectAttempts: 0,    // Infinite retries (default: 0)
 })
 ```
@@ -110,7 +111,8 @@ await provider.connect({
 | `serverUrl` | `string` | ✅ Yes | WebSocket server URL (ws:// or wss://) |
 | `room` | `string` | ✅ Yes | Room/channel name for collaboration |
 | `autoReconnect` | `boolean` | ❌ No | Enable automatic reconnection (default: `true`) |
-| `reconnectDelay` | `number` | ❌ No | Delay before reconnection in ms (default: `2000`) |
+| `reconnectDelay` | `number` | ❌ No | Delay before the first reconnection in ms; doubles per failed attempt with ±50 % jitter (default: `2000`) |
+| `maxReconnectDelay` | `number` | ❌ No | Cap on the reconnection delay in ms (default: `10000`) |
 | `maxReconnectAttempts` | `number` | ❌ No | Max reconnect attempts, 0=infinite (default: `0`) |
 | `protocols` | `string \| string[]` | ❌ No | WebSocket sub-protocols |
 | `debug` | `boolean` | ❌ No | Enable debug logging (default: `false`) |

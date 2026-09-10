@@ -13,11 +13,60 @@ const MESSAGE_SYNC = 0
 const MESSAGE_AWARENESS = 1
 const MESSAGE_PUBSUB = 2
 const MESSAGE_SYNC_VERIFIED = 3 // Sync message with hash verification
-const MESSAGE_PUBSUB_TARGETED = 4 // Pub/sub message aimed at a single target
-
-// Sub-channel inside a MESSAGE_AWARENESS frame: [opcode 1][channel][update].
-const AWARENESS_CHANNEL_MAIN = 0
-const AWARENESS_CHANNEL_APP = 1
+const MESSAGE_BATCH = 4 // Envelope for N independently-typed sub-messages sent as one wire message
+// Digest beacon: replaces SyncStep1 on the wire. [version][flags][sender
+// clientID][state vector][delete-set hash]. Receivers reply only when the
+// sender is behind them or the delete-set hashes differ (SyncStep2, as
+// before), or - on a JOIN-flagged beacon with equal state - with their own
+// beacon as an ack; otherwise not at all. See
+// docs/superpowers/specs/2026-09-05-digest-beacon-design.md and
+// _handleDigest(). Versions are append-only: receivers read the fields
+// they know and ignore trailing bytes.
+const MESSAGE_SYNC_DIGEST = 5
+const DIGEST_VERSION = 1
+const DIGEST_FLAG_JOIN = 1 // bit 0: "I just joined - send me your presence and confirm my state"
+// bit 1: this message is an ACK, not a request. It echoes the state vector
+// and delete-set hash of the JOIN beacon it answers ("I hold exactly this
+// state too"), never the sender's own state - so it is never read as a
+// request and never collects a SyncStep2 from anyone. Receivers whose state
+// equals the echoed digest mark themselves synced (the joiner it was for,
+// and everyone else in that state); receivers holding a pending ack for the
+// same digest drop it. See _handleDigest(). Before this flag existed the ack
+// was the acker's own beacon; an acker that was itself behind the room (a
+// joiner acking another joiner) made every peer ahead of it reply with a
+// SyncStep2, and acks landing after an edit burst had started did the same
+// (Task 3c in the design doc).
+const DIGEST_FLAG_ACK = 2
+// bit 2: "ack me if our states are equal" WITHOUT the presence request of
+// DIGEST_FLAG_JOIN. Sent only by the response-wait retry
+// (_armResponseWait): a joiner that gets neither a SyncStep2 nor an ack
+// within the wait has lost one message or the other and asks again - reply
+// suppression deliberately leaves ~1 reply per request, so a single lost
+// reply would otherwise strand the joiner's `synced` until the next
+// periodic beacon (never, with syncInterval 0). Measured: the last joiner
+// of a simultaneous 5-peer burst at 10% loss failed to reach `synced` in 1
+// of 600 runs before this existed. Resync beacons do NOT request acks: in
+// an equal room every peer would answer, and at high latency the
+// suppression window cannot thin those replies (measured 4-5x more acks).
+const DIGEST_FLAG_CONFIRM = 4
+// bit 3: the sender is CONFIRMED - it has received a SyncStep2, or an equal
+// digest from a confirmed peer, or its own join asked three times and got
+// nothing better (so it is the room). A joiner's response wait is satisfied
+// only by data (SyncStep2) or by an equal digest carrying this bit: an
+// equal ack from a fellow joiner says nothing about whether the room holds
+// more than both of us, and treating it as an answer left a joiner whose
+// SyncStep2 was lost with an empty document (measured: 1 of 150 lossy
+// 15-peer joins; research doc item 13 follow-up in the phase-1b design).
+const DIGEST_FLAG_SETTLED = 8
+// Full-state push (connect()/syncNow()): the whole document as one update,
+// no hash, no sequence number, applied and nothing else. Before this type a
+// push was a MESSAGE_SYNC_VERIFIED update whose hash was the PUSHER's state
+// - every peer holding more data read that as divergence and scheduled a
+// resync of its own (research doc item 12), the seed of the cascade in item
+// 13. Not a SyncStep2 either: receiving one must not flip `synced` (an
+// empty joiner's push says nothing about the room's content). See
+// docs/superpowers/specs/2026-09-05-resync-cascade-design.md.
+const MESSAGE_SYNC_PUSH = 6
 
 /**
  * CRC32 lookup table for fast computation.
@@ -98,25 +147,111 @@ function unwrapAndVerifyMessage(wrapped: Uint8Array): Uint8Array | null {
   return message
 }
 
+/** Byte-wise equality of two Uint8Arrays. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false
+  }
+  return true
+}
+
 /**
- * Compute a cheap hash of document state for desync detection.
+ * Componentwise minimum of two encoded state vectors: the state a
+ * SyncStep2 must start from to serve both requesters. Clients missing from
+ * one side count as clock 0 and are omitted (omitted = 0 on the wire).
+ */
+function minStateVector(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const ma = Y.decodeStateVector(a)
+  const mb = Y.decodeStateVector(b)
+  const out = new Map<number, number>()
+  for (const [client, clock] of ma) {
+    const m = Math.min(clock, mb.get(client) ?? 0)
+    if (m > 0) out.set(client, m)
+  }
+  return Y.encodeStateVector(out)
+}
+
+/**
+ * Whether this runtime has the Compression Streams API (Node 18+, all
+ * evergreen browsers). Checked once at module load; compressionThresholdBytes
+ * falls back to sending uncompressed (still flag-byte-prefixed, flag=0) if
+ * this is false, rather than throwing.
+ */
+const COMPRESSION_AVAILABLE =
+  typeof CompressionStream !== 'undefined' &&
+  typeof DecompressionStream !== 'undefined'
+
+/** Drain a ReadableStream<Uint8Array> into a single concatenated Uint8Array. */
+async function _readAllChunks(
+  readable: ReadableStream<Uint8Array>,
+): Promise<Uint8Array> {
+  const chunks: Uint8Array[] = []
+  const reader = readable.getReader()
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+  }
+  const total = chunks.reduce((sum, c) => sum + c.length, 0)
+  const out = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    out.set(chunk, offset)
+    offset += chunk.length
+  }
+  return out
+}
+
+/**
+ * Compress with deflate-raw (no gzip header/trailer - see
+ * compressionThresholdBytes's doc comment for why deflate-raw over gzip).
+ */
+async function compressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
+  const cs = new CompressionStream('deflate-raw')
+  const writer = cs.writable.getWriter()
+  // The writer promises reject too when the stream errors; the reader side
+  // already surfaces that error, and an unhandled rejection here crashes
+  // Node (seen with a corrupt deflate stream in the Nostr end-to-end test).
+  writer.write(data as unknown as BufferSource).catch(() => {})
+  writer.close().catch(() => {})
+  return _readAllChunks(cs.readable)
+}
+
+/** Inverse of compressDeflateRaw(). */
+async function decompressDeflateRaw(data: Uint8Array): Promise<Uint8Array> {
+  const ds = new DecompressionStream('deflate-raw')
+  const writer = ds.writable.getWriter()
+  writer.write(data as unknown as BufferSource).catch(() => {})
+  writer.close().catch(() => {})
+  return _readAllChunks(ds.readable)
+}
+
+/**
+ * Prepend a 1-byte compressed(1)/uncompressed(0) flag. Only used when
+ * compressionThresholdBytes is configured - see that option's doc comment
+ * for why this is a deliberate, opt-in wire-format change.
+ */
+function prefixCompressionFlag(flag: 0 | 1, data: Uint8Array): Uint8Array {
+  const out = new Uint8Array(1 + data.length)
+  out[0] = flag
+  out.set(data, 1)
+  return out
+}
+
+/**
+ * Compute a cheap hash of document state for verification.
  *
- * Hashes the state VECTOR, not encodeStateAsUpdate, for two independent reasons:
- *
- * 1. CORRECTNESS: the full update byte stream is NOT canonical across
- *    CRDT-convergent replicas (client-block and tombstone ordering differ per
- *    peer), so hashing it flags false divergence and triggers an endless
- *    re-sync loop. The state vector (clientID -> clock) is serialized in sorted
- *    clientID order by Yjs, so two convergent docs hash identically, while a
- *    missed update still shows up as a differing clock — exactly the "did we
- *    fall behind?" signal this check exists to provide.
- * 2. COST: O(number of distinct clients) instead of O(document content size),
- *    so this no longer re-serializes the entire document on every update.
- *
- * Two peers can only reach the same state vector by having applied the same set
- * of operations, so real content divergence is still caught. (CRC32 already
- * guards wire corruption, and sequence tracking guards reordering/loss — this
- * hash is the last line of defense against logical divergence between peers.)
+ * Hashes the state VECTOR (each client's clock), not the full document
+ * content — O(number of distinct clients) instead of O(document content
+ * size). `Y.encodeStateVector()` writes entries sorted by clientID, so the
+ * result is deterministic regardless of the internal Map's iteration order.
+ * Two peers can only reach the same state vector by having applied the same
+ * set of operations, so this still catches real content divergence; it just
+ * no longer re-serializes the entire document on every single update.
+ * (CRC32 already guards against wire corruption, and sequence tracking
+ * guards against reordering/loss — this hash is the last line of defense
+ * against logical divergence between peers.)
  */
 function computeDocHash(doc: Y.Doc): number {
   const state = Y.encodeStateVector(doc)
@@ -125,6 +260,111 @@ function computeDocHash(doc: Y.Doc): number {
     hash = ((hash << 5) - hash + state[i]) | 0
   }
   return hash
+}
+
+/**
+ * Cheap, peer-deterministic hash of the document's delete set - the half of
+ * a Yjs document's identity that the state vector does NOT cover (yjs
+ * INTERNALS.md: "deletions are tracked in the DeleteSet, and do not update
+ * the state vector"). Two docs that differ only by a lost delete-only
+ * update have identical state vectors, so `computeDocHash` can never
+ * detect that divergence; this hash can, at heartbeat granularity (see
+ * `_encodeSyncStep1()` / `_handleDigest()`).
+ *
+ * Cost: `Y.createDeleteSetFromStructStore` walks every struct (Yjs keeps no
+ * incremental delete set), so this is O(items) - fine once per heartbeat
+ * (every empty SyncStep2 already did this exact walk inside
+ * `encodeStateAsUpdate`), NOT fine per update; hence the cache in
+ * `_deleteSetHash()`. Per-client runs come out already sorted and merged;
+ * the only per-peer non-determinism is `Map` insertion order, fixed by
+ * sorting client IDs before hashing.
+ *
+ * Exported for the property check in test/dummy/bench-idle-room.ts.
+ * @internal
+ */
+export function computeDeleteSetHash(doc: Y.Doc): number {
+  const ds = Y.createDeleteSetFromStructStore(doc.store)
+  const encoder = encoding.createEncoder()
+  const clients = Array.from(ds.clients.keys()).sort((x, y) => x - y)
+  for (const client of clients) {
+    encoding.writeVarUint(encoder, client)
+    for (const item of ds.clients.get(client)!) {
+      encoding.writeVarUint(encoder, item.clock)
+      encoding.writeVarUint(encoder, item.len)
+    }
+  }
+  return computeCRC32(encoding.toUint8Array(encoder))
+}
+
+/**
+ * The Yjs updates a CRC-wrapped frame (as handed to `Transport.send`)
+ * carries: the update of a MESSAGE_SYNC_VERIFIED or MESSAGE_SYNC
+ * Update/SyncStep2 message, the whole document of a MESSAGE_SYNC_PUSH,
+ * each such sub-message of a MESSAGE_BATCH - and nothing for awareness,
+ * pub/sub, digest beacons and SyncStep1 requests, which carry no document
+ * state. For persistence transports (`providers/indexeddb`, LiaScript's
+ * Dexie cache): store only what this returns, and only this. Storing whole
+ * frames and replaying them on the next load resurrects the previous
+ * session's clientID as a phantom peer (its presence, its beacons - which
+ * the provider then answers into the store, multiplying rows) and keeps
+ * ~10x the bytes (a keystroke's frame carries its cursor). A frame this
+ * cannot parse yields `[]`, never a partial read. Frames of a provider with
+ * `compressionThresholdBytes` set (a leading flag byte) are not supported.
+ * Round 7, item 6; measured in test/dummy/bench-persist-log.ts.
+ */
+export function extractDocUpdates(frame: Uint8Array): Uint8Array[] {
+  const updates: Uint8Array[] = []
+  const walk = (message: Uint8Array): void => {
+    const decoder = decoding.createDecoder(message)
+    const type = decoding.readVarUint(decoder)
+    switch (type) {
+      case MESSAGE_BATCH:
+        while (decoding.hasContent(decoder)) walk(decoding.readVarUint8Array(decoder))
+        break
+      case MESSAGE_SYNC_VERIFIED:
+      case MESSAGE_SYNC: {
+        if (type === MESSAGE_SYNC_VERIFIED) {
+          decoding.readVarUint(decoder) // sequence number
+          decoding.readVarUint(decoder) // sender clientID
+        }
+        const sub = decoding.readVarUint(decoder)
+        if (
+          sub === syncProtocol.messageYjsSyncStep2 ||
+          sub === syncProtocol.messageYjsUpdate
+        ) {
+          updates.push(decoding.readVarUint8Array(decoder))
+        }
+        break
+      }
+      case MESSAGE_SYNC_PUSH:
+        updates.push(decoding.readVarUint8Array(decoder))
+        break
+      default:
+        break
+    }
+  }
+  try {
+    if (frame.length > 4) walk(frame.subarray(4))
+  } catch {
+    return []
+  }
+  return updates
+}
+
+/**
+ * The counterpart of `extractDocUpdates()` for the load path of a
+ * persistence transport: wraps one (merged) update as a CRC-wrapped
+ * MESSAGE_SYNC SyncStep2 frame. Handed to the `onMessage` callback, the
+ * provider applies it as the answer to its own request - `synced` fires,
+ * nothing is sent back - exactly what a local copy is: the peer that had
+ * our document.
+ */
+export function frameDocUpdate(update: Uint8Array): Uint8Array {
+  const encoder = encoding.createEncoder()
+  encoding.writeVarUint(encoder, MESSAGE_SYNC)
+  encoding.writeVarUint(encoder, syncProtocol.messageYjsSyncStep2)
+  encoding.writeVarUint8Array(encoder, update)
+  return wrapMessageWithChecksum(encoding.toUint8Array(encoder))
 }
 
 /**
@@ -153,21 +393,6 @@ export class PubSubChannel extends Observable<string> {
    */
   publish(topic: string, message: any): void {
     this.provider._sendPubSub(topic, message)
-  }
-
-  /**
-   * Publish a message to a single target instead of broadcasting.
-   *
-   * On transports with `sendTo`, `target` is the peer's ID and delivery is
-   * direct. On transports without it, the message is broadcast with the
-   * target embedded and dropped by every provider whose `localId` differs.
-   *
-   * @param target - Recipient id (transport peerId, or a `localId`)
-   * @param topic - Topic name
-   * @param message - Any JSON-serializable data
-   */
-  publishTo(target: string, topic: string, message: any): void {
-    this.provider._sendPubSubTo(target, topic, message)
   }
 
   /**
@@ -240,18 +465,48 @@ export class GenericProvider extends Observable<string> {
   public readonly doc: Y.Doc
   public readonly transport: Transport
   public readonly awareness: awarenessProtocol.Awareness
-  // Independent Awareness for app/module use (cursors, presence): isolated
-  // from `awareness`, synced over the same opcode via a channel byte.
-  public readonly appAwareness: awarenessProtocol.Awareness
   public readonly pubsub: PubSubChannel
 
   private _status: ConnectionStatus = { state: 'disconnected' }
   private _synced: boolean = false
   private _destroying: boolean = false
-  private _syncInterval: number // ms between periodic syncs
+  private _syncInterval: number // ms between periodic syncs (base, unbacked-off)
   private _syncIntervalId?: ReturnType<typeof setTimeout>
   private _verifyUpdates: boolean // whether to send/verify hashes
   private _disableBc: boolean // whether to disable BroadcastChannel
+
+  // Idle backoff for the periodic-sync interval - see idleBackoffEnabled's
+  // doc comment. `_currentSyncIntervalMs` is what `_jitteredSyncInterval()`
+  // actually jitters; it equals `_syncInterval` for the entire connected
+  // lifetime unless `_idleBackoffEnabled` is true, which is the mechanism
+  // that makes this option provably invisible when off (same field, same
+  // value, same jitter formula as before this option existed).
+  private _idleBackoffEnabled: boolean
+  private _idleBackoffMaxMs: number
+  private _currentSyncIntervalMs: number
+  private _lastActivityTime: number = Date.now()
+  private _lastPeriodicTickTime: number = Date.now()
+  // connect()'s periodic scheduler, kept so _markActivity() can re-arm a
+  // backed-off timer at the base interval right away (phase 1d, design D).
+  private _periodicScheduler?: (delayMs?: number) => void
+
+  // Round 5, item 3 - Trickle (RFC 6206) suppression of the periodic
+  // beacon. Equal periodic beacons overheard since our last tick; at the
+  // tick we stay quiet if at least `_trickleK` were heard (the room has
+  // already compared itself against our exact digest), else we beacon.
+  // Reset at every tick, and whenever our digest changes (any applied
+  // update - the `_dsHashCache = null` line in the update handler): a count
+  // taken before an edit says nothing about the state after it. The beacon
+  // `_markActivity()` re-arms after a local edit is never suppressed
+  // (`_beaconForced`): it is the first link of the phase-1d recovery chain
+  // for a peer that lost that edit. Measured in
+  // test/dummy/bench-idle-room.ts (steady-state mode): idle beacons go from
+  // N(N-1) per interval to ~W(N)*(N-1) (Lambert W: ~3 senders per interval
+  // room-wide at N=50). Requests (JOIN, CONFIRM, resync) are never counted
+  // as ours and never suppressed.
+  private _trickleK: number
+  private _equalBeaconsHeard: number = 0
+  private _beaconForced: boolean = false
 
   // BroadcastChannel state for cross-tab sync
   private _bcChannel: string = ''
@@ -275,9 +530,16 @@ export class GenericProvider extends Observable<string> {
   private _lastResyncAttemptTime: number = 0
   private _pendingResyncTimeoutId?: ReturnType<typeof setTimeout>
 
-  // Rate limiting for sync requests
+  // Rate limiting for sync traffic - two budgets since phase 1b: one for
+  // what we ask for (beacons, pushes, syncNow), one for what we owe
+  // (SyncStep2 replies, acks). With a single shared budget a join burst's
+  // replies spent the slots a peer needed for its own recovery (measured:
+  // joiners arriving within 10 s of a burst converged in 13 s once, and a
+  // 50-peer room's periodic beacons ran at a third of their rate for 10 s
+  // after every join burst). Same size, same window, independent.
   private _syncRequestTimes: number[] = []
-  private _maxSyncRequestsPerWindow: number // max requests per window
+  private _syncReplyTimes: number[] = []
+  private _maxSyncRequestsPerWindow: number // max requests per window (per budget)
   private _syncRequestWindowMs: number // rate-limit window, ms
 
   // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
@@ -291,6 +553,140 @@ export class GenericProvider extends Observable<string> {
   private _pendingSyncReply: Uint8Array | null = null
   private _pendingSyncReplyTimeoutId?: ReturnType<typeof setTimeout>
   private _syncReplySuppressionMs: number
+  // Whether _pendingSyncReply is a digest-beacon ack (see _handleDigest())
+  // rather than a SyncStep2. An overheard beacon with a digest equal to ours
+  // makes a pending ACK redundant (the joiner it was for has received that
+  // same beacon and is synced by it) but says nothing about a pending
+  // SyncStep2, which carries data - so only acks are cancelled on that
+  // signal. Measured in test/dummy/bench-user-scaling.ts: without this, acks
+  // were ~94% of a 50-peer join burst's messages (Task 3b in the design doc).
+  private _pendingSyncReplyIsAck: boolean = false
+  // The requester's state vector the pending SyncStep2 answers (null for
+  // acks and for replies to plain SyncStep1s). A later request with the
+  // same state vector is the same question: the pending reply's bytes are
+  // refreshed to the current document and the timer kept, instead of the
+  // old reply being flushed as "a different request" - measured: with one
+  // peer typing while K empty peers join, keystroke and JOIN-beacon
+  // arrivals interleave at random, every keystroke in between changed the
+  // reply bytes, and each settled peer flushed up to K replies (Task 7 in
+  // the phase-1b design doc).
+  private _pendingSyncReplyTargetSv: Uint8Array | null = null
+
+  // Response-wait for our own JOIN/CONFIRM/resync beacons - see
+  // DIGEST_FLAG_CONFIRM and _armResponseWait(). A SyncStep2 or an equal
+  // ack/beacon counts as a response.
+  private _responseWaitTimer?: ReturnType<typeof setTimeout>
+  private _responseWaitAttempts: number = 0
+  private _responseSeen: boolean = false
+  // Phase 1e: an equal ack or equal beacon from an UNSETTLED peer arrived
+  // during the current response wait. Not a response (a settled peer with
+  // content may still answer), but evidence that the room is a fresh one
+  // whose peers are all in our state - see _armResponseWait().
+  private _equalUnsettledSeen: boolean = false
+  private _responseWaitFlags: number = 0 // flags for the retry beacon: CONFIRM after a JOIN, 0 after a resync
+  private _pendingCheckTimer?: ReturnType<typeof setTimeout> // see _schedulePendingCheck()
+  // Phase 1d (design A): a beacon showed its sender ahead of us. Re-check
+  // after a grace and ask if we are still behind - see _scheduleBehindCheck().
+  private _behindCheckTimer?: ReturnType<typeof setTimeout>
+  private _behindSv: Uint8Array | null = null
+
+  // Round-trip estimate from our own requests (JOIN/resync beacon -> first
+  // SyncStep2 or ack): the minimum of the last 8 samples, because a sample
+  // includes the responder's random suppression delay and the fastest
+  // reply had the least of it. Drives _replySuppressionMaxDelay() (a
+  // suppression window shorter than the one-way latency suppresses
+  // nothing: at 250-350 ms latency every peer ahead of a requester replied
+  // before any reply could be overheard, ~20 replies per request at N=100)
+  // and _armResponseWait()'s first delay (a fixed 1 s fired premature
+  // retries on the Matrix profile). See the phase-1b design doc, 1c.
+  private _rttSamples: number[] = []
+  private _requestSentAt: number = 0
+  // See DIGEST_FLAG_SETTLED. Reset on connect (a re-joining peer is a joiner).
+  private _confirmed: boolean = false
+
+  // ClientIDs we have heard from (beacon and verified-update senders, and
+  // the ids a relayed presence table names), each with the time we last
+  // heard it. The reply-suppression gate ("is there someone else who could
+  // answer?") used awareness alone, and in a join burst the awareness
+  // messages trail the beacons - so the gate was still closed exactly when
+  // 49 requests arrived at once, and every one got an immediate reply
+  // (phase-1b design, item 3). Cleared on disconnect, pruned by the lease
+  // sweep after a lease of silence (round 7, item 3: on a relay transport a
+  // reload's old clientID never says goodbye, and every one of them counted
+  // in _peerCount() forever).
+  private _knownPeers: Map<number, number> = new Map()
+
+  // Transport address (the `from` of Transport.onMessage) per remote
+  // clientID, learned from beacons and verified updates; lets replies, acks
+  // and presence responses go to the requester alone when the transport
+  // has sendTo (phase-1c design, item B). Cleared on disconnect, pruned
+  // with _knownPeers.
+  private _peerAddress: Map<number, string> = new Map()
+  // Requesters whose JOIN presence request the pending presence-response
+  // timer covers (see _schedulePresenceResponse).
+  private _presencePending: Set<number> = new Set()
+  // Phase 1e: an awareness message carrying OUR state at our current clock
+  // arrived since the presence-response timer was armed - the room's
+  // relayer (see _schedulePresenceResponse) already told the joiner about
+  // us, our own response would repeat it.
+  private _presenceCovered: boolean = false
+
+  // One timer that answers every JOIN beacon arriving within its window
+  // with a single presence broadcast (phase-1b design, item 4). The 100 ms
+  // cursor throttle is the wrong coalescing window for this: at 350 ms
+  // latency a 50-peer join burst's beacons spread over several of them and
+  // each peer re-announced presence 2-3 times per burst.
+  private _presenceResponseTimer?: ReturnType<typeof setTimeout>
+
+  // Same NACK-style suppression as _pendingSyncReply above, applied to
+  // awareness updates that are a pure timeout-triggered removal (see
+  // _scheduleAwarenessRemoval()) - every OTHER connected peer runs its own
+  // independent 30s outdatedTimeout sweep (y-protocols/awareness.js), so
+  // one peer going silent (crash/dirty drop, not a clean disconnect())
+  // causes an O(N) simultaneous "peer X is gone" broadcast burst without
+  // this. See docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
+  // item 7 and test/dummy/bench-awareness-removal-burst.ts.
+  private _pendingAwarenessRemoval: number[] | null = null
+  private _pendingAwarenessRemovalTimeoutId?: ReturnType<typeof setTimeout>
+
+  // onPeerConnect debounce: coalesces a burst of near-simultaneous
+  // onPeerConnect events (e.g. many mesh peers joining within a short
+  // window) into a single syncNow() call instead of one per event. See
+  // connect()'s onPeerConnect handler and _schedulePeerConnectSync().
+  private _peerConnectDebounceMs: number
+  private _pendingPeerConnectSyncTimeoutId?: ReturnType<typeof setTimeout>
+  // Peers whose channel opened since the debounce timer was armed (the
+  // `from`/sendTo address). Round 5, item 5: on a transport with sendTo
+  // each gets a plain beacon addressed to it - it answers with what we
+  // lack and its own JOIN beacon makes us answer it - instead of the
+  // full-state push + beacon broadcast to EVERY connection that
+  // `_syncNow(0)` did (the O(N^2) mesh-join burst CLAUDE.md warns about).
+  private _pendingPeerConnectIds: Set<string> = new Set()
+
+  // Round 5, item 5: the state vector and delete-set hash the room last
+  // confirmed as equal to ours (an equal digest from any peer, see
+  // _handleDigest). A reconnect's push then carries only what we produced
+  // since - our offline edits, the one thing a push exists for (round 2:
+  // one message must survive alone) - instead of the whole document, which
+  // on a chunking transport was several messages per reconnect. A room
+  // that has been replaced meanwhile shows up behind in its own JOIN
+  // beacons and is answered like any late joiner. Null until the first
+  // confirmation: the first connect still pushes everything.
+  private _confirmedSv: Uint8Array | null = null
+  private _confirmedDsHash: number | null = null
+  // connect() is awaiting ConnectionConfig.waitFor: doc updates are the local load.
+  private _loading: boolean = false
+
+  // Outgoing-payload compression, gated by size. See
+  // compressionThresholdBytes's doc comment for the wire-format
+  // compatibility tradeoff of enabling this at all.
+  private _compressionThresholdBytes?: number
+
+  // Cached computeDeleteSetHash(doc); null = stale. Invalidated on every
+  // doc 'update' (deletes are content changes, so this is exact; inserts
+  // invalidate needlessly but cheaply). See computeDeleteSetHash's doc for
+  // why this must not be recomputed per update.
+  private _dsHashCache: number | null = null
 
   // Sequence numbers for causal ordering
   private _localSeqNum: number = 0 // Our sequence number counter
@@ -307,34 +703,51 @@ export class GenericProvider extends Observable<string> {
   private _seqWindowSize: number
   private _gapGraceMs: number
 
-  // Update batching/debouncing
-  private _batchUpdates: number = 0 // milliseconds delay (0 = disabled)
+  // Update batching/debouncing. `_batchUpdates` 0 (the default) no longer
+  // means a synchronous send from inside the Y.Doc 'update' event: the
+  // update is merged into `_pendingUpdate` and flushed at the end of the
+  // current task (a microtask - no timer, no measurable delay), so that
+  // (a) the several transactions an editor binding can emit for one input
+  // event leave as one message and (b) the cursor awareness the binding
+  // sets right after the text change in the same task rides along in the
+  // same wire message (round 5, item 1 - see _flushPendingUpdate()).
+  // `_batchTimeoutId` is set only for the timed (`batchUpdates > 0`) flush;
+  // `_flushScheduled` covers both.
+  private _batchUpdates: number = 0 // milliseconds delay (0 = end of current task)
   private _pendingUpdate: Uint8Array | null = null
   private _batchTimeoutId?: ReturnType<typeof setTimeout>
+  private _flushScheduled: boolean = false
 
   // Awareness throttling - prevents awareness from flooding document sync
-  private _awarenessInterval: number = 100 // ms between awareness broadcasts
+  private _awarenessInterval: number | 'auto' = 100 // ms between awareness broadcasts, or 'auto' (round 6, item 9)
+  // ms of throttle added per known peer under `awarenessInterval: 'auto'`
+  private static readonly AWARENESS_AUTO_MS_PER_PEER = 20
   private _pendingAwarenessClients: Set<number> = new Set()
   private _awarenessTimeoutId?: ReturnType<typeof setTimeout>
   private _lastAwarenessTime: number = 0
-  // Independent throttle state for the app awareness channel.
-  private _pendingAppAwarenessClients: Set<number> = new Set()
-  private _appAwarenessTimeoutId?: ReturnType<typeof setTimeout>
-  private _lastAppAwarenessTime: number = 0
-
-  // Origins whose updates are never sent to the transport (local-only txns).
-  private _excludeOrigins: Set<any> = new Set()
-
-  // This provider's identity, used to filter targeted pubsub messages.
-  private _localId?: string
-
-  // Connect-time sync strategy: 'push-pull' (default) sends full local state
-  // then requests remote; 'pull' only requests remote state.
-  private _syncMode: 'push-pull' | 'pull' = 'push-pull'
 
   private _updateHandler?: (update: Uint8Array, origin: any) => void
   private _awarenessUpdateHandler?: (changed: any, origin: any) => void
-  private _appAwarenessUpdateHandler?: (changed: any, origin: any) => void
+
+  // Round 5, item 2 - the awareness lease. y-protocols/awareness renews the
+  // local state every outdatedTimeout/2 = 15 s and drops silent peers at
+  // 30 s, both module constants (awareness.js). Measured in
+  // test/dummy/bench-idle-room.ts (steady-state mode): once idle backoff
+  // has parked the beacons at the 60 s cap, those renewals are 80 % of an
+  // idle room's deliveries (N=50: 9,800 of 12,250 per minute) and a third
+  // of a typing room's. When the provider created the Awareness instance
+  // it replaces that sweep with its own at `_awarenessTimeoutMs`
+  // (`_awarenessSweepId`), renews only after lease/2 of silence - any
+  // digest, verified update or ack we send counts as presence
+  // (`_touchPeer`, the MQTT keep-alive rule), and any such message from a
+  // peer refreshes its lease here - and removes with origin 'timeout', so
+  // the existing removal suppression applies. Transports that report
+  // departures (onPeerDisconnect) default the lease to 5 min: the renewal
+  // class then all but disappears. Room-wide setting - a removal is
+  // authoritative by clock, so the shortest lease in a room decides.
+  private _awarenessTimeoutMs: number
+  private _awarenessSweepId?: ReturnType<typeof setTimeout>
+  private _ownsAwareness: boolean
   private _unsubscribeTransport?: () => void
   private _beforeUnloadHandler?: () => void
 
@@ -350,8 +763,6 @@ export class GenericProvider extends Observable<string> {
     transport: Transport,
     options: {
       awareness?: awarenessProtocol.Awareness
-      // Optional second Awareness for app/module use; created if omitted.
-      appAwareness?: awarenessProtocol.Awareness
       /**
        * Interval in milliseconds for periodic sync retries.
        * Helps recover from packet loss. Set to 0 to disable.
@@ -367,7 +778,12 @@ export class GenericProvider extends Observable<string> {
       /**
        * Batch (debounce) document updates to reduce network traffic.
        * Updates are collected and sent after this delay in milliseconds.
-       * Set to 0 to send updates immediately (no batching).
+       * 0 sends at the end of the current task (a microtask: no timer, no
+       * measurable delay) - the transactions one input event produces
+       * leave as one message, together with the cursor awareness the
+       * editor binding sets in the same task (round 5, item 1; measured in
+       * test/dummy/bench-typing-census.ts). Before round 5, 0 sent
+       * synchronously from inside the Y.Doc 'update' event.
        * Recommended: 50-200ms for good balance between latency and efficiency.
        * @default the transport's `preferredBatchMs` hint if it declares one,
        * otherwise 0 (disabled - immediate transmission)
@@ -386,36 +802,20 @@ export class GenericProvider extends Observable<string> {
        * Awareness updates (cursors, presence) are batched and sent at this interval.
        * Set to 0 for immediate transmission (not recommended for high-frequency updates).
        * This prevents awareness from flooding document sync on limited transports.
-       * @default 100 (100ms between awareness broadcasts)
+       * `'auto'` (round 6, item 9) scales the interval with room size instead
+       * of a fixed value: `max(transport hint ?? 100, 20 * peerCount)` ms -
+       * cursor-only traffic (no typing) is rate * (N-1) per mover and
+       * otherwise unbounded by room size. A latency trade (slower cursors in
+       * large rooms for fewer messages), so opt-in only; see
+       * docs/superpowers/specs/2026-09-07-sync-optimization-round-6.md.
+       * @default the transport's `preferredAwarenessMs` hint if it declares one, else 100
        */
-      awarenessInterval?: number
+      awarenessInterval?: number | 'auto'
       /**
-       * Transaction origins whose updates should not be sent to peers.
-       * Updates from these origins stay local (never reach the transport).
-       * @default [] (no origins excluded)
-       */
-      excludeOrigins?: any[]
-      /**
-       * This provider's identity for targeted pubsub (publishTo).
-       * On transports without sendTo, targeted messages are broadcast and
-       * dropped unless their target matches this id.
-       */
-      localId?: string
-      /**
-       * Connect-time sync strategy.
-       * - 'push-pull' (default): push full local state to peers, then request
-       *   remote state. Correct for P2P transports where there is no
-       *   authoritative peer to pull from (e.g. offline edits must be pushed).
-       * - 'pull': only request remote state on connect (SyncStep1), never push
-       *   full local state. Use with relay/server transports (e.g. y-websocket)
-       *   where the server holds authoritative state and a reconnecting client
-       *   should adopt it rather than push a competing local copy.
-       * @default 'push-pull'
-       */
-      syncMode?: 'push-pull' | 'pull'
-      /**
-       * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
-       * combined) this provider will send within `syncRequestWindowMs`.
+       * Max number of sync requests (digest beacons and syncNow() pushes
+       * combined) this provider will send within `syncRequestWindowMs` -
+       * and, as a separate budget of the same size, max number of sync
+       * replies (SyncStep2, acks) it will send in that window.
        * Protects against self-inflicted resync storms (e.g. many hash
        * mismatches firing in a short window under packet loss). Raise this
        * if legitimate resyncs are being throttled under heavy loss; lower
@@ -430,14 +830,30 @@ export class GenericProvider extends Observable<string> {
        */
       syncRequestWindowMs?: number
       /**
-       * Max random delay (ms) before replying to a SyncStep1 request, used
-       * to let other peers' replies pre-empt a redundant one (NACK-style
-       * suppression). Only engages once at least 2 other peers are known via
-       * awareness. Larger values suppress more redundant traffic in large
-       * rooms at the cost of higher requester-perceived latency.
+       * Base max random delay (ms) before replying to a SyncStep1 request,
+       * used to let other peers' replies pre-empt a redundant one
+       * (NACK-style suppression). Only engages once at least 2 other peers
+       * are known via awareness. The actual max delay scales up from this
+       * base with room size (see `_replySuppressionMaxDelay()`) - a larger
+       * room has more repliers racing within the same window, so it's given
+       * more time for the "someone already answered" signal to be overheard
+       * before more repliers commit. This option is the small-room baseline
+       * and the growth-rate multiplier's unit, not a hard cap (see the
+       * `200`ms cap in `_replySuppressionMaxDelay()`).
        * @default 30
        */
       syncReplySuppressionMs?: number
+      /**
+       * Debounce window (ms) for coalescing onPeerConnect-triggered
+       * syncNow() calls. Mesh transports (peerjs, simple-peer) fire
+       * onPeerConnect once per newly-connected remote peer; without
+       * coalescing, N peers joining within a short window each
+       * independently trigger a full-state broadcast to everyone already
+       * connected - an O(N^2) burst. A burst of onPeerConnect events within
+       * this window collapses into a single syncNow() call.
+       * @default 50
+       */
+      peerConnectDebounceMs?: number
       /**
        * Grace period (ms) after detecting a suspected sequence-number gap
        * before requesting a resync. Tolerates mere network reordering
@@ -454,6 +870,141 @@ export class GenericProvider extends Observable<string> {
        * @default 64
        */
       seqWindowSize?: number
+      /**
+       * Minimum payload size (bytes, measured on the CRC32-wrapped bytes
+       * about to be sent) above which a message is compressed
+       * (`deflate-raw`, via the standard CompressionStream/
+       * DecompressionStream Web API) before being handed to the network
+       * transport. Below this size, messages are sent byte-for-byte as they
+       * are today.
+       *
+       * Measured on synthetic Yjs docs (test/dummy/bench-compression-ratio.ts):
+       * a single-keystroke update (~20 bytes) actually gets BIGGER under
+       * gzip (fixed ~18-byte header/trailer) and is break-even at best under
+       * deflate-raw - not worth the async round trip through the
+       * Compression Streams API for a handful of bytes saved. A clean
+       * ~3.3KB doc compresses ~17x; a ~45KB doc with heavy edit-history
+       * churn (tombstones from insert/delete cycles) still compresses ~8x.
+       * 2048 is chosen so ordinary typing traffic (tens to a few hundred
+       * bytes per update - the majority of real-world traffic per this
+       * project's prior benchmark rounds) NEVER crosses it and is completely
+       * unaffected, while a full-document push/reply large enough to matter
+       * (and, on chunking transports like PubNub/Ably, large enough to
+       * multiply into several wire messages) reliably compresses down well
+       * below its own pre-compression size.
+       *
+       * `deflate-raw` (not `gzip`) is used deliberately: gzip's fixed
+       * header/trailer overhead makes it a net loss for anything under
+       * roughly 200 bytes (measured), while deflate-raw has ~0 fixed
+       * overhead and compresses at least as well for every size measured.
+       *
+       * IMPORTANT - wire-format compatibility: this project has no
+       * versioned wire-protocol negotiation. Enabling this (any truthy
+       * value) changes the wire format for EVERY message this instance
+       * sends: a 1-byte compressed/uncompressed flag is prepended ahead of
+       * the existing CRC32 wrapper on every message, compressed or not, so
+       * the receiving side can unambiguously tell them apart. A peer NOT
+       * running this option (or running an older version of this library)
+       * will misinterpret that leading flag byte as the start of the CRC32
+       * wrapper and reject every message as corrupted. All peers in a room
+       * must set this the same way (all enabled, or all disabled) for the
+       * room to function. This is a real, deliberate tradeoff - not a
+       * detail - which is why this defaults to fully disabled rather than
+       * auto-enabling above some size unconditionally.
+       *
+       * `0` disables compression entirely and keeps the wire format
+       * byte-for-byte identical to before this option existed; `undefined`
+       * takes the transport's `preferredCompressMinBytes` hint (2048 on
+       * PubNub, Matrix and Nostr, which carry the frame as opaque bytes),
+       * else disabled. NOT usable with a transport that strips the CRC32
+       * header or reads the message type at a fixed offset (Ably, Supabase,
+       * Gun today): the flag byte sits ahead of that header, so such a
+       * transport hands the receiver a frame it cannot parse - measured in
+       * the Nostr end-to-end test before that provider was made
+       * frame-transparent.
+       * @default the transport's `preferredCompressMinBytes` hint, else undefined
+       */
+      compressionThresholdBytes?: number
+      /**
+       * Awareness lease (ms): a peer whose presence has not been refreshed
+       * for this long is removed; our own state is re-announced after half
+       * of it without any digest, update or ack from us. Replaces
+       * y-protocols/awareness's fixed 30 s / 15 s when the provider created
+       * the Awareness instance (an `awareness` passed in keeps y-protocols'
+       * own sweep and constants). Every peer of a room must use the same
+       * value: a removal is authoritative, so the shortest lease in the room
+       * decides for everyone and a longer-lease peer would flap. Longer =
+       * fewer renewal broadcasts (N(N-1) per lease/2), but a crashed peer's
+       * presence lingers up to this long on transports without a leave
+       * signal.
+       * @default 300000 when the transport implements `onPeerDisconnect`
+       * (departures are reported, the lease is only a safety net), else
+       * 30000 (y-protocols' value)
+       */
+      awarenessTimeoutMs?: number
+      /**
+       * Trickle redundancy constant (RFC 6206 §4.2) for the periodic
+       * beacon: the tick stays silent when at least this many periodic
+       * beacons with a digest equal to ours were overheard since the
+       * previous tick - the room has already compared itself against our
+       * exact state, so our beacon would add nothing. A settled idle room
+       * then sends ~3 beacons per interval in total instead of one per
+       * peer (round 5, item 3). 1 = fewest messages; 2 = one lost beacon
+       * does not silence a window; 0 = off (every tick beacons, as before
+       * round 5). JOIN/CONFIRM/resync requests and the beacon re-armed by a
+       * local edit are never suppressed.
+       * @default 1
+       */
+      trickleK?: number
+      /**
+       * Back off the periodic-sync interval (see `syncInterval`) when the
+       * room is idle, instead of ticking at a fixed cadence forever. After
+       * each periodic tick that saw no activity since the previous tick -
+       * no LOCAL document edit, no corrupted/rejected wire message - the
+       * interval DOUBLES (capped at `idleBackoffMaxMs`) for the next tick.
+       * Local activity re-arms the tick at once, at a random point inside
+       * `syncInterval`. Remote updates and awareness changes do not count
+       * (phase 1e): a listener has nothing a beacon would announce, and the
+       * editor's own beacon heals a listener that lost the keystroke - so
+       * one typist no longer keeps every peer at the base cadence
+       * (N*(N-1) deliveries per interval). Deliberately does NOT
+       * count the periodic tick's own routine SyncStep1/SyncStep2 exchange
+       * as activity (see `_markActivity()`'s doc comment for why treating
+       * that as activity would make this option a no-op - an earlier draft
+       * of this feature made exactly that mistake, caught by this option's
+       * own bench script). Still composes with the existing +/-20% jitter
+       * (`_jitteredSyncInterval()`) at whatever the current backed-off value
+       * is.
+       *
+       * The tradeoff this used to carry - a message dropped right before
+       * the room went quiet was caught only by the loser's OWN next tick,
+       * up to `idleBackoffMaxMs` away - is gone since phase 1d: the sender
+       * of that message had activity, so its interval is at the base, and
+       * its next beacon shows the loser it is behind; the loser asks after a
+       * short grace (`_scheduleBehindCheck`). Measured in
+       * test/dummy/bench-idle-backoff.ts (300 ms base / 2.4 s cap so the
+       * effect fits a short run): recovery median 1,741 ms with the old
+       * rule, see the phase-1d design doc's "After Task 4" for the number
+       * with this one. What remains is the cadence of a fully idle room:
+       * one beacon per peer per `idleBackoffMaxMs` instead of per
+       * `syncInterval`. Off restores the fixed cadence.
+       * @default true
+       */
+      idleBackoffEnabled?: boolean
+      /**
+       * Ceiling (ms) for the backed-off periodic-sync interval when
+       * `idleBackoffEnabled` is true. Doubling from a 5000ms base reaches
+       * this in 4 idle ticks (5s/10s/20s/40s/60s). 60000 is chosen so the
+       * worst-case loss-recovery latency this trades away stays the same
+       * order of magnitude as `y-protocols/awareness`'s own built-in
+       * peer-removal timeout (30s, halved from its 60s+ `_checkInterval`
+       * sweep window) rather than growing unbounded - a room silent long
+       * enough to be fully backed off is, on this timescale, already close
+       * to "everyone's gone idle/timed out" territory anyway. Ignored when
+       * `idleBackoffEnabled` is false.
+       * @default 60000
+       */
+      idleBackoffMaxMs?: number
     } = {},
   ) {
     super()
@@ -462,22 +1013,39 @@ export class GenericProvider extends Observable<string> {
     this.transport = transport
     this.pubsub = new PubSubChannel(this)
     this.awareness = options.awareness || new awarenessProtocol.Awareness(doc)
-    this.appAwareness =
-      options.appAwareness || new awarenessProtocol.Awareness(doc)
     this._syncInterval = options.syncInterval ?? 5000
     this._verifyUpdates = options.verifyUpdates ?? true
     this._batchUpdates =
       options.batchUpdates ?? transport.preferredBatchMs ?? 0
     this._disableBc = options.disableBc ?? false
-    this._awarenessInterval = options.awarenessInterval ?? 100
-    this._excludeOrigins = new Set(options.excludeOrigins ?? [])
-    this._localId = options.localId
-    this._syncMode = options.syncMode ?? 'push-pull'
+    this._awarenessInterval =
+      options.awarenessInterval ?? transport.preferredAwarenessMs ?? 100
     this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20
     this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000
     this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30
+    this._peerConnectDebounceMs = options.peerConnectDebounceMs ?? 50
     this._gapGraceMs = options.gapGraceMs ?? 300
     this._seqWindowSize = options.seqWindowSize ?? 64
+    // Explicit 0 disables even when the transport hints a floor.
+    this._compressionThresholdBytes =
+      (options.compressionThresholdBytes ?? transport.preferredCompressMinBytes) ||
+      undefined
+    this._idleBackoffEnabled = options.idleBackoffEnabled ?? true
+    this._idleBackoffMaxMs = options.idleBackoffMaxMs ?? 60000
+    this._trickleK = options.trickleK ?? 1
+    this._ownsAwareness = !options.awareness
+    this._awarenessTimeoutMs =
+      options.awarenessTimeoutMs ??
+      (typeof transport.onPeerDisconnect === 'function' ? 300000 : 30000)
+    // Silence y-protocols' own 3 s sweep on an awareness we created - the
+    // lease sweep that replaces it is armed in connect() and cleared in
+    // disconnect() (round 7, item 2: it used to start here and outlive
+    // disconnect(), keeping a dropped provider alive through its timer).
+    if (this._ownsAwareness) {
+      const aw = this.awareness as unknown as { _checkInterval?: ReturnType<typeof setInterval> }
+      if (aw._checkInterval !== undefined) clearInterval(aw._checkInterval)
+    }
+    this._currentSyncIntervalMs = this._syncInterval
 
     this._setupDocumentSync()
     this._setupAwarenessSync()
@@ -514,19 +1082,21 @@ export class GenericProvider extends Observable<string> {
       // Setup BroadcastChannel for cross-tab sync (if enabled and available)
       this._setupBroadcastChannel(config)
 
-      // Connect the transport
-      await this.transport.connect(config)
-
-      // Register for incoming messages
-      this._unsubscribeTransport = this.transport.onMessage((data) => {
-        this._handleIncomingMessage(data)
+      // Register for incoming messages and new-peer notifications BEFORE
+      // connecting the transport. Some transports (e.g. PeerJS for a
+      // joining, non-coordinator peer) establish and fully open their first
+      // connection *inside* transport.connect() itself — so a peer-connect
+      // notification or an immediate reply from the other side can arrive
+      // before that promise resolves. Registering after the await left
+      // exactly that window uncovered: whatever arrived during it was
+      // silently dropped since neither callback was wired up yet.
+      this._unsubscribeTransport = this.transport.onMessage((data, from) => {
+        this._handleIncomingMessage(data, from)
       })
 
-      // When a new WebRTC peer channel opens, immediately push our full state
-      // so peers that reconnected after offline edits receive our changes.
       if (this.transport.onPeerConnect) {
-        const unsubPeer = this.transport.onPeerConnect((_peerId: string) => {
-          if (!this._destroying) this.syncNow()
+        const unsubPeer = this.transport.onPeerConnect((peerId: string) => {
+          if (!this._destroying) this._schedulePeerConnectSync(peerId)
         })
         const originalUnsub = this._unsubscribeTransport
         this._unsubscribeTransport = () => {
@@ -534,34 +1104,128 @@ export class GenericProvider extends Observable<string> {
           unsubPeer()
         }
       }
-
-      this._setStatus({ state: 'connected' })
-
-      // Send initial sync. In 'push-pull' mode, syncNow() pushes our local
-      // state (so offline edits reach currently-connected peers) then requests
-      // remote state. In 'pull' mode, only request remote state — a relay/server
-      // holds authoritative state and we adopt it rather than pushing a
-      // competing local copy on every (re)connect.
-      if (this._syncMode === 'pull') {
-        this._sendSyncStep1()
-      } else {
-        this.syncNow()
+      if (this.transport.onPeerDisconnect) {
+        const unsubLeave = this.transport.onPeerDisconnect((peerId: string) => {
+          if (!this._destroying) this._handlePeerLeave(peerId)
+        })
+        const originalUnsub = this._unsubscribeTransport
+        this._unsubscribeTransport = () => {
+          originalUnsub?.()
+          unsubLeave()
+        }
       }
 
-      // Broadcast local awareness state
-      this._broadcastAwareness([this.doc.clientID])
-      this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP)
+      // Connect the transport
+      await this.transport.connect(config)
+
+      this._setStatus({ state: 'connected' })
+      this._startAwarenessSweep()
+
+      // Seed the round-trip estimate from the transport's hint (see
+      // Transport.expectedRttMs); the minimum-of-8 rule lets real samples
+      // take over as soon as they arrive.
+      if (this.transport.expectedRttMs) {
+        this._rttSamples = [this.transport.expectedRttMs]
+      }
+
+      // Persistence first (round 5, item 7): let a local copy load before
+      // the first beacon says what we have. While it loads, the doc
+      // updates it produces are the load, not edits - they are not
+      // broadcast - and afterwards the loaded state counts as confirmed:
+      // no full-state push. The beacon reconciles: peers behind us (our
+      // offline edits) see themselves behind and ask; peers ahead of us
+      // answer. Measured in bench-reconnect-push part 2: a 50 KB copy that
+      // loaded 100 ms after connect cost the room a 50 KB SyncStep2, and a
+      // first version of waitFor that only delayed the beacon cost 100 KB
+      // (the load's broadcast plus the push). See ConnectionConfig.waitFor.
+      if (config.waitFor) {
+        this._loading = true
+        try {
+          await config.waitFor
+        } catch {
+          // The local load failed; sync from the room as if there were none.
+        }
+        this._loading = false
+        if (this._destroying || !this.transport.isConnected) return
+        this._confirmedSv = Y.encodeStateVector(this.doc)
+        this._confirmedDsHash = this._deleteSetHash()
+      }
+
+      // Send initial sync pushing our local state plus requesting remote state.
+      // syncNow() is used instead of _sendSyncStep1() so that any offline edits
+      // made before this connect() call are pushed to currently-connected peers
+      // (e.g. same-browser tabs via BroadcastChannel).
+      this.syncNow()
+      // (Local awareness goes out inside syncNow()'s batch, or via its
+      // throttled fallback - a second broadcast here was a duplicate 100ms
+      // later.)
 
       // Start periodic sync to handle packet loss
       // Just request sync without sending full state (avoid redundant broadcasts)
       // _sendSyncStep1() already checks the shared rate limiter internally
       // and silently drops the request if it's exceeded.
+      //
+      // Uses a recursive setTimeout (re-jittered by ~20% each tick) rather
+      // than a plain setInterval so peers that connect() within a short
+      // window of each other - the common case: everyone joining a room
+      // near session start, or reconnecting together after a shared network
+      // blip - don't end up with near-synchronized periodic timers that all
+      // fire in the same few milliseconds every syncInterval. This doesn't
+      // reduce total periodic-sync traffic, only spreads it out so a room's
+      // background traffic is smooth instead of bursty.
       if (this._syncInterval > 0) {
-        this._syncIntervalId = setInterval(() => {
-          if (this.transport.isConnected && !this._destroying) {
-            this._sendSyncStep1()
-          }
-        }, this._syncInterval)
+        // Reset idle-backoff state on every (re)connect so a reconnect
+        // always starts its first tick at the base interval, never
+        // inheriting a backed-off value left over from a previous session.
+        this._currentSyncIntervalMs = this._syncInterval
+        this._lastActivityTime = Date.now()
+        this._lastPeriodicTickTime = Date.now()
+        this._equalBeaconsHeard = 0
+        this._beaconForced = false
+        const scheduleNextPeriodicSync = (delayMs?: number) => {
+          this._syncIntervalId = setTimeout(() => {
+            const tickTime = Date.now()
+            if (this._idleBackoffEnabled) {
+              // "Activity" = anything _markActivity() call sites observed
+              // (incoming message via transport or BroadcastChannel, local
+              // or remote doc change, local or remote awareness change)
+              // since the LAST tick fired - not since backoff started, so a
+              // single quiet tick after a burst of activity still resets to
+              // base rather than needing a full quiet cycle to catch up.
+              const hadActivitySinceLastTick =
+                this._lastActivityTime > this._lastPeriodicTickTime
+              this._currentSyncIntervalMs = hadActivitySinceLastTick
+                ? this._syncInterval
+                : Math.min(
+                    this._idleBackoffMaxMs,
+                    this._currentSyncIntervalMs * 2,
+                  )
+            }
+            this._lastPeriodicTickTime = tickTime
+            if (this.transport.isConnected && !this._destroying) {
+              // Beacon only. Presence is no longer re-announced per tick on
+              // any transport: a joiner requests it via DIGEST_FLAG_JOIN
+              // (see _handleDigest()), and y-protocols/awareness renews the
+              // local state itself every outdatedTimeout/2 = 15s
+              // (awareness.js _checkInterval), which the awareness update
+              // handler broadcasts. Measured in
+              // test/dummy/bench-idle-room.ts: the per-tick re-announce was
+              // ~40% of an idle room's deliveries.
+              // Trickle (round 5, item 3): silent if enough equal beacons
+              // were overheard since the last tick - see _equalBeaconsHeard.
+              const suppressed =
+                this._trickleK > 0 &&
+                !this._beaconForced &&
+                this._equalBeaconsHeard >= this._trickleK
+              if (!suppressed) this._sendSyncStep1()
+              this._equalBeaconsHeard = 0
+              this._beaconForced = false
+            }
+            if (!this._destroying) scheduleNextPeriodicSync()
+          }, delayMs ?? this._jitteredSyncInterval())
+        }
+        this._periodicScheduler = scheduleNextPeriodicSync
+        scheduleNextPeriodicSync()
       }
     } catch (error) {
       this._setStatus({
@@ -579,8 +1243,14 @@ export class GenericProvider extends Observable<string> {
   disconnect(): void {
     // Stop periodic sync
     if (this._syncIntervalId !== undefined) {
-      clearInterval(this._syncIntervalId)
+      clearTimeout(this._syncIntervalId)
       this._syncIntervalId = undefined
+    }
+    this._periodicScheduler = undefined
+    // Stop the awareness lease sweep (armed in connect(); round 7, item 2).
+    if (this._awarenessSweepId !== undefined) {
+      clearTimeout(this._awarenessSweepId)
+      this._awarenessSweepId = undefined
     }
 
     // Reset resync escalation tracking
@@ -595,29 +1265,79 @@ export class GenericProvider extends Observable<string> {
       this._pendingResyncTimeoutId = undefined
     }
 
+    // Stop any pending gap-check timers and forget per-sender sequence
+    // tracking. Without this, a gap-check timer armed before this
+    // disconnect() keeps running in the background and can fire
+    // _requestResync() after reconnect using sequence-number bookkeeping
+    // from the PREVIOUS connection - a spurious resync race disconnected
+    // from anything actually missing in the new session. Mirrors the
+    // equivalent cleanup in destroy().
+    for (const timer of this._gapCheckTimers.values()) {
+      clearTimeout(timer)
+    }
+    this._gapCheckTimers.clear()
+    this._remoteSeqInfo.clear()
+
+    // Cancel any pending debounced onPeerConnect sync - a reconnect gets a
+    // fresh burst of onPeerConnect events (if the transport supports it) and
+    // shouldn't fire a stale one left over from before this disconnect.
+    if (this._pendingPeerConnectSyncTimeoutId !== undefined) {
+      clearTimeout(this._pendingPeerConnectSyncTimeoutId)
+      this._pendingPeerConnectSyncTimeoutId = undefined
+    }
+    this._pendingPeerConnectIds.clear()
+
     // Reset the sync rate-limit budget. Without this, a reconnect inherits
     // whatever budget was left over from before the disconnect - and since
     // syncNow()'s full-state push now shares this same limiter (see
     // _tryReserveSyncSlot()), a rate-limited reconnect could silently skip
     // the very push that delivers edits made while offline.
     this._syncRequestTimes = []
+    this._syncReplyTimes = []
+    this._knownPeers.clear()
+    this._peerAddress.clear()
+    this._presencePending.clear()
+
+    // A pending response-wait belongs to a request on the old connection.
+    if (this._responseWaitTimer !== undefined) {
+      clearTimeout(this._responseWaitTimer)
+      this._responseWaitTimer = undefined
+    }
+    if (this._pendingCheckTimer !== undefined) {
+      clearTimeout(this._pendingCheckTimer)
+      this._pendingCheckTimer = undefined
+    }
+    if (this._behindCheckTimer !== undefined) {
+      clearTimeout(this._behindCheckTimer)
+      this._behindCheckTimer = undefined
+    }
+    this._behindSv = null
+    if (this._presenceResponseTimer !== undefined) {
+      clearTimeout(this._presenceResponseTimer)
+      this._presenceResponseTimer = undefined
+    }
+    this._responseWaitAttempts = 0
+    this._responseSeen = false
+    this._equalUnsettledSeen = false
+    this._rttSamples = []
+    this._requestSentAt = 0
+    this._confirmed = false
 
     // Drop any pending suppressed sync reply - safe to simply discard (not
     // flush/send like batched updates/awareness below), since a suppressed
     // reply is by design redundant with whatever the room already has.
     this._cancelPendingSyncReply()
 
-    // Flush any pending batched updates before disconnecting
-    if (this._batchTimeoutId !== undefined) {
-      clearTimeout(this._batchTimeoutId)
-      this._batchTimeoutId = undefined
+    // Same reasoning for a pending suppressed awareness-removal broadcast -
+    // every other surviving peer is independently running the same
+    // suppression for the same departure, so dropping ours on disconnect
+    // (rather than flushing it through a transport that's about to go
+    // down) is safe.
+    this._cancelPendingAwarenessRemoval()
 
-      // Send pending update if transport is still connected
-      if (this._pendingUpdate && this.transport.isConnected) {
-        this._sendUpdate(this._pendingUpdate)
-      }
-      this._pendingUpdate = null
-    }
+    // Flush any pending batched updates before disconnecting (sent only if
+    // the transport is still connected; dropped otherwise, as before)
+    this._flushPendingUpdate()
 
     // Flush pending awareness updates before disconnecting
     if (this._awarenessTimeoutId !== undefined) {
@@ -635,23 +1355,6 @@ export class GenericProvider extends Observable<string> {
     }
     this._pendingAwarenessClients.clear()
 
-    // Flush pending app awareness updates before disconnecting
-    if (this._appAwarenessTimeoutId !== undefined) {
-      clearTimeout(this._appAwarenessTimeoutId)
-      this._appAwarenessTimeoutId = undefined
-
-      if (
-        this._pendingAppAwarenessClients.size > 0 &&
-        this.transport.isConnected
-      ) {
-        this._sendAwarenessNow(
-          Array.from(this._pendingAppAwarenessClients),
-          AWARENESS_CHANNEL_APP,
-        )
-      }
-    }
-    this._pendingAppAwarenessClients.clear()
-
     // Disconnect BroadcastChannel
     this._disconnectBroadcastChannel()
 
@@ -663,11 +1366,6 @@ export class GenericProvider extends Observable<string> {
     // Mark local client as offline in awareness
     awarenessProtocol.removeAwarenessStates(
       this.awareness,
-      [this.doc.clientID],
-      'disconnect',
-    )
-    awarenessProtocol.removeAwarenessStates(
-      this.appAwareness,
       [this.doc.clientID],
       'disconnect',
     )
@@ -686,7 +1384,7 @@ export class GenericProvider extends Observable<string> {
 
     // Stop periodic sync (disconnect() will also do this, but be explicit)
     if (this._syncIntervalId !== undefined) {
-      clearInterval(this._syncIntervalId)
+      clearTimeout(this._syncIntervalId)
       this._syncIntervalId = undefined
     }
 
@@ -700,17 +1398,12 @@ export class GenericProvider extends Observable<string> {
     // this, but be explicit)
     this._cancelPendingSyncReply()
 
-    // Flush any pending batched updates before destroying
-    if (this._batchTimeoutId !== undefined) {
-      clearTimeout(this._batchTimeoutId)
-      this._batchTimeoutId = undefined
+    // Same, for a pending suppressed awareness-removal broadcast
+    // (disconnect() will also do this, but be explicit)
+    this._cancelPendingAwarenessRemoval()
 
-      // Send pending update if transport is still connected
-      if (this._pendingUpdate && this.transport.isConnected) {
-        this._sendUpdate(this._pendingUpdate)
-      }
-      this._pendingUpdate = null
-    }
+    // Flush any pending batched updates before destroying
+    this._flushPendingUpdate()
 
     this.disconnect()
 
@@ -720,14 +1413,17 @@ export class GenericProvider extends Observable<string> {
       this._updateHandler = undefined
     }
 
-    // Remove awareness update listeners
+    // Remove awareness update listener
     if (this._awarenessUpdateHandler) {
-      this.awareness.off('update', this._awarenessUpdateHandler)
+      this.awareness.off(
+        this._ownsAwareness ? 'change' : 'update',
+        this._awarenessUpdateHandler,
+      )
       this._awarenessUpdateHandler = undefined
     }
-    if (this._appAwarenessUpdateHandler) {
-      this.appAwareness.off('update', this._appAwarenessUpdateHandler)
-      this._appAwarenessUpdateHandler = undefined
+    if (this._awarenessSweepId !== undefined) {
+      clearTimeout(this._awarenessSweepId)
+      this._awarenessSweepId = undefined
     }
 
     // Remove beforeunload handler
@@ -737,7 +1433,6 @@ export class GenericProvider extends Observable<string> {
     }
 
     this.awareness.destroy()
-    this.appAwareness.destroy()
     super.destroy()
   }
 
@@ -770,15 +1465,33 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Force an immediate sync with remote peers.
-   * Useful after network interruptions or to manually trigger re-sync.
+   * Push local state + request remote state, gated by the shared rate
+   * limiter. Returns whether it actually reserved a slot and sent anything
+   * - `false` means the caller was rate-limited right now. Extracted out of
+   * `syncNow()` so `_requestResync()`'s scheduled retry (see below) can tell
+   * the difference between "sent" and "silently skipped" and react to it,
+   * instead of assuming a resync always succeeds once it fires.
+   *
+   * @param push - whether to also broadcast full local document state.
+   * `_requestResync()`'s retry passes `false` (pull-only is enough for a
+   * resync trigger - see its call site).
+   * @param buildExtra - optional callback, invoked ONLY once a rate-limit
+   * slot is actually reserved (so it never runs, and never mutates
+   * whatever state it touches, on a call that ends up rate-limited),
+   * returning additional already-encoded sub-messages to fold into the SAME
+   * batched wire send as the push/pull messages below - e.g. an awareness
+   * update that's ready to go out "now" anyway (see
+   * `_tryImmediateAwarenessMessage()`). Pure wire-framing: whether a caller
+   * passes this never changes whether/when the push+pull half itself sends,
+   * only how many separate `transport.send()`/`bc.publish()` calls it costs.
+   * @param flags - digest beacon flags: DIGEST_FLAG_JOIN from syncNow(), 0
+   * from the peer-connect debounce and the resync retry (see _syncNow()).
    */
-  syncNow(): void {
-    if (!this.transport.isConnected) {
-      console.warn('Cannot sync: transport not connected')
-      return
-    }
-
+  private _trySyncPushPull(
+    push: boolean = true,
+    buildExtra?: () => Uint8Array[],
+    flags: number = 0,
+  ): boolean {
     // Push (full document state) and pull (SyncStep1 request) share a
     // single rate-limit reservation. syncNow() is called from several
     // triggers that can all fire in a short window when many peers are
@@ -790,23 +1503,317 @@ export class GenericProvider extends Observable<string> {
     // test/dummy/bench-user-scaling.ts: at 100 simulated users this drove
     // message counts to 20-200x the theoretical linear cost. See
     // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md.
-    if (this._tryReserveSyncSlot()) {
-      // Send our current document state to all peers
-      // This ensures any changes made while offline are transmitted
-      const update = Y.encodeStateAsUpdate(this.doc)
-      if (update.length > 0) {
-        this._sendUpdate(update)
-      }
+    if (!this._tryReserveSyncSlot()) return false
 
-      // Send sync request to get updates from others
-      this._writeSyncStep1()
+    const messages: Uint8Array[] = []
+
+    // Send our document state to all peers - everything on the first
+    // connect, only what we produced since the room last confirmed our
+    // state afterwards (see _confirmedSv). This is what carries edits made
+    // while offline.
+    if (push) {
+      const update = Y.encodeStateAsUpdate(this.doc, this._confirmedSv ?? undefined)
+      let worthPushing = update.length > 0
+      if (worthPushing && this._confirmedSv !== null) {
+        // A diff against a confirmed state is never byte-empty (it always
+        // carries the delete set): push it only if it holds structs, or
+        // deletes the room has not confirmed.
+        try {
+          worthPushing =
+            Y.parseUpdateMeta(update).to.size > 0 ||
+            this._deleteSetHash() !== this._confirmedDsHash
+        } catch {
+          worthPushing = true
+        }
+      }
+      if (worthPushing) {
+        messages.push(this._encodePush(update))
+      }
     }
 
-    // Broadcast current awareness state - independently throttled and much
-    // cheaper than a full document push, so it isn't gated by the sync
-    // rate limiter above even when the sync half is skipped.
-    this._broadcastAwareness([this.doc.clientID])
-    this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP)
+    // Send sync request to get updates from others
+    messages.push(this._encodeSyncStep1(flags))
+
+    if (buildExtra) {
+      messages.push(...buildExtra())
+    }
+
+    // Batched into one wire message (MESSAGE_BATCH) instead of one
+    // transport.send()/bc.publish() call per sub-message - see _sendBatch().
+    this._sendBatch(messages)
+    if (flags & DIGEST_FLAG_JOIN) this._armResponseWait(DIGEST_FLAG_CONFIRM)
+    return true
+  }
+
+  /**
+   * Force an immediate sync with remote peers.
+   * Useful after network interruptions or to manually trigger re-sync.
+   * Sends the beacon with DIGEST_FLAG_JOIN: peers answer with their
+   * presence and, if our state already matches theirs, with an ack beacon
+   * so `synced` flips without a data round trip.
+   */
+  syncNow(): void {
+    this._syncNow(DIGEST_FLAG_JOIN)
+  }
+
+  /**
+   * syncNow() body. `flags` = 0 for callers that must NOT request presence:
+   * `_schedulePeerConnectSync()` (mesh transports already re-broadcast
+   * presence to a newcomer via their own onPeerConnect -> syncNow()).
+   */
+  private _syncNow(flags: number): void {
+    if (!this.transport.isConnected) {
+      console.warn('Cannot sync: transport not connected')
+      return
+    }
+    if (flags & DIGEST_FLAG_JOIN) this._confirmed = false // a (re-)joiner until answered
+
+    // Try to fold the awareness broadcast into the same wire send as the
+    // sync push+pull below. _tryImmediateAwarenessMessage() only returns
+    // non-null (and only mutates awareness-throttle state) when the
+    // throttle would have let an immediate send through anyway - so this
+    // never changes awareness throttle semantics, only whether it travels
+    // as its own message or bundled with the sync message going out "now"
+    // too. Built inside buildExtra so it's only even attempted once a sync
+    // rate-limit slot is confirmed reserved (see _trySyncPushPull's doc).
+    let awarenessBatched = false
+    const sent = this._trySyncPushPull(
+      true,
+      () => {
+        const msg = this._tryImmediateAwarenessMessage([this.doc.clientID])
+        if (msg) {
+          awarenessBatched = true
+          return [msg]
+        }
+        return []
+      },
+      flags,
+    )
+
+    // Awareness broadcasting is independently throttled and explicitly NOT
+    // gated by the sync rate limiter above - preserve that exactly: it
+    // always ends up broadcast one way or another (batched above, or via
+    // its own throttled path here), regardless of whether the sync half
+    // above was rate-limited.
+    if (!sent || !awarenessBatched) {
+      this._broadcastAwareness([this.doc.clientID])
+    }
+  }
+
+  /**
+   * Compute the next periodic-sync delay, jittered by ~+/-20% around
+   * `_currentSyncIntervalMs` (== `_syncInterval` unless `idleBackoffEnabled`
+   * has backed it off - see that option's doc comment). Re-jittered fresh
+   * each tick (not computed once per connect()) so a room's peers - which
+   * commonly all connect() within a short window of each other - drift
+   * apart over time instead of staying loosely synchronized. Extracted to
+   * its own method purely so benchmarks can shadow it to compare against
+   * the unjittered baseline.
+   */
+  private _jitteredSyncInterval(): number {
+    const jitter = 1 + (Math.random() * 2 - 1) * 0.2 // +/-20%
+    return this._currentSyncIntervalMs * jitter
+  }
+
+  /**
+   * Record that "activity" happened right now, for `idleBackoffEnabled`'s
+   * benefit. Cheap (one timestamp write) and called unconditionally
+   * regardless of whether idle backoff is enabled, so there's no behavioral
+   * branch to keep in sync - the backoff decision in connect()'s periodic
+   * tick is the only place that actually reads this.
+   *
+   * Call sites are deliberately NOT "any inbound wire message" - an earlier
+   * version of this hooked `_handleIncomingMessage()` unconditionally, which
+   * made the periodic tick's OWN SyncStep1 request and the SyncStep2 reply
+   * answering it (empty payload - nothing to sync) each count as "activity",
+   * permanently resetting the backoff on every single tick and making the
+   * whole feature a no-op (caught by this bench script's own first run: ON
+   * and OFF produced statistically indistinguishable message counts). Both
+   * Yjs's `doc.emit('update', ...)` and y-protocols' `awareness.emit('update', ...)`
+   * already only fire when something with actual content changed
+   * (`hasContent`/non-empty added+updated+removed - confirmed by reading
+   * yjs's `Transaction.js` and y-protocols' `awareness.js` directly), so
+   * hooking THOSE instead is exactly "local or remote document/awareness
+   * change" with no extra filtering needed - a no-op SyncStep2 reply, a
+   * digest beacon, or a duplicate/no-change awareness re-announce (e.g. a
+   * JOIN-triggered presence response that changed nothing) never reaches
+   * these handlers. A corrupted (CRC32
+   * mismatch) message is real evidence of wire activity that neither
+   * handler would ever see (it's rejected before decoding) - see the
+   * explicit call in `_processWrappedMessage()`'s corruption branch.
+   *
+   * Call sites: `_setupDocumentSync()`'s update handler (LOCAL document
+   * edits only, since phase 1e) and `_processWrappedMessage()`'s
+   * corrupted-message branch (wire noise, not silence).
+   */
+  private _markActivity(): void {
+    this._lastActivityTime = Date.now()
+    // A backed-off periodic timer is re-armed at the base interval NOW, not
+    // at its next tick (which may be idleBackoffMaxMs away). Design D of
+    // the phase-1d doc rests on it: the peer that just had activity beacons
+    // within one base interval, and a peer that lost that activity's
+    // message learns from that beacon that it is behind (design A) - its
+    // own backed-off interval no longer bounds the recovery. Measured in
+    // test/dummy/bench-idle-backoff.ts. At most once per idle stretch.
+    if (
+      this._idleBackoffEnabled &&
+      this._currentSyncIntervalMs !== this._syncInterval &&
+      this._syncIntervalId !== undefined &&
+      this._periodicScheduler !== undefined
+    ) {
+      clearTimeout(this._syncIntervalId)
+      this._currentSyncIntervalMs = this._syncInterval
+      // Phase 1e: at a random point inside the base interval, not a full
+      // one (the phase-1d note): the loser's recovery chain starts with
+      // this beacon - so Trickle never suppresses it (round 5, item 3).
+      this._beaconForced = true
+      this._periodicScheduler(Math.random() * this._syncInterval)
+    }
+  }
+
+  /**
+   * The lease sweep: y-protocols' own (awareness.js `_checkInterval`: renew
+   * at outdatedTimeout/2, remove at outdatedTimeout, every
+   * outdatedTimeout/10) replaced by the same loop at `_awarenessTimeoutMs`,
+   * the period jittered so a room that joined together does not renew in
+   * one burst (measured: all 49 listeners of a 50-peer room renewed inside
+   * the same 10 s window). The renew/remove half runs only on an awareness
+   * we created (`_ownsAwareness`); the peer-table prune (round 7, item 3)
+   * runs regardless. Armed by connect(), cleared by disconnect() - round 7,
+   * item 2: started from the constructor it outlived disconnect(), ticking
+   * ~20 times a minute and keeping the dropped provider reachable
+   * (test/dummy/bench-reload-phantoms.ts, part 2).
+   */
+  private _startAwarenessSweep(): void {
+    if (this._awarenessSweepId !== undefined) return
+    const lease = this._awarenessTimeoutMs
+    const arm = () => {
+      this._awarenessSweepId = setTimeout(tick, (lease / 10) * (0.8 + Math.random() * 0.4))
+    }
+    const tick = () => {
+      const now = Date.now()
+      if (this._ownsAwareness) {
+        const mine = this.awareness.meta.get(this.doc.clientID)
+        if (
+          this.awareness.getLocalState() !== null &&
+          mine !== undefined &&
+          lease / 2 <= now - mine.lastUpdated
+        ) {
+          this.awareness.setLocalState(this.awareness.getLocalState()) // renew: bumps the clock
+          this._broadcastAwareness([this.doc.clientID]) // 'change' does not fire for an equal state (item 8)
+        }
+        const remove: number[] = []
+        this.awareness.meta.forEach((meta, clientID) => {
+          if (
+            clientID !== this.doc.clientID &&
+            lease <= now - meta.lastUpdated &&
+            this.awareness.getStates().has(clientID)
+          ) {
+            remove.push(clientID)
+          }
+        })
+        if (remove.length > 0) {
+          awarenessProtocol.removeAwarenessStates(this.awareness, remove, 'timeout')
+        }
+      }
+      // Round 7, item 3: forget peers not heard from for a lease. A live
+      // peer is heard at least every lease/2 through its presence renewal
+      // (every receiver scans it, above at MESSAGE_AWARENESS); a pruned
+      // peer that speaks again is simply learned again. Measured before
+      // this: 30 reloads in a 20-peer relay room left 49 known peers for
+      // good, and every cursor moved at a 50-peer room's 'auto' interval
+      // (test/dummy/bench-reload-phantoms.ts). awareness.meta is left to
+      // y-protocols: it holds the clock a late message is checked against.
+      for (const [id, heardAt] of this._knownPeers) {
+        if (lease <= now - heardAt) {
+          this._knownPeers.delete(id)
+          this._peerAddress.delete(id)
+          this._remoteSeqInfo.delete(id)
+        }
+      }
+      // Re-arm only while connected: a disconnect() from inside a listener
+      // above has just cleared the timer, and must stay cleared.
+      if (!this._destroying && this._status.state === 'connected') arm()
+      else this._awarenessSweepId = undefined
+    }
+    arm()
+  }
+
+  /**
+   * A digest, verified update or ack from `clientID` (or one we are about
+   * to send, for our own id) is proof of presence: refresh the lease the
+   * sweep above checks. Only for ids with a state - a departed peer's
+   * `meta` entry survives its removal (y-protocols keeps it for the clock)
+   * and must not be revived by a late message.
+   */
+  private _touchPeer(clientID: number): void {
+    const meta = this.awareness.meta.get(clientID)
+    if (meta !== undefined && this.awareness.getStates().has(clientID)) {
+      meta.lastUpdated = Date.now()
+    }
+  }
+
+  /**
+   * Transport.onPeerDisconnect: the peer at `peerId` is gone. Forget its
+   * address and id, drop its awareness state with origin 'peer-left': the
+   * broadcast goes through the same suppression as a timeout removal, but
+   * with a long window - every peer gets the leave signal in the same
+   * millisecond, and at the reply window (~170 ms at N=50) 28 of 49
+   * survivors broadcast before the first broadcast could be overheard
+   * (bench-awareness-removal-burst, DUMMY_PEER_EVENTS=1). One broadcast
+   * room-wide is still worth having: it corrects a joiner that received
+   * this peer in a relayed presence table but had no channel to it yet.
+   */
+  private _handlePeerLeave(peerId: string): void {
+    const gone: number[] = []
+    for (const [clientID, address] of this._peerAddress) {
+      if (address === peerId) gone.push(clientID)
+    }
+    for (const id of gone) {
+      this._peerAddress.delete(id)
+      this._knownPeers.delete(id)
+    }
+    const present = gone.filter((id) => this.awareness.getStates().has(id))
+    if (present.length > 0) {
+      awarenessProtocol.removeAwarenessStates(this.awareness, present, 'peer-left')
+    }
+  }
+
+  /** Cached delete-set hash - see computeDeleteSetHash(). */
+  private _deleteSetHash(): number {
+    if (this._dsHashCache === null) {
+      this._dsHashCache = computeDeleteSetHash(this.doc)
+    }
+    return this._dsHashCache
+  }
+
+  /**
+   * Debounce onPeerConnect-triggered syncNow() calls. A burst of connect
+   * events within `_peerConnectDebounceMs` collapses into one call instead
+   * of one per event - without this, N peers joining a mesh in a short
+   * window each independently broadcast full state to everyone already
+   * connected (O(N^2) traffic), since onPeerConnect fires once per
+   * newly-opened peer connection with no coalescing of its own.
+   */
+  private _schedulePeerConnectSync(peerId?: string): void {
+    if (peerId !== undefined) this._pendingPeerConnectIds.add(peerId)
+    if (this._pendingPeerConnectSyncTimeoutId !== undefined) return
+    this._pendingPeerConnectSyncTimeoutId = setTimeout(() => {
+      this._pendingPeerConnectSyncTimeoutId = undefined
+      const ids = Array.from(this._pendingPeerConnectIds)
+      this._pendingPeerConnectIds.clear()
+      if (!this.transport.isConnected || this._destroying) return
+      if (typeof this.transport.sendTo === 'function' && ids.length > 0) {
+        // Round 5, item 5: one plain beacon to each new peer, nothing to
+        // the rest of the mesh. Not rate-limited as a request: it answers
+        // a channel that just opened, and the peer's own JOIN beacon is
+        // the fallback if it is lost.
+        const beacon = wrapMessageWithChecksum(this._encodeSyncStep1(0))
+        for (const id of ids) this._sendToTransport(beacon, id)
+        return
+      }
+      this._syncNow(0)
+    }, this._peerConnectDebounceMs)
   }
 
   /**
@@ -816,18 +1823,21 @@ export class GenericProvider extends Observable<string> {
    */
   private _setupDocumentSync(): void {
     this._updateHandler = (update: Uint8Array, origin: any) => {
-      // Don't send updates that originated from this provider
-      // This prevents infinite loops when receiving updates
-      if (origin === this) return
-      // Don't send updates from excluded origins (local-only txns)
-      if (this._excludeOrigins.has(origin)) return
-
-      if (this._batchUpdates > 0) {
-        // Batch mode: merge updates and debounce
+      this._dsHashCache = null
+      this._equalBeaconsHeard = 0 // our digest changed - see the Trickle fields
+      // Fires for BOTH local edits and remotely-applied updates (the latter
+      // go through doc.transact with origin=this) - see _markActivity()'s
+      // doc comment. Phase 1e: only a LOCAL edit counts as activity for
+      // idle backoff - a listener has nothing a beacon would announce, and
+      // the typist's base-interval beacon heals any listener that lost the
+      // keystroke (phase 1d design A). Before this, one typist kept all N
+      // peers at the base cadence: N*(N-1) deliveries per interval against
+      // N-1 per keystroke.
+      // Don't send updates that originated from this provider (received
+      // from the wire) or from the local load connect() is waiting for.
+      if (origin !== this && !this._loading) {
+        this._markActivity()
         this._batchUpdate(update)
-      } else {
-        // Immediate mode: send right away
-        this._sendUpdate(update)
       }
     }
 
@@ -835,8 +1845,9 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Batch/debounce updates to reduce network traffic.
-   * Merges multiple updates and sends after delay.
+   * Merge a local update into the pending batch and schedule its flush:
+   * after `batchUpdates` ms (debounced) when that is > 0, otherwise at the
+   * end of the current task via queueMicrotask - see `_pendingUpdate`.
    */
   private _batchUpdate(update: Uint8Array): void {
     // Merge with pending update if exists
@@ -855,19 +1866,36 @@ export class GenericProvider extends Observable<string> {
       this._pendingUpdate = update
     }
 
-    // Clear existing timeout
+    if (this._batchUpdates > 0) {
+      // Debounce: restart the timer on every update.
+      if (this._batchTimeoutId !== undefined) clearTimeout(this._batchTimeoutId)
+      this._batchTimeoutId = setTimeout(() => {
+        this._batchTimeoutId = undefined
+        this._flushPendingUpdate()
+      }, this._batchUpdates)
+      this._flushScheduled = true
+      return
+    }
+    if (this._flushScheduled) return
+    this._flushScheduled = true
+    queueMicrotask(() => this._flushPendingUpdate())
+  }
+
+  /**
+   * Send the pending update batch as one wire message, carrying any
+   * awareness change the throttle is holding (see _takePendingAwareness).
+   * Shared by the microtask flush, the timed flush, and the
+   * disconnect()/destroy() flush.
+   */
+  private _flushPendingUpdate(): void {
+    this._flushScheduled = false
     if (this._batchTimeoutId !== undefined) {
       clearTimeout(this._batchTimeoutId)
-    }
-
-    // Set new timeout to send after delay
-    this._batchTimeoutId = setTimeout(() => {
-      if (this._pendingUpdate) {
-        this._sendUpdate(this._pendingUpdate)
-        this._pendingUpdate = null
-      }
       this._batchTimeoutId = undefined
-    }, this._batchUpdates)
+    }
+    const update = this._pendingUpdate
+    this._pendingUpdate = null
+    if (update && this.transport.isConnected) this._sendUpdate(update)
   }
 
   /**
@@ -887,40 +1915,89 @@ export class GenericProvider extends Observable<string> {
       },
       origin: any,
     ) => {
-      // Broadcast awareness changes (unless they came from remote)
+      // Not _markActivity(): awareness changes are not something a beacon
+      // announces (phase 1e; see the idleBackoffEnabled option).
+
+      // Broadcast awareness changes, UNLESS they came from remote (this
+      // comment described the intent since the very first commit, but the
+      // actual origin check was never implemented until now - confirmed by
+      // `git log -p` on this handler). `origin === this` is exactly the
+      // signature the MESSAGE_AWARENESS handler stamps on an update applied
+      // from an incoming wire message (`applyAwarenessUpdate(this.awareness,
+      // ..., this)`, below). Every transport this project targets is a
+      // full-room relay (websocket/pubnub/gun/matrix/ably/supabase) or a
+      // full mesh (peerjs/simple-peer/trystero - see CLAUDE.md), so the
+      // sender's own broadcast already reached every other peer directly;
+      // re-broadcasting it here on receipt is pure redundant traffic that
+      // compounds across every OTHER receiver doing the same thing.
+      // Verified with a throwaway probe: a single awareness field change in
+      // an N-peer room cost N*(N-1) wire deliveries before this check (one
+      // echo per receiver, each reaching N-1 peers) vs. N-1 after - e.g.
+      // N=20: 380 -> 19.
+      //
+      // Carve-out: `applyAwarenessUpdate` has its own defense against a
+      // remote peer incorrectly removing OUR OWN state (a stale/racy
+      // timeout-removal from someone else's clock) - it bumps our clock
+      // instead of deleting our state, but (a quirk of that function) still
+      // reports it via `removed` including our own clientID. That specific
+      // case must still be broadcast so the room's stale belief that we're
+      // gone gets corrected promptly, instead of only self-healing on our
+      // next unrelated state change/renewal (up to ~15s later).
+      if (origin === this) {
+        // An incoming removal might be the SAME departure we have a
+        // suppressed broadcast queued for (see _scheduleAwarenessRemoval())
+        // - someone else already told the room, drop ours.
+        if (removed.length > 0) {
+          this._cancelPendingAwarenessRemovalIfOverlaps(removed)
+        }
+        if (!removed.includes(this.awareness.clientID)) {
+          return
+        }
+      }
+
       const changedClients = added.concat(updated).concat(removed)
+
+      // A pure timeout-triggered removal ('timeout' is the exact origin
+      // string y-protocols/awareness.js's own _checkInterval passes to
+      // removeAwarenessStates()) is redundant across the whole room: every
+      // OTHER connected peer runs the identical 30s-timeout sweep
+      // independently, so all of them detect and would broadcast the SAME
+      // departure within the same ~3s tick - measured as O(N-1) broadcasts
+      // / O((N-1)(N-2)) deliveries for ONE departure in
+      // test/dummy/bench-awareness-removal-burst.ts (e.g. N=50: 2352
+      // deliveries). Delay + drop-if-overheard, exactly mirroring
+      // _scheduleSyncReply()/_cancelPendingSyncReply()'s suppression of
+      // redundant SyncStep2 replies. Deliberately NOT applied to
+      // 'disconnect'/'window unload' removals (a single broadcaster, not
+      // redundant) or to added/updated clients (every sender's
+      // cursor/presence data is meaningfully different and must never be
+      // suppressed).
+      if (origin === 'timeout' || origin === 'peer-left') {
+        this._scheduleAwarenessRemoval(changedClients, origin)
+        return
+      }
+
       this._broadcastAwareness(changedClients)
     }
 
-    this.awareness.on('update', this._awarenessUpdateHandler)
-
-    this._appAwarenessUpdateHandler = (
-      {
-        added,
-        updated,
-        removed,
-      }: {
-        added: number[]
-        updated: number[]
-        removed: number[]
-      },
-      _origin: any,
-    ) => {
-      const changedClients = added.concat(updated).concat(removed)
-      this._broadcastAwareness(changedClients, AWARENESS_CHANNEL_APP)
-    }
-    this.appAwareness.on('update', this._appAwarenessUpdateHandler)
+    // Round 5, item 8: broadcast on 'change' (y-protocols filters updates
+    // whose state deep-equals the previous one) rather than 'update'
+    // (every setLocalState call) - an app that re-sets unchanged state no
+    // longer costs a broadcast per call. The renewal is the one
+    // equal-state update that must go out; the provider's own sweep sends
+    // it explicitly (_startAwarenessSweep). With an app-supplied Awareness
+    // y-protocols' own sweep renews through 'update' only, so that case
+    // keeps listening on 'update'.
+    this.awareness.on(
+      this._ownsAwareness ? 'change' : 'update',
+      this._awarenessUpdateHandler,
+    )
 
     // Cleanup: mark as offline and disconnect BC when page unloads
     if (typeof window !== 'undefined') {
       this._beforeUnloadHandler = () => {
         awarenessProtocol.removeAwarenessStates(
           this.awareness,
-          [this.doc.clientID],
-          'window unload',
-        )
-        awarenessProtocol.removeAwarenessStates(
-          this.appAwareness,
           [this.doc.clientID],
           'window unload',
         )
@@ -932,20 +2009,98 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Handle incoming messages from the transport.
-   * Verifies message integrity with CRC32 before processing.
-   * Corrupt messages are rejected immediately without attempting to decode.
+   * Handle incoming messages from the transport (or BroadcastChannel).
+   *
+   * When compressionThresholdBytes is disabled (the default), this is a
+   * fully synchronous fast path, byte-for-byte the same behavior as before
+   * that option existed: straight into _processWrappedMessage().
+   *
+   * When enabled, every message - from the network transport AND from
+   * BroadcastChannel (see _send()) - carries a leading compressed(1)/
+   * uncompressed(0) flag byte ahead of the usual CRC32 wrapper. Reading
+   * that flag and, if set, decompressing is inherently async (the
+   * Compression Streams API has no synchronous form), so this method
+   * dispatches to a promise chain instead of processing inline in that
+   * case. This means a large (compressed) message and a small (uncompressed
+   * or below-threshold) message that arrive back-to-back can finish
+   * processing out of arrival order - acceptable here because Yjs updates
+   * are idempotent/commutative (see MESSAGE_SYNC_VERIFIED's handling below)
+   * and because the compression threshold keeps this path almost entirely
+   * to large, full-state syncs, not the per-keystroke incremental updates
+   * that per-sender gap detection actually relies on ordering-sensitive
+   * heuristics for.
    */
-  private _handleIncomingMessage(data: Uint8Array): void {
+  private _handleIncomingMessage(data: Uint8Array, from?: string): void {
+    if (!this._compressionThresholdBytes) {
+      this._processWrappedMessage(data, from)
+      return
+    }
+
+    if (data.length < 1) {
+      console.warn(
+        '[GenericProvider] Dropping empty message (missing compression flag byte)',
+      )
+      return
+    }
+
+    const flag = data[0]
+    const rest = data.subarray(1)
+
+    if (flag === 0) {
+      this._processWrappedMessage(rest, from)
+      return
+    }
+
+    if (!COMPRESSION_AVAILABLE) {
+      console.warn(
+        '[GenericProvider] Received a compressed message but this runtime has no DecompressionStream - dropping it.',
+      )
+      return
+    }
+
+    decompressDeflateRaw(rest)
+      .then((wrapped) => this._processWrappedMessage(wrapped, from))
+      .catch((error) => {
+        // Treat decompression failure the same as a CRC32 mismatch on the
+        // uncompressed path: request a resync rather than silently dropping.
+        console.warn(
+          '[GenericProvider] Failed to decompress incoming message, treating as corrupted:',
+          error,
+        )
+        this._requestResync()
+      })
+  }
+
+  /**
+   * Verify message integrity with CRC32 and decode. Corrupt messages are
+   * rejected immediately without attempting to decode. Operates on bytes
+   * that have already had any compression flag/decompression handled by
+   * _handleIncomingMessage() - this is the pre-compression-feature
+   * implementation, unchanged.
+   */
+  private _processWrappedMessage(data: Uint8Array, from?: string): void {
     // Verify message integrity with CRC32 checksum
     const message = unwrapAndVerifyMessage(data)
 
     if (message === null) {
-      // Message is corrupted - reject it immediately
+      // Message is corrupted - reject it immediately. Note: if this was a
+      // MESSAGE_BATCH envelope, the CRC32 wrap covers the WHOLE batch, so a
+      // single corrupted bit here loses every sub-message it contained, not
+      // just one - a deliberate tradeoff of batching multiple logical
+      // messages behind one wire message/one checksum. See _sendBatch()'s
+      // doc comment for why this was chosen over per-sub-message checksums,
+      // and this project's benchmark suite (bench-corruption-storm.ts,
+      // bench-packet-loss.ts) for how that tradeoff was measured.
       console.warn(
         `[GenericProvider] 💥 Corrupted message rejected: CRC32 checksum mismatch. ` +
           `This is expected if data corruption simulation is enabled.`,
       )
+
+      // Wire noise, not silence - counts as activity for idleBackoffEnabled
+      // even though nothing here reaches the doc/awareness update handlers
+      // (the message is rejected before decoding). See _markActivity()'s
+      // doc comment.
+      this._markActivity()
 
       // Request re-sync to recover any lost data - routed through the
       // shared coordinator so this doesn't stack an independent timer on
@@ -957,214 +2112,548 @@ export class GenericProvider extends Observable<string> {
 
     // Message integrity verified - safe to decode
     try {
-      const decoder = decoding.createDecoder(message)
-      const messageType = decoding.readVarUint(decoder)
-
-      switch (messageType) {
-        case MESSAGE_SYNC: {
-          const encoder = encoding.createEncoder()
-          encoding.writeVarUint(encoder, MESSAGE_SYNC)
-
-          const syncMessageType = syncProtocol.readSyncMessage(
-            decoder,
-            encoder,
-            this.doc,
-            this, // transaction origin
-          )
-
-          if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-            // If we received SyncStep2, we're synced
-            if (!this._synced) {
-              this._synced = true
-              this.emit('synced', [true])
-            }
-
-            // Someone else's SyncStep2 reply just arrived - our own pending
-            // reply (if any) is now most likely redundant.
-            this._cancelPendingSyncReply()
-          }
-
-          // Send reply if needed. Suppression only engages with genuine
-          // redundancy (>=2 other known peers via awareness) - below that,
-          // there's no "someone else" to rely on, so reply immediately
-          // (still rate-limited via _sendSyncReply() as a hard backstop).
-          if (encoding.length(encoder) > 1) {
-            if (this.awareness.getStates().size >= 3) {
-              this._scheduleSyncReply(encoding.toUint8Array(encoder))
-            } else {
-              this._sendSyncReply(encoding.toUint8Array(encoder))
-            }
-          }
-          break
-        }
-
-        case MESSAGE_AWARENESS: {
-          const channel = decoding.readVarUint(decoder)
-          awarenessProtocol.applyAwarenessUpdate(
-            channel === AWARENESS_CHANNEL_APP
-              ? this.appAwareness
-              : this.awareness,
-            decoding.readVarUint8Array(decoder),
-            this, // origin
-          )
-          break
-        }
-
-        case MESSAGE_PUBSUB: {
-          // Read topic
-          const topic = decoding.readVarString(decoder)
-          // Read message payload
-          const payloadBytes = decoding.readVarUint8Array(decoder)
-
-          try {
-            // Decode JSON payload
-            const decoder = new TextDecoder()
-            const payloadStr = decoder.decode(payloadBytes)
-            const message = JSON.parse(payloadStr)
-
-            // Emit to pubsub channel
-            this.pubsub._handleMessage(topic, message)
-          } catch (error) {
-            console.error('Error decoding pub/sub message:', error)
-          }
-          break
-        }
-
-        case MESSAGE_PUBSUB_TARGETED: {
-          const target = decoding.readVarString(decoder)
-          const topic = decoding.readVarString(decoder)
-          const payloadBytes = decoding.readVarUint8Array(decoder)
-
-          // Drop messages aimed at someone else (broadcast-and-filter path).
-          if (this._localId !== undefined && target !== this._localId) {
-            break
-          }
-
-          try {
-            const message = JSON.parse(new TextDecoder().decode(payloadBytes))
-            this.pubsub._handleMessage(topic, message)
-          } catch (error) {
-            console.error('Error decoding targeted pub/sub message:', error)
-          }
-          break
-        }
-
-        case MESSAGE_SYNC_VERIFIED: {
-          // Sync message with sequence number and hash verification
-          // Read sequence number and clientID first
-          const seqNum = decoding.readVarUint(decoder)
-          const senderClientID = decoding.readVarUint(decoder)
-
-          // Track for gap detection only — does NOT gate whether we apply
-          // the update below (see _trackRemoteSeq() for why).
-          this._trackRemoteSeq(senderClientID, seqNum)
-
-          // Always apply the update. Yjs updates are idempotent/commutative,
-          // so re-applying an already-seen update is a harmless no-op.
-          // Under reordering, a merely-late (not actually duplicate) update
-          // must still be applied here — the old "skip if seqNum <= last
-          // seen" logic silently dropped such updates forever whenever a
-          // later-numbered message happened to arrive first.
-          const encoder = encoding.createEncoder()
-          encoding.writeVarUint(encoder, MESSAGE_SYNC)
-
-          const syncMessageType = syncProtocol.readSyncMessage(
-            decoder,
-            encoder,
-            this.doc,
-            this, // transaction origin
-          )
-
-          // Someone else's SyncStep2 reply just arrived - our own pending
-          // reply (if any) is now most likely redundant. Mirrors the
-          // MESSAGE_SYNC case: the reply encoded above is always a plain
-          // MESSAGE_SYNC-typed message regardless of which message type
-          // triggered it, so the same suppression scheme applies here too.
-          if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-            this._cancelPendingSyncReply()
-          }
-
-          // Read the expected hash from sender (signed integer)
-          const expectedHash = decoding.readVarInt(decoder)
-
-          // Compute our local hash after applying the update
-          const localHash = computeDocHash(this.doc)
-
-          // Verify hash match
-          if (localHash !== expectedHash) {
-            // If we already know this sender has a suspected reordering gap
-            // (see _trackRemoteSeq()/_scheduleGapCheck()), a hash mismatch
-            // right now is the *expected* transient state — we're missing a
-            // piece that's very likely still in flight, not actually
-            // diverged. Let the pending gap-check grace period resolve it
-            // instead of also escalating the hash-mismatch backoff: under
-            // heavy reordering this previously caused a burst of mismatches
-            // to rack up the exponential backoff to its 10s cap within a
-            // single edit burst, purely from timing, not real divergence.
-            // A hash mismatch with NO pending gap (in-order, but still
-            // wrong) is not explained by reordering and still escalates
-            // normally below.
-            const reorderingSuspected = this._gapCheckTimers.has(
-              senderClientID,
-            )
-
-            if (!reorderingSuspected) {
-              // Push our full state AND request theirs (syncNow() does
-              // both). A hash mismatch means the two peers have diverged -
-              // one side may have edits the other lacks. Routed through the
-              // shared coordinator so this doesn't stack an independent
-              // timer on top of any corrupted-message/gap-confirmed resync
-              // already pending.
-              this._requestResync()
-
-              // Logged with the shared attempt counter (kept as "#N" for
-              // compatibility with existing tooling/benchmarks that grep
-              // for this exact "Hash mismatch #" pattern) - it now reflects
-              // the unified resync-attempt count rather than a
-              // hash-mismatch-specific one, since the two escalation
-              // counters were merged.
-              console.warn(
-                `[GenericProvider] Hash mismatch #${this._resyncAttemptCount} detected! Local: ${localHash}, Expected: ${expectedHash}`,
-              )
-            }
-          }
-
-          // If we received SyncStep2, we're synced (unless hash mismatched)
-          if (
-            syncMessageType === syncProtocol.messageYjsSyncStep2 &&
-            !this._synced &&
-            localHash === expectedHash
-          ) {
-            this._synced = true
-            this.emit('synced', [true])
-          }
-
-          // Send reply if needed (as standard MESSAGE_SYNC). Suppression
-          // only engages with genuine redundancy (>=2 other known peers via
-          // awareness) - below that, reply immediately (still rate-limited
-          // via _sendSyncReply() as a hard backstop). Matches the
-          // MESSAGE_SYNC case's gate exactly; without this, a hash-mismatch
-          // resync burst under packet loss bypassed suppression entirely,
-          // since every peer answering a post-mismatch SyncStep1 replied
-          // immediately via this path.
-          if (encoding.length(encoder) > 1) {
-            if (this.awareness.getStates().size >= 3) {
-              this._scheduleSyncReply(encoding.toUint8Array(encoder))
-            } else {
-              this._sendSyncReply(encoding.toUint8Array(encoder))
-            }
-          }
-          break
-        }
-
-        default:
-          console.warn('Unknown message type:', messageType)
-      }
+      this._dispatchMessage(message, from)
     } catch (error) {
       // This should only happen for logic errors, not corruption
       // (corruption is caught by CRC32 check above)
       console.error('[GenericProvider] Error handling message:', error)
     }
+  }
+
+  /**
+   * Decode and act on one already-integrity-verified, already-decompressed
+   * message. Split out of `_processWrappedMessage()` so `MESSAGE_BATCH`
+   * (see `_sendBatch()`) can recurse into this for each sub-message it
+   * unwraps, running the EXACT SAME per-message-type logic used for a
+   * top-level message rather than a parallel reimplementation. A thrown
+   * error partway through a batch's sub-messages aborts the REST of that
+   * batch (propagates up to `_processWrappedMessage()`'s catch) - same as
+   * a logic error aborting a single top-level message today, just now
+   * scoped to "the rest of this batch" instead of "this one message".
+   */
+  private _dispatchMessage(message: Uint8Array, from?: string): void {
+    const decoder = decoding.createDecoder(message)
+    const messageType = decoding.readVarUint(decoder)
+
+    switch (messageType) {
+      case MESSAGE_BATCH: {
+        // Payload is N length-prefixed sub-messages (writeVarUint8Array
+        // per sub-message, mirroring MESSAGE_AWARENESS's own framing).
+        // Each was NOT individually CRC32-wrapped - see _sendBatch()'s doc
+        // comment - so just decode and dispatch each one directly.
+        while (decoding.hasContent(decoder)) {
+          const subMessage = decoding.readVarUint8Array(decoder)
+          this._dispatchMessage(subMessage, from)
+        }
+        break
+      }
+
+      case MESSAGE_SYNC_DIGEST: {
+        this._handleDigest(decoder, from)
+        break
+      }
+
+      case MESSAGE_SYNC_PUSH: {
+        // Somebody's whole document: apply it, nothing else (see the
+        // constant's comment for why no hash check and no synced flip).
+        Y.applyUpdate(this.doc, decoding.readVarUint8Array(decoder), this)
+        this._checkPendingAfterReply()
+        break
+      }
+
+      case MESSAGE_SYNC: {
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, MESSAGE_SYNC)
+
+        const syncMessageType = syncProtocol.readSyncMessage(
+          decoder,
+          encoder,
+          this.doc,
+          this, // transaction origin
+        )
+
+        if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+          // If we received SyncStep2, we're synced (and confirmed: we have
+          // heard from a peer that had data for us)
+          this._confirmed = true
+          this._noteResponse(true)
+          this._markSynced()
+          // Design E (phase 1d): a SyncStep2 carries its encoder's own pending
+          // structs, so a responder missing a struct hands us the same hole.
+          // Our response wait just ended - make sure something still asks.
+          this._checkPendingAfterReply()
+
+          // Someone else's SyncStep2 reply just arrived - our own pending
+          // reply (if any) is now most likely redundant.
+          this._cancelPendingSyncReply()
+        }
+
+        // Send reply if needed. Suppression only engages with genuine
+        // redundancy (>=2 other known peers via awareness) - below that,
+        // there's no "someone else" to rely on, so reply immediately
+        // (still rate-limited via _sendSyncReply() as a hard backstop).
+        if (encoding.length(encoder) > 1) {
+          this._replyToSyncRequest(encoding.toUint8Array(encoder))
+        }
+        break
+      }
+
+      case MESSAGE_AWARENESS: {
+        const payload = decoding.readVarUint8Array(decoder)
+
+        // Someone else's removal broadcast just arrived - cancel our own
+        // suppressed removal for the same clientID(s), if pending (see
+        // _scheduleAwarenessRemoval()). This MUST be checked here, at the
+        // wire-message level, before calling applyAwarenessUpdate() below -
+        // by the time this arrives we've very likely already independently
+        // detected and applied the SAME removal ourselves (every peer's
+        // 30s outdatedTimeout sweep fires near-simultaneously, well before
+        // this message's network delay elapses - see
+        // test/dummy/bench-awareness-removal-burst.ts), so
+        // applyAwarenessUpdate() below will see a clock it already knows
+        // and emit no 'update' event at all - mirrors exactly how the
+        // MESSAGE_SYNC/MESSAGE_SYNC_VERIFIED case above cancels
+        // _pendingSyncReply on seeing a SyncStep2 message TYPE arrive, not
+        // on whether it changed anything locally.
+        const scan = this._scanAwarenessPayload(payload)
+        if (scan.removed.length > 0) {
+          this._cancelPendingAwarenessRemovalIfOverlaps(scan.removed)
+        }
+        if (scan.coversUs) this._presenceCovered = true
+        // Round 5, item 3: with Trickle, settled peers rarely beacon, so a
+        // joiner would learn them only from the few phase-winning beacons
+        // per interval. The relayed presence table names everyone - ids
+        // only, addresses stay beacon-learned (unicast needs a `from`).
+        const heardAt = Date.now()
+        for (const id of scan.present) {
+          if (id !== this.doc.clientID) this._knownPeers.set(id, heardAt)
+        }
+
+        awarenessProtocol.applyAwarenessUpdate(
+          this.awareness,
+          payload,
+          this, // origin
+        )
+        break
+      }
+
+      case MESSAGE_PUBSUB: {
+        // Read topic
+        const topic = decoding.readVarString(decoder)
+        // Read message payload
+        const payloadBytes = decoding.readVarUint8Array(decoder)
+
+        try {
+          // Decode JSON payload
+          const decoder = new TextDecoder()
+          const payloadStr = decoder.decode(payloadBytes)
+          const message = JSON.parse(payloadStr)
+
+          // Emit to pubsub channel
+          this.pubsub._handleMessage(topic, message)
+        } catch (error) {
+          console.error('Error decoding pub/sub message:', error)
+        }
+        break
+      }
+
+      case MESSAGE_SYNC_VERIFIED: {
+        // Sync message with sequence number and hash verification
+        // Read sequence number and clientID first
+        const seqNum = decoding.readVarUint(decoder)
+        const senderClientID = decoding.readVarUint(decoder)
+
+        // Track for gap detection only — does NOT gate whether we apply
+        // the update below (see _trackRemoteSeq() for why).
+        this._trackRemoteSeq(senderClientID, seqNum)
+        this._knownPeers.set(senderClientID, Date.now())
+        if (from !== undefined) this._peerAddress.set(senderClientID, from)
+        this._touchPeer(senderClientID)
+
+        // Always apply the update. Yjs updates are idempotent/commutative,
+        // so re-applying an already-seen update is a harmless no-op.
+        // Under reordering, a merely-late (not actually duplicate) update
+        // must still be applied here — the old "skip if seqNum <= last
+        // seen" logic silently dropped such updates forever whenever a
+        // later-numbered message happened to arrive first.
+        // Peek at the sync sub-message's payload (SyncStep2/Update carry
+        // an update as a varUint8Array right after the sub-type) without
+        // consuming the decoder - _isLateUpdate() needs the bytes after
+        // readSyncMessage() has applied them.
+        const updateBytes = this._peekSyncUpdate(decoder)
+
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, MESSAGE_SYNC)
+
+        const syncMessageType = syncProtocol.readSyncMessage(
+          decoder,
+          encoder,
+          this.doc,
+          this, // transaction origin
+        )
+
+        // Someone else's SyncStep2 reply just arrived - our own pending
+        // reply (if any) is now most likely redundant. Mirrors the
+        // MESSAGE_SYNC case: the reply encoded above is always a plain
+        // MESSAGE_SYNC-typed message regardless of which message type
+        // triggered it, so the same suppression scheme applies here too.
+        if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
+          this._cancelPendingSyncReply()
+          this._confirmed = true
+          this._checkPendingAfterReply()
+          this._noteResponse(true)
+        }
+
+        // Read the expected hash from sender (signed integer)
+        const expectedHash = decoding.readVarInt(decoder)
+
+        // Compute our local hash after applying the update
+        const localHash = computeDocHash(this.doc)
+
+        // Verify hash match
+        if (localHash !== expectedHash) {
+          // If we already know this sender has a suspected reordering gap
+          // (see _trackRemoteSeq()/_scheduleGapCheck()), a hash mismatch
+          // right now is the *expected* transient state — we're missing a
+          // piece that's very likely still in flight, not actually
+          // diverged. Let the pending gap-check grace period resolve it
+          // instead of also escalating the hash-mismatch backoff: under
+          // heavy reordering this previously caused a burst of mismatches
+          // to rack up the exponential backoff to its 10s cap within a
+          // single edit burst, purely from timing, not real divergence.
+          // A hash mismatch with NO pending gap (in-order, but still
+          // wrong) is not explained by reordering and still escalates
+          // normally below.
+          const reorderingSuspected = this._gapCheckTimers.has(
+            senderClientID,
+          )
+
+          // A late update - one whose content we had already been past
+          // when it arrived (its sender's clock in the update is below
+          // ours, because a SyncStep2 or a reordered later update got here
+          // first) - carries a hash of a state we have legitimately moved
+          // beyond. Its mismatch says nothing about anything we lack; it
+          // was the other half of the item-13 cascade (a resync's reply
+          // fast-forwards a peer, then every in-flight keystroke behind it
+          // mismatches). Cheap to detect from the update's own metadata.
+          const lateUpdate = this._isLateUpdate(updateBytes)
+
+          // Yjs's own verdict: if the update could not be fully integrated
+          // because a causal dependency is missing, the struct store holds
+          // it as pending. That is the ONE mismatch that is evidence of a
+          // gap - and under jitter it is usually a reordering that the
+          // next few ms resolve, so it gets the same grace a sequence gap
+          // gets before a beacon goes out (_schedulePendingCheck). It also
+          // covers the case the sequence anchor no longer does: since the
+          // connect push carries no sequence number (MESSAGE_SYNC_PUSH), a
+          // peer's first keystroke can be the first numbered message we see
+          // from it, and a reordered first burst has no earlier number to
+          // open a gap against.
+          const pending =
+            this.doc.store.pendingStructs !== null ||
+            this.doc.store.pendingDs !== null
+
+          if (pending) {
+            this._schedulePendingCheck()
+          } else if (!reorderingSuspected && !lateUpdate) {
+            // Push our full state AND request theirs (syncNow() does
+            // both). A hash mismatch means the two peers have diverged -
+            // one side may have edits the other lacks. Routed through the
+            // shared coordinator so this doesn't stack an independent
+            // timer on top of any corrupted-message/gap-confirmed resync
+            // already pending.
+            this._requestResync()
+
+            // Logged with the shared attempt counter (kept as "#N" for
+            // compatibility with existing tooling/benchmarks that grep
+            // for this exact "Hash mismatch #" pattern) - it now reflects
+            // the unified resync-attempt count rather than a
+            // hash-mismatch-specific one, since the two escalation
+            // counters were merged.
+            console.warn(
+              `[GenericProvider] Hash mismatch #${this._resyncAttemptCount} detected! Local: ${localHash}, Expected: ${expectedHash}`,
+            )
+          }
+        }
+
+        // If we received SyncStep2, we're synced (unless hash mismatched)
+        if (
+          syncMessageType === syncProtocol.messageYjsSyncStep2 &&
+          localHash === expectedHash
+        ) {
+          this._markSynced()
+        }
+
+        // Send reply if needed (as standard MESSAGE_SYNC). Suppression
+        // only engages with genuine redundancy (>=2 other known peers via
+        // awareness) - below that, reply immediately (still rate-limited
+        // via _sendSyncReply() as a hard backstop). Matches the
+        // MESSAGE_SYNC case's gate exactly; without this, a hash-mismatch
+        // resync burst under packet loss bypassed suppression entirely,
+        // since every peer answering a post-mismatch SyncStep1 replied
+        // immediately via this path.
+        if (encoding.length(encoder) > 1) {
+          this._replyToSyncRequest(encoding.toUint8Array(encoder))
+        }
+        break
+      }
+
+      default:
+        console.warn('Unknown message type:', messageType)
+    }
+  }
+
+  /**
+   * Handle a digest beacon (MESSAGE_SYNC_DIGEST). Reply rule (design doc
+   * §3): SyncStep2 if the sender is behind us or its delete-set hash
+   * differs from ours (the SyncStep2 always carries our full delete set, so
+   * it also heals a lost delete on their side - and their beacon does the
+   * same for us, symmetrically, within one interval); our own beacon as an
+   * ack if the beacon is JOIN-flagged and states are equal; nothing
+   * otherwise - which is what removes the ~5-12 empty replies per heartbeat
+   * measured at N=50 in test/dummy/bench-idle-room.ts. "Sender is ahead of
+   * us" triggers no reply: our own next beacon fetches it. Nothing here
+   * removes a recovery path (the round-2 lesson in
+   * 2026-09-04-resync-message-reduction-design.md's addendum), only
+   * replies that carry no information.
+   *
+   * `synced`: a beacon we are not behind, with equal delete-set hash, is a
+   * stronger statement than the empty SyncStep2 it replaces ("you lack
+   * nothing I have"), so it marks us synced too - this is what keeps two
+   * fresh peers, or a whole concurrent join burst, converging to `synced`
+   * with no acks needing to survive the rate limiter.
+   */
+  private _handleDigest(decoder: decoding.Decoder, from?: string): void {
+    decoding.readVarUint(decoder) // DIGEST_VERSION - append-only, nothing to branch on yet
+    const flags = decoding.readVarUint(decoder)
+    const senderClientID = decoding.readVarUint(decoder)
+    this._knownPeers.set(senderClientID, Date.now())
+    if (from !== undefined) this._peerAddress.set(senderClientID, from)
+    this._touchPeer(senderClientID)
+    const remoteSv = decoding.readVarUint8Array(decoder)
+    const remoteDsHash = decoding.readVarUint(decoder)
+    // Any trailing bytes belong to a newer version; ignored by design.
+
+    const remote = Y.decodeStateVector(remoteSv)
+    const local = Y.decodeStateVector(Y.encodeStateVector(this.doc))
+    let senderBehind = false
+    for (const [client, clock] of local) {
+      if ((remote.get(client) ?? 0) < clock) {
+        senderBehind = true
+        break
+      }
+    }
+    let weBehind = false
+    for (const [client, clock] of remote) {
+      if ((local.get(client) ?? 0) < clock) {
+        weBehind = true
+        break
+      }
+    }
+    const dsEqual = remoteDsHash === this._deleteSetHash()
+    const equal = !senderBehind && !weBehind && dsEqual
+    if (equal) {
+      // Any peer holding exactly our state has confirmed it - see _confirmedSv.
+      this._confirmedSv = remoteSv
+      this._confirmedDsHash = remoteDsHash
+    }
+
+    if (flags & DIGEST_FLAG_ACK) {
+      // Somebody confirmed the echoed state (see DIGEST_FLAG_ACK). If it is
+      // ours, we're synced; if we were about to confirm the same state, we
+      // no longer need to. Never a request: no reply, no presence.
+      if (equal) {
+        if (flags & DIGEST_FLAG_SETTLED) {
+          this._confirmed = true
+          this._noteResponse(true)
+        } else {
+          this._equalUnsettledSeen = true
+        }
+        this._markSynced()
+        this._cancelPendingAck()
+      }
+      return
+    }
+
+    // An equal-digest beacon from a settled peer's periodic tick has just
+    // told the room (including whoever our pending ack was for) that this
+    // state is confirmed. Our ack would say the same thing again. Task 3b
+    // in the design doc: without this, acks were ~94% of a 50-peer join
+    // burst's messages, throttled only by the rate limiter. An equal JOIN
+    // beacon (another joiner in the same burst) asks for an ack too; our
+    // pending ack - identical bytes, since it echoes that same state -
+    // answers it as well, and _scheduleSyncReply() dedupes it below.
+    if (equal && !(flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM))) {
+      // A peer's periodic/resync beacon in our state: it makes our pending
+      // ack redundant, and - if that peer is confirmed - it answers our
+      // own outstanding join as well as any ack would. It also counts for
+      // Trickle: the room has just compared itself against our digest.
+      this._equalBeaconsHeard++
+      if (flags & DIGEST_FLAG_SETTLED) {
+        this._confirmed = true
+        this._noteResponse(false)
+      } else {
+        this._equalUnsettledSeen = true
+      }
+      this._cancelPendingAck()
+    }
+
+    if (senderBehind || !dsEqual) {
+      const encoder = encoding.createEncoder()
+      encoding.writeVarUint(encoder, MESSAGE_SYNC)
+      syncProtocol.writeSyncStep2(encoder, this.doc, remoteSv)
+      let reply: Uint8Array = encoding.toUint8Array(encoder)
+      if (!dsEqual) {
+        // Round 5: a delete moves no clock, so the hash cannot say which of
+        // us lacks a delete - and a SyncStep2 heals only its receiver. The
+        // loser of a delete-only update was healed only by its OWN next
+        // beacon, which idle backoff parks for up to 60 s (bench-idle-room
+        // part b failed its 11 s cap at a 5 s interval). So the reply asks
+        // back: our beacon rides in the same batch, and if the sender is
+        // the one ahead it answers with its delete set. Terminates: a peer
+        // healed by the SyncStep2 half sees an equal digest in the beacon
+        // half and stays silent. (A behind-check timer on the mismatch was
+        // tried first: every peer that overheard the loser's beacon armed
+        // one and asked - ~2x the deliveries of a lossy edit burst on the
+        // Matrix profile.)
+        reply = this._encodeBatch([reply, this._encodeSyncStep1(0)])
+      }
+      this._replyToSyncRequest(reply, false, remoteSv, senderClientID)
+    } else if (flags & (DIGEST_FLAG_JOIN | DIGEST_FLAG_CONFIRM)) {
+      this._replyToSyncRequest(
+        this._encodeAck(remoteSv, remoteDsHash),
+        true,
+        null,
+        senderClientID,
+      )
+    }
+
+    if (!weBehind && dsEqual) {
+      this._markSynced()
+    }
+    if (weBehind) {
+      // The sender has something we lack. Not a request yet - the update
+      // may still be in flight (see _scheduleBehindCheck).
+      this._scheduleBehindCheck(remoteSv)
+    }
+
+    if (flags & DIGEST_FLAG_JOIN && this.awareness.getLocalState() !== null) {
+      // Presence on demand: the joiner asked. One broadcast per burst of
+      // joiners (see _schedulePresenceResponse), never suppressed (each
+      // responder's state is distinct). Skipped when we have no state to
+      // announce.
+      this._schedulePresenceResponse(senderClientID)
+    }
+  }
+
+  /**
+   * Answer a JOIN beacon's presence request once for all JOIN beacons that
+   * arrive within `clamp(2 * minRTT, 100, 500)` ms of the first - long
+   * enough to cover a join burst spread by latency, short enough that a
+   * lone joiner sees the room's presence within a few round trips.
+   */
+  private _schedulePresenceResponse(requester: number): void {
+    this._presencePending.add(requester)
+    if (this._presenceResponseTimer !== undefined) return
+    this._presenceCovered = false
+    const rtt = this._rttMinMs()
+    // Phase 1e, relay path: one peer per 2 s bucket - the first-ranked
+    // for a constant requester - relays the whole awareness table at once
+    // (the way y-websocket's server does; clocks travel with the states,
+    // a peer's own echoed state at an equal clock is ignored by
+    // applyAwarenessUpdate). Everyone else waits the usual window, and
+    // stays silent if that table carried their state (_presenceCovered).
+    // Presence per late join: ~N deliveries instead of (N-1)^2 - it was
+    // 82% of a late join into a 100-peer room (bench-join-census). Bytes
+    // are unchanged (the table goes to everyone). Peers that cannot yet
+    // tell (no RTT estimate on a slow link, so the table may arrive after
+    // their window) fall back to the broadcast of their own state, as
+    // before. The unicast path below is untouched.
+    // Needs a view of the room: in a fresh burst the first JOIN arrives
+    // before any peer is known, everyone would rank first and relay a
+    // table each - the broadcast fallback is right for that case.
+    const relayer =
+      !this._canUnicast(requester) &&
+      this._knownPeers.size >= 3 &&
+      this._responderRank(0, 1) === 0
+    const delay = relayer ? 0 : Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt))
+    this._presenceResponseTimer = setTimeout(() => {
+      this._presenceResponseTimer = undefined
+      const requesters = Array.from(this._presencePending)
+      this._presencePending.clear()
+      if (this._destroying || !this.transport.isConnected) return
+      if (this.awareness.getLocalState() === null) return
+      // Every joiner covered by this timer is addressable: one unicast
+      // each ((N-1) deliveries per joiner room-wide) instead of one
+      // broadcast ((N-1)^2). Otherwise the broadcast, as before.
+      if (requesters.every((id) => this._canUnicast(id))) {
+        const msg = this._encodeAwareness([this.doc.clientID])
+        for (const id of requesters) this._sendDirect(id, msg)
+      } else if (relayer) {
+        this._sendAwarenessNow(Array.from(this.awareness.getStates().keys()))
+      } else if (!this._presenceCovered) {
+        this._broadcastAwareness([this.doc.clientID])
+      }
+    }, delay)
+  }
+
+  /**
+   * Max random delay (ms) before replying to a SyncStep1 request, scaled by
+   * a room-size signal already available (`this.awareness.getStates().size`
+   * - the same signal read at the `>= 3` suppression gate). A fixed window
+   * (the pre-fix behavior: always `_syncReplySuppressionMs`) doesn't scale
+   * with room size, so a larger room has more independent repliers racing
+   * to answer the same request within the same window - more of them lose
+   * the race and get silently dropped by the `_sendSyncReply()` rate-limit
+   * backstop instead of never sending in the first place. Measured in
+   * test/dummy/bench-corruption-storm.ts: the SyncStep2/SyncStep1 ratio (
+   * ideally ~1 if suppression alone were sufficient) grew from ~1.1-1.3 at
+   * N=2 to ~4.5-5.9 at N=10 with the fixed 30ms window.
+   *
+   * `min(cap, base * log2(peerCount))` - log2 growth spreads replies over a
+   * wider window as the room grows without the delay exploding at very high
+   * N. Capped at 200ms: the slowest-profile round trip this project
+   * benchmarks against (Matrix, ~350ms one-way) already tolerates hundreds
+   * of ms of latency, so 200ms of extra requester-perceived delay stays
+   * well inside that budget while still giving a 100-peer room roughly
+   * 6-7x the base window instead of an unbounded one.
+   */
+  /**
+   * How many peers we believe are in the room: awareness states (includes
+   * ourselves) or, if larger, the distinct beacon/update senders we have
+   * heard plus ourselves. See `_knownPeers`.
+   */
+  private _peerCount(): number {
+    return Math.max(this.awareness.getStates().size, this._knownPeers.size + 1)
+  }
+
+  /**
+   * Resolves `_awarenessInterval` to a concrete ms value: the configured
+   * fixed number, or (round 6, item 9) `max(transport hint ?? 100,
+   * AWARENESS_AUTO_MS_PER_PEER * peerCount)` when set to `'auto'`.
+   */
+  private _effectiveAwarenessInterval(): number {
+    if (this._awarenessInterval !== 'auto') return this._awarenessInterval
+    const hint = this.transport.preferredAwarenessMs ?? 100
+    return Math.max(
+      hint,
+      GenericProvider.AWARENESS_AUTO_MS_PER_PEER * this._peerCount(),
+    )
+  }
+
+  private _replySuppressionMaxDelay(): number {
+    const peerCount = this._peerCount()
+    const byRoomSize = Math.min(
+      200,
+      this._syncReplySuppressionMs * Math.log2(Math.max(2, peerCount)),
+    )
+    // Phase 1b: the window must exceed the one-way latency or nobody
+    // overhears anybody in time (see _rttSamples). 1.5x the smallest
+    // observed round trip, capped at 2 s - on a 350 ms profile that is
+    // ~1 s of extra requester-perceived delay in exchange for ~1 reply
+    // instead of ~20.
+    const rtt = this._rttMinMs()
+    return rtt === null ? byRoomSize : Math.min(2000, Math.max(byRoomSize, 1.5 * rtt))
   }
 
   /**
@@ -1174,14 +2663,84 @@ export class GenericProvider extends Observable<string> {
    * redundant - the requester likely already got what it needed.
    *
    * A reply that is already pending when this is called answers a
-   * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
-   * later by peer B's) - it must not be silently overwritten by the new
-   * one. Flush it immediately, then schedule the new reply fresh. The only
-   * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
-   * because we overheard someone else's SyncStep2 for the SAME request.
+   * *different* request (e.g. peer A's request, followed 5ms later by
+   * peer B's) - it must not be silently overwritten by the new one. Flush
+   * it immediately, then schedule the new reply fresh. The only sanctioned
+   * ways a reply gets dropped are `_cancelPendingSyncReply()` (we overheard
+   * someone else's SyncStep2 for the SAME request), `_cancelPendingAck()`,
+   * and the identical-bytes case below.
+   *
+   * Identical-bytes case (Task 3c in the design doc): K peers with the same
+   * state asking at once (K empty joiners in a burst) get K byte-identical
+   * SyncStep2s from us - the same full document K times, one flushed
+   * immediately per arriving request, each burning a rate-limit slot. If
+   * the new reply's bytes equal the pending reply's bytes, the pending one
+   * already answers this request too: keep it (same delay, same
+   * suppression) and drop the new one. Measured in
+   * test/dummy/bench-join-after-burst.ts.
    */
-  private _scheduleSyncReply(reply: Uint8Array): void {
+  private _scheduleSyncReply(
+    reply: Uint8Array,
+    isAck: boolean = false,
+    targetSv: Uint8Array | null = null,
+    requester: number | null = null,
+  ): void {
+    if (this._pendingSyncReplyTimeoutId !== undefined && this._pendingSyncReply !== null) {
+      if (bytesEqual(this._pendingSyncReply, reply)) {
+        return // identical answer already scheduled
+      }
+      if (
+        targetSv !== null &&
+        this._pendingSyncReplyTargetSv !== null &&
+        bytesEqual(this._pendingSyncReplyTargetSv, targetSv)
+      ) {
+        // Same question (same requester state), newer document: refresh
+        // the answer, keep the timer. See _pendingSyncReplyTargetSv.
+        this._pendingSyncReply = reply
+        return
+      }
+      if (
+        !isAck &&
+        !this._pendingSyncReplyIsAck &&
+        targetSv !== null &&
+        this._pendingSyncReplyTargetSv !== null
+      ) {
+        // Two requesters, both behind, different states: one SyncStep2
+        // from the componentwise minimum of both state vectors contains
+        // everything either of them lacks. Keep the pending reply's timer
+        // and widen its content instead of flushing it. The flush (the
+        // rule below, kept for acks and legacy SyncStep1s) sent an
+        // unsuppressed broadcast for every second request that arrived
+        // inside the suppression window; with the window at 1.5x RTT on a
+        // 350 ms link and several peers behind after a lossy edit burst
+        // that was ~4-5 broadcast replies per beacon (phase-1c results).
+        const merged = minStateVector(this._pendingSyncReplyTargetSv, targetSv)
+        const encoder = encoding.createEncoder()
+        encoding.writeVarUint(encoder, MESSAGE_SYNC)
+        syncProtocol.writeSyncStep2(encoder, this.doc, merged)
+        this._pendingSyncReply = encoding.toUint8Array(encoder)
+        this._pendingSyncReplyTargetSv = merged
+        return
+      }
+      // Phase 1e: an ack and a SyncStep2 never flush each other. A room
+      // whose JOIN waits expire together sends N CONFIRMs in the same
+      // millisecond; while a lossy edit burst is still healing, some of
+      // them find us equal (ack) and some behind (SyncStep2), and the flush
+      // rule below turned every type change into an immediate broadcast -
+      // ~650 replies in 200 ms at N=50, 5 % loss (probe timeline in the
+      // phase-1e design doc). An ack adds nothing to a pending reply of
+      // either kind (the requester's wait retries, or an equal peer's
+      // SETTLED ack confirms it); a SyncStep2 replaces a pending ack.
+      if (isAck) return
+      if (this._pendingSyncReplyIsAck) {
+        clearTimeout(this._pendingSyncReplyTimeoutId)
+        this._pendingSyncReplyTimeoutId = undefined
+      }
+    }
+
     if (this._pendingSyncReplyTimeoutId !== undefined) {
+      // Only a legacy plain SyncStep1 (no target state vector) still
+      // flushes a pending SyncStep2.
       if (this._pendingSyncReply) {
         this._sendSyncReply(this._pendingSyncReply)
       }
@@ -1190,12 +2749,23 @@ export class GenericProvider extends Observable<string> {
     }
 
     this._pendingSyncReply = reply
-    const delay = Math.random() * this._syncReplySuppressionMs
+    this._pendingSyncReplyIsAck = isAck
+    this._pendingSyncReplyTargetSv = targetSv
+    // Acks keep the uniform window: they carry no data, so their delay
+    // costs nothing but a few ms on a joiner's `synced` flip, and in a
+    // join burst one pending ack answers every equal JOIN that arrives
+    // inside that window (identical bytes, deduped above). Ranked, rank 0
+    // fired at once for every requester - measured: fresh-burst acks
+    // 6,039 -> 15,147 at Gun N=100, join-after-burst Matrix 147 -> 686.
+    const delay = isAck
+      ? Math.random() * this._replySuppressionMaxDelay()
+      : this._replyDelay(requester)
     this._pendingSyncReplyTimeoutId = setTimeout(() => {
       this._pendingSyncReplyTimeoutId = undefined
       if (this._pendingSyncReply) {
         this._sendSyncReply(this._pendingSyncReply)
         this._pendingSyncReply = null
+        this._pendingSyncReplyTargetSv = null
       }
     }, delay)
   }
@@ -1207,6 +2777,517 @@ export class GenericProvider extends Observable<string> {
       this._pendingSyncReplyTimeoutId = undefined
     }
     this._pendingSyncReply = null
+    this._pendingSyncReplyIsAck = false
+    this._pendingSyncReplyTargetSv = null
+  }
+
+  /**
+   * Cancel a pending reply only if it is a digest ack - see
+   * `_pendingSyncReplyIsAck`. Called from `_handleDigest()` on every
+   * overheard beacon whose digest equals ours.
+   */
+  private _cancelPendingAck(): void {
+    if (this._pendingSyncReplyIsAck) {
+      this._cancelPendingSyncReply()
+    }
+  }
+
+  /**
+   * Route a SyncStep2 (or digest-ack) reply through the redundancy
+   * suppression when there's genuine redundancy (>= 2 other known peers via
+   * awareness - below that there's no "someone else" to rely on), else send
+   * immediately. Both paths are rate-limited by `_sendSyncReply()`. Shared
+   * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
+   */
+  private _replyToSyncRequest(
+    reply: Uint8Array,
+    isAck: boolean = false,
+    targetSv: Uint8Array | null = null,
+    toClientID?: number,
+  ): void {
+    // A peer that knows it is incomplete does not answer. A SyncStep2 is
+    // encoded from integrated structs only, so with structs (or a delete
+    // set) still pending ours would be provably partial - and the
+    // requester's response wait ends on the first SyncStep2 it gets, so a
+    // partial answer strands it until its next trigger (phase-1c gates:
+    // 5 s resync backoff, or a stall with syncInterval 0). In relay mode a
+    // partial broadcast also cancels the complete replies other peers had
+    // pending. Let them answer; the requester retries if nobody does, and
+    // in unicast mode the rank bucket rotates the responders every 2 s.
+    // An ack from us would likewise confirm a state we do not trust.
+    if (
+      this.doc.store.pendingStructs !== null ||
+      this.doc.store.pendingDs !== null
+    ) {
+      return
+    }
+
+    // Unicast path (transport has sendTo and we know the requester's
+    // address): nobody overhears a unicast, so the delay-and-cancel
+    // suppression below cannot thin the replies. Instead each candidate
+    // responder decides for itself whether it is one of ~3 that answer
+    // (_selectedResponder), and answers at once - no suppression delay,
+    // one delivery. The requester's response wait retries if all ~3 are
+    // lost. Phase-1c design, item B.
+    if (toClientID !== undefined && this._canUnicast(toClientID)) {
+      if (!this._selectedResponder(toClientID)) return
+      if (!this._tryReserveReplySlot()) return
+      this._sendDirect(toClientID, reply)
+      return
+    }
+
+    // Acks ALWAYS take the delayed/suppressible path: they carry no data,
+    // so the only cost of delaying one is a few ms on the joiner's `synced`
+    // flip (measured before this rule: 37,240 of a 50-peer join burst's
+    // 40,915 deliveries were immediate acks). Everything else goes through
+    // suppression once there is someone else who could answer - counted
+    // from beacon/update senders as well as awareness, see _peerCount().
+    if (isAck || this._peerCount() >= 3) {
+      this._scheduleSyncReply(reply, isAck, targetSv, toClientID ?? null)
+    } else {
+      this._sendSyncReply(reply)
+    }
+  }
+
+  /** Whether a reply to `clientID` can go over Transport.sendTo. */
+  private _canUnicast(clientID: number): boolean {
+    return (
+      typeof this.transport.sendTo === 'function' &&
+      this._peerAddress.has(clientID)
+    )
+  }
+
+  /**
+   * Responder self-selection for unicast replies: the three peers whose
+   * hash for this requester ranks lowest among the peers we know answer
+   * it. Every candidate ranks itself against the same known set, so the
+   * sets agree wherever the views agree, and the peer that ranks first in
+   * the true order always ranks first in its own view - the selection is
+   * never empty. A 2 s time bucket in the hash rotates the ranking, so
+   * three departed peers at the top only delay a reply until the
+   * requester's next attempt. Everyone answers in rooms of four or fewer.
+   * (A first cut chose each responder independently with probability 3/N;
+   * ~5 % of requests then selected nobody and waited for the 1 s retry.)
+   */
+  private _selectedResponder(requester: number): boolean {
+    if (this._peerCount() < 4) return true
+    return this._responderRank(requester, 3) < 3
+  }
+
+  /**
+   * How many known peers rank below us for `requester` in the current 2 s
+   * bucket (counting stops at `cap`). Shared by unicast self-selection
+   * (rank < 3 answers) and, since phase 1e, the relay-mode reply delay
+   * (rank r waits r slots, see _replyDelay()).
+   */
+  private _responderRank(requester: number, cap: number): number {
+    const bucket = Math.floor(Date.now() / 2000)
+    const rank = (id: number) =>
+      (Math.imul(requester ^ bucket, 0x9e3779b1) ^ Math.imul(id, 0x85ebca6b)) >>> 0
+    const mine = rank(this.doc.clientID)
+    let better = 0
+    for (const id of this._knownPeers.keys()) {
+      if (id === requester || id === this.doc.clientID) continue
+      if (rank(id) < mine && ++better >= cap) break
+    }
+    return better
+  }
+
+  /**
+   * Delay before a suppressible reply goes out (relay path). Phase 1e:
+   * ranked, not uniform. A uniform draw from [0, W] lets ~N * L / W
+   * repliers fire before the first reply is overheard (L = one-way
+   * latency): 10-27 SyncStep2 sends per request at N=100 in
+   * test/dummy/bench-join-census.ts, and the WebRTC join-burst cell's
+   * 16-34k spread. With the responder rank (the same hash the unicast
+   * self-selection uses) rank 0 answers at once and rank r waits r
+   * windows (W = _replySuppressionMaxDelay(), 1.5x the minimum round
+   * trip: with request arrival spread 2jL and reply flight L(1+j), rank 1
+   * has overheard rank 0 iff the slot is >= L(1+3j), which 3L(1-j) covers
+   * up to j~0.33). Ranks >= 8 add a random window on top so a room whose
+   * first eight ranked peers are all gone does not answer in one
+   * avalanche. Without an RTT sample or a requester id (legacy SyncStep1)
+   * the uniform window stays.
+   */
+  private _replyDelay(requester: number | null): number {
+    const window = this._replySuppressionMaxDelay()
+    const rtt = this._rttMinMs()
+    if (requester === null || rtt === null) return Math.random() * window
+    // Half a window per rank (0.75 x the minimum round trip): a rank that
+    // stays silent (pending structs during a lossy burst, phase 1d B)
+    // costs the requester half a window, not a whole one - at a full
+    // window the Matrix 5 % loss fan-out's median convergence doubled
+    // (1.1 -> 2.2 s, worst 7.6 s); the price is an occasional second
+    // reply where the jitter exceeds ~1/3 (probe numbers in the design doc).
+    const slot = Math.max(this._syncReplySuppressionMs, 0.75 * rtt)
+    const rank = this._responderRank(requester, 8)
+    return rank * slot + (rank >= 8 ? Math.random() * window : 0)
+  }
+
+  /**
+   * Send one already-encoded message to a single peer over
+   * Transport.sendTo, with the same CRC32 wrapping and optional compression
+   * as a broadcast. Not mirrored to BroadcastChannel (a same-browser tab
+   * never appears as an addressable peer). Returns false if the peer's
+   * address is unknown or the transport cannot unicast.
+   */
+  private _sendDirect(clientID: number, data: Uint8Array): boolean {
+    const address = this._peerAddress.get(clientID)
+    if (address === undefined || typeof this.transport.sendTo !== 'function') {
+      return false
+    }
+    if (!this.transport.isConnected) return false
+    this._sendToTransport(wrapMessageWithChecksum(data), address)
+    return true
+  }
+
+  /**
+   * Re-check Yjs's pending-struct store after the gap grace period and
+   * request a resync (a beacon, see _requestResync) only if something is
+   * still missing. One timer; a check scheduled while one is pending is
+   * absorbed. Cleared on disconnect/destroy.
+   */
+  /**
+   * A beacon (a peer's periodic tick, or its request) just showed its
+   * sender ahead of us. Until phase 1d nothing happened with that: a peer
+   * whose last update was lost (no later message to open a sequence gap
+   * against), or whose request was answered by a responder that was
+   * itself behind, waited for its OWN next periodic beacon - up to
+   * syncInterval, up to idleBackoffMaxMs with idle backoff on. Now we
+   * check again after a grace and, if still behind that state, ask through
+   * the resync coordinator (coalesced, backed off, rate-limited).
+   *
+   * The grace is what keeps this quiet during typing: at Matrix latency
+   * almost every receiver of a periodic beacon is "behind" by a keystroke
+   * that is still in flight (jitter +-140 ms); max(gapGraceMs, 2 x minRTT)
+   * later it has arrived and the check finds nothing to do. A lost
+   * keystroke that opened a sequence gap is already being requested by the
+   * gap check - the outstanding response wait tells us so, and we stay
+   * quiet. One timer, the newest state vector: a later beacon that shows us
+   * behind by more replaces the reference, the timer keeps running.
+   */
+  private _scheduleBehindCheck(remoteSv: Uint8Array): void {
+    this._behindSv = remoteSv
+    if (this._behindCheckTimer !== undefined) return
+    const rtt = this._rttMinMs()
+    const delay = Math.max(this._gapGraceMs, rtt === null ? 0 : 2 * rtt)
+    this._behindCheckTimer = setTimeout(() => {
+      this._behindCheckTimer = undefined
+      const sv = this._behindSv
+      this._behindSv = null
+      if (sv === null || this._destroying || !this.transport.isConnected) return
+      // A request of ours sent within the grace is still being answered.
+      // An OLDER outstanding wait is not a reason to stay behind: a new
+      // room's first peers keep their JOIN wait parked for seconds (three
+      // retries, nobody SETTLED yet), and measured against it the check
+      // never fired - bench-idle-backoff's recovery stayed at one
+      // backed-off interval (1,846 ms) with this line reading
+      // `_responseWaitTimer !== undefined`.
+      if (this._requestSentAt > 0 && Date.now() - this._requestSentAt < delay) return
+      const remote = Y.decodeStateVector(sv)
+      const local = Y.decodeStateVector(Y.encodeStateVector(this.doc))
+      for (const [client, clock] of remote) {
+        if ((local.get(client) ?? 0) < clock) {
+          this._requestResync()
+          return
+        }
+      }
+    }, delay)
+  }
+
+  /** Design E: after a reply or push, pending structs mean the sender had the same hole - arm the grace check. */
+  private _checkPendingAfterReply(): void {
+    if (
+      this.doc.store.pendingStructs !== null ||
+      this.doc.store.pendingDs !== null
+    ) {
+      this._schedulePendingCheck()
+    }
+  }
+
+  private _schedulePendingCheck(): void {
+    if (this._pendingCheckTimer !== undefined) return
+    this._pendingCheckTimer = setTimeout(() => {
+      this._pendingCheckTimer = undefined
+      if (this._destroying || !this.transport.isConnected) return
+      // A request of ours may already be outstanding (JOIN or resync beacon
+      // with its response wait running): whatever is pending is what that
+      // request is fetching, and the response wait retries if it is lost.
+      // Asking again here just raced the responders' suppression window
+      // (measured: a joiner's keystrokes-before-content check fired at
+      // 300 ms while the settled peers' replies were still delayed by a
+      // window of up to ~300 ms, and every such re-beacon collected
+      // another round of replies).
+      // ... but only a request that went out within the last grace, whose
+      // answer may still be on its way. Deferring to ANY outstanding
+      // response wait (the rule until phase 1d) parked every pending check
+      // behind a new room's JOIN wait - three retries with nobody SETTLED
+      // yet, 19.6 s on a 700 ms link - so a peer that lost a keystroke in
+      // such a room asked only once an overheard reply happened to clear
+      // that wait (phase-1d design doc, "After Task 4", the fresh-budget
+      // Matrix fan-out). Look again once the recent request is answered or
+      // given up - dropping the check here left a joiner whose SyncStep2
+      // predated the keystrokes it had received with nine pending updates
+      // and no trigger (measured: 2 of 150 lossy 15-peer joins).
+      const rtt = this._rttMinMs()
+      const recent = Math.max(this._gapGraceMs, rtt === null ? 0 : 2 * rtt)
+      if (this._requestSentAt > 0 && Date.now() - this._requestSentAt < recent) {
+        this._schedulePendingCheck()
+        return
+      }
+      if (
+        this.doc.store.pendingStructs !== null ||
+        this.doc.store.pendingDs !== null
+      ) {
+        this._requestResync()
+      }
+    }, this._gapGraceMs)
+  }
+
+  /**
+   * Return the update payload of a SyncStep2/Update sync sub-message
+   * without advancing `decoder` (null for SyncStep1 or malformed input).
+   * y-protocols frames both as [subType varUint][update varUint8Array].
+   */
+  private _peekSyncUpdate(decoder: decoding.Decoder): Uint8Array | null {
+    const peek = decoding.clone(decoder)
+    try {
+      const subType = decoding.readVarUint(peek)
+      if (subType === syncProtocol.messageYjsSyncStep1) return null
+      return decoding.readVarUint8Array(peek)
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Whether an update we just applied was already superseded here: every
+   * client it touches ends at a clock we were at or beyond BEFORE this
+   * update (i.e. it added nothing). Uses the update's own metadata
+   * (`Y.parseUpdateMeta`), O(clients in the update).
+   */
+  private _isLateUpdate(updateBytes: Uint8Array | null): boolean {
+    if (!updateBytes) return false
+    try {
+      const { to } = Y.parseUpdateMeta(updateBytes)
+      if (to.size === 0) return false
+      const local = Y.decodeStateVector(Y.encodeStateVector(this.doc))
+      for (const [client, clock] of to) {
+        // `to` is the exclusive end clock of the update's range for that
+        // client; our state vector is exclusive too. Equal means the update
+        // brought us exactly here (not late); greater means we were past it.
+        if ((local.get(client) ?? 0) <= clock) return false
+      }
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Flip `synced` once and emit; idempotent. */
+  private _markSynced(): void {
+    if (!this._synced) {
+      this._synced = true
+      this.emit('synced', [true])
+    }
+  }
+
+  /**
+   * Wait for a response to the JOIN or resync beacon we just sent. If
+   * neither a SyncStep2 nor an equal ack/beacon arrives within 1s (then
+   * 2s, 4s), ask again - with a CONFIRM beacon after a JOIN (so an equal
+   * room acks), with a plain beacon after a resync (only peers ahead of us
+   * need to answer; an equal room's silence is the correct answer and its
+   * periodic beacons end the wait) - three times at most; after that the
+   * periodic beacon is the fallback, as before. Requester-side retry is how the protocol
+   * stays loss-tolerant now that reply suppression leaves ~1 reply per
+   * request; N-fold redundant replies were the old (accidental) way.
+   */
+  private _armResponseWait(retryFlags: number): void {
+    if (this._responseWaitTimer !== undefined) return
+    this._responseSeen = false
+    if (this._responseWaitAttempts === 0) this._equalUnsettledSeen = false
+    this._responseWaitFlags = retryFlags
+    this._requestSentAt = Date.now()
+    const rtt = this._rttMinMs()
+    const delay =
+      Math.max(1000, rtt === null ? 0 : 4 * rtt) *
+      Math.pow(2, this._responseWaitAttempts)
+    this._responseWaitTimer = setTimeout(() => {
+      this._responseWaitTimer = undefined
+      // Phase 1e: a fresh room - equal but unsettled peers answered both
+      // the JOIN and one CONFIRM retry, nobody settled did. Two rounds
+      // instead of three; the first confirmed peers' acks then carry
+      // SETTLED for everyone after them. Measured in
+      // test/dummy/bench-join-census.ts (b): the third round was ~a third
+      // of a fresh N=100 room's 92k-delivery join burst.
+      const freshRoomDone =
+        this._equalUnsettledSeen && this._responseWaitAttempts >= 1
+      if (
+        this._responseSeen ||
+        this._responseWaitAttempts >= 3 ||
+        freshRoomDone ||
+        !this.transport.isConnected ||
+        this._destroying
+      ) {
+        // Asked three times, nobody had more for us: we are the room's
+        // state (or its first peer). Bootstraps DIGEST_FLAG_SETTLED in a
+        // brand-new room so later joiners are confirmed by our acks.
+        if (this._responseWaitAttempts >= 3 || freshRoomDone) this._confirmed = true
+        this._responseWaitAttempts = 0
+        return
+      }
+      this._responseWaitAttempts++
+      this._sendSyncStep1(this._responseWaitFlags) // rate-limited; a dropped attempt is simply retried next round
+      this._armResponseWait(this._responseWaitFlags)
+    }, delay)
+  }
+
+  /**
+   * A SyncStep2 or an equal ack/beacon arrived - whatever we asked for is
+   * answered. `sample` = it was a direct reply (SyncStep2/ack), so its
+   * timing is a round-trip sample; an equal periodic beacon from a settled
+   * peer also ends the wait but says nothing about latency.
+   */
+  private _noteResponse(sample: boolean): void {
+    if (sample && this._requestSentAt > 0) {
+      this._rttSamples.push(Date.now() - this._requestSentAt)
+      if (this._rttSamples.length > 8) this._rttSamples.shift()
+    }
+    this._requestSentAt = 0
+    this._responseSeen = true
+    this._responseWaitAttempts = 0
+    if (this._responseWaitTimer !== undefined) {
+      clearTimeout(this._responseWaitTimer)
+      this._responseWaitTimer = undefined
+    }
+  }
+
+  /** Minimum of the recent round-trip samples, or null before the first reply. */
+  private _rttMinMs(): number | null {
+    return this._rttSamples.length === 0 ? null : Math.min(...this._rttSamples)
+  }
+
+  /**
+   * Delay a pure timeout-removal awareness broadcast and drop it if
+   * another peer's broadcast of the SAME removal is overheard first (see
+   * the `origin === this` branch in `_setupAwarenessSync()`'s handler,
+   * which calls `_cancelPendingAwarenessRemovalIfOverlaps()`) - the exact
+   * same NACK-style suppression `_scheduleSyncReply()` already applies to
+   * SyncStep2 replies, reusing the same room-size-scaled delay
+   * (`_replySuppressionMaxDelay()`).
+   *
+   * A pending removal already queued when this is called is for a
+   * DIFFERENT departure (two peers timing out, or leaving, within the same
+   * window): since round 5 the ids are merged into the pending set and its
+   * timer kept - one broadcast carries both - instead of flushing the
+   * first as an unsuppressed broadcast (with the long leave window below a
+   * burst of departures would have flushed on every peer). An overheard
+   * broadcast trims only the ids it covers from the pending set
+   * (`_cancelPendingAwarenessRemovalIfOverlaps()`).
+   *
+   * Window: the reply-suppression window for timeouts (sweeps are spread
+   * over seconds anyway); for leaves reported by the transport - all
+   * survivors learn of them in the same millisecond - ten times that,
+   * at least a second, so the first broadcast is overheard before the
+   * rest fire. A departure is not urgent: every peer already dropped the
+   * state locally.
+   */
+  private _scheduleAwarenessRemoval(clients: number[], origin: string = 'timeout'): void {
+    if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
+      const pending = this._pendingAwarenessRemoval ?? []
+      for (const id of clients) if (!pending.includes(id)) pending.push(id)
+      this._pendingAwarenessRemoval = pending
+      return
+    }
+
+    this._pendingAwarenessRemoval = clients.slice()
+    const window = this._replySuppressionMaxDelay()
+    const delay =
+      Math.random() * (origin === 'peer-left' ? Math.max(1000, 10 * window) : window)
+    this._pendingAwarenessRemovalTimeoutId = setTimeout(() => {
+      this._pendingAwarenessRemovalTimeoutId = undefined
+      if (this._pendingAwarenessRemoval) {
+        this._broadcastAwareness(this._pendingAwarenessRemoval)
+        this._pendingAwarenessRemoval = null
+      }
+    }, delay)
+  }
+
+  /**
+   * Peek at an awareness-update payload (still in
+   * `awarenessProtocol.encodeAwarenessUpdate()`'s wire encoding) for
+   * clientIDs whose state is `null` (a removal), without applying it.
+   * y-protocols/awareness.js doesn't export a standalone decoder for this,
+   * only `applyAwarenessUpdate()` (which also mutates state) and
+   * `modifyAwarenessUpdate()` (which re-encodes) - so this mirrors the
+   * format by hand: varUint length, then per entry
+   * [varUint clientID][varUint clock][varString JSON state]. Used to cancel
+   * a pending suppressed removal (see `_scheduleAwarenessRemoval()`) at the
+   * wire-message level, before `applyAwarenessUpdate()` runs - see the
+   * `MESSAGE_AWARENESS` case's comment for why timing matters here.
+   */
+  private _scanAwarenessPayload(payload: Uint8Array): {
+    removed: number[]
+    present: number[]
+    coversUs: boolean
+  } {
+    const removed: number[] = []
+    const present: number[] = []
+    let coversUs = false
+    try {
+      const d = decoding.createDecoder(payload)
+      const len = decoding.readVarUint(d)
+      const ourClock = this.awareness.meta.get(this.awareness.clientID)?.clock ?? 0
+      for (let i = 0; i < len; i++) {
+        const clientID = decoding.readVarUint(d)
+        const clock = decoding.readVarUint(d)
+        const state = JSON.parse(decoding.readVarString(d))
+        if (state === null) removed.push(clientID)
+        else {
+          present.push(clientID)
+          if (clientID === this.awareness.clientID && clock >= ourClock) coversUs = true
+        }
+      }
+    } catch {
+      // Malformed payload - let applyAwarenessUpdate() below be the one
+      // that deals with it (or throws); suppression is a pure optimization,
+      // never worth failing the actual message handling over.
+    }
+    return { removed, present, coversUs }
+  }
+
+  /**
+   * Trim a pending suppressed removal broadcast by `removedClientIds` -
+   * someone else already broadcast those departures; what they did not
+   * cover stays queued.
+   */
+  private _cancelPendingAwarenessRemovalIfOverlaps(
+    removedClientIds: number[],
+  ): void {
+    if (!this._pendingAwarenessRemoval) return
+    const rest = this._pendingAwarenessRemoval.filter(
+      (id) => !removedClientIds.includes(id),
+    )
+    if (rest.length === this._pendingAwarenessRemoval.length) return
+    if (rest.length > 0) {
+      this._pendingAwarenessRemoval = rest // someone covered part of it; the rest stays queued
+      return
+    }
+    if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
+      clearTimeout(this._pendingAwarenessRemovalTimeoutId)
+      this._pendingAwarenessRemovalTimeoutId = undefined
+    }
+    this._pendingAwarenessRemoval = null
+  }
+
+  /** Cancel a pending suppressed awareness-removal broadcast, if any. */
+  private _cancelPendingAwarenessRemoval(): void {
+    if (this._pendingAwarenessRemovalTimeoutId !== undefined) {
+      clearTimeout(this._pendingAwarenessRemovalTimeoutId)
+      this._pendingAwarenessRemovalTimeoutId = undefined
+    }
+    this._pendingAwarenessRemoval = null
   }
 
   /**
@@ -1229,7 +3310,7 @@ export class GenericProvider extends Observable<string> {
    * would itself become log spam exactly when things are already noisy.
    */
   private _sendSyncReply(reply: Uint8Array): void {
-    if (!this._tryReserveSyncSlot()) {
+    if (!this._tryReserveReplySlot()) {
       return // Rate limited - drop the reply silently
     }
     this._send(reply)
@@ -1367,8 +3448,26 @@ export class GenericProvider extends Observable<string> {
     )
     this._pendingResyncTimeoutId = setTimeout(() => {
       this._pendingResyncTimeoutId = undefined
-      if (this.transport.isConnected && !this._destroying) {
-        this.syncNow()
+      if (!this.transport.isConnected || this._destroying) return
+
+      // A resync trigger means "I may be missing something" - never "the
+      // room is missing my data" (my updates travel on their own, and the
+      // connect-time push covers offline edits). So: ask with a 12-byte
+      // beacon; the peers ahead of me reply with exactly the diff (a
+      // SyncStep2 against my state vector, suppressed as any reply), the
+      // rest stay silent. Until phase 1b this pushed the WHOLE document to
+      // the room on every trigger, and that push - a hashed update of my
+      // state - failed the hash check at every peer ahead of me, which
+      // scheduled a resync of its own: the cascade of research doc item 13
+      // (198,990 deliveries for 10 keystrokes at N=100 on the Gun profile,
+      // the rate limiter's ceiling). If the beacon or its reply is lost,
+      // _armResponseWait() re-beacons (1s/2s/4s); the periodic beacon is
+      // the fallback after that. A rate-limited attempt re-arms through
+      // this same coordinator so a stranded peer keeps retrying.
+      if (this._sendSyncStep1(0)) {
+        this._armResponseWait(0)
+      } else {
+        this._requestResync()
       }
     }, delay)
   }
@@ -1382,60 +3481,103 @@ export class GenericProvider extends Observable<string> {
    * its own uncapped or separately-capped allowance.
    */
   private _tryReserveSyncSlot(): boolean {
+    return this._tryReserveSlot(this._syncRequestTimes)
+  }
+
+  /** Same limiter, separate budget, for SyncStep2 replies and acks. */
+  private _tryReserveReplySlot(): boolean {
+    return this._tryReserveSlot(this._syncReplyTimes)
+  }
+
+  private _tryReserveSlot(times: number[]): boolean {
     const now = Date.now()
 
-    // Clean up old entries outside the rate limit window
-    this._syncRequestTimes = this._syncRequestTimes.filter(
-      (t) => now - t < this._syncRequestWindowMs,
-    )
+    // Drop entries outside the rolling window (in place: the arrays are
+    // referenced from two fields)
+    let keep = 0
+    for (const t of times) {
+      if (now - t < this._syncRequestWindowMs) times[keep++] = t
+    }
+    times.length = keep
 
-    if (this._syncRequestTimes.length >= this._maxSyncRequestsPerWindow) {
+    if (times.length >= this._maxSyncRequestsPerWindow) {
       return false
     }
 
-    this._syncRequestTimes.push(now)
+    times.push(now)
     return true
   }
 
   /**
-   * Encode and send a SyncStep1 message requesting missing updates.
-   * Does not check the rate limiter itself - callers must reserve a slot
-   * via `_tryReserveSyncSlot()` first.
+   * Encode the digest beacon that replaces SyncStep1 (see
+   * MESSAGE_SYNC_DIGEST). Still the one place every "request sync" path
+   * goes through (connect()'s syncNow(), the periodic tick,
+   * _requestResync()'s retry), so they all switched together.
    */
-  private _writeSyncStep1(): void {
+  private _encodeSyncStep1(flags: number = 0): Uint8Array {
+    if (this._confirmed) flags |= DIGEST_FLAG_SETTLED
+    this._touchPeer(this.doc.clientID)
     const encoder = encoding.createEncoder()
-    // SyncStep1 is always sent as standard MESSAGE_SYNC (no verification)
-    // It's just a request, not an assertion of state
-    encoding.writeVarUint(encoder, MESSAGE_SYNC)
-    syncProtocol.writeSyncStep1(encoder, this.doc)
-    this._send(encoding.toUint8Array(encoder))
+    encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST)
+    encoding.writeVarUint(encoder, DIGEST_VERSION)
+    encoding.writeVarUint(encoder, flags)
+    encoding.writeVarUint(encoder, this.doc.clientID)
+    encoding.writeVarUint8Array(encoder, Y.encodeStateVector(this.doc))
+    encoding.writeVarUint(encoder, this._deleteSetHash())
+    return encoding.toUint8Array(encoder)
   }
 
   /**
-   * Send SyncStep1 message to request missing updates.
-   * This is sent when first connecting to sync with remote peers.
-   * Note: SyncStep1 is just a request and doesn't include hash verification.
-   * Rate limited to prevent spam.
+   * Encode an ack for a JOIN beacon: same framing as a beacon, DIGEST_FLAG_ACK
+   * set, and the JOINER's state vector + delete-set hash echoed back instead
+   * of ours (see DIGEST_FLAG_ACK for why it must never carry our own state).
    */
-  private _sendSyncStep1(): void {
+  private _encodeAck(ackedSv: Uint8Array, ackedDsHash: number): Uint8Array {
+    this._touchPeer(this.doc.clientID)
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST)
+    encoding.writeVarUint(encoder, DIGEST_VERSION)
+    encoding.writeVarUint(
+      encoder,
+      DIGEST_FLAG_ACK | (this._confirmed ? DIGEST_FLAG_SETTLED : 0),
+    )
+    encoding.writeVarUint(encoder, this.doc.clientID)
+    encoding.writeVarUint8Array(encoder, ackedSv)
+    encoding.writeVarUint(encoder, ackedDsHash)
+    return encoding.toUint8Array(encoder)
+  }
+
+  /**
+   * Send the periodic digest beacon. Rate limited to prevent spam. Returns
+   * whether it actually sent (false means rate-limited).
+   */
+  private _sendSyncStep1(flags: number = 0): boolean {
     if (!this._tryReserveSyncSlot()) {
       console.warn(
         `[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`,
       )
-      return // Drop the request
+      return false // Drop the request
     }
-
-    this._writeSyncStep1()
+    this._send(this._encodeSyncStep1(flags))
+    return true
   }
 
   /**
-   * Send a document update to the transport.
-   * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
+   * Encode a document update, without sending it. Extracted from the old
+   * `_sendUpdate()` so `_trySyncPushPull()` can fold the push half into a
+   * batched wire send (see `_sendBatch()`); `_sendUpdate()` below is the
+   * send-immediately form still used by every other update-emitting path
+   * (the doc-update handler, batch-flush, disconnect/destroy flush) since
+   * those aren't part of this batching effort's scope.
+   *
+   * NOTE: has a side effect (`_localSeqNum++`) - call exactly once per
+   * logical update, same as before.
    */
-  private _sendUpdate(update: Uint8Array): void {
+  private _encodeUpdate(update: Uint8Array): Uint8Array {
     const encoder = encoding.createEncoder()
 
     if (this._verifyUpdates) {
+      this._touchPeer(this.doc.clientID)
       // Use verified sync protocol with sequence number and hash
       encoding.writeVarUint(encoder, MESSAGE_SYNC_VERIFIED)
 
@@ -1454,6 +3596,41 @@ export class GenericProvider extends Observable<string> {
       syncProtocol.writeUpdate(encoder, update)
     }
 
+    return encoding.toUint8Array(encoder)
+  }
+
+  /**
+   * Encode a full-state push (see MESSAGE_SYNC_PUSH): the document as one
+   * update, deliberately without the hash and sequence number that
+   * `_encodeUpdate()` adds to incremental updates.
+   */
+  private _encodePush(update: Uint8Array): Uint8Array {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_SYNC_PUSH)
+    encoding.writeVarUint8Array(encoder, update)
+    return encoding.toUint8Array(encoder)
+  }
+
+  /**
+   * Send a document update to the transport, with whatever awareness change
+   * the throttle is holding folded into the same wire message (round 5,
+   * item 1). If verifyUpdates is enabled, the update carries a sequence
+   * number and document hash for ordering and desync detection.
+   */
+  private _sendUpdate(update: Uint8Array): void {
+    this._sendBatch([this._encodeUpdate(update), ...this._takePendingAwareness()])
+  }
+
+  /**
+   * Send awareness update to the transport.
+   */
+  private _sendAwarenessUpdate(changedClients: number[]): void {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(this.awareness, changedClients),
+    )
     this._send(encoding.toUint8Array(encoder))
   }
 
@@ -1491,126 +3668,159 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Send a targeted pub/sub message.
-   * Uses transport.sendTo when available (direct delivery), otherwise
-   * broadcasts a targeted frame that non-target providers drop.
-   * Internal method called by PubSubChannel.
-   */
-  _sendPubSubTo(target: string, topic: string, message: any): void {
-    if (!this.transport.isConnected) {
-      console.warn('Cannot send targeted pub/sub message: not connected')
-      return
-    }
-
-    try {
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, MESSAGE_PUBSUB_TARGETED)
-      encoding.writeVarString(encoder, target)
-      encoding.writeVarString(encoder, topic)
-
-      const messageBytes = new TextEncoder().encode(JSON.stringify(message))
-      encoding.writeVarUint8Array(encoder, messageBytes)
-
-      const frame = encoding.toUint8Array(encoder)
-
-      if (this.transport.sendTo) {
-        // Direct delivery to the target peer.
-        const wrapped = wrapMessageWithChecksum(frame)
-        const result = this.transport.sendTo(target, wrapped)
-        if (result instanceof Promise) {
-          result.catch((error) => {
-            console.error('Error sending targeted pub/sub message:', error)
-          })
-        }
-      } else {
-        // Broadcast-and-filter: dropped by non-target providers on receive.
-        this._send(frame)
-      }
-    } catch (error) {
-      console.error('Error sending targeted pub/sub message:', error)
-    }
-  }
-
-  /**
    * Broadcast awareness state for the specified clients.
    * Throttled to prevent awareness updates from flooding document sync.
    * Multiple rapid updates are batched together.
    */
-  private _broadcastAwareness(
-    clients: number[],
-    channel: number = AWARENESS_CHANNEL_MAIN,
-  ): void {
+  private _broadcastAwareness(clients: number[]): void {
     if (clients.length === 0) return
 
-    const isApp = channel === AWARENESS_CHANNEL_APP
-    const pending = isApp
-      ? this._pendingAppAwarenessClients
-      : this._pendingAwarenessClients
+    const interval = this._effectiveAwarenessInterval()
 
     // If throttling is disabled, send immediately
-    if (this._awarenessInterval <= 0) {
-      this._sendAwarenessNow(clients, channel)
+    if (interval <= 0) {
+      this._sendAwarenessNow(clients)
       return
     }
 
     // Add clients to pending set
     for (const client of clients) {
-      pending.add(client)
+      this._pendingAwarenessClients.add(client)
     }
 
     // If we already have a scheduled broadcast, let it handle the batched clients
-    if (
-      (isApp ? this._appAwarenessTimeoutId : this._awarenessTimeoutId) !==
-      undefined
-    ) {
+    if (this._awarenessTimeoutId !== undefined) {
       return
     }
 
     // Calculate delay - respect minimum interval since last broadcast
     const now = Date.now()
-    const lastTime = isApp ? this._lastAppAwarenessTime : this._lastAwarenessTime
-    const delay = Math.max(0, this._awarenessInterval - (now - lastTime))
+    const timeSinceLastBroadcast = now - this._lastAwarenessTime
+    const delay = Math.max(0, interval - timeSinceLastBroadcast)
 
     // Schedule the batched broadcast
-    const timeoutId = setTimeout(() => {
-      if (isApp) {
-        this._appAwarenessTimeoutId = undefined
-        this._lastAppAwarenessTime = Date.now()
-      } else {
-        this._awarenessTimeoutId = undefined
-        this._lastAwarenessTime = Date.now()
-      }
+    this._awarenessTimeoutId = setTimeout(() => {
+      this._awarenessTimeoutId = undefined
+      this._lastAwarenessTime = Date.now()
 
-      // Send all pending clients in one message
-      const clientsToSend = Array.from(pending)
-      pending.clear()
+      // Send all pending clients in one message - and a pending timed
+      // update batch (`batchUpdates > 0`) with them, update first.
+      const clientsToSend = Array.from(this._pendingAwarenessClients)
+      this._pendingAwarenessClients.clear()
 
       if (clientsToSend.length > 0) {
-        this._sendAwarenessNow(clientsToSend, channel)
+        this._sendBatch([...this._takePendingUpdate(), this._encodeAwareness(clientsToSend)])
       }
     }, delay)
+  }
 
-    if (isApp) this._appAwarenessTimeoutId = timeoutId
-    else this._awarenessTimeoutId = timeoutId
+  /**
+   * Round 5, item 1: the awareness change the throttle is holding rides
+   * along with a wire message that is leaving anyway. Returns the encoded
+   * awareness sub-message (or nothing) and commits the throttle state
+   * exactly as the timer's own flush would. A piggybacked broadcast costs
+   * no message, only its payload bytes, so it goes out early instead of as
+   * its own message up to `_awarenessInterval` later. Measured in
+   * test/dummy/bench-typing-census.ts: a keystroke in an editor binding is
+   * a text insert plus a cursor update - two broadcasts per keystroke
+   * before this, one after. Broadcast paths only: `_sendDirect` and the
+   * BroadcastChannel-only publishes never call this.
+   */
+  private _takePendingAwareness(): Uint8Array[] {
+    if (this._awarenessTimeoutId === undefined) return []
+    clearTimeout(this._awarenessTimeoutId)
+    this._awarenessTimeoutId = undefined
+    const clients = Array.from(this._pendingAwarenessClients)
+    this._pendingAwarenessClients.clear()
+    if (clients.length === 0) return []
+    this._lastAwarenessTime = Date.now()
+    return [this._encodeAwareness(clients)]
+  }
+
+  /**
+   * The counterpart for the timed batch: a `batchUpdates > 0` batch that is
+   * still waiting rides along with an awareness flush (Matrix: both
+   * default to 2 s, so a typist's cursor and text leave as one PUT).
+   */
+  private _takePendingUpdate(): Uint8Array[] {
+    if (this._batchTimeoutId === undefined || !this._pendingUpdate) return []
+    clearTimeout(this._batchTimeoutId)
+    this._batchTimeoutId = undefined
+    this._flushScheduled = false
+    const update = this._pendingUpdate
+    this._pendingUpdate = null
+    return [this._encodeUpdate(update)]
+  }
+
+  /**
+   * Encode an awareness update, without sending it. Extracted from the old
+   * `_sendAwarenessNow()` so `_tryImmediateAwarenessMessage()` can fold it
+   * into a batched wire send instead of always sending it as its own
+   * message.
+   */
+  private _encodeAwareness(clients: number[]): Uint8Array {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(this.awareness, clients),
+    )
+    return encoding.toUint8Array(encoder)
   }
 
   /**
    * Send awareness update immediately without throttling.
    */
-  private _sendAwarenessNow(
-    clients: number[],
-    channel: number = AWARENESS_CHANNEL_MAIN,
-  ): void {
-    const aw =
-      channel === AWARENESS_CHANNEL_APP ? this.appAwareness : this.awareness
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
-    encoding.writeVarUint(encoder, channel)
-    encoding.writeVarUint8Array(
-      encoder,
-      awarenessProtocol.encodeAwarenessUpdate(aw, clients),
-    )
-    this._send(encoding.toUint8Array(encoder))
+  private _sendAwarenessNow(clients: number[]): void {
+    this._send(this._encodeAwareness(clients))
+  }
+
+  /**
+   * Attempt to build an awareness broadcast message for immediate
+   * inclusion in the same wire send as a sync message a caller is about to
+   * send anyway (see `_trySyncPushPull`'s `buildExtra` parameter), instead
+   * of going through
+   * `_broadcastAwareness()`'s independent debounce.
+   *
+   * Only returns non-null when the throttle would have let an immediate
+   * send through anyway - i.e. no debounced broadcast is already pending
+   * AND (throttling is disabled, or at least `_awarenessInterval` ms have
+   * passed since the last broadcast) - so this never changes awareness
+   * throttle semantics, only whether the resulting message travels as its
+   * own wire send or bundled with a sync message that happens to be going
+   * out "now" too.
+   *
+   * Mutates the same state `_broadcastAwareness()`'s own immediate-send
+   * branches mutate (`_pendingAwarenessClients`, `_lastAwarenessTime`) -
+   * once this returns non-null, the state is already committed as "sent
+   * now", so the caller MUST actually send the returned message (bundled
+   * or standalone) rather than discarding it.
+   */
+  private _tryImmediateAwarenessMessage(clients: number[]): Uint8Array | null {
+    if (clients.length === 0) return null
+
+    // A debounced broadcast is already scheduled - let it handle these
+    // clients via the normal pending-set path below, don't race it with an
+    // immediate send here.
+    if (this._awarenessTimeoutId !== undefined) return null
+
+    const interval = this._effectiveAwarenessInterval()
+    if (interval > 0) {
+      const timeSinceLastBroadcast = Date.now() - this._lastAwarenessTime
+      if (timeSinceLastBroadcast < interval) return null
+    }
+
+    // Merge with anything already pending (normally empty here since no
+    // timer is scheduled, but merge for safety) and commit to sending now -
+    // mirrors exactly what _broadcastAwareness()'s own immediate
+    // (_awarenessInterval <= 0) and debounced-timer-fired branches do.
+    for (const c of clients) this._pendingAwarenessClients.add(c)
+    const clientsToSend = Array.from(this._pendingAwarenessClients)
+    this._pendingAwarenessClients.clear()
+    if (clientsToSend.length === 0) return null
+    this._lastAwarenessTime = Date.now()
+
+    return this._encodeAwareness(clientsToSend)
   }
 
   /**
@@ -1652,56 +3862,26 @@ export class GenericProvider extends Observable<string> {
     const encoderSync = encoding.createEncoder()
     encoding.writeVarUint(encoderSync, MESSAGE_SYNC)
     syncProtocol.writeSyncStep1(encoderSync, this.doc)
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)),
-      this,
-    )
+    this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)))
 
     // Broadcast local state via BroadcastChannel (wrapped with CRC32)
     const encoderState = encoding.createEncoder()
     encoding.writeVarUint(encoderState, MESSAGE_SYNC)
     syncProtocol.writeSyncStep2(encoderState, this.doc)
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoderState)),
-      this,
-    )
+    this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderState)))
 
     // Broadcast local awareness state via BroadcastChannel (wrapped with CRC32)
     if (this.awareness.getLocalState() !== null) {
-      this._publishAwarenessToBroadcastChannel(
-        this.awareness,
-        AWARENESS_CHANNEL_MAIN,
+      const encoderAwareness = encoding.createEncoder()
+      encoding.writeVarUint(encoderAwareness, MESSAGE_AWARENESS)
+      encoding.writeVarUint8Array(
+        encoderAwareness,
+        awarenessProtocol.encodeAwarenessUpdate(this.awareness, [
+          this.doc.clientID,
+        ]),
       )
+      this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoderAwareness)))
     }
-    if (this.appAwareness.getLocalState() !== null) {
-      this._publishAwarenessToBroadcastChannel(
-        this.appAwareness,
-        AWARENESS_CHANNEL_APP,
-      )
-    }
-  }
-
-  /**
-   * Encode and publish an awareness update for the local client to the BroadcastChannel.
-   */
-  private _publishAwarenessToBroadcastChannel(
-    awareness: awarenessProtocol.Awareness,
-    channel: number,
-  ): void {
-    const encoder = encoding.createEncoder()
-    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
-    encoding.writeVarUint(encoder, channel)
-    encoding.writeVarUint8Array(
-      encoder,
-      awarenessProtocol.encodeAwarenessUpdate(awareness, [this.doc.clientID]),
-    )
-    bc.publish(
-      this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
-      this,
-    )
   }
 
   /**
@@ -1713,32 +3893,79 @@ export class GenericProvider extends Observable<string> {
     }
 
     // Broadcast awareness state with null (indicating disconnect) - wrapped with CRC32
-    for (const [awareness, channel] of [
-      [this.awareness, AWARENESS_CHANNEL_MAIN],
-      [this.appAwareness, AWARENESS_CHANNEL_APP],
-    ] as const) {
-      const encoder = encoding.createEncoder()
-      encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
-      encoding.writeVarUint(encoder, channel)
-      encoding.writeVarUint8Array(
-        encoder,
-        awarenessProtocol.encodeAwarenessUpdate(
-          awareness,
-          [this.doc.clientID],
-          new Map(),
-        ),
-      )
-      bc.publish(
-        this._bcChannel,
-        wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
-        this,
-      )
-    }
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_AWARENESS)
+    encoding.writeVarUint8Array(
+      encoder,
+      awarenessProtocol.encodeAwarenessUpdate(
+        this.awareness,
+        [this.doc.clientID],
+        new Map(),
+      ),
+    )
+    this._bcPublish(wrapMessageWithChecksum(encoding.toUint8Array(encoder)))
 
     // Unsubscribe from channel
     bc.unsubscribe(this._bcChannel, this._bcSubscriber)
     this._bcConnected = false
     this._bcSubscriber = undefined
+  }
+
+  /**
+   * Send N already-encoded, already-typed sub-messages as ONE wire message
+   * instead of N separate `transport.send()`/`bc.publish()` calls, when
+   * there's more than one to send. Used at trigger points that
+   * conceptually produce a single event but historically sent multiple
+   * independent messages for it (sync push, sync pull, awareness) - see
+   * `_trySyncPushPull()` (connect-time push + digest beacon + awareness in
+   * one wire message).
+   *
+   * Design (see the task's framing requirements):
+   * - Each sub-message is length-prefixed with `writeVarUint8Array`,
+   *   consistent with how this codebase already frames variable-length
+   *   payloads elsewhere (e.g. MESSAGE_AWARENESS). On receipt,
+   *   `_dispatchMessage()`'s `MESSAGE_BATCH` case unwraps and re-dispatches
+   *   each one through the EXACT SAME per-message-type logic used for a
+   *   top-level message - no parallel reimplementation.
+   * - Sub-messages are NOT individually CRC32-wrapped here - the whole
+   *   batch envelope goes through the normal, single `_send()` pipeline
+   *   below, which wraps the WHOLE envelope in exactly one CRC32 checksum
+   *   (and, if `compressionThresholdBytes` is configured, one compression
+   *   pass) - built and computed exactly like any other outgoing message,
+   *   so this composes with the existing compression pipeline for free
+   *   rather than fighting it with a second, nested wrap/compress step.
+   *   The tradeoff: a single corrupted bit anywhere in a batched wire
+   *   message now invalidates every sub-message it carried, not just one -
+   *   per-sub-message CRC32s would avoid that, at the cost of ~4 extra
+   *   bytes per sub-message for a benefit that only matters under active
+   *   corruption. This tradeoff is exactly what
+   *   test/dummy/bench-corruption-storm.ts and bench-packet-loss.ts exist
+   *   to measure empirically, per this task's validation requirements,
+   *   rather than deciding it by design argument alone.
+   * - BroadcastChannel (cross-tab) traffic is NOT specially batched beyond
+   *   whatever `_send()` already does per call - same-tab-group cross-tab
+   *   traffic is local/cheap, and `_send()` already only issues one
+   *   `bc.publish()` per call regardless, so a batch of N sub-messages
+   *   already becomes exactly one `bc.publish()` call for free once routed
+   *   through here - no separate BC-specific batching logic needed.
+   */
+  private _sendBatch(messages: Uint8Array[]): void {
+    if (messages.length === 0) return
+    if (messages.length === 1) {
+      this._send(messages[0])
+      return
+    }
+    this._send(this._encodeBatch(messages))
+  }
+
+  /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */
+  private _encodeBatch(messages: Uint8Array[]): Uint8Array {
+    const encoder = encoding.createEncoder()
+    encoding.writeVarUint(encoder, MESSAGE_BATCH)
+    for (const message of messages) {
+      encoding.writeVarUint8Array(encoder, message)
+    }
+    return encoding.toUint8Array(encoder)
   }
 
   /**
@@ -1750,18 +3977,80 @@ export class GenericProvider extends Observable<string> {
     // Wrap message with CRC32 checksum
     const wrappedData = wrapMessageWithChecksum(data)
 
-    // Send via BroadcastChannel to other tabs first
-    if (this._bcConnected) {
-      bc.publish(this._bcChannel, wrappedData, this)
-    }
+    // Send via BroadcastChannel to other tabs first.
+    if (this._bcConnected) this._bcPublish(wrappedData)
 
     // Send via network transport
     if (!this.transport.isConnected) {
       return
     }
 
+    this._sendToTransport(wrappedData)
+  }
+
+  /**
+   * Publish already-CRC32-wrapped bytes to the other tabs. BroadcastChannel
+   * is same-process - never worth compressing - but when
+   * compressionThresholdBytes is enabled every message still needs the
+   * leading flag byte _handleIncomingMessage() expects regardless of
+   * source, so this sends flag=0 in that case. The ONE place for every BC
+   * publish: the connect-time burst in _setupBroadcastChannel() used to
+   * publish without the flag, and with compression on (the transport
+   * hints made that a default) the other tab read a CRC byte as the flag
+   * and failed to inflate three messages per join (Nostr playground,
+   * 2026-09-06).
+   */
+  private _bcPublish(wrappedData: Uint8Array): void {
+    bc.publish(
+      this._bcChannel,
+      this._compressionThresholdBytes
+        ? prefixCompressionFlag(0, wrappedData)
+        : wrappedData,
+      this,
+    )
+  }
+
+  /**
+   * Send already-CRC32-wrapped bytes to the network transport, compressing
+   * first if compressionThresholdBytes is configured and this payload
+   * clears it. See that option's doc comment for the size threshold
+   * reasoning and the wire-format compatibility tradeoff of enabling it.
+   */
+  private _sendToTransport(wrappedData: Uint8Array, to?: string): void {
+    const threshold = this._compressionThresholdBytes
+    if (!threshold) {
+      this._dispatchToTransport(wrappedData, to)
+      return
+    }
+
+    if (!COMPRESSION_AVAILABLE || wrappedData.length < threshold) {
+      this._dispatchToTransport(prefixCompressionFlag(0, wrappedData), to)
+      return
+    }
+
+    compressDeflateRaw(wrappedData)
+      .then((compressed) => {
+        this._dispatchToTransport(prefixCompressionFlag(1, compressed), to)
+      })
+      .catch((error) => {
+        console.error(
+          '[GenericProvider] Compression failed, sending uncompressed:',
+          error,
+        )
+        this._dispatchToTransport(prefixCompressionFlag(0, wrappedData), to)
+      })
+  }
+
+  /**
+   * Hand fully-framed bytes to transport.send() - or transport.sendTo() when
+   * a peer address is given - tolerating a sync or async result.
+   */
+  private _dispatchToTransport(data: Uint8Array, to?: string): void {
     try {
-      const result = this.transport.send(wrappedData)
+      const result =
+        to !== undefined && typeof this.transport.sendTo === 'function'
+          ? this.transport.sendTo(to, data)
+          : this.transport.send(data)
       // Handle async send
       if (result instanceof Promise) {
         result.catch((error) => {

@@ -4,9 +4,9 @@ Local persistence transport for Yjs using browser's IndexedDB.
 
 ## Features
 
-- 🔒 **Automatic Persistence** - All document updates are automatically saved
-- 📦 **Efficient Storage** - Optimized storage and retrieval of updates
-- 🗜️ **Auto-Compaction** - Reduces storage size when needed
+- 🔒 **Automatic Persistence** - Every document update is saved as it happens - and only document updates: the provider's presence, beacons and requests never reach the store
+- 📦 **One Row per Load** - The stored updates are loaded as one merged update and written back as one row
+- 🗜️ **Lossless Compaction** - Rows are merged, never dropped; on by default
 - 🌐 **Offline First** - Works completely offline, no network required
 - 🧹 **Cleanup Support** - Clear old updates or entire database
 - 📊 **Statistics** - Monitor storage usage and update count
@@ -52,13 +52,13 @@ const transport = new IndexedDBTransport({
   // Database version (default: 1)
   version: 1,
   
-  // Enable auto-compaction (default: false)
+  // Compact (merge every row into one) automatically (default: true)
   autoCompact: true,
   
-  // Compact after this many updates (default: 0 = disabled)
+  // ... when this many rows have accumulated (default: 0 = use maxUpdates)
   compactThreshold: 100,
   
-  // Maximum updates before compaction required (default: 500)
+  // Row count at which auto-compaction runs when compactThreshold is 0 (default: 500)
   maxUpdates: 500,
   
   // Enable debug logging (default: false)
@@ -74,7 +74,7 @@ const transport = new IndexedDBTransport({
 ### Manual Compaction
 
 ```typescript
-// Compact database to reduce storage size
+// Merge every stored row into one (lossless)
 await transport.compact()
 ```
 
@@ -104,18 +104,27 @@ await IndexedDBTransport.deleteDatabase('my-document', 'yjs')
 ## How It Works
 
 1. **Connection**: Opens IndexedDB database for the specified room
-2. **Loading**: Loads all existing updates when connected
-3. **Persistence**: Each document update is stored as it occurs
-4. **Compaction**: Optionally reduces storage by removing old updates
-5. **Restoration**: On reconnection, all updates are replayed
+2. **Loading**: Merges every stored row into one update, hands it to the
+   provider as one SyncStep2 (`synced` fires) and writes it back as one row
+3. **Persistence**: Each frame the provider sends is reduced to the Yjs
+   update it carries (`extractDocUpdates` from the core) and stored as one
+   row; presence, beacons and requests carry none and are skipped
+4. **Compaction**: Merges the rows into one when `maxUpdates` (or
+   `compactThreshold`) rows have accumulated - lossless
+
+Not for a provider with `compressionThresholdBytes` set: the frame parser
+expects the plain CRC-wrapped frame, and this transport sets no
+`preferredCompressMinBytes`.
 
 ## Storage Structure
 
 Each update is stored as:
 ```typescript
 {
-  update: Uint8Array,  // The Yjs update
-  timestamp: number    // When it was stored
+  update: Uint8Array,  // One Yjs update
+  timestamp: number,   // When it was stored
+  raw: true            // Absent on rows written before round 7, which hold
+                       // a whole provider frame; the loader reads both
 }
 ```
 
@@ -150,14 +159,15 @@ const localProvider = new GenericProvider(
   doc,
   new IndexedDBTransport()
 )
-await localProvider.connect({ room: 'my-doc' })
 
-// Network sync
+// Network sync - let the local copy load before the first beacon says
+// what we have (ConnectionConfig.waitFor), or the room answers with the
+// whole document although it is already on disk
 const networkProvider = new GenericProvider(
   doc,
   new PeerJSTransport({ peer: Peer })
 )
-await networkProvider.connect({ room: 'my-doc' })
+await networkProvider.connect({ room: 'my-doc', waitFor: localProvider.connect({ room: 'my-doc' }) })
 
 // Now you have both local persistence AND real-time sync!
 ```
@@ -196,16 +206,16 @@ Browser storage limits vary:
 - **Firefox**: ~50% of free disk space
 - **Safari**: 1GB (can request more)
 
-The provider includes auto-compaction to manage storage efficiently.
+Auto-compaction (on by default) keeps the log at one row per 500 updates;
+a load trims it to one row.
 
 ## Best Practices
 
-### 1. Enable Auto-Compaction
+### 1. Tune Compaction
 
 ```typescript
 const transport = new IndexedDBTransport({
-  autoCompact: true,
-  compactThreshold: 100  // Compact every 100 updates
+  compactThreshold: 100  // Merge the rows into one every 100 updates instead of 500
 })
 ```
 
@@ -281,7 +291,7 @@ provider.on('status', (event) => {
 
 ### Storage Full
 
-Enable auto-compaction or manually compact:
+Compaction is automatic; to merge the rows right now:
 ```typescript
 await transport.compact()
 ```

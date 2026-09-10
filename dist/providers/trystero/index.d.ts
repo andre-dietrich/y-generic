@@ -158,13 +158,31 @@ export declare class TrysteroTransport implements Transport {
     private sendUpdate;
     private peers;
     private onJoinErrorCallback?;
+    private _peerConnectCallback?;
+    private _peerDisconnectCallback?;
     constructor(options: TrysteroTransportOptions);
     private log;
     get isConnected(): boolean;
     connect(config: ConnectionConfig): Promise<void>;
     disconnect(): void;
     send(data: Uint8Array): Promise<void>;
-    onMessage(callback: (data: Uint8Array) => void): () => void;
+    /**
+     * Transport.sendTo: deliver to one peer (Trystero's action send accepts
+     * a target peer id). Used by GenericProvider for replies, acks and
+     * presence responses.
+     */
+    sendTo(peerId: string, data: Uint8Array): Promise<void>;
+    onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
+    /**
+     * Register callback for new peer data-channel connections. Lets
+     * GenericProvider push our current doc/awareness state to a peer as
+     * soon as their channel opens, instead of only at our own connect()
+     * time (which fires before any mesh connection exists) or the next
+     * periodic sync tick.
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
+    /** Transport.onPeerDisconnect: Trystero's onPeerLeave, the same peer id. */
+    onPeerDisconnect(callback: (peerId: string) => void): () => void;
     /**
      * Set a callback for join errors (optional).
      */

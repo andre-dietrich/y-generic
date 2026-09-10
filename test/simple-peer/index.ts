@@ -403,7 +403,7 @@ async function init() {
 
   // Listen to sync changes
   provider.on('synced', (event: any) => {
-    const synced = event.synced
+    const synced = typeof event === 'boolean' ? event : !!event?.synced // the provider emits a boolean
     updateSyncStatus(synced)
 
     if (synced) {

@@ -44,6 +44,7 @@
  */
 
 import * as Y from 'yjs'
+import * as decoding from 'lib0/decoding'
 import { GenericProvider } from '../../src/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
 import { sleep, instrumentHub } from './bench-user-scaling'
@@ -53,6 +54,11 @@ const N_VALUES = [2, 5, 10]
 const EDIT_STREAM_MS = 3000 // how long the edit burst + corruption runs
 const EDIT_INTERVAL_MS = 50 // one insert every 50ms while corrupting
 const SETTLE_TIMEOUT_MS = 15000 // convergence grace period once corruption stops
+// Periodic beacon for the peers under test (override: SYNC_INTERVAL_MS).
+// Phase 1d: with 0, a peer left behind by corruption has no fallback at all
+// once its own retries are spent - that measures the option, not the
+// protocol. bench-packet-loss and bench-late-join run with 2 s since 1b.
+const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 2000)
 
 interface WarnCounts {
   corrupted: number
@@ -91,52 +97,43 @@ async function withWarnCounts<T>(
  * clean) copy, i.e. corruption shared across the whole room per message
  * rather than independent per wire link. Real network corruption happens
  * per physical link, so each recipient must get its own independent coin
- * flip. Returns a restore function.
+ * flip. Returns a restore function that really stops the corruption.
+ *
+ * "Really": the corrupting closure is what the provider subscribed with at
+ * connect() and stays registered for the transport's lifetime, so the
+ * restore must flip a flag that closure reads - restoring the `onMessage`
+ * method alone only affects future subscriptions. Until 2026-09-06 it did
+ * only the latter, so the "converged once corruption stopped" column was
+ * measured under continued corruption: at 50 % it was a coin flip per
+ * reply, and the N=2 / 50 % cell stalled in 3 of 5 runs of one evening
+ * with a perfectly healthy protocol (each stall: one peer behind, its 5 s
+ * resync retry answered, the answer corrupted again).
  */
 function withCorruption(
   transport: DummyTransport,
   corruptionRate: number,
 ): () => void {
+  let active = true
   const originalOnMessage = transport.onMessage.bind(transport)
-  transport.onMessage = (callback: (data: Uint8Array) => void) => {
-    return originalOnMessage((data: Uint8Array) => {
-      if (corruptionRate > 0 && Math.random() < corruptionRate) {
+  transport.onMessage = (callback: (data: Uint8Array, from?: string) => void) => {
+    return originalOnMessage((data: Uint8Array, from?: string) => {
+      if (active && corruptionRate > 0 && Math.random() < corruptionRate) {
         const corrupted = new Uint8Array(data)
         const idx = Math.floor(Math.random() * corrupted.length)
         corrupted[idx] ^= 0xff
-        callback(corrupted)
+        callback(corrupted, from)
       } else {
-        callback(data)
+        callback(data, from)
       }
     })
   }
   return () => {
+    active = false
     transport.onMessage = originalOnMessage
   }
 }
 
-/**
- * Classify an outgoing (never-corrupted, sender-side) wire message by type
- * for fanout analysis: is a resync's request (SyncStep1) answered by ~1
- * reply (SyncStep2) regardless of N (suppression working), or does the
- * reply count scale with N (suppression not engaging / not enough)?
- * Wire format: [4-byte CRC][varUint msgType][varUint syncSubType?]. Types
- * 0-3 and sync subtypes 0-2 all fit a single-byte varUint.
- */
-function classify(data: Uint8Array): string {
-  if (data.length < 5) return 'other'
-  const msgType = data[4]
-  if (msgType === 0 || msgType === 3) {
-    const subType = data.length > 5 ? data[5] : -1
-    if (subType === 0) return 'syncStep1'
-    if (subType === 1) return 'syncStep2'
-    if (subType === 2) return 'update'
-    return 'sync-other'
-  }
-  if (msgType === 1) return 'awareness'
-  if (msgType === 2) return 'pubsub'
-  return 'other'
-}
+const MESSAGE_BATCH = 4
 
 interface TypeCounts {
   syncStep1: number
@@ -149,15 +146,46 @@ function newTypeCounts(): TypeCounts {
   return { syncStep1: 0, syncStep2: 0, update: 0, awareness: 0 }
 }
 
+/**
+ * Classify an outgoing (never-corrupted, sender-side) wire message by type
+ * for fanout analysis: is a resync's request (SyncStep1) answered by ~1
+ * reply (SyncStep2) regardless of N (suppression working), or does the
+ * reply count scale with N (suppression not engaging / not enough)?
+ * Recurses into MESSAGE_BATCH envelopes (see src/index.ts's _sendBatch()/
+ * _dispatchMessage()) - a batched push+pull now travels as ONE wire
+ * message, but must still be counted as one syncStep1 + one update (etc)
+ * for this ratio analysis to stay meaningful, not silently disappear into
+ * an unclassified bucket.
+ */
+function classifyOne(msg: Uint8Array, counts: TypeCounts): void {
+  const decoder = decoding.createDecoder(msg)
+  const msgType = decoding.readVarUint(decoder)
+  if (msgType === 0 || msgType === 3) {
+    const subType = decoding.readVarUint(decoder)
+    if (subType === 0) counts.syncStep1++
+    else if (subType === 1) counts.syncStep2++
+    else if (subType === 2) counts.update++
+  } else if (msgType === 5) {
+    // MESSAGE_SYNC_DIGEST (digest-beacon plan, 2026-09-05) - the request
+    // class, replaces SyncStep1 on the wire; counted as syncStep1 so the
+    // SyncStep2/SyncStep1 ratio stays comparable across the change.
+    counts.syncStep1++
+  } else if (msgType === 6) {
+    counts.update++ // MESSAGE_SYNC_PUSH: connect-time full state (phase 1b)
+  } else if (msgType === 1) {
+    counts.awareness++
+  } else if (msgType === MESSAGE_BATCH) {
+    while (decoding.hasContent(decoder)) {
+      classifyOne(decoding.readVarUint8Array(decoder), counts)
+    }
+  }
+}
+
 /** Shadow DummyTransport.prototype.send globally to classify+count sends. */
 function withSendClassification(counts: TypeCounts): () => void {
   const original = DummyTransport.prototype.send
   DummyTransport.prototype.send = function (data: Uint8Array) {
-    const label = classify(data)
-    if (label === 'syncStep1') counts.syncStep1++
-    else if (label === 'syncStep2') counts.syncStep2++
-    else if (label === 'update') counts.update++
-    else if (label === 'awareness') counts.awareness++
+    if (data.length >= 5) classifyOne(data.subarray(4), counts)
     return original.call(this, data)
   }
   return () => {
@@ -176,12 +204,19 @@ function makeProviders(
   const restoreFns: Array<() => void> = []
   for (let i = 0; i < N; i++) {
     const doc = new Y.Doc()
-    const transport = new DummyTransport({ hub, latency: 15, jitter: 0.2 })
+    const transport = new DummyTransport({
+      hub,
+      latency: 15,
+      jitter: 0.2,
+      // DUMMY_UNICAST=1 models a mesh transport with Transport.sendTo (phase
+      // 1c): replies to a corrupted peer's beacon then travel as unicasts.
+      unicast: process.env.DUMMY_UNICAST === '1',
+    })
     restoreFns.push(withCorruption(transport, corruptionRate))
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
       verifyUpdates: true,
-      syncInterval: 0,
+      syncInterval: SYNC_INTERVAL_MS,
       ...(syncReplySuppressionMs !== undefined ? { syncReplySuppressionMs } : {}),
     })
     // Bump local awareness state past the genesis clock (0) - required for
@@ -287,6 +322,25 @@ async function runOnce(
       await sleep(20)
     }
     const convergeMs = Date.now() - convergeStart
+    if (!converged) {
+      // Diagnostics for the rare stall: which peers are behind, and what
+      // state their recovery machinery is in (private fields, on purpose).
+      const typist = docs[0].clientID
+      providers.forEach((p, i) => {
+        const txt = docs[i].getText('content').toString()
+        if (txt === target) return
+        const q = p as unknown as Record<string, unknown>
+        const sv = Y.decodeStateVector(Y.encodeStateVector(docs[i]))
+        console.log(
+          `  STALL peer ${i}: len=${txt.length}/${target.length} typistClock=${sv.get(typist) ?? 0} ` +
+            `pending=${docs[i].store.pendingStructs !== null} wait=${q._responseWaitTimer !== undefined} ` +
+            `waitAttempts=${q._responseWaitAttempts} resyncTimer=${q._pendingResyncTimeoutId !== undefined} ` +
+            `resyncAttempts=${q._resyncAttemptCount} reqBudget=${(q._syncRequestTimes as number[]).length} ` +
+            `replyBudget=${(q._syncReplyTimes as number[]).length} synced=${p.synced} confirmed=${q._confirmed} ` +
+            `knownPeers=${(q._knownPeers as Map<number, number>).size} addresses=${(q._peerAddress as Map<number, string>).size}`,
+        )
+      })
+    }
 
     for (const p of providers) p.destroy()
     hub.clear()

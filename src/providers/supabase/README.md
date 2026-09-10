@@ -19,6 +19,14 @@ Real-time collaborative editing with Supabase Realtime and optional database per
 npm install y-generic @supabase/supabase-js yjs
 ```
 
+## Wire format
+
+Updates are broadcast as **binary payloads** (no base64), which needs
+`@supabase/supabase-js` **2.91.0 or newer on every peer** - an older client
+silently drops binary broadcasts. Updates above 200 KB are sent as base64
+chunks and reassembled; updates above 2 KB are compressed first
+(`compressionThresholdBytes` hint, see the `GenericProvider` option).
+
 ## Database Setup (for Persistent Mode)
 
 Create a table in your Supabase project:
@@ -30,12 +38,11 @@ CREATE TABLE yjs_documents (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Optional: Add RLS policies if needed
+-- The dashboard's Table Editor enables row level security by default;
+-- without a policy the anon key can neither read nor write the row.
 ALTER TABLE yjs_documents ENABLE ROW LEVEL SECURITY;
-
--- Allow public read/write (adjust as needed)
 CREATE POLICY "Public Access" ON yjs_documents
-  FOR ALL USING (true);
+  FOR ALL USING (true) WITH CHECK (true);
 ```
 
 ## Usage
@@ -77,14 +84,17 @@ await provider.connect({
   supabaseUrl: 'https://xxxxx.supabase.co',
   supabaseKey: 'your-anon-key',
   room: 'my-room',
-  persistent: true, // Enable persistence
-  password: 'optional-secret', // Optional password protection
-  persistDebounceMs: 2000 // Debounce database writes (default: 2000ms)
+  persistent: true,
+  doc, // the Y.Doc to persist - required with persistent: true
+  password: 'optional-secret', // optional; hashed into the row id
+  tableName: 'yjs_documents', // default
+  persistDebounceMs: 2000, // default
 })
 
-// States are synchronized AND saved to database
-// Document is loaded from database on connect
-// Updates are debounced and saved automatically
+// On connect the stored state is applied like a peer's full-state push;
+// every document update schedules a debounced write of the full state
+// (one row per room); disconnect() flushes a pending write. Not usable
+// together with compressionThresholdBytes.
 ```
 
 ### With Password Protection
@@ -110,10 +120,9 @@ interface SupabaseConfig {
 
   // Optional
   password?: string          // Password to secure the room (hashed)
-  persistent?: boolean       // Enable database persistence (default: false)
-  tableName?: string         // Database table name (default: 'yjs_documents')
-  columnName?: string        // Column for document data (default: 'content')
-  idColumnName?: string      // Column for document ID (default: 'id')
+  persistent?: boolean       // Persist the document in a table (default: false)
+  doc?: Y.Doc                // The Y.Doc to persist (required with persistent)
+  tableName?: string         // Table name (default: 'yjs_documents')
   persistDebounceMs?: number // Debounce delay for DB writes (default: 2000)
   debug?: boolean            // Enable debug logging
 }
@@ -174,3 +183,24 @@ interface SupabaseConfig {
 ## License
 
 MIT
+
+## Presence: departures without a timeout
+
+Every peer tracks itself in the channel's presence set under a random
+id and sends its broadcasts as event `m:<id>`, so receivers know who a
+frame came from. A presence `leave` (clean unsubscribe, closed tab, or
+the server's timeout after a dead connection) reaches every subscriber
+and is passed to `GenericProvider` as `onPeerDisconnect`: the departed
+peer's cursor and name disappear at once instead of after the 30 s
+awareness timeout, and the awareness lease defaults to 5 minutes - the
+presence renewal every peer otherwise broadcasts every 15 s (80 % of an
+idle room's messages once the sync beacons have backed off) stops.
+Presence join/leave events count as Realtime messages, one per
+subscriber per event.
+
+Same-version rule, as for the binary frames: an older peer listens for
+event `message` only and never sees `m:<id>` frames.
+
+Verified against a live project on 2026-09-07 (`test/supabase/live-presence.mjs`):
+two Node peers, one idle minute with no awareness sends, and a peer whose
+channel closed was dropped by the other after 1.2 s.

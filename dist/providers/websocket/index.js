@@ -248,7 +248,13 @@ export class WebSocketTransport {
             return;
         }
         this.reconnectAttempts++;
-        const delay = this.config.reconnectDelay ?? 2000;
+        // Exponential backoff with jitter: the jitter is what breaks the herd
+        // on the relay's return, the cap what keeps recovery quick (y-websocket
+        // caps at 2.5 s, Socket.IO at 5 s; 10 s cuts the storm ~4x for a mean
+        // recovery wait under 8 s).
+        const base = this.config.reconnectDelay ?? 2000;
+        const cap = this.config.maxReconnectDelay ?? 10000;
+        const delay = Math.round(Math.min(cap, base * 2 ** (this.reconnectAttempts - 1)) * (0.5 + Math.random()));
         this.log(`🔄 Attempting reconnection #${this.reconnectAttempts} in ${delay}ms...`);
         this.reconnectTimer = setTimeout(async () => {
             try {

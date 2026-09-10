@@ -45,16 +45,57 @@ export interface PubNubConfig extends ConnectionConfig {
  * const provider = new GenericProvider(doc, transport)
  * ```
  */
+/** Constructor options for PubNubTransport. */
+export interface PubNubTransportOptions {
+  /**
+   * Use PubNub Presence for departures: the transport then implements
+   * `onPeerDisconnect` (presence `leave`/`timeout` events) and
+   * GenericProvider drops a departed peer's awareness at once and lets the
+   * awareness lease default to 5 minutes instead of 30 s, which removes
+   * the 15 s presence renewal broadcasts. Requires the Presence add-on to
+   * be enabled on the keyset (PubNub admin portal) - without it no
+   * presence event ever arrives, so departures would only be noticed after
+   * the long lease; the transport checks `hereNow` after subscribing and
+   * warns if the keyset does not list it. Presence events count as PubNub
+   * transactions. @default false
+   */
+  presence?: boolean
+}
+
 export class PubNubTransport implements Transport {
   private pubnub: any = null
   private channel: string = ''
+  private readonly presenceEnabled: boolean
+  /**
+   * Transport.onPeerDisconnect - present only with `presence: true` (see
+   * PubNubTransportOptions), so GenericProvider keeps the 30 s awareness
+   * lease on a keyset without Presence. Peer ids are publisher uuids, the
+   * same `from` onMessage passes.
+   */
+  readonly onPeerDisconnect?: (callback: (peerId: string) => void) => () => void
+
+  constructor(options: PubNubTransportOptions = {}) {
+    this.presenceEnabled = options.presence ?? false
+    if (this.presenceEnabled) {
+      this.onPeerDisconnect = (callback: (peerId: string) => void) => {
+        this._peerDisconnectCallback = callback
+        return () => {
+          this._peerDisconnectCallback = undefined
+        }
+      }
+    }
+  }
   private uuid: string = ''
-  private messageCallback?: (data: Uint8Array) => void
+  private messageCallback?: (data: Uint8Array, from?: string) => void
+  private _peerDisconnectCallback?: (peerId: string) => void
   private _isConnected: boolean = false
   private config: PubNubConfig | null = null
   private debug: boolean = false
   private messageBuffer: Uint8Array[] = [] // Buffer messages until callback is set
   private chunkBuffer: Map<string, Map<number, string>> = new Map() // Buffer for reassembling chunks
+  // Compress a full-document push before it is base64-encoded and chunked
+  // (see Transport.preferredCompressMinBytes).
+  readonly preferredCompressMinBytes = 2048
 
   // PubNub has a 32 KiB message limit. We use 30 KB for safety (after base64 encoding)
   private readonly MAX_MESSAGE_SIZE = 30000
@@ -124,6 +165,7 @@ export class PubNubTransport implements Transport {
             this._isConnected = true
             clearTimeout(timeout)
             this.log('✅ Connected to PubNub')
+            if (this.presenceEnabled) this.verifyPresence()
             resolve()
           } else if (statusEvent.category === 'PNNetworkDownCategory') {
             this.log('⚠️ Network is down')
@@ -156,9 +198,10 @@ export class PubNubTransport implements Transport {
                 `📨 Received ${data.length} bytes from ${event.publisher}`,
               )
 
-              // If callback is set, process immediately
+              // If callback is set, process immediately (the publisher
+              // uuid is the peer id onPeerDisconnect reports)
               if (this.messageCallback) {
-                this.messageCallback(data)
+                this.messageCallback(data, event.publisher)
               } else {
                 // Buffer message until callback is registered
                 this.log(
@@ -173,13 +216,23 @@ export class PubNubTransport implements Transport {
         },
         presence: (event: any) => {
           this.log(`Presence: ${event.action}`, event)
+          // PubNub presence (withPresence below): leave = clean unsubscribe,
+          // timeout = heartbeat missed. Both mean the peer is gone.
+          if (
+            (event.action === 'leave' || event.action === 'timeout') &&
+            event.uuid &&
+            event.uuid !== this.uuid
+          ) {
+            this._peerDisconnectCallback?.(event.uuid)
+          }
         },
       })
 
-      // Subscribe to channel
+      // Subscribe to channel (presence only when asked for - see
+      // PubNubTransportOptions.presence; it costs transactions)
       this.pubnub.subscribe({
         channels: [this.channel],
-        withPresence: true,
+        withPresence: this.presenceEnabled,
       })
     })
   }
@@ -323,7 +376,7 @@ export class PubNubTransport implements Transport {
         )
 
         if (this.messageCallback) {
-          this.messageCallback(reassembledData)
+          this.messageCallback(reassembledData, publisher)
         } else {
           this.messageBuffer.push(reassembledData)
         }
@@ -336,7 +389,7 @@ export class PubNubTransport implements Transport {
   /**
    * Register message callback
    */
-  onMessage(callback: (data: Uint8Array) => void): () => void {
+  onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
     this.messageCallback = callback
 
     // Flush any buffered messages
@@ -351,6 +404,36 @@ export class PubNubTransport implements Transport {
     return () => {
       this.messageCallback = undefined
     }
+  }
+
+
+  /**
+   * With `presence: true`: after subscribing, check that the keyset lists us
+   * in hereNow - a keyset without the Presence add-on never emits presence
+   * events, and GenericProvider would then trust a leave signal that never
+   * comes (departures noticed only after the 5-minute lease).
+   */
+  private verifyPresence(): void {
+    setTimeout(async () => {
+      if (!this.pubnub || !this._isConnected) return
+      try {
+        const response = await this.pubnub.hereNow({
+          channels: [this.channel],
+          includeUUIDs: true,
+        })
+        const occupants: Array<{ uuid: string }> =
+          response?.channels?.[this.channel]?.occupants ?? []
+        if (!occupants.some((o) => o.uuid === this.uuid)) {
+          console.warn(
+            '[PubNubTransport] presence: true, but the keyset does not list this client in hereNow - ' +
+              'enable the Presence add-on for the keyset in the PubNub admin portal, or construct the transport without presence. ' +
+              'Until then a departed peer is only removed after the awareness lease.',
+          )
+        }
+      } catch (error) {
+        this.log('presence check failed:', error)
+      }
+    }, 3000)
   }
 
   /**

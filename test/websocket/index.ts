@@ -174,8 +174,15 @@ async function initWithConfig(config: {
   // IMPORTANT: verifyUpdates must be false for y-websocket compatibility
   // y-websocket uses message type 3 for "messageQueryAwareness" but GenericProvider
   // uses type 3 for "MESSAGE_SYNC_VERIFIED" when verifyUpdates=true
+  // Presence lease (round 5): this transport cannot report departures, so
+  // peers renew their presence every lease/2; 120 s instead of y-protocols'
+  // 30 s cuts those renewals by three quarters (80 % of an idle room's
+  // messages once the beacons have backed off) at the price of a cursor that
+  // lingers up to 2 min after a tab is killed. Clean closes are still
+  // announced at once. Every peer of a room must use the same value.
   const provider = new GenericProvider(doc, transport, {
     verifyUpdates: false, // Required for y-websocket server compatibility
+    awarenessTimeoutMs: 120000,
   })
 
   // Listen to status changes
@@ -194,7 +201,7 @@ async function initWithConfig(config: {
 
   // Listen to sync changes
   provider.on('synced', (event: any) => {
-    const synced = event.synced
+    const synced = typeof event === 'boolean' ? event : !!event?.synced // the provider emits a boolean
     updateSyncStatus(synced)
 
     if (synced) {

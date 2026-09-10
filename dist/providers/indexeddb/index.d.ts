@@ -6,12 +6,19 @@
  * for persistence across browser sessions.
  *
  * Features:
- * - Automatic persistence of all document updates
- * - Efficient storage and retrieval
- * - Optional compaction to reduce storage size
+ * - Persists the document's updates as they happen - and nothing else: the
+ *   provider's presence, beacons and requests are not stored (round 7,
+ *   item 6: stored and replayed, they resurrected the previous session as a
+ *   phantom peer and cost ~10x the bytes)
+ * - Loads the stored updates as one merged update and trims the log to
+ *   that one row (every load appends a full-document push otherwise)
+ * - Lossless compaction (merge), on by default
  * - Works offline (no network required)
- * - Automatic cleanup of old updates
  * - Supports multiple documents/rooms
+ * - Pairs with a network provider on the same document through
+ *   `connect({ waitFor })` (see ConnectionConfig.waitFor)
+ * - Not for a provider with `compressionThresholdBytes` set: the frame
+ *   parser expects the plain CRC-wrapped frame
  *
  * @example
  * ```typescript
@@ -31,11 +38,8 @@
  *
  * @example
  * ```typescript
- * // With automatic compaction every 100 updates
- * const transport = new IndexedDBTransport({
- *   compactThreshold: 100,
- *   autoCompact: true
- * })
+ * // Compact (merge the rows into one) every 100 updates instead of 500
+ * const transport = new IndexedDBTransport({ compactThreshold: 100 })
  * ```
  */
 import type { Transport, ConnectionConfig } from '../../transport';
@@ -54,14 +58,15 @@ export interface IndexedDBTransportOptions {
      */
     version?: number;
     /**
-     * Automatically compact storage when update count reaches this threshold.
-     * Set to 0 to disable auto-compaction.
-     * @default 0 (disabled)
+     * Compact (merge every row into one) when the row count reaches this
+     * threshold; 0 = use `maxUpdates`.
+     * @default 0
      */
     compactThreshold?: number;
     /**
-     * Enable automatic compaction.
-     * @default false
+     * Compact automatically at the threshold. Lossless since round 7 (it used
+     * to delete the oldest 90 % of rows - the document), hence on by default.
+     * @default true
      */
     autoCompact?: boolean;
     /**
@@ -70,8 +75,7 @@ export interface IndexedDBTransportOptions {
      */
     debug?: boolean;
     /**
-     * Maximum number of updates to store before compaction is required.
-     * Prevents unbounded growth of the update log.
+     * Row count at which auto-compaction runs when `compactThreshold` is 0.
      * @default 500
      */
     maxUpdates?: number;
@@ -120,7 +124,12 @@ export declare class IndexedDBTransport implements Transport {
      */
     disconnect(): void;
     /**
-     * Send (store) an update to IndexedDB.
+     * Store what the frame carries of the document - one row per frame that
+     * carries anything. Presence, beacons and requests are the provider's
+     * conversation with the room, and this transport is not the room: stored
+     * and replayed on the next load they resurrected the previous session's
+     * clientID as a phantom peer and were answered into the store again
+     * (round 7, item 6; test/dummy/bench-persist-log.ts).
      */
     send(data: Uint8Array): void;
     /**
@@ -128,16 +137,31 @@ export declare class IndexedDBTransport implements Transport {
      */
     onMessage(callback: (data: Uint8Array) => void): () => void;
     /**
-     * Load all stored updates from database.
+     * Load the stored document: every row merged into one update, handed to
+     * the provider as one SyncStep2 (`frameDocUpdate`: applied, `synced`
+     * fires, nothing is sent back) and written back as that one row. Every
+     * page load appends a full-document push (GenericProvider's connect), so
+     * without the trim the log grew by one document per load - y-indexeddb
+     * trims the same way at its PREFERRED_TRIM_SIZE.
      */
     private loadUpdates;
+    /**
+     * The stored document as one update: every row read, merged and - when
+     * there was more than one, or one in the pre-round-7 frame format -
+     * written back as one row, all in one readwrite transaction (a
+     * concurrent send() queues behind it, so nothing added meanwhile can be
+     * cleared away). Rows that carry no document state (old presence or
+     * beacon frames) are dropped. Null for an empty store. Shared by
+     * loadUpdates() and compact().
+     */
+    private mergeStore;
     /**
      * Check if compaction should be triggered.
      */
     private shouldCompact;
     /**
-     * Compact the database by merging updates.
-     * This reduces storage size by consolidating the update history.
+     * Merge every stored row into one. Lossless - it used to delete the
+     * oldest 90 % of rows, i.e. the document (round 7, item 6).
      */
     compact(): Promise<void>;
     /**

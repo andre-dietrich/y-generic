@@ -7,8 +7,16 @@ export interface WebSocketConfig extends ConnectionConfig {
     serverUrl: string;
     /** Enable automatic reconnection on disconnect (default: true) */
     autoReconnect?: boolean;
-    /** Reconnection delay in milliseconds (default: 2000) */
+    /**
+     * Delay before the first reconnection attempt in milliseconds (default:
+     * 2000). Doubles per failed attempt, jittered by ±50 %, capped at
+     * `maxReconnectDelay` - a classroom of 30 browsers used to hit a
+     * restarting relay 15 times a second in lockstep and come back in the
+     * same instant (round 7, item 4; test/dummy/bench-ws-reconnect-storm.ts).
+     */
     reconnectDelay?: number;
+    /** Cap on the reconnection delay in milliseconds (default: 10000) */
+    maxReconnectDelay?: number;
     /** Maximum reconnection attempts (0 = infinite, default: 0) */
     maxReconnectAttempts?: number;
     /** WebSocket protocols (optional) */

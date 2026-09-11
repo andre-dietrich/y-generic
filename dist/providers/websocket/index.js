@@ -117,6 +117,17 @@ export class WebSocketTransport {
                     this._isConnected = true;
                     this.reconnectAttempts = 0;
                     this.log(`✅ WebSocket connected to room: ${config.room}`);
+                    // y-websocket handshake: the server answers a plain SyncStep1 with
+                    // SyncStep2 (its whole document) and nothing else - the provider's
+                    // digest beacon is relayed to other clients but never answered by
+                    // the server itself, so without this a joiner never receives the
+                    // state the server already holds. Empty state vector: the transport
+                    // has no doc; the provider applies the full doc as a no-op where it
+                    // already has it (y-websocket's own client does the same on first
+                    // connect). Sent raw: no CRC header on this wire.
+                    // ponytail: full-doc pull on every (re)connect; pass the real state
+                    // vector via a Transport hint if that ever measures as too heavy.
+                    this.ws.send(new Uint8Array([0, 0, 1, 0]));
                     // Flush queued messages
                     this.flushMessageQueue();
                     resolve();

@@ -929,6 +929,7 @@ export class PeerJSTransport implements Transport {
               if (peerId !== this.coordinatorPeerId) {
                 this.knownPeers.add(peerId)
                 this.roomPeers.add(peerId)
+                this.connectToPeer(peerId)
               }
             }
 

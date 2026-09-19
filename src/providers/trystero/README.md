@@ -40,7 +40,7 @@ npm install trystero
 import * as Y from 'yjs'
 import { GenericProvider } from 'y-generic'
 import { TrysteroTransport } from 'y-generic/providers/trystero'
-import { joinRoom } from 'trystero/nostr'
+import { joinRoom, getRelaySockets } from 'trystero/nostr'
 
 // Create Yjs document
 const doc = new Y.Doc()
@@ -48,6 +48,7 @@ const doc = new Y.Doc()
 // Create Trystero transport
 const transport = new TrysteroTransport({
   joinRoom,
+  getRelaySockets, // lets the transport re-join after Trystero re-opened its relay sockets
   appId: 'my-unique-app-id', // Must be the same for all collaborators
   debug: true
 })
@@ -152,6 +153,15 @@ const transport = new TrysteroTransport({
 - **`firebaseApp`** `any` - (Firebase only) Firebase app instance
 - **`rootPath`** `string` - (Firebase only) Custom root path for matchmaking data
 - **`manualRelayReconnection`** `boolean` - (Nostr/BitTorrent only) Disable automatic reconnection
+- **`getRelaySockets`** `() => Record<string, WebSocket>` - **recommended**: the strategy module's
+  `getRelaySockets` (nostr, torrent and mqtt export it next to `joinRoom`). Trystero re-opens a relay
+  socket that closed but does not subscribe again on it - the peer keeps its links and is deaf to every
+  new offer. A phone in the background loses all its relay sockets at once. With this option the
+  transport re-joins the room once none of the sockets it joined with is left (one flapping relay out
+  of several does not count). Measured with 25 browsers: a page frozen for 20 s never connected to a
+  peer that joined afterwards, and after a relay restart nobody could join; with the option 2.5 s / 0.8 s
+- **`resumeAfterMs`** `number` - without `getRelaySockets`: re-join a few seconds after the page slept
+  this long (default: `15000`, `0` disables)
 - **`debug`** `boolean` - Enable debug logging (default: `false`)
 
 ## Additional Methods

@@ -21,11 +21,11 @@ import { log, updateStatus, updateSyncStatus } from '../shared/ui-helpers.js'
 
 // Import all Trystero strategy modules
 // @ts-ignore - importing from local minified files
-import { joinRoom as joinRoomNostr } from './trystero-nostr.min.js'
+import { joinRoom as joinRoomNostr, getRelaySockets as relaySocketsNostr } from './trystero-nostr.min.js'
 // @ts-ignore
-import { joinRoom as joinRoomTorrent } from './trystero-torrent.min.js'
+import { joinRoom as joinRoomTorrent, getRelaySockets as relaySocketsTorrent } from './trystero-torrent.min.js'
 // @ts-ignore
-import { joinRoom as joinRoomMqtt } from './trystero-mqtt.min.js'
+import { joinRoom as joinRoomMqtt, getRelaySockets as relaySocketsMqtt } from './trystero-mqtt.min.js'
 // @ts-ignore
 import { joinRoom as joinRoomIpfs } from './trystero-ipfs.min.js'
 
@@ -81,6 +81,14 @@ wss://tracker.files.fm:7073/announce`,
     relayHelp: 'IPFS node URLs for peer discovery. One URL per line.',
     defaultRelays: '',
   },
+}
+
+// The strategy's getRelaySockets, where it has one: lets the transport notice
+// that Trystero re-opened its relay sockets (it does not subscribe again).
+const STRATEGY_RELAY_SOCKETS: Partial<Record<Strategy, () => Record<string, WebSocket>>> = {
+  nostr: relaySocketsNostr,
+  torrent: relaySocketsTorrent,
+  mqtt: relaySocketsMqtt,
 }
 
 // Get joinRoom function for a strategy
@@ -253,6 +261,7 @@ async function initWithConfig(config: {
 
   const transportOptions: any = {
     joinRoom: config.joinRoom,
+    getRelaySockets: STRATEGY_RELAY_SOCKETS[config.strategy],
     appId: config.appId,
     debug: config.debug,
   }

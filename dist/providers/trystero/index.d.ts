@@ -33,7 +33,7 @@ import type { Transport, ConnectionConfig } from '../../transport';
  * Trystero room instance type.
  */
 export interface TrysteroRoom {
-    leave: () => void;
+    leave: () => void | Promise<void>;
     getPeers: () => Record<string, any>;
     onPeerJoin: (callback: (peerId: string) => void) => void;
     onPeerLeave: (callback: (peerId: string) => void) => void;
@@ -140,6 +140,33 @@ export interface TrysteroTransportOptions {
      */
     manualRelayReconnection?: boolean;
     /**
+     * The strategy module's `getRelaySockets` (nostr, torrent, mqtt export
+     * it next to `joinRoom`). Trystero re-opens a relay socket that closed
+     * but does not subscribe again on it: the peer keeps its links and goes
+     * deaf to every offer from then on. A phone in the background loses all
+     * its relay sockets at once - measured with 25 real browsers
+     * (test/e2e/room-scenarios.mjs): a page frozen for 20 s ("WebSocket
+     * connection failed: Page entered Back-Forward Cache") never connected
+     * to a peer that joined afterwards, and after a relay restart nobody
+     * could join the room any more. With this option the transport watches
+     * the sockets and, once NONE of those it joined with is left (a single
+     * flapping relay out of several does not count), leaves and re-joins the
+     * room on the re-opened sockets.
+     * @example
+     * ```typescript
+     * import { joinRoom, getRelaySockets } from 'trystero/nostr'
+     * new TrysteroTransport({ joinRoom, getRelaySockets, appId: 'my-app' })
+     * ```
+     */
+    getRelaySockets?: () => Record<string, WebSocket>;
+    /**
+     * Without `getRelaySockets`: leave and re-join the room when the page did
+     * not run for this long (ms), a few seconds after it woke up (Trystero's
+     * first socket retry takes 3.3 s). 0 disables.
+     * @default 15000
+     */
+    resumeAfterMs?: number;
+    /**
      * Enable debug logging.
      * @default false
      */
@@ -160,10 +187,24 @@ export declare class TrysteroTransport implements Transport {
     private onJoinErrorCallback?;
     private _peerConnectCallback?;
     private _peerDisconnectCallback?;
+    private _joinedSockets;
+    private _socketWatch?;
+    private _stopResumeWatch?;
+    private _rejoining;
     constructor(options: TrysteroTransportOptions);
     private log;
     get isConnected(): boolean;
     connect(config: ConnectionConfig): Promise<void>;
+    /** Join the Trystero room and wire it up - at connect() and again at every rejoin(). */
+    private joinTrysteroRoom;
+    /**
+     * Leave and join again: the only way to make Trystero subscribe again on
+     * relay sockets it re-opened (see the getRelaySockets option). Our links
+     * go with the room; GenericProvider resyncs each one as it comes back.
+     */
+    private rejoin;
+    /** None of the relay sockets we joined with is left open, and a re-opened one is: re-join on it. */
+    private checkRelaySockets;
     disconnect(): void;
     send(data: Uint8Array): Promise<void>;
     /**

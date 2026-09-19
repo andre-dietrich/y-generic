@@ -45,7 +45,7 @@ import Peer from 'simple-peer'
 
 const transport = new SimplePeerTransport({
   peer: Peer, // Pass the simple-peer constructor
-  signaling: ['wss://signaling.yjs.dev'],
+  signaling: ['wss://y-webrtc-eu.fly.dev'],
   password: 'optional-encryption',
   maxConns: 30
 })
@@ -68,11 +68,21 @@ await provider.connect({ room: 'my-room' })
 - Privacy-focused applications
 
 **Options:**
-- `signaling`: Array of signaling server URLs (default: `['wss://signaling.yjs.dev']`)
+- `signaling`: Array of signaling server URLs (default: `['wss://y-webrtc-eu.fly.dev']`,
+  y-webrtc's public server). A lost connection is re-opened with backoff; the server must
+  answer `{type:'ping'}` with `{type:'pong'}` (y-webrtc's `bin/server.js` does)
 - `password`: Optional encryption password
 - `maxConns`: Max peer connections (default: 20-35 random)
 - `peerOpts`: Options passed to simple-peer
+- `connectTimeout`: ms a peer connection may take to open before its entry is dropped (default: 30000)
+- `resumeAfterMs`: rebuild all links under a new peer id when the page did not run for this
+  long - a phone browser in the background, a suspended laptop (default: 15000, 0 disables)
 - `debug`: Enable debug logging
+
+**Phones:** a backgrounded page is suspended; its peers drop the silent link after ~30 s.
+The transport notices the sleep by its own timers, reconnects signaling, and re-joins under a
+new peer id; GenericProvider then resyncs document and presence per link. See
+`docs/superpowers/specs/2026-09-19-webrtc-mobile-resilience-research.md`.
 
 ### PeerJS Transport (Peer-to-Peer)
 
@@ -120,7 +130,20 @@ await provider.connect({ room: 'my-room' })
 - `peerOptions`: PeerJS server configuration (default: uses PeerJS Cloud)
 - `password`: Optional encryption password
 - `maxConns`: Max peer connections (default: 20-35 random)
+- `connectTimeout`: ms a data connection may take to open before its entry is dropped and
+  re-dialed (default: 30000)
+- `iceDisconnectTimeout`: ms a link may stay in ICE state `disconnected` before it is closed
+  (default: 15000) - Chrome never reports `failed` for a peer that vanished, and PeerJS closes
+  on `failed` only
+- `resumeAfterMs`: leave and re-join the room when the page did not run for this long
+  (default: 15000, 0 disables)
 - `debug`: Enable debug logging
+
+**Known limit:** peers find each other through one coordinator, the peer holding the id
+`yjs-coordinator-<room>`. When it goes silent (a phone asleep) the others elect a new one,
+but the PeerJS server keeps a dead registration for up to its `alive_timeout` (60 s): the
+existing mesh keeps working meanwhile, **new joiners wait** until the id is free. For rooms
+opened from phones prefer the simple-peer or Trystero transport.
 
 ## Coming Soon
 

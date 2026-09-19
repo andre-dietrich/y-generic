@@ -103,6 +103,22 @@ beacon (`_schedulePeerConnectSync`, debounced 50 ms) instead of a full-state `sy
 broadcast — the O(N²) full-state burst the dummy benchmark design doc describes is history;
 `test/dummy/bench-mesh-join-burst.ts` is the gate.
 
+What phones do to these transports (a suspended page: silent links dropped by the room after
+~30 s, a dead signaling socket, a wall-clock jump on resume) is covered by
+`docs/superpowers/specs/2026-09-19-webrtc-mobile-resilience-research.md`. Its gates run the real
+transports against scripted backends under plain Node - `test/providers/repro-simple-peer-sleep.ts`
+(the real simple-peer on a fake `wrtc` + fake signaling socket), `test/providers/repro-peerjs-coordinator.ts`
+(a scripted PeerJS constructor) - plus `test/dummy/bench-presence-after-relink.ts` and
+`bench-wake-false-timeout.ts` for the core; run them after touching connection lifecycle code in
+`simple-peer/`, `peerjs/` or the awareness sweep. Two real-browser E2E scripts go further than any
+fake can (`test/simple-peer/e2e-resume.mjs`, `test/peerjs/e2e-handover.mjs`: headless Chrome via
+`puppeteer-core`, real WebRTC; their headers name what they need) - the second one is what found
+that Chrome parks a vanished peer's link in ICE `disconnected` forever. Two rules they enforce: never assign
+`peer._pc.on*statechange` (simple-peer owns those properties), and a connection's `close`/`error`
+handler may only remove its own entry, never "whatever is under this peer id now".
+`src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds
+`Date.now()` far ahead of its last tick), used by both mesh transports to re-join under a new id.
+
 ### Design docs
 
 `docs/superpowers/specs/` and `docs/superpowers/plans/` contain point-in-time design/spec

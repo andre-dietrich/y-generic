@@ -72,6 +72,7 @@ export class WebSocketTransport {
         this._isConnected = false;
         this.debug = false;
         this.reconnectAttempts = 0;
+        this._everOpened = false; // the next onopen is a RE-connect
         this.intentionalDisconnect = false;
         this.messageQueue = []; // Queue messages until connected
         this.receivedBuffer = []; // Buffer messages received before callback registered
@@ -117,6 +118,8 @@ export class WebSocketTransport {
                     this._isConnected = true;
                     this.reconnectAttempts = 0;
                     this.log(`✅ WebSocket connected to room: ${config.room}`);
+                    const reopened = this._everOpened;
+                    this._everOpened = true;
                     // y-websocket handshake: the server answers a plain SyncStep1 with
                     // SyncStep2 (its whole document) and nothing else - the provider's
                     // digest beacon is relayed to other clients but never answered by
@@ -130,6 +133,13 @@ export class WebSocketTransport {
                     this.ws.send(new Uint8Array([0, 0, 1, 0]));
                     // Flush queued messages
                     this.flushMessageQueue();
+                    // A socket that came BACK (a phone out of the background, a relay
+                    // restart): the server dropped our presence when the old socket
+                    // closed, and edits made meanwhile are unsent. The provider
+                    // announces itself again and pushes what the room has not
+                    // confirmed (onPeerConnect -> _schedulePeerConnectSync).
+                    if (reopened)
+                        this._peerConnectCallback?.('server');
                     resolve();
                 };
                 this.ws.onmessage = (event) => {
@@ -195,6 +205,20 @@ export class WebSocketTransport {
     /**
      * Register message callback
      */
+    /**
+     * Transport.onPeerConnect: fires when the socket to the server re-opens
+     * after a drop (never for the first connect - connect()'s own syncNow()
+     * covers that). Without it the provider never learned of a reconnect:
+     * the server had removed our presence with the old socket, and the room
+     * listed us again only with our next presence renewal, up to a lease
+     * later (test/dummy/e2e-edrys-ws.ts, check 4).
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        return () => {
+            this._peerConnectCallback = undefined;
+        };
+    }
     onMessage(callback) {
         this.messageCallback = callback;
         // Flush any buffered messages that arrived before callback was registered

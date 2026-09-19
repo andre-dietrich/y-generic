@@ -72,6 +72,15 @@ await provider.connect({
 
 **Why?** GenericProvider's `MESSAGE_SYNC_VERIFIED` (type 3) conflicts with y-websocket's `messageQueryAwareness` (type 3). Setting `verifyUpdates: false` uses standard sync messages (type 0) that are compatible.
 
+`verifyUpdates: false` is also what tells GenericProvider that the server keeps **its own copy of the
+document** (it applies plain sync messages and broadcasts what changed, and relays everything else
+unread). In this mode a document update always travels alone (never batched with a cursor), the
+server's SyncStep1 is answered at once, and the presence table is not relayed by peers - each of
+these was a way to leave the server's copy with a hole, after which typed text reached nobody
+(`test/dummy/e2e-edrys-ws.ts`, `test/e2e/room-scenarios.mjs`). After a dropped socket re-opens, the
+transport tells the provider (`onPeerConnect`), which announces its presence again and pushes what
+the room has not confirmed.
+
 ### With Auto-reconnect
 
 ```typescript

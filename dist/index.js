@@ -1320,6 +1320,12 @@ export class GenericProvider extends Observable {
         if (present.length > 0) {
             awarenessProtocol.removeAwarenessStates(this.awareness, present, 'peer-left');
         }
+        // Our last link just went: that says something about US (a resume, our
+        // network), nothing about the room. The removal broadcast queued above
+        // would go out over the links we get back first, naming everybody we
+        // have not re-learned by then.
+        if (this._peerAddress.size === 0)
+            this._cancelPendingAwarenessRemoval();
     }
     /** Cached delete-set hash - see computeDeleteSetHash(). */
     _deleteSetHash() {
@@ -1377,6 +1383,13 @@ export class GenericProvider extends Observable {
                     this._sendToTransport(frame, id);
                 return;
             }
+            // No unicast: a relay whose socket re-opened (WebSocketTransport), or a
+            // mesh without sendTo. Same reason for the bump as above - the
+            // server removed our presence when the old socket closed, at the
+            // clock we would re-send.
+            const state = this.awareness.getLocalState();
+            if (state !== null && this._ownsAwareness)
+                this.awareness.setLocalState(state);
             this._syncNow(0);
         }, this._peerConnectDebounceMs);
     }
@@ -1699,7 +1712,22 @@ export class GenericProvider extends Observable {
                 // there's no "someone else" to rely on, so reply immediately
                 // (still rate-limited via _sendSyncReply() as a hard backstop).
                 if (encoding.length(encoder) > 1) {
-                    this._replyToSyncRequest(encoding.toUint8Array(encoder));
+                    if (!this._verifyUpdates) {
+                        // A plain SyncStep1 in y-websocket mode is the SERVER asking for
+                        // what its own copy of the document lacks (peers ask with
+                        // digests). Nobody overhears that answer, so the suppression
+                        // had nothing to thin - but it delayed the reply and then
+                        // cancelled it when the server's own SyncStep2 (its answer to
+                        // the transport's handshake) arrived: with 3+ clients nobody
+                        // refilled a restarted server's doc, and every later update
+                        // stayed pending there, never broadcast (e2e-edrys-ws check 5).
+                        // The reply is a diff against the server's state vector: a few
+                        // bytes when the server is up to date.
+                        this._send(encoding.toUint8Array(encoder));
+                    }
+                    else {
+                        this._replyToSyncRequest(encoding.toUint8Array(encoder));
+                    }
                 }
                 break;
             }
@@ -1734,7 +1762,29 @@ export class GenericProvider extends Observable {
                     if (id !== this.doc.clientID)
                         this._knownPeers.set(id, heardAt);
                 }
-                awarenessProtocol.applyAwarenessUpdate(this.awareness, payload, this);
+                // Somebody ELSE says a peer is gone that we hold a live link to: on
+                // a transport that reports link closes the link is the better
+                // witness. A peer that lost all its links (a phone resuming - the
+                // mesh transports rebuild under a new id) took every
+                // onPeerDisconnect for a departure and broadcast the removal of
+                // whoever it had not re-learned yet; the room dropped those peers
+                // at their unchanged clock although nobody's link to them had gone
+                // down - with 25 real browsers, bystanders ended up in 8 of 25
+                // rosters (test/e2e/room-scenarios.mjs,
+                // test/dummy/bench-resume-roster.ts). A peer's own goodbye (its
+                // address is the sender) and our own link's close still remove it.
+                let update = payload;
+                if (from !== undefined &&
+                    scan.removed.length > 0 &&
+                    typeof this.transport.onPeerDisconnect === 'function') {
+                    const vetoed = scan.removed.filter((id) => {
+                        const address = this._peerAddress.get(id);
+                        return address !== undefined && address !== from && id !== this.doc.clientID;
+                    });
+                    if (vetoed.length > 0)
+                        update = this._withoutAwarenessEntries(payload, vetoed);
+                }
+                awarenessProtocol.applyAwarenessUpdate(this.awareness, update, this);
                 break;
             }
             case MESSAGE_PUBSUB: {
@@ -2037,7 +2087,14 @@ export class GenericProvider extends Observable {
         // Needs a view of the room: in a fresh burst the first JOIN arrives
         // before any peer is known, everyone would rank first and relay a
         // table each - the broadcast fallback is right for that case.
-        const relayer = !this._canUnicast(requester) &&
+        // Not in y-websocket mode (verifyUpdates:false): such a server books
+        // every awareness entry to the connection it arrived on and removes
+        // them all when that socket closes - a relayer's socket dying (a phone
+        // in the background) took the bystanders it had once relayed out of
+        // every roster (test/e2e/room-scenarios.mjs, websocket, 'sleep'). The
+        // server hands a joiner the whole table itself anyway.
+        const relayer = this._verifyUpdates &&
+            !this._canUnicast(requester) &&
             this._knownPeers.size >= 3 &&
             this._responderRank(0, 1) === 0;
         const delay = relayer ? 0 : Math.min(500, Math.max(100, rtt === null ? 0 : 2 * rtt));
@@ -2661,6 +2718,27 @@ export class GenericProvider extends Observable {
      * wire-message level, before `applyAwarenessUpdate()` runs - see the
      * `MESSAGE_AWARENESS` case's comment for why timing matters here.
      */
+    /** Re-encode an awareness update without the entries of `drop` (same hand-decoded format as below). */
+    _withoutAwarenessEntries(payload, drop) {
+        const d = decoding.createDecoder(payload);
+        const len = decoding.readVarUint(d);
+        const keep = [];
+        for (let i = 0; i < len; i++) {
+            const clientID = decoding.readVarUint(d);
+            const clock = decoding.readVarUint(d);
+            const json = decoding.readVarString(d);
+            if (!drop.includes(clientID))
+                keep.push([clientID, clock, json]);
+        }
+        const e = encoding.createEncoder();
+        encoding.writeVarUint(e, keep.length);
+        for (const [clientID, clock, json] of keep) {
+            encoding.writeVarUint(e, clientID);
+            encoding.writeVarUint(e, clock);
+            encoding.writeVarString(e, json);
+        }
+        return encoding.toUint8Array(e);
+    }
     _scanAwarenessPayload(payload) {
         const removed = [];
         const present = [];
@@ -3007,7 +3085,24 @@ export class GenericProvider extends Observable {
      * number and document hash for ordering and desync detection.
      */
     _sendUpdate(update) {
-        this._sendBatch([this._encodeUpdate(update), ...this._takePendingAwareness()]);
+        const awareness = this._takePendingAwareness();
+        if (!this._verifyUpdates) {
+            // verifyUpdates:false is the mode for y-websocket style servers, which
+            // keep their OWN copy of the document: they apply a plain sync
+            // message (opcode 0) to it and broadcast what changed, and relay
+            // everything else unread. A keystroke that rode in a MESSAGE_BATCH
+            // with the cursor reached the peers but not the server's doc; every
+            // later plain update depended on it, stayed pending there and was
+            // never broadcast - with a cursor in the awareness state, typed text
+            // reached nobody (test/dummy/e2e-edrys-ws.ts, check 3; found with 25
+            // browsers in test/e2e/room-scenarios.mjs). Here a document update
+            // always travels alone.
+            this._send(this._encodeUpdate(update));
+            for (const message of awareness)
+                this._send(message);
+            return;
+        }
+        this._sendBatch([this._encodeUpdate(update), ...awareness]);
     }
     /**
      * Send awareness update to the transport.

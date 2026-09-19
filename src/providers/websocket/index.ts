@@ -104,6 +104,8 @@ export class WebSocketTransport implements Transport {
   private _isConnected: boolean = false
   private debug: boolean = false
   private reconnectAttempts: number = 0
+  private _everOpened: boolean = false // the next onopen is a RE-connect
+  private _peerConnectCallback?: (peerId: string) => void
   private reconnectTimer?: ReturnType<typeof setTimeout>
   private intentionalDisconnect: boolean = false
   private messageQueue: Uint8Array[] = [] // Queue messages until connected
@@ -158,6 +160,8 @@ export class WebSocketTransport implements Transport {
           this._isConnected = true
           this.reconnectAttempts = 0
           this.log(`✅ WebSocket connected to room: ${config.room}`)
+          const reopened = this._everOpened
+          this._everOpened = true
 
           // y-websocket handshake: the server answers a plain SyncStep1 with
           // SyncStep2 (its whole document) and nothing else - the provider's
@@ -173,6 +177,13 @@ export class WebSocketTransport implements Transport {
 
           // Flush queued messages
           this.flushMessageQueue()
+
+          // A socket that came BACK (a phone out of the background, a relay
+          // restart): the server dropped our presence when the old socket
+          // closed, and edits made meanwhile are unsent. The provider
+          // announces itself again and pushes what the room has not
+          // confirmed (onPeerConnect -> _schedulePeerConnectSync).
+          if (reopened) this._peerConnectCallback?.('server')
 
           resolve()
         }
@@ -251,6 +262,21 @@ export class WebSocketTransport implements Transport {
   /**
    * Register message callback
    */
+  /**
+   * Transport.onPeerConnect: fires when the socket to the server re-opens
+   * after a drop (never for the first connect - connect()'s own syncNow()
+   * covers that). Without it the provider never learned of a reconnect:
+   * the server had removed our presence with the old socket, and the room
+   * listed us again only with our next presence renewal, up to a lease
+   * later (test/dummy/e2e-edrys-ws.ts, check 4).
+   */
+  onPeerConnect(callback: (peerId: string) => void): () => void {
+    this._peerConnectCallback = callback
+    return () => {
+      this._peerConnectCallback = undefined
+    }
+  }
+
   onMessage(callback: (data: Uint8Array) => void): () => void {
     this.messageCallback = callback
 

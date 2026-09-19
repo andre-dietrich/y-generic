@@ -59,6 +59,8 @@ export declare class WebSocketTransport implements Transport {
     private _isConnected;
     private debug;
     private reconnectAttempts;
+    private _everOpened;
+    private _peerConnectCallback?;
     private reconnectTimer?;
     private intentionalDisconnect;
     private messageQueue;
@@ -79,6 +81,15 @@ export declare class WebSocketTransport implements Transport {
     /**
      * Register message callback
      */
+    /**
+     * Transport.onPeerConnect: fires when the socket to the server re-opens
+     * after a drop (never for the first connect - connect()'s own syncNow()
+     * covers that). Without it the provider never learned of a reconnect:
+     * the server had removed our presence with the old socket, and the room
+     * listed us again only with our next presence renewal, up to a lease
+     * later (test/dummy/e2e-edrys-ws.ts, check 4).
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     onMessage(callback: (data: Uint8Array) => void): () => void;
     /**
      * Handle incoming WebSocket message

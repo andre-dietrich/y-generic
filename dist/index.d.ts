@@ -932,6 +932,8 @@ export declare class GenericProvider extends Observable<string> {
      * wire-message level, before `applyAwarenessUpdate()` runs - see the
      * `MESSAGE_AWARENESS` case's comment for why timing matters here.
      */
+    /** Re-encode an awareness update without the entries of `drop` (same hand-decoded format as below). */
+    private _withoutAwarenessEntries;
     private _scanAwarenessPayload;
     /**
      * Trim a pending suppressed removal broadcast by `removedClientIds` -

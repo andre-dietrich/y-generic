@@ -4,7 +4,9 @@
 
 Research **and implementation** on branch `round-8` from `main` @ 209a103
 (2026-09-19), one commit per component (simple-peer, peerjs, core), version
-1.6.0. André's report: a phone browser joins a room over WebRTC;
+1.6.0 - and a second pass the same day with 25 real browsers per transport
+(WebSocket included), seven more findings, version 1.7.0: see "Second pass"
+below. André's report: a phone browser joins a room over WebRTC;
 another app comes to the front or the display goes off; the link breaks,
 and coming back to the room is unreliable. Asked for: walk through every
 WebRTC connection path (transport and core), find out what y-webrtc does
@@ -92,6 +94,65 @@ because it leaves simple-peer's failure detection intact, its signaling
 socket reconnects by itself (lib0 `WebsocketClient`), and it re-announces
 the moment a peer closes. S1, S3 and S4 are regressions against it, not
 missing features.
+
+## Second pass: 25 peers in a real browser (v1.7.0)
+
+André, after the v1.6.0 commits: "with how many peers did you test?" - three,
+at most. `test/e2e/room-scenarios.mjs` now runs each WebRTC transport and the
+WebSocket transport as a **classroom: 25 Chrome contexts** (isolated, one
+renderer each, local servers: y-webrtc's signaling server, a PeerJS server,
+a minimal NIP-01 relay for Trystero's nostr strategy, the edrys y-websocket
+relay) through seven scenarios: join, five peers typing at once, a killed tab,
+five pages frozen for 20 s (Chrome closes a frozen page's WebSockets: "Page
+entered Back-Forward Cache" - the closest a desktop gets to a backgrounded
+phone), a reload, a server restart with a new peer joining afterwards, and
+(peerjs) the coordinator's tab killed. `DIAG=1` names who is missing from
+whose roster.
+
+Every failure below was invisible with two or three peers. None of them is a
+regression of round 8 - except that F2 had a self-healing path which the
+round-8 presence bump closed (which is how it became permanent and visible).
+
+| # | Transport | Found at 25 peers | Cause | After the fix |
+|---|---|---|---|---|
+| F1 | simple-peer, peerjs | one peer ended with 20 of 24 links and missing from 4 rosters - at join, no churn needed | `maxConns` defaulted to 20-34 (y-webrtc's value). y-webrtc re-broadcasts what it receives, so a partial mesh works there; GenericProvider needs a FULL mesh (nobody relays). A room of 21+ peers lost pairs | default 64, documented as "every peer of the room must fit": 24 links everywhere |
+| F2 | core (mesh) | after five peers resumed at once, bystanders that had nothing to do with it were left in 8 of 25 rosters, for good; final rosters 15-21 of 25, the document identical throughout | a peer that drops all its links itself (resume) took each onPeerDisconnect for a departure and, ~1 s later, broadcast the removal of everyone it had not re-learned yet; receivers held those peers at the same clock and dropped them, although their own links to them were fine | a removal claimed by a third party is ignored for a peer we hold a live link to (transports that report link closes); a peer whose LAST link went cancels its removal broadcast. `bench-resume-roster`: 8 foreign roster entries lost, one roster stuck at 2 of 10 -> 0 lost, all complete. E2E: all rosters complete 2.1 s after the unfreeze, full mesh |
+| F3 | trystero | a page that had been frozen never connected to a peer that joined afterwards (18 of 24 rosters); after a relay restart nobody could join at all (0 links) | Trystero re-opens a relay socket that closed but does not send its subscriptions (REQ) again: the peer keeps its links and is deaf to every new offer. A phone in the background loses all relay sockets at once | new option `getRelaySockets` (the strategy module exports it): once none of the sockets we joined with is left, leave and re-join the room. Reload after a freeze: never -> 2.5 s; join after a relay restart: never -> 0.8 s |
+| F4 | websocket (y-websocket style server) | typed text reached NOBODY as soon as the awareness state held a cursor (1 of 25 editors) | `verifyUpdates:false` servers keep their own copy of the document: they apply plain sync messages and broadcast what changed, and relay everything else unread. The first keystroke rode in a MESSAGE_BATCH with the cursor (round 5, item 1) - relayed, never applied to the server's doc; every later plain update depended on it, stayed pending there and was never broadcast | in this mode a document update always travels alone. `e2e-edrys-ws` check 3: NO ("t") -> YES; E2E: 60 concurrent characters everywhere after 23 ms |
+| F5 | websocket | after a relay restart, text typed afterwards reached nobody (90 s watched) | the restarted server asks every client for its state with a plain SyncStep1; with 3+ clients the reply was delayed by the reply suppression and then cancelled by the server's own (empty) SyncStep2 - nobody refilled the server's doc | in this mode a plain SyncStep1 is answered at once, unsuppressed (a diff against the server's state vector). Check 5: never -> 50 ms; E2E: 19 ms |
+| F6 | websocket | after a socket dropped and re-opened (frozen page, phone) the peer stayed out of the rosters for up to a lease (> 120 s in the playground) | the server removed its presence with the old socket; the transport reconnected by itself and the provider never learned of it, so it re-sent its state at the clock the room had just seen removed | `WebSocketTransport.onPeerConnect` fires on every RE-open; the provider bumps its clock, announces itself and pushes what the room has not confirmed. Check 4: 14.8 s -> 1.4-2.7 s; E2E: 2.8 s |
+| F7 | websocket | bystanders dropped out of 23 rosters for a few seconds when a frozen peer's socket closed | the server books every awareness entry to the connection it arrived on and removes them all with it; a peer that had once relayed the whole presence table for a joiner (phase 1e) "owned" those users | no presence-table relay in this mode (the server hands a joiner the table itself) |
+
+Found on the way, in the harness, not the library: five cursors typing at the
+same spot interleave their runs - the editor, not a loss; the typing scenario
+counts characters.
+
+Results on the final code, 25 peers (ms; "rosters" = every peer lists every
+other peer):
+
+| Scenario | simple-peer | peerjs | trystero | websocket |
+|---|---|---|---|---|
+| join: rosters complete / links per peer | 37 / 24 | 1,921 / 24 | 434 / 24 | 405 / - |
+| 60 characters of 5 concurrent typists everywhere | 39 | 76 | 971 | 23 |
+| killed tab dropped from every roster | 17,217 | 22,253 | 7,053 | 454 |
+| 5 pages frozen 20 s: missed text / rosters complete | 125 / 2,308 (5 of 5 resumed) | 138 / 1,777 (5 of 5 resumed) | 67 / 85 (re-join follows within seconds) | 2,834 / 2,841 |
+| reload: rosters complete | 467 | 958 | 1,945 | 548 |
+| server restart: new text everywhere / new peer in every roster | 33 / 733 | 20 / 1,221 | 27 / 1,128 | 19 / 775 |
+| coordinator killed: dropped / new peer in, rosters complete | - | 23,050 / 24,770 after the kill | - | - |
+| final: editors identical, rosters, links | yes, 25/25, 24 | yes, 25/25, 24 | yes, 25/25, 24 | yes, 25/25, - |
+
+Regression gates of the core changes (v1.6.0 -> now): `bench-mesh-join-burst`
+251 / 1,076 / 2,304 -> 269 / 1,057 / 2,217 messages, `allSynced` everywhere;
+`bench-reconnect-push` 3-4 deliveries per reconnect in both; all repros and
+benches of the first pass unchanged (`bench-presence-after-relink` 78 ms,
+`bench-wake-false-timeout` 0 lost). No wire-format change.
+
+Still not tested: a real phone, any browser but Chrome, the public
+infrastructure (PeerJS cloud, public Nostr relays - a room of 25 against
+somebody else's servers is not a test to run casually), rooms larger than 25.
+For the edrys fork (`dev`): F4-F7 are in the path it uses - its `syncMode:
+'pull'` and app-awareness opcode differ from `main`, so they want a run of
+`room-scenarios.mjs websocket` on that branch.
 
 > Everything from here on describes the code **as found** (`main` @ 209a103,
 > before the fixes); line numbers and the quoted repro output refer to that

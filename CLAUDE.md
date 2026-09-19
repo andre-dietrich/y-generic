@@ -113,7 +113,13 @@ transports against scripted backends under plain Node - `test/providers/repro-si
 `simple-peer/`, `peerjs/` or the awareness sweep. Two real-browser E2E scripts go further than any
 fake can (`test/simple-peer/e2e-resume.mjs`, `test/peerjs/e2e-handover.mjs`: headless Chrome via
 `puppeteer-core`, real WebRTC; their headers name what they need) - the second one is what found
-that Chrome parks a vanished peer's link in ICE `disconnected` forever. Two rules they enforce: never assign
+that Chrome parks a vanished peer's link in ICE `disconnected` forever.
+`test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket>` runs a classroom-sized room
+(25 Chrome contexts, local servers) through join / concurrent typing / a killed tab / five frozen
+pages / a reload / a server restart / (peerjs) a killed coordinator; `DIAG=1` names who is missing
+from whose roster. Every failure it found was invisible with 2-3 peers: `maxConns` cutting the mesh,
+a resuming peer's removal broadcast emptying bystanders' rosters, Trystero not re-subscribing, and
+three ways `verifyUpdates:false` (y-websocket mode) left a hole in the server's copy of the document. Two rules they enforce: never assign
 `peer._pc.on*statechange` (simple-peer owns those properties), and a connection's `close`/`error`
 handler may only remove its own entry, never "whatever is under this peer id now".
 `src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds

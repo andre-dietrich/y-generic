@@ -1690,8 +1690,22 @@ export class GenericProvider extends Observable<string> {
     const arm = () => {
       this._awarenessSweepId = setTimeout(tick, (lease / 10) * (0.8 + Math.random() * 0.4))
     }
+    // A tick that is late by a good part of the lease AND finds expired
+    // peers ran on a page that slept (a phone in the background, a
+    // suspended laptop): Date.now() jumped, and nobody could renew into a
+    // suspended page. A tab whose timers are merely throttled keeps
+    // receiving renewals and finds nothing expired. Expiring them was
+    // wrong for the room, not just for us: the removal broadcast made every
+    // bystander drop every other bystander - 297 roster entries lost and
+    // 378 deliveries for one phone waking up in a 10-peer room
+    // (test/dummy/bench-wake-false-timeout.ts). Instead: one more lease,
+    // and ask the room (a JOIN beacon: presence, and our offline edits).
+    let lastTick = Date.now()
     const tick = () => {
       const now = Date.now()
+      const slept = now - lastTick - (lease / 10) * 1.2 >= lease / 4
+      lastTick = now
+      let woke = false
       if (this._ownsAwareness) {
         const mine = this.awareness.meta.get(this.doc.clientID)
         if (
@@ -1712,7 +1726,10 @@ export class GenericProvider extends Observable<string> {
             remove.push(clientID)
           }
         })
-        if (remove.length > 0) {
+        if (remove.length > 0 && slept) {
+          for (const id of remove) this.awareness.meta.get(id)!.lastUpdated = now
+          woke = true
+        } else if (remove.length > 0) {
           awarenessProtocol.removeAwarenessStates(this.awareness, remove, 'timeout')
         }
       }
@@ -1726,11 +1743,16 @@ export class GenericProvider extends Observable<string> {
       // y-protocols: it holds the clock a late message is checked against.
       for (const [id, heardAt] of this._knownPeers) {
         if (lease <= now - heardAt) {
+          if (slept) {
+            this._knownPeers.set(id, now) // same grace as above
+            continue
+          }
           this._knownPeers.delete(id)
           this._peerAddress.delete(id)
           this._remoteSeqInfo.delete(id)
         }
       }
+      if (woke && this.transport.isConnected && !this._destroying) this.syncNow()
       // Re-arm only while connected: a disconnect() from inside a listener
       // above has just cleared the timer, and must stay cleared.
       if (!this._destroying && this._status.state === 'connected') arm()
@@ -1808,8 +1830,29 @@ export class GenericProvider extends Observable<string> {
         // the rest of the mesh. Not rate-limited as a request: it answers
         // a channel that just opened, and the peer's own JOIN beacon is
         // the fallback if it is lost.
-        const beacon = wrapMessageWithChecksum(this._encodeSyncStep1(0))
-        for (const id of ids) this._sendToTransport(beacon, id)
+        //
+        // Our presence rides in the same frame (no extra delivery). A link
+        // that re-opens - a phone back from the background, a WiFi -> LTE
+        // switch - belongs to a peer that dropped our state when the link
+        // died ('peer-left') but kept our clock, and y-protocols ignores a
+        // state at an equal clock: the document healed in ~100 ms, the
+        // roster only with our next clock bump, 0.5-1.5 leases later
+        // (test/dummy/bench-presence-after-relink.ts). Hence the bump. On a
+        // real mesh it is also the first presence a joiner's peers get: its
+        // JOIN beacon went out at connect(), before any channel was open.
+        // Only on an awareness we own - an app-supplied one renews through
+        // y-protocols every 15 s, and its 'update' listener would turn the
+        // bump into a room-wide broadcast.
+        const messages = [this._encodeSyncStep1(0)]
+        const state = this.awareness.getLocalState()
+        if (state !== null) {
+          if (this._ownsAwareness) this.awareness.setLocalState(state) // equal state: no 'change', no broadcast
+          messages.push(this._encodeAwareness([this.doc.clientID]))
+        }
+        const frame = wrapMessageWithChecksum(
+          messages.length === 1 ? messages[0] : this._encodeBatch(messages),
+        )
+        for (const id of ids) this._sendToTransport(frame, id)
         return
       }
       this._syncNow(0)

@@ -41,6 +41,8 @@
     "test/dummy/bench-ws-reconnect-storm.ts",
     "test/dummy/bench-gun-awareness-replay.ts",
     "test/dummy/bench-persist-log.ts",
+    "test/dummy/bench-presence-after-relink.ts",
+    "test/dummy/bench-wake-false-timeout.ts",
     "test/providers/check-chunking.ts",
     "test/providers/repro-simple-peer-sleep.ts",
     "test/providers/repro-peerjs-coordinator.ts",

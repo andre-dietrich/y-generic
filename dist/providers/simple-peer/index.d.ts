@@ -70,7 +70,10 @@ export interface SimplePeerTransportOptions {
     /**
      * Array of signaling server URLs for peer discovery.
      * Signaling servers are only used to discover peers, not for data transfer.
-     * @default ['wss://signaling.yjs.dev']
+     * A lost connection is re-opened with exponential backoff; the server
+     * must answer `{type:'ping'}` with `{type:'pong'}` (y-webrtc's does) or
+     * publish something at least every 30 s, else the socket counts as dead.
+     * @default ['wss://y-webrtc-eu.fly.dev'] (y-webrtc's public server)
      */
     signaling?: string[];
     /**
@@ -110,6 +113,22 @@ export interface SimplePeerTransportOptions {
      */
     peerOpts?: Record<string, any>;
     /**
+     * How long (ms) a peer connection may take to open. An entry that is not
+     * connected by then is dropped, so the peer's next announce gets a fresh
+     * attempt - an unanswered offer has no failure event of its own.
+     * @default 30000
+     */
+    connectTimeout?: number;
+    /**
+     * Rebuild all links under a new peer id when the page did not run for
+     * this long (ms) - a phone browser in the background, a suspended
+     * laptop. The other side dropped a silent link after ~30 s, this side
+     * would still read it as connected for ~30 s after waking up.
+     * 0 disables.
+     * @default 15000
+     */
+    resumeAfterMs?: number;
+    /**
      * Enable debug logging.
      * @default false
      */
@@ -131,6 +150,11 @@ export declare class SimplePeerTransport implements Transport {
     private signalingConns;
     private announcedPeers;
     private announceInterval?;
+    private _shouldConnect;
+    private signalingAttempts;
+    private signalingTimers;
+    private _stopResumeWatch?;
+    private _resetting;
     /**
      * Create a new SimplePeer transport.
      *
@@ -141,6 +165,18 @@ export declare class SimplePeerTransport implements Transport {
      * Connect to the room via signaling servers and start discovering peers.
      */
     connect(config: ConnectionConfig): Promise<void>;
+    /**
+     * The page slept (see watchResume): every link is dead on the other side
+     * or about to be, and the room holds dead entries under our peer id that
+     * would swallow our announces until their ICE times out. Start over
+     * under a new id - no entry anywhere matches it - and with fresh
+     * signaling sockets (the old ones may be half-open); their onopen
+     * subscribes and announces. GenericProvider resyncs each link as it
+     * opens (onPeerConnect).
+     */
+    private handleResume;
+    /** Publish our peer id to the room on every open signaling connection. */
+    private announce;
     /**
      * Disconnect from all peers and signaling servers.
      */
@@ -187,6 +223,15 @@ export declare class SimplePeerTransport implements Transport {
      * Connect to a signaling server.
      */
     private connectSignaling;
+    /**
+     * Re-open a signaling connection that closed while we should be
+     * connected - a phone's OS closes the socket of a backgrounded page, and
+     * without it the transport can neither announce nor receive offers
+     * (repro-simple-peer-sleep, part 3). Same curve as WebSocketTransport
+     * (round 7, item 4): doubling from 1 s, +-50 % jitter, capped at 10 s.
+     * onopen subscribes and announces again.
+     */
+    private scheduleSignalingReconnect;
     /**
      * Handle messages from signaling server.
      */

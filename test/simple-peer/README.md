@@ -22,7 +22,7 @@ This demo tests peer-to-peer synchronization using SimplePeer transport (WebRTC 
    
    const transport = new SimplePeerTransport({
      peer: Peer, // Pass the simple-peer constructor
-     signaling: ['wss://signaling.yjs.dev'],
+     signaling: ['wss://y-webrtc-eu.fly.dev'],
      iceServers: [
        { urls: 'stun:stun.l.google.com:19302' },
        {
@@ -50,7 +50,7 @@ This demo tests peer-to-peer synchronization using SimplePeer transport (WebRTC 
 
 ## How It Works
 
-1. **Signaling**: Uses `signaling.yjs.dev` for peer discovery only
+1. **Signaling**: Uses `y-webrtc-eu.fly.dev` for peer discovery only
 2. **WebRTC**: Actual document data transfers directly between peers via WebRTC data channels (powered by simple-peer library)
 3. **Mesh Network**: Each peer connects to multiple others for resilience
 4. **No Central Server**: After initial signaling, all sync happens peer-to-peer
@@ -83,7 +83,7 @@ This demo tests peer-to-peer synchronization using SimplePeer transport (WebRTC 
 
 Signaling servers are used for peer discovery only (not for data transfer).
 
-**Default**: `wss://signaling.yjs.dev`, `wss://0.peerjs.com/peerjs`
+**Default**: `wss://y-webrtc-eu.fly.dev`, `wss://0.peerjs.com/peerjs`
 
 **In the UI**: Click "⚙️ WebRTC Configuration" to configure signaling servers in the browser.
 
@@ -92,7 +92,7 @@ Signaling servers are used for peer discovery only (not for data transfer).
 const transport = new SimplePeerTransport({
   peer: SimplePeer,
   signaling: [
-    'wss://signaling.yjs.dev',
+    'wss://y-webrtc-eu.fly.dev',
     'wss://y-webrtc-signaling-eu.herokuapp.com',
     // Add your own signaling server
   ]
@@ -113,7 +113,7 @@ STUN servers help establish direct peer connections through NAT.
 ```typescript
 const transport = new SimplePeerTransport({
   peer: SimplePeer,
-  signaling: ['wss://signaling.yjs.dev'],
+  signaling: ['wss://y-webrtc-eu.fly.dev'],
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -134,7 +134,7 @@ TURN servers relay traffic when direct connections fail (e.g., behind strict fir
 ```typescript
 const transport = new SimplePeerTransport({
   peer: SimplePeer,
-  signaling: ['wss://signaling.yjs.dev'],
+  signaling: ['wss://y-webrtc-eu.fly.dev'],
   iceServers: [
     // STUN servers (no auth required)
     { urls: 'stun:stun.l.google.com:19302' },

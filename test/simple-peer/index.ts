@@ -69,7 +69,7 @@ const defaultConfig: {
   iceServers: IceServer[]
 } = {
   // Use official y-webrtc signaling server (most reliable)
-  signaling: ['wss://signaling.yjs.dev'],
+  signaling: ['wss://y-webrtc-eu.fly.dev'],
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
@@ -244,7 +244,7 @@ function populateConfigForm(): void {
       'turn-servers',
     ) as HTMLTextAreaElement
 
-    signalingInput.value = 'wss://signaling.yjs.dev\nwss://0.peerjs.com/peerjs'
+    signalingInput.value = 'wss://y-webrtc-eu.fly.dev\nwss://0.peerjs.com/peerjs'
     stunInput.value =
       'stun:stun.l.google.com:19302\nstun:stun1.l.google.com:19302'
     turnInput.value = ''

@@ -42,6 +42,7 @@
     "test/dummy/bench-gun-awareness-replay.ts",
     "test/dummy/bench-persist-log.ts",
     "test/providers/check-chunking.ts",
+    "test/providers/repro-simple-peer-sleep.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

@@ -30,6 +30,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
+import { watchResume } from '../resume'
 
 /**
  * SimplePeer constructor type (from simple-peer library).
@@ -74,7 +75,10 @@ export interface SimplePeerTransportOptions {
   /**
    * Array of signaling server URLs for peer discovery.
    * Signaling servers are only used to discover peers, not for data transfer.
-   * @default ['wss://signaling.yjs.dev']
+   * A lost connection is re-opened with exponential backoff; the server
+   * must answer `{type:'ping'}` with `{type:'pong'}` (y-webrtc's does) or
+   * publish something at least every 30 s, else the socket counts as dead.
+   * @default ['wss://y-webrtc-eu.fly.dev'] (y-webrtc's public server)
    */
   signaling?: string[]
 
@@ -119,6 +123,24 @@ export interface SimplePeerTransportOptions {
   peerOpts?: Record<string, any>
 
   /**
+   * How long (ms) a peer connection may take to open. An entry that is not
+   * connected by then is dropped, so the peer's next announce gets a fresh
+   * attempt - an unanswered offer has no failure event of its own.
+   * @default 30000
+   */
+  connectTimeout?: number
+
+  /**
+   * Rebuild all links under a new peer id when the page did not run for
+   * this long (ms) - a phone browser in the background, a suspended
+   * laptop. The other side dropped a silent link after ~30 s, this side
+   * would still read it as connected for ~30 s after waking up.
+   * 0 disables.
+   * @default 15000
+   */
+  resumeAfterMs?: number
+
+  /**
    * Enable debug logging.
    * @default false
    */
@@ -161,7 +183,7 @@ const MSG_TYPE_CHUNKED = 0x01
 let messageIdCounter = 0
 
 interface SignalingMessage {
-  type: 'announce' | 'signal' | 'subscribe' | 'publish'
+  type: 'announce' | 'signal' | 'subscribe' | 'publish' | 'ping' | 'pong'
   from?: string
   to?: string
   signal?: any
@@ -180,6 +202,8 @@ export class SimplePeerTransport implements Transport {
     password: string
     maxConns: number
     peerOpts: Record<string, any>
+    connectTimeout: number
+    resumeAfterMs: number
     debug: boolean
   }
   private _connected: boolean = false
@@ -192,6 +216,13 @@ export class SimplePeerTransport implements Transport {
   private signalingConns: WebSocket[] = []
   private announcedPeers: Set<string> = new Set()
   private announceInterval?: ReturnType<typeof setInterval>
+  // Signaling reconnect: true between connect() and disconnect(); failed
+  // attempts and the pending retry timer per server URL.
+  private _shouldConnect: boolean = false
+  private signalingAttempts: Map<string, number> = new Map()
+  private signalingTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
+  private _stopResumeWatch?: () => void
+  private _resetting: boolean = false // handleResume(): removePeer() must not announce the old id
 
   /**
    * Create a new SimplePeer transport.
@@ -226,10 +257,12 @@ export class SimplePeerTransport implements Transport {
 
     this.options = {
       peer: options.peer,
-      signaling: options.signaling ?? ['wss://signaling.yjs.dev'],
+      signaling: options.signaling ?? ['wss://y-webrtc-eu.fly.dev'],
       password: options.password ?? '',
       maxConns: options.maxConns ?? 20 + Math.floor(Math.random() * 15),
       peerOpts,
+      connectTimeout: options.connectTimeout ?? 30000,
+      resumeAfterMs: options.resumeAfterMs ?? 15000,
       debug: options.debug ?? false,
     }
 
@@ -252,6 +285,7 @@ export class SimplePeerTransport implements Transport {
     }
 
     this._room = config.room
+    this._shouldConnect = true
     this.log(`🔌 Connecting to room "${config.room}" as ${this.peerId}`)
 
     // Try to connect to signaling servers
@@ -291,32 +325,62 @@ export class SimplePeerTransport implements Transport {
     )
 
     // Start periodic re-announce to help late joiners discover us
-    this.announceInterval = setInterval(() => {
-      if (
-        this.peers.size < this.options.maxConns &&
-        this.signalingConns.length > 0
-      ) {
-        this.log('Re-announcing presence...')
-        for (const ws of this.signalingConns) {
-          this.sendSignaling(ws, {
-            type: 'publish',
-            topic: this._room,
-            from: this.peerId,
-          })
-        }
-      }
-    }, 5000) // Re-announce every 5 seconds for better peer discovery
+    this.announceInterval = setInterval(() => this.announce(), 5000)
+
+    if (this.options.resumeAfterMs > 0) {
+      this._stopResumeWatch = watchResume(this.options.resumeAfterMs, (sleptMs) =>
+        this.handleResume(sleptMs),
+      )
+    }
+  }
+
+  /**
+   * The page slept (see watchResume): every link is dead on the other side
+   * or about to be, and the room holds dead entries under our peer id that
+   * would swallow our announces until their ICE times out. Start over
+   * under a new id - no entry anywhere matches it - and with fresh
+   * signaling sockets (the old ones may be half-open); their onopen
+   * subscribes and announces. GenericProvider resyncs each link as it
+   * opens (onPeerConnect).
+   */
+  private handleResume(sleptMs: number): void {
+    if (!this._connected) return
+    this.log(`⏰ Page slept ${sleptMs}ms — rebuilding all links under a new peer id`)
+    this.peerId = this.generatePeerId()
+    this._resetting = true
+    for (const id of Array.from(this.peers.keys())) this.removePeer(id)
+    this._resetting = false
+    for (const ws of this.signalingConns.slice()) ws.close()
+  }
+
+  /** Publish our peer id to the room on every open signaling connection. */
+  private announce(): void {
+    if (this.peers.size >= this.options.maxConns) return
+    for (const ws of this.signalingConns) {
+      this.sendSignaling(ws, {
+        type: 'publish',
+        topic: this._room,
+        from: this.peerId,
+      })
+    }
   }
 
   /**
    * Disconnect from all peers and signaling servers.
    */
   disconnect(): void {
+    this._shouldConnect = false
+    for (const timer of this.signalingTimers.values()) clearTimeout(timer)
+    this.signalingTimers.clear()
+    this.signalingAttempts.clear()
     if (!this._connected) return
 
     this.log(
       `🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`,
     )
+
+    this._stopResumeWatch?.()
+    this._stopResumeWatch = undefined
 
     // Stop re-announce interval
     if (this.announceInterval) {
@@ -534,9 +598,21 @@ export class SimplePeerTransport implements Transport {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url)
       let resolved = false
+      // Liveness, as lib0's WebsocketClient does it for y-webrtc: a ping
+      // every 15 s, and a socket that has been silent for 30 s is closed -
+      // a half-open socket (WiFi -> LTE, a suspended page) reports nothing
+      // by itself. onclose then reconnects.
+      let lastMessageAt = Date.now()
+      let pingTimer: ReturnType<typeof setInterval> | undefined
 
       ws.onopen = () => {
         this.log(`🟢 Signaling connected: ${url}`)
+        this.signalingAttempts.delete(url)
+        lastMessageAt = Date.now()
+        pingTimer = setInterval(() => {
+          if (Date.now() - lastMessageAt > 30000) ws.close()
+          else this.sendSignaling(ws, { type: 'ping' })
+        }, 15000)
 
         // Subscribe to room
         this.sendSignaling(ws, {
@@ -569,6 +645,7 @@ export class SimplePeerTransport implements Transport {
       }
 
       ws.onmessage = (event) => {
+        lastMessageAt = Date.now()
         try {
           const msg: SignalingMessage = JSON.parse(event.data)
           // Only log signal-bearing messages to avoid flooding with pure topology pings
@@ -598,10 +675,12 @@ export class SimplePeerTransport implements Transport {
 
       ws.onclose = () => {
         this.log(`🔴 Signaling disconnected: ${url}`)
+        if (pingTimer) clearInterval(pingTimer)
         const index = this.signalingConns.indexOf(ws)
         if (index > -1) {
           this.signalingConns.splice(index, 1)
         }
+        this.scheduleSignalingReconnect(url)
       }
 
       // Timeout after 10 seconds
@@ -610,9 +689,35 @@ export class SimplePeerTransport implements Transport {
           resolved = true
           this.log(`⏱️ Signaling connection timeout: ${url}`)
           reject(new Error('Signaling connection timeout'))
+          ws.close() // onclose schedules the next attempt
         }
       }, 10000)
     })
+  }
+
+  /**
+   * Re-open a signaling connection that closed while we should be
+   * connected - a phone's OS closes the socket of a backgrounded page, and
+   * without it the transport can neither announce nor receive offers
+   * (repro-simple-peer-sleep, part 3). Same curve as WebSocketTransport
+   * (round 7, item 4): doubling from 1 s, +-50 % jitter, capped at 10 s.
+   * onopen subscribes and announces again.
+   */
+  private scheduleSignalingReconnect(url: string): void {
+    if (!this._shouldConnect || this.signalingTimers.has(url)) return
+    const attempt = (this.signalingAttempts.get(url) ?? 0) + 1
+    this.signalingAttempts.set(url, attempt)
+    const delay = Math.round(
+      Math.min(10000, 1000 * 2 ** (attempt - 1)) * (0.5 + Math.random()),
+    )
+    this.log(`🔄 Signaling reconnect #${attempt} to ${url} in ${delay}ms`)
+    this.signalingTimers.set(
+      url,
+      setTimeout(() => {
+        this.signalingTimers.delete(url)
+        if (this._shouldConnect) this.connectSignaling(url).catch(() => {})
+      }, delay),
+    )
   }
 
   /**
@@ -645,13 +750,7 @@ export class SimplePeerTransport implements Transport {
             // can discover us (they may have missed our initial publish)
             if (!shouldInitiate) {
               this.log('📢 Re-announcing so initiator can find us...')
-              for (const ws of this.signalingConns) {
-                this.sendSignaling(ws, {
-                  type: 'publish',
-                  topic: this._room,
-                  from: this.peerId,
-                })
-              }
+              this.announce()
             }
           }
         }
@@ -701,6 +800,9 @@ export class SimplePeerTransport implements Transport {
           this.handlePeerSignal(msg.from, msg.signal)
         }
         break
+
+      case 'pong':
+        break // liveness only, see connectSignaling()
 
       default:
         this.log(`❓ Unknown signaling message type: ${msg.type}`)
@@ -752,6 +854,17 @@ export class SimplePeerTransport implements Transport {
 
     this.peers.set(remotePeerId, peerConn)
 
+    // An offer nobody answers produces no event at all - without this the
+    // entry stayed for good and swallowed every later announce of that
+    // peer (repro-simple-peer-sleep, part 5).
+    const connectTimer = setTimeout(() => {
+      if (!peerConn.connected && this.peers.get(remotePeerId) === peerConn) {
+        this.log(`⏱️ No connection to ${remotePeerId} after ${this.options.connectTimeout}ms — dropping the entry`)
+        this.removePeer(remotePeerId)
+      }
+    }, this.options.connectTimeout)
+    peer.on('close', () => clearTimeout(connectTimer))
+
     // Handle signaling data (ICE candidates and SDP)
     peer.on('signal', (signal: any) => {
       this.log(`📤 Signal to ${remotePeerId}: ${signal.type ?? 'candidate'}`)
@@ -773,6 +886,7 @@ export class SimplePeerTransport implements Transport {
     const onChannelOpen = (via: string) => {
       if (peerConn.connected) return // already fired
       peerConn.connected = true
+      clearTimeout(connectTimer)
       const connectedCount = Array.from(this.peers.values()).filter(
         (p) => p.connected,
       ).length
@@ -785,15 +899,15 @@ export class SimplePeerTransport implements Transport {
     // Handle connection
     peer.on('connect', () => onChannelOpen('connect'))
 
-    // Handle ICE connection state for debugging
-    if (peer._pc) {
-      peer._pc.oniceconnectionstatechange = () => {
-        this.log(`🧊 ICE ${remotePeerId}: ${peer._pc.iceConnectionState}`)
-      }
-      peer._pc.onconnectionstatechange = () => {
-        this.log(`🔗 Connection ${remotePeerId}: ${peer._pc.connectionState}`)
-      }
-    }
+    // ICE state for debugging - through simple-peer's own event. Never assign
+    // peer._pc.on*statechange: simple-peer wires the peer connection with
+    // exactly those properties, and replacing them switched off its
+    // failure detection (ICE 'failed' no longer closed the peer) and made
+    // 'connect' depend on the order of the ICE and gathering events
+    // (test/providers/repro-simple-peer-sleep.ts, parts 1-2).
+    peer.on('iceStateChange', (ice: string, gathering: string) => {
+      this.log(`🧊 ICE ${remotePeerId}: ${ice} (gathering: ${gathering})`)
+    })
 
     // Handle incoming data
     peer.on('data', (data: ArrayBuffer) => {
@@ -874,10 +988,17 @@ export class SimplePeerTransport implements Transport {
       }
     })
 
+    // close/error arrive asynchronously: by then the entry under this id
+    // may already be a newer link (handlePeerSignal() replaced it, or the
+    // peer re-dialed after our announce) - only ever remove our own.
+    const removeOwnEntry = () => {
+      if (this.peers.get(remotePeerId) === peerConn) this.removePeer(remotePeerId)
+    }
+
     // Handle errors
     peer.on('error', (error: Error) => {
       this.log(`❌ Peer error [${remotePeerId}]: ${error.message ?? error}`)
-      this.removePeer(remotePeerId)
+      removeOwnEntry()
     })
 
     // Handle close
@@ -888,7 +1009,7 @@ export class SimplePeerTransport implements Transport {
       this.log(
         `🔴 Peer channel closed: ${remotePeerId} — ${connectedCount}/${this.peers.size - 1} remaining`,
       )
-      this.removePeer(remotePeerId)
+      removeOwnEntry()
     })
   }
 
@@ -897,6 +1018,16 @@ export class SimplePeerTransport implements Transport {
    */
   private handlePeerSignal(remotePeerId: string, signal: any): void {
     let peerConn = this.peers.get(remotePeerId)
+
+    // An offer for an entry that is already connected: the remote rebuilt
+    // its side of the link (it lost us first) - this transport never
+    // renegotiates. The old peer object would reject the offer (new DTLS
+    // fingerprint) and lose it, leaving the remote's initiator half-open.
+    if (peerConn?.connected && signal?.type === 'offer') {
+      this.log(`♻️ Fresh offer from connected peer ${remotePeerId} — replacing the old link`)
+      this.removePeer(remotePeerId)
+      peerConn = undefined
+    }
 
     if (!peerConn) {
       this.log(
@@ -941,6 +1072,10 @@ export class SimplePeerTransport implements Transport {
         `🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`,
       )
       this._peerDisconnectCallback?.(peerId)
+      // As y-webrtc does on a peer's close/error: announce at once, so a
+      // peer that is still there re-dials within a signaling round trip
+      // instead of the next 5 s tick.
+      if (this._connected && !this._resetting) this.announce()
     }
   }
 

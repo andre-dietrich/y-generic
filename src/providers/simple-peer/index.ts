@@ -108,9 +108,14 @@ export interface SimplePeerTransportOptions {
   password?: string
 
   /**
-   * Maximum number of WebRTC peer connections.
-   * Too many connections can overwhelm the browser.
-   * @default 20 + random(0-15)
+   * Maximum number of peer connections. GenericProvider needs a FULL mesh
+   * (a peer's broadcast reaches everyone directly, nobody relays): every
+   * peer of the room must fit. A room larger than this loses pairs - they
+   * see neither each other's presence nor each other's edits as they
+   * happen. The former default (20-34, y-webrtc's, which relays) cut rooms
+   * of 21+ peers: with 25 real browsers one peer ended up with 20 links
+   * and missing from four rosters (test/e2e/room-scenarios.mjs).
+   * @default 64
    */
   maxConns?: number
 
@@ -259,7 +264,7 @@ export class SimplePeerTransport implements Transport {
       peer: options.peer,
       signaling: options.signaling ?? ['wss://y-webrtc-eu.fly.dev'],
       password: options.password ?? '',
-      maxConns: options.maxConns ?? 20 + Math.floor(Math.random() * 15),
+      maxConns: options.maxConns ?? 64,
       peerOpts,
       connectTimeout: options.connectTimeout ?? 30000,
       resumeAfterMs: options.resumeAfterMs ?? 15000,

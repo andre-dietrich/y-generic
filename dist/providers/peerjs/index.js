@@ -78,7 +78,7 @@ export class PeerJSTransport {
             peer: options.peer,
             peerOptions: options.peerOptions ?? {},
             password: options.password ?? '',
-            maxConns: options.maxConns ?? 20 + Math.floor(Math.random() * 15),
+            maxConns: options.maxConns ?? 64,
             connectTimeout: options.connectTimeout ?? 30000,
             iceDisconnectTimeout: options.iceDisconnectTimeout ?? 15000,
             resumeAfterMs: options.resumeAfterMs ?? 15000,

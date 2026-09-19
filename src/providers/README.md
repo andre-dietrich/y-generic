@@ -47,7 +47,6 @@ const transport = new SimplePeerTransport({
   peer: Peer, // Pass the simple-peer constructor
   signaling: ['wss://y-webrtc-eu.fly.dev'],
   password: 'optional-encryption',
-  maxConns: 30
 })
 const provider = new GenericProvider(doc, transport)
 await provider.connect({ room: 'my-room' })
@@ -72,7 +71,8 @@ await provider.connect({ room: 'my-room' })
   y-webrtc's public server). A lost connection is re-opened with backoff; the server must
   answer `{type:'ping'}` with `{type:'pong'}` (y-webrtc's `bin/server.js` does)
 - `password`: Optional encryption password
-- `maxConns`: Max peer connections (default: 20-35 random)
+- `maxConns`: Max peer connections (default: 64). The core needs a full mesh - a room larger
+  than this loses pairs of peers
 - `peerOpts`: Options passed to simple-peer
 - `connectTimeout`: ms a peer connection may take to open before its entry is dropped (default: 30000)
 - `resumeAfterMs`: rebuild all links under a new peer id when the page did not run for this
@@ -106,7 +106,6 @@ const transport = new PeerJSTransport({
     secure: true
   },
   password: 'optional-encryption',
-  maxConns: 30
 })
 const provider = new GenericProvider(doc, transport)
 await provider.connect({ room: 'my-room' })
@@ -129,7 +128,8 @@ await provider.connect({ room: 'my-room' })
 **Options:**
 - `peerOptions`: PeerJS server configuration (default: uses PeerJS Cloud)
 - `password`: Optional encryption password
-- `maxConns`: Max peer connections (default: 20-35 random)
+- `maxConns`: Max peer connections (default: 64). The core needs a full mesh - a room larger
+  than this loses pairs of peers
 - `connectTimeout`: ms a data connection may take to open before its entry is dropped and
   re-dialed (default: 30000)
 - `iceDisconnectTimeout`: ms a link may stay in ICE state `disconnected` before it is closed

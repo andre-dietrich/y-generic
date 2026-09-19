@@ -94,7 +94,7 @@ export class SimplePeerTransport {
             peer: options.peer,
             signaling: options.signaling ?? ['wss://y-webrtc-eu.fly.dev'],
             password: options.password ?? '',
-            maxConns: options.maxConns ?? 20 + Math.floor(Math.random() * 15),
+            maxConns: options.maxConns ?? 64,
             peerOpts,
             connectTimeout: options.connectTimeout ?? 30000,
             resumeAfterMs: options.resumeAfterMs ?? 15000,

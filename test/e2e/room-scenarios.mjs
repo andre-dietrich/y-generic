@@ -21,14 +21,22 @@
  *  rejoin      one peer reloads the page. Until it has the room's text and
  *              every roster is complete.
  *  restart     the server (signaling / PeerJS server / Nostr relay /
- *              WebSocket relay) is killed for 5 s and restarted. Until a
- *              text typed afterwards is everywhere; then a NEW peer joins:
- *              until it has the text and every roster shows it.
+ *              WebSocket relay) is killed for 5 s and restarted; one peer
+ *              types while it is down. Until that text is everywhere, until
+ *              a text typed afterwards is; then a NEW peer joins: until it
+ *              has the text and every roster shows it.
  *  coordinator (peerjs only) the tab of the room's coordinator is killed,
  *              then a new peer joins. Until every roster is complete.
  *
- * Usage: node test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket>
+ * Usage: node test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket|ably|pubnub|nostr|gun>
  *   N=25 FREEZE_MS=20000 SCENARIOS=join,typing,... OUT=results.json override.
+ *
+ * ably and pubnub run against the real service with the keys of .env
+ * (node --env-file=.env test/e2e/room-scenarios.mjs ably); nostr and gun
+ * against a local relay, or with LIVE=1 against the public relays named in
+ * .env (nostrRelayURLs, gunDB_ServerURL). Whatever cannot be restarted is
+ * reached through a CONNECT proxy of this script, and "restart" cuts that
+ * proxy for 5 s: every socket of every peer dies at once - a network outage.
  *
  * Needs (none of it is a dependency of this package):
  *   puppeteer-core + a Chrome     PUPPETEER=/path/to/puppeteer-core  CHROME=/usr/bin/google-chrome
@@ -37,10 +45,16 @@
  *   trystero:    nothing else (a minimal NIP-01 relay runs in this process; strategy nostr)
  *   websocket:   a y-websocket style server  WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js
  *                (git clone https://github.com/edrys-labs/edrys-websocket-server && npm install --omit=dev)
+ *   ably/pubnub: ABLY_KEY / PUBNUB_PUBLISH_KEY + PUBNUB_SUBSCRIBE_KEY (.env); the SDKs come from their CDNs
+ *   nostr:       nothing else (the NIP-01 relay of this process)
+ *   gun:         the gun package where Node finds it for Docker/gun/relay.js   NODE_PATH=/path/to/node_modules
+ *                (npm install gun somewhere - inside this repo npm skips it, an optional peer dependency)
  * The playground itself is served by this script (parcel serve, own dist dir).
  */
 
 import { spawn } from 'node:child_process'
+import http from 'node:http'
+import net from 'node:net'
 import { createRequire } from 'node:module'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -61,11 +75,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 // ---------------------------------------------------------------- servers
 
-function spawned(cmd, args, env = {}) {
+function spawned(cmd, args, env = {}, cwd = undefined) {
   let child
   return {
     start() {
-      child = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' })
+      child = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore', cwd })
     },
     stop() {
       child?.kill('SIGKILL')
@@ -76,10 +90,13 @@ function spawned(cmd, args, env = {}) {
 /** NIP-01, as much of it as Trystero's nostr strategy uses: REQ {kinds, "#x"}, EVENT, CLOSE. */
 function nostrRelay(port) {
   let wss
+  let seen // DIAG: what reached this relay since its (re)start
   return {
     start() {
+      seen = { connections: 0, REQ: 0, EVENT: 0, CLOSE: 0 }
       wss = new WebSocketServer({ port })
       wss.on('connection', (ws) => {
+        seen.connections++
         ws.subs = new Map()
         ws.on('message', (raw) => {
           let msg
@@ -88,6 +105,7 @@ function nostrRelay(port) {
           } catch {
             return
           }
+          if (msg[0] in seen) seen[msg[0]]++
           if (msg[0] === 'REQ') {
             ws.subs.set(msg[1], msg[2] ?? {})
             ws.send(JSON.stringify(['EOSE', msg[1]]))
@@ -96,13 +114,17 @@ function nostrRelay(port) {
           } else if (msg[0] === 'EVENT') {
             const ev = msg[1]
             ws.send(JSON.stringify(['OK', ev.id, true, '']))
-            const topics = (ev.tags ?? []).filter((t) => t[0] === 'x').map((t) => t[1])
+            // Tag filters: "#x" (Trystero's topic), "#r" (NostrTransport's room) - any "#<tag>".
+            const tagsOk = (f) =>
+              Object.keys(f)
+                .filter((k) => k[0] === '#')
+                .every((k) => (ev.tags ?? []).some((t) => t[0] === k.slice(1) && f[k].includes(t[1])))
             for (const client of wss.clients) {
               if (client.readyState !== 1 || !client.subs) continue
               for (const [id, f] of client.subs) {
                 const kindOk = !f.kinds || f.kinds.includes(ev.kind)
-                const topicOk = !f['#x'] || f['#x'].some((x) => topics.includes(x))
-                if (kindOk && topicOk) client.send(JSON.stringify(['EVENT', id, ev]))
+                const sinceOk = !f.since || ev.created_at >= f.since
+                if (kindOk && sinceOk && tagsOk(f)) client.send(JSON.stringify(['EVENT', id, ev]))
               }
             }
           }
@@ -110,11 +132,63 @@ function nostrRelay(port) {
       })
     },
     stop() {
+      if (process.env.DIAG) console.log(`  [diag relay] since its start: ${JSON.stringify(seen)}`)
       for (const c of wss?.clients ?? []) c.terminate()
       wss?.close()
     },
   }
 }
+
+/**
+ * "The network" between Chrome and a backend nobody here can restart (Ably,
+ * PubNub, public relays): an HTTP CONNECT proxy every page tunnels through.
+ * stop() cuts all tunnels and refuses new ones - for the clients the same
+ * thing as a server restart: every socket dies at once, then comes back.
+ * (Chrome never sends localhost through a proxy: the playground is not affected.)
+ */
+function connectProxy(port) {
+  let server
+  const sockets = new Set()
+  return {
+    start() {
+      server = http.createServer((_, res) => res.writeHead(405).end())
+      server.on('connect', (req, client, head) => {
+        const [host, p] = req.url.split(':')
+        const upstream = net.connect(Number(p) || 443, host, () => {
+          client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+          upstream.write(head)
+          upstream.pipe(client)
+          client.pipe(upstream)
+        })
+        for (const [s, other] of [[client, upstream], [upstream, client]]) {
+          sockets.add(s)
+          s.on('error', () => {})
+          s.on('close', () => {
+            sockets.delete(s)
+            other.destroy()
+          })
+        }
+      })
+      server.listen(port, '127.0.0.1')
+    },
+    stop() {
+      server?.close()
+      for (const s of sockets) s.destroy()
+    },
+  }
+}
+
+const envList = (name) =>
+  (process.env[name] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+const need = (name) => {
+  if (!process.env[name]) throw new Error(`${name} is not set - run with node --env-file=.env`)
+  return process.env[name]
+}
+/** LIVE=1: nostr and gun against the public relays of .env instead of a local one. */
+const LIVE = !!process.env.LIVE
 
 const fill = (page, sel, value) =>
   page.$eval(
@@ -199,6 +273,63 @@ const ADAPTERS = {
       await page.click('#connect-btn')
     },
   },
+  ably: {
+    entry: 'test/ably/index.html',
+    mesh: false,
+    proxy: true,
+    vanishTimeoutMs: 90000, // Ably presence reports the leave of a connection that went silent
+    server: () => connectProxy(SERVER_PORT),
+    async prepare() {},
+    async join(page) {
+      await fill(page, '#config-api-key', need('ABLY_KEY'))
+      await fill(page, '#config-room', ROOM)
+      await page.click('#connect-btn')
+    },
+  },
+  pubnub: {
+    entry: 'test/pubnub/index.html',
+    mesh: false,
+    proxy: true,
+    vanishTimeoutMs: 90000, // no presence in the playground: the 30 s lease
+    server: () => connectProxy(SERVER_PORT),
+    async prepare() {},
+    async join(page) {
+      await fill(page, '#config-publish-key', need('PUBNUB_PUBLISH_KEY'))
+      await fill(page, '#config-subscribe-key', need('PUBNUB_SUBSCRIBE_KEY'))
+      await fill(page, '#config-room', ROOM)
+      await page.click('#connect-btn')
+    },
+  },
+  nostr: {
+    entry: 'test/nostr/index.html',
+    mesh: false,
+    proxy: LIVE,
+    vanishTimeoutMs: 150000, // the playground's 120 s presence lease
+    server: () => (LIVE ? connectProxy(SERVER_PORT) : nostrRelay(SERVER_PORT)),
+    async prepare() {},
+    async join(page) {
+      await fill(page, '#relays', LIVE ? envList('nostrRelayURLs').join('\n') : `ws://localhost:${SERVER_PORT}`)
+      await fill(page, '#room-name', ROOM)
+      await page.click('#connect-btn')
+    },
+  },
+  gun: {
+    entry: 'test/gun/index.html',
+    mesh: false,
+    proxy: LIVE,
+    vanishTimeoutMs: 150000, // the playground's 120 s presence lease
+    // 127.0.0.1, not localhost: over ::1 a Gun relay delivers no live writes (test/gun/relay.sh)
+    server: () =>
+      LIVE
+        ? connectProxy(SERVER_PORT)
+        : spawned('node', [join(process.cwd(), 'Docker/gun/relay.js')], { PORT: String(SERVER_PORT) }, mkdtempSync(join(tmpdir(), 'ygen-gun-'))),
+    async prepare() {},
+    async join(page) {
+      await fill(page, '#config-room', ROOM)
+      await fill(page, '#config-peers', LIVE ? envList('gunDB_ServerURL').join('\n') : `http://127.0.0.1:${SERVER_PORT}/gun`)
+      await page.click('#connect-btn')
+    },
+  },
 }
 
 // ---------------------------------------------------------------- helpers
@@ -211,17 +342,22 @@ const roster = (p) =>
     if (mesh) return mesh.children.length
     return document.querySelectorAll('#users-list li .user-color').length + 1
   })
-const links = (p) => p.page.evaluate(() => Number(document.getElementById('peer-count').textContent))
+const links = (p) => p.page.evaluate(() => Number(document.getElementById('peer-count')?.textContent ?? NaN)) // no such badge: nostr
 const text = (p) => p.page.evaluate(() => document.querySelector('.ql-editor').innerText)
 
 /** ms until pred holds for every peer; -1 on timeout (and how many were short of it). */
 async function untilAll(peers, pred, timeoutMs) {
   const t0 = Date.now()
   let ok = 0
+  let said = t0
   while (Date.now() - t0 < timeoutMs) {
     const results = await Promise.all(peers.map((p) => pred(p).catch(() => false)))
     ok = results.filter(Boolean).length
     if (ok === peers.length) return { ms: Date.now() - t0, ok, of: peers.length }
+    if (process.env.DIAG && Date.now() - said >= 5000) {
+      said = Date.now()
+      console.log(`    ... ${ok} of ${peers.length} after ${Math.round((said - t0) / 1000)} s`)
+    }
     await sleep(400)
   }
   return { ms: -1, ok, of: peers.length }
@@ -279,16 +415,42 @@ async function main() {
       '--disable-background-timer-throttling',
       '--disable-renderer-backgrounding',
       '--disable-backgrounding-occluded-windows',
+      ...(adapter.proxy ? [`--proxy-server=http://127.0.0.1:${SERVER_PORT}`] : []),
     ],
   })
+
+  // What the room puts on the wire: every WebSocket frame a page sends (and
+  // PubNub's publish requests), timestamped. A hosted backend meters exactly
+  // this - Ably's free tier rejects what exceeds 50 messages/s on a channel.
+  const sent = []
+  const wire = (from, to = Date.now()) => {
+    const perSecond = new Map()
+    for (const t of sent) if (t >= from && t < to) perSecond.set(Math.floor(t / 1000), (perSecond.get(Math.floor(t / 1000)) ?? 0) + 1)
+    const total = [...perSecond.values()].reduce((a, b) => a + b, 0)
+    return { total, 'per second, mean': Math.round(total / Math.max(1, (to - from) / 1000)), 'per second, peak': Math.max(0, ...perSecond.values()) }
+  }
+
+  // One console line per refused send: ably-js reports each as Protocol.onNack, the
+  // PubNub transport logs its failed publishes itself.
+  const refused = (p) => p.logs.filter((l) => /Protocol\.onNack|\[PubNubTransport\] ❌/.test(l)).length
 
   let serial = 0
   const open = async () => {
     const context = await browser.createBrowserContext()
     const page = await context.newPage()
     const peer = { id: serial++, page, logs: [] }
+    const cdp = await page.createCDPSession()
+    await cdp.send('Network.enable')
+    cdp.on('Network.webSocketFrameSent', () => sent.push(Date.now()))
+    cdp.on('Network.requestWillBeSent', (e) => /\/publish\//.test(e.request.url) && sent.push(Date.now()))
     page.on('console', (m) => peer.logs.push(`${new Date().toISOString().slice(14, 23)} [${m.type()}] ${m.text()}`))
     page.on('pageerror', (e) => peer.logs.push(`${new Date().toISOString().slice(14, 23)} [pageerror] ${e.message}`))
+    // The playgrounds alert() a failed connect - an open dialog blocks every evaluate().
+    page.on('dialog', (d) => {
+      peer.logs.push(`${new Date().toISOString().slice(14, 23)} [dialog] ${d.message()}`)
+      console.log(`    p${peer.id} dialog: ${d.message().slice(0, 400)}`)
+      d.dismiss().catch(() => {})
+    })
     await adapter.prepare(page)
     await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load' })
     await adapter.join(page)
@@ -301,6 +463,11 @@ async function main() {
   /** DIAG=1: who is missing from whose roster, links and (simple-peer) maxConns per peer. */
   const diag = async (label) => {
     if (!process.env.DIAG) return
+    // No name field (nostr): rosters cannot say WHO is missing, only how many.
+    if (!(await peers[0].page.$('#user-name'))) {
+      console.log(`  [diag ${label}] roster sizes: ${(await Promise.all(peers.map(roster))).join(' ')}`)
+      return
+    }
     const names = (p) =>
       p.page.evaluate((self) => {
         const mesh = Array.from(document.querySelectorAll('#user-list .user-badge span'))
@@ -313,7 +480,7 @@ async function main() {
     peers.forEach((p, i) => {
       const missing = peers.map((q) => `p${q.id}`).filter((n) => !rosters[i].includes(n))
       const maxConns = p.logs.map((l) => /maxConns: (\d+)/.exec(l)?.[1]).find(Boolean) ?? '-'
-      if (missing.length > 0 || linkCounts[i] < peers.length - 1)
+      if (missing.length > 0 || (adapter.mesh && linkCounts[i] < peers.length - 1))
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
     })
     const seenBy = peers.map((q) => rosters.filter((r) => r.includes(`p${q.id}`)).length)
@@ -334,14 +501,30 @@ async function main() {
       opening.push(open())
       await sleep(i === 0 ? 3000 : 200) // the first peer opens the room (PeerJS: claims the coordinator id)
     }
-    peers = await Promise.all(opening)
-    record('join', 'all pages loaded and connected after', { ms: Date.now() - tJoin, ok: N, of: N })
-    record('join', `every roster shows ${N} users`, await untilAll(peers, async (p) => (await roster(p)) === N, 180000))
+    // A peer that could not join (the service refused it) is a result, not a crash.
+    const opened = await Promise.allSettled(opening)
+    peers = opened.filter((o) => o.status === 'fulfilled').map((o) => o.value)
+    if (peers.length < N) record('join', 'peers that FAILED to join', `${N - peers.length} of ${N}`)
+    record('join', 'all pages loaded and connected after', { ms: Date.now() - tJoin, ok: peers.length, of: N })
+    // Rosters that are not complete within 10 s wait for a presence renewal (half a lease): say who is missing.
+    const complete = async (p) => (await roster(p)) === peers.length
+    let rosters = await untilAll(peers, complete, 10000)
+    if (rosters.ms < 0) {
+      await diag('join, 10 s in')
+      const rest = await untilAll(peers, complete, 170000)
+      rosters = rest.ms < 0 ? rest : { ...rest, ms: rest.ms + 10000 }
+    }
+    record('join', `every roster shows ${peers.length} users`, rosters)
     await sleep(3000)
-    record('join', 'links per peer (peer-count)', stats(await Promise.all(peers.map(links))))
+    if (adapter.mesh) record('join', 'links per peer (peer-count)', stats(await Promise.all(peers.map(links))))
     await diag('after join')
+    record('join', 'frames sent by the whole room during the join', wire(tJoin))
+    record('join', 'sends the backend refused (console)', peers.reduce((n, p) => n + refused(p), 0))
     await type(peers[0], 'hello-from-0 ')
     record('join', 'text of one peer in every editor', await untilAll(peers, async (p) => (await text(p)).includes('hello-from-0'), 60000))
+    const tIdle = Date.now()
+    await sleep(10000)
+    record('join', 'frames sent by the whole room in 10 idle seconds', wire(tIdle))
 
     // ---- typing
     if (wanted.includes('typing')) {
@@ -364,14 +547,15 @@ async function main() {
       )
       record('typing', 'all 60 characters of five concurrent typists in every editor (after the typing ended)', all)
       record('typing', 'typing itself took (ms)', typedAfter)
-      const texts = await Promise.all(peers.map(text))
-      record('typing', 'editors identical', new Set(texts).size === 1)
+      record('typing', 'frames sent by the whole room', wire(t0))
+      const same = await untilAll([peers[0]], async () => new Set(await Promise.all(peers.map(text))).size === 1, 30000)
+      record('typing', 'editors identical', same.ms >= 0)
     }
 
     // ---- vanish
     if (wanted.includes('vanish')) {
       console.log('vanish')
-      const gone = peers[N - 1]
+      const gone = peers[peers.length - 1]
       await gone.page.close()
       peers = others(gone)
       record('vanish', `every roster dropped the killed tab (${peers.length} users)`, await untilAll(peers, async (p) => (await roster(p)) === peers.length, adapter.vanishTimeoutMs))
@@ -415,9 +599,13 @@ async function main() {
     if (wanted.includes('restart')) {
       console.log('restart (server down for 5 s)')
       server.stop()
-      await sleep(5000)
+      await sleep(1000)
+      await type(peers[3], 'typed-during-outage ') // unsent: no transport queues for a dead link
+      await sleep(4000)
       server.start()
-      await sleep(12000) // the clients' reconnect backoff
+      const tBack = Date.now()
+      record('restart', 'text typed DURING the outage in every editor (since the restart)', await untilAll(peers, async (p) => (await text(p)).includes('typed-during-outage'), 90000))
+      await sleep(Math.max(0, 12000 - (Date.now() - tBack))) // the clients' reconnect backoff
       await type(peers[2], 'typed-after-restart ')
       record('restart', 'text typed after the restart in every editor', await untilAll(peers, async (p) => (await text(p)).includes('typed-after-restart'), 90000))
       const t0 = Date.now()
@@ -455,6 +643,7 @@ async function main() {
     await diag('final')
     const texts = await Promise.all(peers.map(text))
     record('final', 'editors identical', new Set(texts).size === 1)
+    record('final', 'sends the backend refused (console, whole run)', peers.reduce((n, p) => n + refused(p), 0))
     record('final', 'rosters', stats(await Promise.all(peers.map(roster))))
     if (adapter.mesh) record('final', 'links per peer', stats(await Promise.all(peers.map(links))))
   } finally {

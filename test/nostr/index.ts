@@ -184,11 +184,13 @@ async function connect() {
     const cursors = quill!.getModule('cursors')
     binding = new QuillBinding(yText, quill!, provider.awareness)
 
-    // Set awareness user info
-    provider.awareness.setLocalStateField('user', {
-      name: randomName,
-      color: randomColor,
-    })
+    // Set awareness user info; the name field renames us (as in the other playgrounds)
+    const nameInput = document.getElementById('user-name') as HTMLInputElement
+    nameInput.value = nameInput.value || randomName
+    const announce = () =>
+      provider?.awareness.setLocalStateField('user', { name: nameInput.value, color: randomColor })
+    nameInput.oninput = announce
+    announce()
 
     // Setup event listeners
     provider.on('status', ({ status }: any) => {

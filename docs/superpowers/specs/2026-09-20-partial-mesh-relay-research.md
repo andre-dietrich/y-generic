@@ -17,6 +17,9 @@ three fixes, no new API, no wire-format change: v1.5.0 to v1.8.1 share a room.
 sections "Firefox in the room" and "A real phone in the room") - again no new
 API (`resumeAfterMs` was and is an option, its default went from 15 s to 30 s)
 and no wire-format change.
+**Version 1.8.3**, later that night: what the same two tests found on a relay
+transport ("Firefox and the relay transports: Nostr") - two fixes in the core,
+one in the Nostr transport, no new API, no wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in

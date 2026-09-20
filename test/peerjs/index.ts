@@ -11,6 +11,12 @@ import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
 import { GenericProvider } from '../../src/index'
 import { PeerJSTransport } from '../../src/providers/peerjs/index'
+import { installPhoneReport } from '../e2e/phone-report'
+
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless room
+// mates) connect by themselves - the PeerJS server is the page's own host, no STUN (one LAN).
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
 
 // Peer is loaded from CDN as a global variable
 declare const Peer: any
@@ -347,14 +353,39 @@ async function initWithConfig(config: {
   const randomColor =
     randomColors[Math.floor(Math.random() * randomColors.length)]
 
-  userNameInput.value = randomName
+  userNameInput.value = sessionName ?? randomName
   userColorInput.value = randomColor
 
   // Set initial awareness state
   provider.awareness.setLocalStateField('user', {
-    name: randomName,
+    name: sessionName ?? randomName,
     color: randomColor,
   })
+
+  // `?phone`: the phone tells on itself through its presence (test/e2e/phone-report.ts).
+  if (sessionName === 'phone') {
+    installPhoneReport({
+      awareness: provider.awareness,
+      yText,
+      links: () => transport.connectedPeers,
+      logTag: '[PeerJSTransport]',
+      timeline: [
+        { match: 'Page slept', label: (l) => `slept ${/slept (\d+)ms/.exec(l)?.[1] ?? '?'} ms` },
+        { match: 'Peer disconnected from PeerJS server', label: () => 'server link lost' },
+        { match: 'PeerJS reconnect #', label: (l) => `reconnect ${/#(\d+)/.exec(l)?.[1] ?? ''}` },
+        { match: 'Network restored', label: () => 'network restored' },
+        { match: 'Offline', label: () => 'offline: deferring' },
+        { match: 'Successfully claimed coordinator', label: () => 'claimed coordinator' },
+        { match: 'Successfully connected to new coordinator', label: () => 'connected to new coordinator' },
+        { match: 'Connected to coordinator', label: () => 'connected to coordinator' },
+        { match: 'Coordinator disconnected', label: () => 'coordinator link lost' },
+        { match: 'Timeout connecting to coordinator', label: () => 'coordinator TIMEOUT' },
+        { match: 'Re-join after resume failed', label: () => 're-join FAILED' },
+        { match: 'Peer error', label: (l) => `peer error ${l.split('Peer error:')[1]?.trim().slice(0, 40) ?? ''}` },
+        { match: 'Re-connecting to known peer', label: () => 're-dial', count: true },
+      ],
+    })
+  }
 
   // Update awareness on user input
   userNameInput.addEventListener('input', () => {
@@ -589,9 +620,23 @@ function setupConnectionForm() {
   })
 }
 
+/** `?phone` / `?desk=<name>`: fill the form from the address and connect - nothing to type on a phone. */
+function connectSession() {
+  setupConnectionForm()
+  if (sessionName === null) return
+  const set = (id: string, value: string) => ((document.getElementById(id) as HTMLInputElement | HTMLTextAreaElement).value = value)
+  set('config-room', session.get('room') ?? 'phone-room')
+  set('config-peerjs-host', location.hostname)
+  set('config-peerjs-port', session.get('sig') ?? '4470')
+  set('config-ice-servers', '')
+  ;(document.getElementById('config-secure') as HTMLInputElement).checked = false
+  ;(document.getElementById('config-debug') as HTMLInputElement).checked = true
+  ;(document.getElementById('connect-btn') as HTMLButtonElement).click()
+}
+
 // Start when DOM is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', setupConnectionForm)
+  document.addEventListener('DOMContentLoaded', connectSession)
 } else {
-  setupConnectionForm()
+  connectSession()
 }

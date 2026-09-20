@@ -31,7 +31,8 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs]
+ *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
  *   PEERS=8 MINUTES=12 TYPE_MS=4000 LAN_IP=192.168.x.y APP_PORT=3450 SERVER_PORT=4470 OUT=timeline.json
  */
 
@@ -45,7 +46,21 @@ const require = createRequire(import.meta.url)
 const puppeteer = require(process.env.PUPPETEER ?? 'puppeteer-core')
 
 const TRANSPORT = process.argv[2] ?? 'simple-peer'
-if (TRANSPORT !== 'simple-peer') throw new Error('only simple-peer so far: its playground understands ?phone')
+// What serves the room: the playground to build, and the server the peers meet at - on ALL
+// interfaces, the phone comes over the LAN.
+const BACKENDS = {
+  'simple-peer': {
+    entry: 'test/simple-peer/index.html',
+    server: (port) => ['node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(port) }],
+  },
+  peerjs: {
+    entry: 'test/peerjs/index.html',
+    // npm install peer (not a dependency of this package): PEERJS_BIN=/path/to/node_modules/.bin/peerjs
+    server: (port) => [process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(port), '--host', '0.0.0.0'], {}],
+  },
+}
+const backend = BACKENDS[TRANSPORT]
+if (!backend) throw new Error(`usage: phone-session.mjs <${Object.keys(BACKENDS).join('|')}> - playgrounds that understand ?phone`)
 const PEERS = Number(process.env.PEERS ?? 8)
 const MINUTES = Number(process.env.MINUTES ?? 12)
 const TYPE_MS = Number(process.env.TYPE_MS ?? 4000)
@@ -69,10 +84,11 @@ const say = (what, extra = {}) => {
 }
 
 async function main() {
-  const signaling = spawn('node', ['node_modules/y-webrtc/bin/server.js'], { env: { ...process.env, PORT: String(SERVER_PORT) }, stdio: 'ignore' })
+  const [cmd, args, env] = backend.server(SERVER_PORT)
+  const signaling = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' })
   const parcel = spawn(
     'node',
-    ['node_modules/.bin/parcel', 'serve', 'test/simple-peer/index.html', '--dist-dir', mkdtempSync(join(tmpdir(), 'ygen-phone-')), '--port', String(APP_PORT), '--host', '0.0.0.0', '--no-hmr'],
+    ['node_modules/.bin/parcel', 'serve', backend.entry, '--dist-dir', mkdtempSync(join(tmpdir(), 'ygen-phone-')), '--port', String(APP_PORT), '--host', '0.0.0.0', '--no-hmr'],
     { stdio: ['ignore', 'pipe', 'ignore'] },
   )
   await new Promise((resolve, reject) => {
@@ -95,7 +111,7 @@ async function main() {
       await page.goto(`http://${LAN_IP}:${APP_PORT}/?desk=d${i}&sig=${SERVER_PORT}`, { waitUntil: 'load' })
       await page.waitForSelector('.ql-editor', { timeout: 60000 })
       peers.push(page)
-      await sleep(200)
+      await sleep(i === 0 ? 3000 : 200) // the first peer opens the room (PeerJS: claims the coordinator id)
     }
     const watcher = peers[0]
     const typist = peers[1]

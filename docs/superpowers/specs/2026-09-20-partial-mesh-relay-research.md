@@ -519,6 +519,23 @@ had gone one by one in the background): it was the `visibilitychange` path that
 dialled. Which of the two a phone takes depends on the device's mood; both dial
 at once now.
 
+**PeerJS on the phone** (after v1.8.2; Chrome on Android, 8 desktop peers, the
+playground's `?phone` mode connects by itself) - comes back every time:
+
+| hidden for | all 8 links back | first missed text | its own timeline |
+|---|---|---|---|
+| 67 s | 4.5 s | 2.3 s | no sleep reported (the tab kept running): server link lost 16 - reconnect 3 at 1948 - first text 2296 - connected to coordinator 3974 |
+| 111 s | **1.5 s** | 1.1 s | slept 50830 ms noticed at 90 - connected to coordinator 994 |
+| 238 s | **1.5 s** | 1.2 s | slept 177615 ms noticed at 173 - connected to coordinator 926 |
+
+The resume path (a new `Peer`, a new socket) is the fast one. The 4.5 s case is
+the pattern simple-peer had: the page came back while PeerJS's reconnect sat in
+its backoff ("reconnect 3" only 1.9 s after the return). The transport already
+reconnects on the browser's `online`; doing the same when the tab becomes visible
+would take ~2 s off. Not done. What was typed on the phone arrived (16 of 180
+characters); the phone's last report said 177 of 180 - taken for report lag at the
+end of the session, not checked.
+
 Also seen by accident: a tab forgotten in Chrome for 2,907 s (48 min), on the OLD
 code, across a restart of the signaling server, came back into the new room by
 itself and had the first text after 0.65 s.

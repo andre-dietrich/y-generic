@@ -17,6 +17,13 @@ import {
   videoHandler as sharedVideoHandler,
 } from '../shared/quill-media.js'
 import { log, updateStatus, updateSyncStatus } from '../shared/ui-helpers.js'
+import { installPhoneReport } from '../e2e/phone-report'
+
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless room
+// mates) take the relay from the page's own host and connect by themselves - one room over
+// the LAN, nothing to set up on the phone.
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
 
 // Register custom Quill blots
 registerMediaBlots()
@@ -171,6 +178,12 @@ async function connect() {
       awarenessTimeoutMs: 120000,
     })
 
+    ;(window as any).__provider = provider // test/e2e/phone-session.mjs reads the room through it
+    // What a mesh transport calls its links: the relays that hold our subscription (no
+    // public getter for it - a playground may look)
+    const links = (): number => (transport as any)._hearing.size
+    ;(window as any).__links = links
+
     // Connect with configuration (kind 27370 is ephemeral: no history)
     await provider.connect({
       room,
@@ -191,6 +204,22 @@ async function connect() {
       provider?.awareness.setLocalStateField('user', { name: nameInput.value, color: randomColor })
     nameInput.oninput = announce
     announce()
+
+    // `?phone`: the phone tells on itself through its presence (test/e2e/phone-report.ts).
+    if (sessionName === 'phone') {
+      installPhoneReport({
+        awareness: provider.awareness,
+        yText,
+        links,
+        logTag: '[NostrTransport]',
+        timeline: [
+          { match: 'Subscription closed', label: (l) => `subscription closed, again in ${/again in (\d+) ms/.exec(l)?.[1] ?? '?'} ms` },
+          { match: 'Page is back', label: () => 'page back: subscribing now' },
+          { match: 'EOSE', label: () => 'subscribed' },
+          { match: 'Received event', label: () => 'event', count: true },
+        ],
+      })
+    }
 
     // Setup event listeners
     provider.on('status', ({ status }: any) => {
@@ -273,6 +302,13 @@ if (savedRelays) {
 document.getElementById('relays')!.addEventListener('input', (e) => {
   localStorage.setItem('nostr-relays', (e.target as HTMLTextAreaElement).value)
 })
+
+if (sessionName !== null) {
+  ;(document.getElementById('relays') as HTMLTextAreaElement).value = `ws://${location.hostname}:${session.get('sig') ?? '4470'}`
+  ;(document.getElementById('room-name') as HTMLInputElement).value = session.get('room') ?? 'phone-room'
+  ;(document.getElementById('user-name') as HTMLInputElement).value = sessionName
+  connect()
+}
 
 log('Nostr Provider Test initialized')
 log('Click Connect - the default relays need no account')

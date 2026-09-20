@@ -151,8 +151,14 @@ Firefox delays a hidden tab's timers by up to ~20 s in a busy room; `FIREFOX_EAC
 and a visible tab each). That is why a late timer is not a sleep: `watchResume` reports one only
 when ticks AND links were silent for `resumeAfterMs` (30 s), at the first sign of life after the
 silence - never "a message means awake", a waking page handles its queued messages first
-(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs`: a real phone in a room of
-headless peers, reporting on itself through its presence. Why the mesh stays full and what a relay under the
+(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|peerjs|nostr>`: a real
+phone in a room of headless peers, reporting on itself through its presence. What a page
+still owes the room when it unloads (its presence removal, a pending update batch) must not
+wait for a timer - a hidden Firefox tab runs none before it is gone:
+`test/dummy/bench-unload-removal.ts`; a relay peer back from a dead link asks the room for its
+presence and forgets the clocks of whoever it expired (`bench-relay-return-roster.ts` - on a
+relay nobody noticed that it was away); and never edit a playground's source while a harness
+run serves it (parcel rebuilds under the run). Why the mesh stays full and what a relay under the
 core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.md`
 (`test/dummy/probe-partial-mesh.ts`).
 

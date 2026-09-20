@@ -7,6 +7,12 @@
  * had its links back, when the first missed text came - and the timeline of it, from the
  * transport's log lines (`timeline`: which lines, and what to call them) and the
  * browser's online / offline events, in ms since the return.
+ *
+ * What the browser tells a page that goes away cannot travel that way - the page is
+ * gone before a report leaves it. Every lifecycle event goes to the session script with
+ * `sendBeacon` instead, which is made for a dying page: no timer, no socket of ours
+ * (port: the `sig` of the address + 1). Found with it missing: a tab closed with the X
+ * of Android Chrome's tab overview stayed in every roster for the whole lease, twice.
  */
 import type * as Y from 'yjs'
 
@@ -17,11 +23,15 @@ type Absence = {
   fewestLinks: number
   linksBackMs?: number
   firstTextMs?: number
+  /** the phone's OWN roster: before it hid, at the return, and after how long it was whole again */
+  rosterBefore: number
+  rosterAtReturn: number
+  rosterBackMs?: number
   events: [number, string][]
 }
 
 export function installPhoneReport(options: {
-  awareness: { setLocalStateField(field: string, value: unknown): void }
+  awareness: { setLocalStateField(field: string, value: unknown): void; getStates(): Map<number, unknown>; on(event: 'change', fn: () => void): void }
   yText: Y.Text
   /** connected links right now */
   links: () => number
@@ -31,19 +41,32 @@ export function installPhoneReport(options: {
   timeline: { match: string; label: (line: string) => string; count?: boolean }[]
 }): void {
   const { awareness, yText, links, logTag, timeline } = options
-  const absences: Absence[] = []
+  const absences: (Absence & { visibleAt: number })[] = []
   let seq = 0
   let hiddenAt = 0
   let linksAtHide = 0
+  let rosterAtHide = 0
   let counted = 0
   let current: (Absence & { visibleAt: number }) | null = null
+  // The phone's own roster over time, and when the browser lost and found the network: what
+  // it cannot report while it is cut off (WiFi off with the page in front - the page runs on
+  // behind a dead link and expires the room) arrives with the first report after it.
+  const loadedAt = Date.now()
+  const life: [number, string][] = []
+  const live = (what: string) => {
+    life.push([Date.now() - loadedAt, what])
+    if (life.length > 60) life.shift()
+  }
+  let lastRoster = -1
   const publish = () =>
     awareness.setLocalStateField('report', {
       seq: ++seq,
       len: yText.length,
       links: links(),
       hidden: document.visibilityState === 'hidden',
-      absences: absences.map(({ hiddenForS, linksBefore, linksAtReturn, fewestLinks, linksBackMs, firstTextMs, events }) => ({ hiddenForS, linksBefore, linksAtReturn, fewestLinks, linksBackMs, firstTextMs, events })),
+      roster: awareness.getStates().size,
+      life,
+      absences: absences.map(({ visibleAt, ...rest }) => rest),
     })
   const note = (what: string) => {
     if (current && Date.now() - current.visibleAt < 90000 && current.events.length < 18) current.events.push([Date.now() - current.visibleAt, what])
@@ -60,8 +83,19 @@ export function installPhoneReport(options: {
       if (current && (counted === 1 || counted === current.linksBefore)) note(`${hit.label(line)} ${counted}`)
     } else note(hit.label(line))
   }
-  window.addEventListener('online', () => note('browser: online'))
-  window.addEventListener('offline', () => note('browser: offline'))
+  const beaconUrl = `http://${location.hostname}:${Number(new URLSearchParams(location.search).get('sig') ?? 4470) + 1}/lifecycle`
+  const beacon = (what: string) => navigator.sendBeacon(beaconUrl, `${what} (visibility ${document.visibilityState}, links ${links()})`)
+  for (const type of ['beforeunload', 'pagehide', 'pageshow']) window.addEventListener(type, (e) => beacon(`${type}${(e as PageTransitionEvent).persisted ? ' persisted' : ''}`))
+  for (const type of ['visibilitychange', 'freeze', 'resume']) document.addEventListener(type, () => beacon(type))
+  window.addEventListener('online', () => (note('browser: online'), live('online'), publish()))
+  window.addEventListener('offline', () => (note('browser: offline'), live('offline'), publish()))
+  awareness.on('change', () => {
+    const size = awareness.getStates().size
+    if (size === lastRoster) return
+    lastRoster = size
+    live(`roster ${size}`)
+    publish()
+  })
   yText.observe(() => {
     if (current && current.firstTextMs === undefined) {
       current.firstTextMs = Date.now() - current.visibleAt
@@ -73,6 +107,7 @@ export function installPhoneReport(options: {
     if (document.visibilityState === 'hidden') {
       hiddenAt = Date.now()
       linksAtHide = links()
+      rosterAtHide = awareness.getStates().size
       publish()
       return
     }
@@ -84,6 +119,8 @@ export function installPhoneReport(options: {
       linksBefore: linksAtHide,
       linksAtReturn: links(),
       fewestLinks: links(), // below linksBefore = the links were rebuilt, not kept
+      rosterBefore: rosterAtHide,
+      rosterAtReturn: awareness.getStates().size,
       events: [[0, `online=${navigator.onLine}`]],
       visibleAt: Date.now(),
     }
@@ -94,8 +131,9 @@ export function installPhoneReport(options: {
     const watch = setInterval(() => {
       const waited = Date.now() - entry.visibleAt
       entry.fewestLinks = Math.min(entry.fewestLinks, links())
-      if (entry.linksBefore > 0 && links() >= entry.linksBefore && (entry.fewestLinks < entry.linksBefore || waited > 5000)) entry.linksBackMs = waited
-      if (entry.linksBackMs !== undefined || waited > 120000) clearInterval(watch)
+      if (entry.linksBackMs === undefined && entry.linksBefore > 0 && links() >= entry.linksBefore && (entry.fewestLinks < entry.linksBefore || waited > 5000)) entry.linksBackMs = waited
+      if (entry.rosterBackMs === undefined && awareness.getStates().size >= entry.rosterBefore) entry.rosterBackMs = waited
+      if ((entry.linksBackMs !== undefined && entry.rosterBackMs !== undefined) || waited > 120000) clearInterval(watch)
       publish()
     }, 500)
   })

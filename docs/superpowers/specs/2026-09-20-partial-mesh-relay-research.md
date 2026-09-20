@@ -549,6 +549,153 @@ Also seen by accident: a tab forgotten in Chrome for 2,907 s (48 min), on the OL
 code, across a restart of the signaling server, came back into the new room by
 itself and had the first text after 0.65 s.
 
+## Firefox and the relay transports: Nostr (same day, evening)
+
+The Firefox and phone rounds above ran on the two mesh transports. The same room
+on Nostr (`room-scenarios.mjs nostr`, the NIP-01 relay of the script, `FIREFOX=10`
+as hidden tabs of one Firefox) - join 0.9 s, five mixed typists 1.4 s, a killed
+tab gone after 121 s (the playground's 120 s lease), five Chrome pages frozen
+40 s: missed text after 1.2 s, the outage: text typed during it everywhere 6.3 s
+after it ended. No false sleep here: a relay transport has no `watchResume`.
+
+**Found: a HIDDEN Firefox tab that reloads leaves its old entry in every roster
+until the lease runs out.** "reload: rosters complete", 25 peers, `join,rejoin`:
+
+| room | before | after |
+|---|---|---|
+| Chrome only | 613 ms | |
+| ten Firefox peers, a process and a visible window each (`FIREFOX_EACH=1`) | 598 ms | |
+| ten Firefox peers as hidden tabs | 111,343 ms (25,549 ms late in a full run) | 3,602 / 2,255 ms |
+
+It is the core, not Nostr. The `beforeunload` handler removes the local presence
+state, and that removal went to the room through the awareness throttle - a
+timer, `setTimeout(0)` at best. A page that is being unloaded still runs it in
+Chrome and in a visible Firefox tab; a hidden Firefox tab clamps its timers to
+1 s and more and is gone before. The update batch (`batchUpdates`, 150 ms by
+Nostr's `preferredBatchMs`) had the same fault with a worse outcome: what was
+typed within that window before the page went away never reached the room.
+Gate: `test/dummy/bench-unload-removal.ts` - B's unload handlers run, and from
+the moment they return nothing B sends leaves the page. Before: still in the
+roster in all three parts (idle before / a presence change just before / typed
+just before: its last words lost); with `TIMERS_ALIVE_MS=50`, Chrome's case, the
+same build passed. Fix: the unload handler flushes the update batch, and a
+removal of origin `'window unload'` goes past the throttle. Every transport has
+it, a relay without a leave signal shows it longest.
+
+Not explained: the 2-4 s that remain against 0.6 s (two runs). A guess, not
+measured: the NEW presence of the reloaded tab still leaves through the throttle
+timer of a hidden tab. A user with the tab in the background does not see it.
+
+Test-bed notes: the playground's source was edited during the first full run
+(parcel rebuilt it under the run; the reloaded peer and the late joiner loaded
+the new bundle) - the three controls and both "after" runs were clean. That run
+also ended with "editors identical: false" for one Firefox typist (three trailing
+newlines, the known `innerText` difference); its Y.Text comparison did not run,
+the pages of that build did not expose their provider. All five clean runs:
+editors and Y.Text identical.
+
+### The real phone on Nostr
+
+`phone-session.mjs nostr` (the relay moved into `test/e2e/nostr-relay.mjs`,
+`?phone` / `?desk` in the Nostr playground; "links" are the relays that hold the
+subscription - one). Nostr needs no secure context without a room password, so
+the plain LAN address works. Chrome on Android, 8 headless peers, one of them
+types every 4 s; measured by the phone on its own clock.
+
+What had been expected by reading - a socket that died without a `close` and is
+never noticed, the pool is built without `enablePing` - did not happen: "links 1
+before / 0 at return" every time, the transport knew. **Found: the backoff.**
+With the display off every attempt to subscribe again fails and the wait climbs
+1, 2, 4 ... 30 s; the phone wakes somewhere in it.
+
+| hidden for | first missed text | the phone's own timeline |
+|---|---|---|
+| 46.9 s | 5.7 s | subscribed 5640 |
+| 106.7 s | **30.3 s** | 185 subscription closed, again in 30000 ms - subscribed 30207 |
+| 278.3 s | 0.4 s | subscribed 317 (a retry happened to be due) |
+| 14.5 s | 0.5 s | subscribed 476 |
+
+Fix (`NostrTransport._resubscribeNow`, on `visibilitychange` visible and on
+`online`, as `PeerJSTransport.reconnectNow`): a subscription that waits in its
+backoff is made at once, and the attempt counters start over - so an attempt
+that is in the air at that moment and fails is repeated after 1 s. Gate:
+`test/nostr/repro-relay-restart.mjs` part 4, 13.2 s -> 1.0 s (its floor). On the
+phone, second session, all three returns in the bad pattern:
+
+| hidden for | first missed text | the phone's own timeline |
+|---|---|---|
+| 67.7 s | 1.2 s | 97 subscription closed, again in 1000 ms - subscribed 1118 |
+| 128.7 s | 1.2 s | 130 subscription closed, again in 1000 ms - subscribed 1136 |
+| 102.6 s | 1.3 s | 188 subscription closed, again in 1000 ms - subscribed 1208 |
+
+It was the counters every time, never a waiting timer ("page back: subscribing
+now" is in no timeline): the overdue retry had fired at the wake, before the
+`visibilitychange`. The room was right throughout: the phone out of the rosters
+after the lease (129 s hidden: gone 2 s before its return), in every roster again
+at the return; what was typed on the phone arrived.
+
+**Found, left to the lease: a tab closed on the phone tells nobody.** Closed with the X of
+Android Chrome's tab overview, the phone stayed in every roster for the whole
+lease - three times (closed ~750 / 591 / 78 s, gone 875 / 711 / 207 s). The page
+now reports every lifecycle event with `sendBeacon` (`phone-report.ts`, printed
+by the session script). Desktop Chrome, tab closed: `beforeunload`, `pagehide`,
+`visibilitychange hidden` - gone from every roster 0.1 s later. The phone:
+`visibilitychange hidden` when the overview opened, and after that NOTHING - no
+`pagehide`, no `beforeunload`, no `freeze`. The last thing such a page is told is
+the same thing it is told when the user looks at another app for a minute. So
+this is not the unload fix above (a handler whose timer never ran): here no
+handler runs. Decided (André, the same evening): the core stays as it is and the
+lease covers it - 30 s by default, the 120 s are the playgrounds' choice for
+relays without a leave signal. The alternative was a hidden page saying so
+(removal at `hidden`, presence again at `visible`): every user who switches tabs
+or apps then leaves the roster for that time. An app that wants that can set an
+`away` field in its presence at `hidden` today.
+
+**Found: back from a dead link, a relay peer's roster stays short.** André saw
+it on the phone: "only two users" after a long time with the display off. Not
+every absence does it - a page that SLEPT is covered since round 8 (a late sweep
+tick: one more lease, and a JOIN beacon), and in one session the roster was 9
+before and 9 at the return after 173 s and 94 s. It takes a page that RUNS ON
+behind a dead link for more than half a lease: it hears no renewal and expires
+the room entry by entry, rightly. Made on purpose - display on, WiFi off for
+2.5 min - and written down by the phone itself (`life` in its report, delivered
+after the return): roster 9, WiFi off at 28 s, 3 at 127 s, 1 at 154 s.
+
+Two causes, both in the core's answer to a relay link that came back
+(`_schedulePeerConnectSync`, the branch without unicast), gate
+`test/dummy/bench-relay-return-roster.ts` (a relay hub, lease 10 s, the phone's
+link away for 15 s while its timers run):
+
+1. It announced itself and synced the document with a beacon that does not ask
+   for presence. Right on a mesh, where the far end of a new link sends its own;
+   on a relay nobody noticed that we were away. The others came back with their
+   renewals, up to half a lease later. Roster whole again: 5.3-5.6 s -> 0.1 s
+   (N=9), 6.0 s -> 0.1 s (N=25). Now it asks (JOIN). The price, when nobody
+   needed to ask - a relay restart, every link away for 1 s and back at once,
+   the 3 s after: 96 -> 208-256 deliveries and 5 -> 10-12 kB at N=9, 696 ->
+   1,272 and 35 -> 62 kB at N=25. About twice, once per restart, ~2.5 kB per peer.
+2. With that fix the phone had 8 of 9 in the same millisecond and the ninth
+   55.5 s later. y-protocols keeps the clock of a peer it expired and ignores a
+   state at an equal clock; a peer that writes or beacons keeps its lease alive
+   with that and never renews its presence, so its clock stands still - and the
+   table that answers the JOIN carries it at the clock the phone remembers. With
+   a writer in the gate's room: 8 of 9, the ninth NEVER (a lease watched);
+   without: 9 of 9. Now a peer that asks as a joiner forgets, as one, the clocks
+   of whoever is not in its roster. 9 of 9 after 0.1 s, three runs of three.
+
+On the phone, the same WiFi test once more with both fixes: roster 2 at 125.5 s,
+1 at 137.3 s, 8 at 154.5 s, **9 at 155.0 s** - the ninth 0.5 s after the others
+instead of 55.5 s. Neighbouring gates on the final core: `bench-last-joiner-roster`
+0 of 12 incomplete, `bench-rate-limited-channel` 5 of 5 converged,
+`bench-renewal-under-churn`, `bench-wake-false-timeout`, `bench-resume-roster`,
+`bench-unload-removal` pass. 25 Chrome peers on the final core
+(`join,typing,sleep,rejoin,restart`), against the third pass of the mobile
+research: rosters after the join 417 ms (412-817), join frames 192 (194), 10 idle
+seconds 3 frames (2), five typists 696 ms (607), reload 596 ms (588), text typed
+during the outage everywhere 2,268 ms after it (2,172), a new peer in every roster
+847 ms (880), editors and Y.Text identical, 0 refused sends. The relay counted 88
+EVENTs from its restart to the end of the run, a new peer's join included.
+
 ## If it is built — order of work
 
 1. Turn the probe into a gate: `bench-partial-mesh.ts` that fails on an incomplete

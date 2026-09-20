@@ -17,6 +17,8 @@
  *
  * Printed as it happens, with seconds since the start:
  *   phone in the roster / gone from the roster / back (as the desktop peers see it)
+ *   phone, browser event: what the browser told the page (visibilitychange, pagehide,
+ *   beforeunload, freeze ... - sent with sendBeacon, so also by a page that is being closed)
  *   the phone's own log, one entry per absence (it stays in the report - the first
  *   session lost every "visible again" to the text report that followed it): hidden
  *   for N s, links before / at the return / fewest after it (fewer than before = the
@@ -31,16 +33,22 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr]
  *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
+ *   nostr: the NIP-01 relay of this process (nostr-relay.mjs); "links" are then the relays a
+ *   peer holds a subscription on (one), and the room drops a silent peer only after the
+ *   playground's 120 s presence lease - the phone and the desktop peers need the internet
+ *   for the nostr-tools bundle of the playground (a CDN)
  *   PEERS=8 MINUTES=12 TYPE_MS=4000 LAN_IP=192.168.x.y APP_PORT=3450 SERVER_PORT=4470 OUT=timeline.json
  */
 
 import { spawn } from 'node:child_process'
+import http from 'node:http'
 import { createRequire } from 'node:module'
 import { mkdtempSync, writeFileSync } from 'node:fs'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { nostrRelay } from './nostr-relay.mjs'
 
 const require = createRequire(import.meta.url)
 const puppeteer = require(process.env.PUPPETEER ?? 'puppeteer-core')
@@ -48,15 +56,27 @@ const puppeteer = require(process.env.PUPPETEER ?? 'puppeteer-core')
 const TRANSPORT = process.argv[2] ?? 'simple-peer'
 // What serves the room: the playground to build, and the server the peers meet at - on ALL
 // interfaces, the phone comes over the LAN.
+const spawned = (cmd, args, env = {}) => {
+  const child = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' })
+  return { stop: () => child.kill('SIGKILL') }
+}
 const BACKENDS = {
   'simple-peer': {
     entry: 'test/simple-peer/index.html',
-    server: (port) => ['node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(port) }],
+    server: (port) => spawned('node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(port) }),
   },
   peerjs: {
     entry: 'test/peerjs/index.html',
     // npm install peer (not a dependency of this package): PEERJS_BIN=/path/to/node_modules/.bin/peerjs
-    server: (port) => [process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(port), '--host', '0.0.0.0'], {}],
+    server: (port) => spawned(process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(port), '--host', '0.0.0.0']),
+  },
+  nostr: {
+    entry: 'test/nostr/index.html',
+    server: (port) => {
+      const relay = nostrRelay(port)
+      relay.start()
+      return relay
+    },
   },
 }
 const backend = BACKENDS[TRANSPORT]
@@ -84,8 +104,19 @@ const say = (what, extra = {}) => {
 }
 
 async function main() {
-  const [cmd, args, env] = backend.server(SERVER_PORT)
-  const signaling = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' })
+  const server = backend.server(SERVER_PORT)
+  // What the browser tells the phone's page about its own life and death (phone-report.ts,
+  // sendBeacon): the only report that still leaves a page that is being closed.
+  const beacons = http
+    .createServer((req, res) => {
+      let body = ''
+      req.on('data', (d) => (body += d))
+      req.on('end', () => {
+        say(`phone, browser event: ${body.slice(0, 120)}`)
+        res.writeHead(204, { 'Access-Control-Allow-Origin': '*' }).end()
+      })
+    })
+    .listen(SERVER_PORT + 1, '0.0.0.0')
   const parcel = spawn(
     'node',
     ['node_modules/.bin/parcel', 'serve', backend.entry, '--dist-dir', mkdtempSync(join(tmpdir(), 'ygen-phone-')), '--port', String(APP_PORT), '--host', '0.0.0.0', '--no-hmr'],
@@ -123,13 +154,14 @@ async function main() {
       watcher.evaluate(() => {
         const pr = window.__provider
         const entry = Array.from(pr.awareness.getStates().entries()).find(([, s]) => s.user?.name === 'phone')
-        return { present: !!entry, report: entry?.[1].report ?? null, roomLen: pr.doc.getText('quill').length, links: pr.transport.connectedPeers }
+        return { present: !!entry, report: entry?.[1].report ?? null, roomLen: pr.doc.getText('quill').length, links: pr.transport.connectedPeers ?? window.__links?.() }
       })
     const everywhere = async () => (await Promise.all(peers.map((p) => p.evaluate(() => Array.from(window.__provider.awareness.getStates().values()).some((s) => s.user?.name === 'phone'))))).every(Boolean)
 
     let present = false
     let said = [] // what was last printed per absence of the phone's own log
     let phoneLog = []
+    const lifeSeen = new Set() // the phone's own roster log (ms since its page loaded): printed once per entry, also after a reload
     const roster = [] // { s, present } as the desktop peers see it
     let nextType = Date.now() + TYPE_MS
     let typed = 0
@@ -148,6 +180,12 @@ async function main() {
         say(present ? `phone in the roster${all ? ' (every roster)' : ''}` : 'phone GONE from the roster', { links: now.links })
         roster.push({ s: Math.round((Date.now() - t0) / 100) / 10, present })
       }
+      // The phone's roster as the phone saw it, also while it was cut off (reported afterwards).
+      for (const [ms, what] of now.report?.life ?? []) {
+        if (lifeSeen.has(`${ms} ${what}`)) continue
+        lifeSeen.add(`${ms} ${what}`)
+        say(`phone, its own view at ${(ms / 1000).toFixed(1)} s of its page: ${what}`)
+      }
       // The phone's own log of its absences: printed whenever an entry appears or gains a number.
       if (now.report?.absences) {
         phoneLog = now.report.absences
@@ -155,6 +193,7 @@ async function main() {
           const line =
             `phone, absence ${i + 1}: hidden for ${a.hiddenForS} s, links ${a.linksBefore} before / ${a.linksAtReturn} at return / fewest ${a.fewestLinks}` +
             `${a.linksBackMs !== undefined ? `, all links back after ${a.linksBackMs} ms` : ''}${a.firstTextMs !== undefined ? `, first missed text after ${a.firstTextMs} ms` : ''}` +
+            `, its roster ${a.rosterBefore} before / ${a.rosterAtReturn} at return${a.rosterBackMs !== undefined ? ` / whole again after ${a.rosterBackMs} ms` : ''}` +
             `\n             its own timeline: ${(a.events ?? []).map(([ms, what]) => `${ms} ${what}`).join(' | ')}`
           if (said[i] !== line) {
             said[i] = line
@@ -169,7 +208,7 @@ async function main() {
     for (const a of phoneLog) {
       console.log(
         `  ${String(a.hiddenForS).padStart(6)} s   ${a.linksBefore} / ${a.linksAtReturn} / ${a.fewestLinks}   ${String(a.linksBackMs ?? '-').padStart(6)} ms   ${String(a.firstTextMs ?? '-').padStart(6)} ms` +
-          `   ${a.fewestLinks < a.linksBefore ? 'links REBUILT' : 'links kept'}`,
+          `   ${a.fewestLinks < a.linksBefore ? 'links REBUILT' : 'links kept'}   roster ${a.rosterBefore} -> ${a.rosterAtReturn}, whole after ${a.rosterBackMs ?? '-'} ms`,
       )
       console.log(`           ${(a.events ?? []).map(([ms, what]) => `${ms} ${what}`).join(' | ')}`)
     }
@@ -180,7 +219,8 @@ async function main() {
     if (process.env.OUT) writeFileSync(process.env.OUT, JSON.stringify({ absences, roster, timeline }, null, 2))
   } finally {
     await browser.close().catch(() => {})
-    signaling.kill('SIGKILL')
+    server.stop()
+    beacons.close()
     parcel.kill('SIGKILL')
   }
 }

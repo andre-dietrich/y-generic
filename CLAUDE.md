@@ -145,7 +145,14 @@ made on purpose - Chrome does that by itself about once per 50-peer join: an `RT
 object that stays at `connecting` after its own `open`; a transport must rebuild a link whose
 `send()` throws, never just log it - `repro-simple-peer-sleep` part 7, `repro-trystero-oneway`;
 `docs/superpowers/specs/2026-09-20-join-presence-miss-note.md`). `DIAG=1` pairs two pages'
-`RTCPeerConnection`s by ICE ufrag and prints what each end sent and received. Why the mesh stays full and what a relay under the
+`RTCPeerConnection`s by ICE ufrag and prints what each end sent and received. `FIREFOX=10` runs
+that many peers in a headless Firefox (tabs of one Firefox: all but the last are HIDDEN, and
+Firefox delays a hidden tab's timers by up to ~20 s in a busy room; `FIREFOX_EACH=1`: a process
+and a visible tab each). That is why a late timer is not a sleep: `watchResume` reports one only
+when ticks AND links were silent for `resumeAfterMs` (30 s), at the first sign of life after the
+silence - never "a message means awake", a waking page handles its queued messages first
+(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs`: a real phone in a room of
+headless peers, reporting on itself through its presence. Why the mesh stays full and what a relay under the
 core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.md`
 (`test/dummy/probe-partial-mesh.ts`).
 

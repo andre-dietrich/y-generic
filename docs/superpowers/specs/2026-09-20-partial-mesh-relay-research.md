@@ -387,6 +387,78 @@ free RAM, 12 cores; 43 s until all pages were loaded).
   at 12 and both count the link: a link that delivers one way, below the core.**
   Details and what to look at next: the note.
 
+## Firefox in the room (same day, after v1.8.1)
+
+`FIREFOX=10` puts ten of the 25 peers into a headless Firefox 153 (puppeteer 25
+over WebDriver BiDi) - the odd-numbered ones, so three of the five typists, the
+peer that reloads and the `oneway` peer that cannot send are Firefox. Chrome and
+Firefox find each other at once: full mesh, rosters after 0.9 s (simple-peer) /
+2.4 s (PeerJS), five mixed typists identical everywhere.
+
+**Found: a HIDDEN Firefox tab was taken for a sleeping page.** Firefox delays
+the timers of a hidden tab in a busy room - measured with a probe in the page
+(`window.__gaps`): ticks 5.6, 9.0, 15.3, 17.6 ... up to 24.2 s late, monotonic
+clock the same, `visibilityState: hidden`; the one visible Firefox tab: none. An
+idle room does not show it (100 s and 180 s untouched: nothing), nor a room that
+only types; its budget throttling caps at 15 s - exactly the transports' old
+`resumeAfterMs`. So every such tick was "the page slept": all links dropped, the
+room joined again under a new id, about once a minute, for every Firefox user
+with the tab in the background - 9 of 10 Firefox peers, links per peer up to 32
+(stale ids), a rename visible after 20-34 s, a joiner in every roster after
+22-26 s. Control: the same room with one Firefox PROCESS per peer
+(`FIREFOX_EACH=1`, every tab visible) on the old threshold - no gap above 5 s, no
+false sleep, the joiner in every roster after 1.3 s.
+
+Fix (`src/providers/resume.ts`, the three mesh transports):
+- default `resumeAfterMs` 15 s -> **30 s**: a link survives that much silence, so
+  a shorter sleep has nothing to repair;
+- and, because 24 s against 30 s is a margin and not a design: the page has slept
+  when ticks **and links** were silent that long - the transports call `alive()`
+  for every message a link delivers, and the first sign of life after the silence
+  reports the sleep. (A first cut said "a message means awake" - wrong: what a
+  page handles first when it wakes up is what queued before it fell asleep, its
+  links are dead by then, and that message talked it out of rebuilding them.
+  Frozen Chrome pages showed the order; `repro-simple-peer-sleep` part 10 holds it.)
+
+Gates: `repro-simple-peer-sleep` parts 8-10 (timers 17 s late: links dropped
+true -> false; no tick for 40 s while the link delivers: left alone; slept 40 s
+and a queued message comes first: still a sleep), parts 1-7 and
+`repro-peerjs-coordinator` unchanged. Real browsers, 15 Chrome + 10 hidden Firefox
+tabs, all scenarios (the freeze now 40 s, longer than the threshold):
+
+| | simple-peer | PeerJS |
+|---|---|---|
+| Firefox tabs that reported a sleep (before: 9 of 10) | 0 | 0 |
+| their largest timer gap | 21.7 s | 17.0 s |
+| frozen Chrome peers that rebuilt their links | 5 of 5 | 5 of 5 |
+| `oneway`: a third peer / the unreachable one sees the rename | 1.2 / 3.3 s | 1.2 / 5.3 s |
+| rosters complete after the unfreeze / a reload | 2.7 / 3.9 s | 2.7 / 3.8 s |
+| at the end | 25 of 25, 24 links, documents identical | the same |
+
+What Firefox costs a HIDDEN tab stays: every timer of the core (awareness
+throttle, batching, reply delays) can come seconds late there - a hidden tab is
+a slow answerer, which the room tolerates (others answer).
+
+Three things that were the test bed, not the library - each looked like a finding
+first: puppeteer's BiDi keyboard takes 11-16 s for 13 characters and blocks the
+page's timers meanwhile (Firefox typists now get `insertText`, paced from the
+harness); `innerText` of a Firefox editor typed into that way ends three newlines
+short of the same document in Chrome (the final check now also compares the
+`Y.Text`); Firefox throws on almost anything asked of a closed `RTCPeerConnection`.
+
+Open: **Trystero with hidden Firefox tabs is slow, and that is Trystero's own
+timers** (its announce cycle and offer pool run on timers Firefox delays by 15-25 s
+in those tabs): rosters complete only 60 s after the join, and after a relay
+restart a new peer was in 21 of 25 rosters when the harness gave up after 3 min
+(15 of 25 before the fix above), links 23-24. Everything else in that run passes
+(`oneway` 1.2 / 6.5 s, killed tab gone after 11 s, documents identical). Nothing
+the transport can do about cheaply; not seen with Chrome-only rooms.
+
+`test/e2e/phone-session.mjs` is ready for the other half of this: a REAL phone
+(Android) joins a room of headless peers over the LAN and tells on itself through
+its presence (`?phone` in the simple-peer playground) - hidden / visible again
+after N s / caught up after N ms. Not run yet.
+
 ## If it is built — order of work
 
 1. Turn the probe into a gate: `bench-partial-mesh.ts` that fails on an incomplete

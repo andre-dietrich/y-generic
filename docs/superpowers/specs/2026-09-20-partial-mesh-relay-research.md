@@ -454,10 +454,70 @@ restart a new peer was in 21 of 25 rosters when the harness gave up after 3 min
 (`oneway` 1.2 / 6.5 s, killed tab gone after 11 s, documents identical). Nothing
 the transport can do about cheaply; not seen with Chrome-only rooms.
 
-`test/e2e/phone-session.mjs` is ready for the other half of this: a REAL phone
-(Android) joins a room of headless peers over the LAN and tells on itself through
-its presence (`?phone` in the simple-peer playground) - hidden / visible again
-after N s / caught up after N ms. Not run yet.
+## A real phone in the room
+
+`test/e2e/phone-session.mjs`: André's Android phone joins 8 headless Chrome peers
+over the LAN (simple-peer, `http://<lan-ip>:3450/?phone`) and tells on itself
+through its presence - one entry per absence that stays in the report, measured on
+the phone's own clock: hidden for N s, links before / at the return / fewest after
+it, all links back after N ms, first missed text after N ms. A desktop peer types a
+character every 4 s. Three absences per session: another app in front (~30 s),
+display off (~60-90 s), display off (~3 min).
+
+**Firefox for Android** (first session; its report format still lost the phone's
+own times): the room dropped the phone every time, ~30 s after it fell silent, and
+it came back by itself every time - out of the roster at 110 / 189 / 315 s, back at
+128 / 259 / 477 s; what was typed on the phone afterwards arrived (28 of 207
+characters); after a 10.6 s absence it was up to date and in every roster 2.6 s
+after the return.
+
+**Chrome on Android** (second session) - recovers by itself every time, the links
+always rebuilt (8 before, 0 at the return):
+
+| hidden for | all 8 links back | first missed text |
+|---|---|---|
+| 42 s (another app) | **1.5 s** | 0.9 s |
+| 87 s (display off) | **9.5 s** | 9.2 s |
+| 206 s (display off) | **11.0 s** | 10.7 s |
+
+The jump is the signaling socket. After a short absence it is still alive; after a
+long one it is dead, and `handleResume()` closed it and left the reconnect to its
+`onclose` - which a browser reports only seconds later for a connection that no
+longer answers the closing handshake. Now the transport gives the old sockets up and
+dials at once (`repro-simple-peer-sleep`, part 11: announced under the new id after
+9.9 s -> 0.7 s with an `onclose` that comes 8 s late). Desktop check, 12 browsers,
+five frozen 40 s: rosters complete 0.5 s after the unfreeze (2.7-5.7 s before).
+
+On the phone itself (Chrome, the fix loaded; the phone now also records its own
+timeline of a recovery - the transport's log lines and the browser's online /
+offline events, in ms since the return):
+
+| hidden for | its own timeline | all 8 links back |
+|---|---|---|
+| 97 s | signaling connected 239 - link 1 open 588 - first text 647 - link 8 open 718 | **0.7 s** (9.5 s before the fix, after 87 s) |
+| 203 s | signaling error 155 - retry 5 in 5841 ms - slept 142293 ms noticed at 156 - signaling connected 6051 - link 8 open 6360 | **6.4 s** |
+
+The second row is a second cause: with the display off that long the socket had
+died in the background and four reconnects had failed; the page woke up BETWEEN
+two retries, noticed the sleep after 0.16 s, found no open socket to replace - and
+sat out the backoff. `dialSignalingNow()`: on a resume (and when the browser says
+`online`, and when the tab becomes visible again) pending retries and attempts
+still in flight are given up and every signaling server without an open socket is
+dialled at once (`repro-simple-peer-sleep`, part 12: announced after 1.0-2.8 s ->
+0.2 s). Desktop check unchanged: 0.5 s after an unfreeze, 0.2 s after a reload, a
+signaling restart passes.
+
+On the phone, with both fixes, **269 s with the display off**: `signaling error 5 -
+signaling connected 166 - link 1 open 530 - first text 592 - link 8 open 903` -
+all 8 links back after **0.9 s** (6.4 s and 11.0 s before). This time Chrome had
+not slept through (its timers ran now and then, no sleep was reported, the links
+had gone one by one in the background): it was the `visibilitychange` path that
+dialled. Which of the two a phone takes depends on the device's mood; both dial
+at once now.
+
+Also seen by accident: a tab forgotten in Chrome for 2,907 s (48 min), on the OLD
+code, across a restart of the signaling server, came back into the new room by
+itself and had the first text after 0.65 s.
 
 ## If it is built — order of work
 

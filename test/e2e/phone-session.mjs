@@ -17,10 +17,12 @@
  *
  * Printed as it happens, with seconds since the start:
  *   phone in the roster / gone from the roster / back (as the desktop peers see it)
- *   phone hidden / visible again after N s (as the phone reports it)
- *   phone has caught up: its document as long as the room's, N ms after it came back
- * and at the end, per absence: how long, whether the room dropped the phone,
- * how long until it was back in every roster and had the text.
+ *   the phone's own log, one entry per absence (it stays in the report - the first
+ *   session lost every "visible again" to the text report that followed it): hidden
+ *   for N s, links before / at the return / fewest after it (fewer than before = the
+ *   links were rebuilt), all links back after N ms, first missed text after N ms -
+ *   measured by the phone on its own clock
+ * and both once more at the end.
  *
  * What to do with the phone (same WiFi as this machine), once "READY" shows:
  *   1. open the printed address, wait until it says the phone is in the roster
@@ -110,9 +112,9 @@ async function main() {
     const everywhere = async () => (await Promise.all(peers.map((p) => p.evaluate(() => Array.from(window.__provider.awareness.getStates().values()).some((s) => s.user?.name === 'phone'))))).every(Boolean)
 
     let present = false
-    let lastReport = null
-    let absences = [] // { hiddenForS, droppedAtS, backAtS, caughtUpMs, inEveryRosterMs }
-    let open = null // the absence that is being resolved
+    let said = [] // what was last printed per absence of the phone's own log
+    let phoneLog = []
+    const roster = [] // { s, present } as the desktop peers see it
     let nextType = Date.now() + TYPE_MS
     let typed = 0
     const end = Date.now() + MINUTES * 60000
@@ -126,47 +128,40 @@ async function main() {
       const now = await look()
       if (now.present !== present) {
         present = now.present
-        say(present ? 'phone in the roster' : 'phone GONE from the roster', { links: now.links })
-        if (!present && open === null) open = { droppedAtS: (Date.now() - t0) / 1000 }
-        else if (!present && open && open.droppedAtS === undefined) open.droppedAtS = (Date.now() - t0) / 1000
+        const all = present ? await everywhere() : false
+        say(present ? `phone in the roster${all ? ' (every roster)' : ''}` : 'phone GONE from the roster', { links: now.links })
+        roster.push({ s: Math.round((Date.now() - t0) / 100) / 10, present })
       }
-      const r = now.report
-      if (r && (!lastReport || r.seq !== lastReport.seq)) {
-        if (r.event === 'hidden') {
-          say('phone reports: hidden')
-          open = open ?? {}
-        } else if (r.event === 'visible') {
-          say(`phone reports: visible again after ${r.hiddenForS} s`)
-          open = { ...(open ?? {}), hiddenForS: r.hiddenForS, backAt: Date.now() }
-        }
-        lastReport = r
-      }
-      // An absence is over when the phone is in EVERY roster and its document is as long as the room's.
-      if (open?.backAt && present && r && r.len >= now.roomLen) {
-        if (open.caughtUpMs === undefined) {
-          open.caughtUpMs = Date.now() - open.backAt
-          say(`phone has caught up (${r.len} characters) ${open.caughtUpMs} ms after it came back`)
-        }
-        if (await everywhere()) {
-          open.inEveryRosterMs = Date.now() - open.backAt
-          say(`phone in every roster ${open.inEveryRosterMs} ms after it came back`)
-          absences.push(open)
-          open = null
-        }
+      // The phone's own log of its absences: printed whenever an entry appears or gains a number.
+      if (now.report?.absences) {
+        phoneLog = now.report.absences
+        phoneLog.forEach((a, i) => {
+          const line =
+            `phone, absence ${i + 1}: hidden for ${a.hiddenForS} s, links ${a.linksBefore} before / ${a.linksAtReturn} at return / fewest ${a.fewestLinks}` +
+            `${a.linksBackMs !== undefined ? `, all links back after ${a.linksBackMs} ms` : ''}${a.firstTextMs !== undefined ? `, first missed text after ${a.firstTextMs} ms` : ''}` +
+            `\n             its own timeline: ${(a.events ?? []).map(([ms, what]) => `${ms} ${what}`).join(' | ')}`
+          if (said[i] !== line) {
+            said[i] = line
+            say(line)
+          }
+        })
       }
       await sleep(500)
     }
 
-    console.log('\nabsences (hidden for / dropped by the room / document caught up / in every roster again):')
-    for (const a of absences) {
+    console.log('\nthe phone about itself - per absence: hidden for / links before, at return, fewest / all links back / first missed text:')
+    for (const a of phoneLog) {
       console.log(
-        `  ${String(a.hiddenForS ?? '?').padStart(5)} s   ${a.droppedAtS !== undefined ? 'dropped' : 'kept   '}   ${String(a.caughtUpMs ?? '-').padStart(6)} ms   ${String(a.inEveryRosterMs ?? '-').padStart(6)} ms`,
+        `  ${String(a.hiddenForS).padStart(6)} s   ${a.linksBefore} / ${a.linksAtReturn} / ${a.fewestLinks}   ${String(a.linksBackMs ?? '-').padStart(6)} ms   ${String(a.firstTextMs ?? '-').padStart(6)} ms` +
+          `   ${a.fewestLinks < a.linksBefore ? 'links REBUILT' : 'links kept'}`,
       )
+      console.log(`           ${(a.events ?? []).map(([ms, what]) => `${ms} ${what}`).join(' | ')}`)
     }
-    if (open) console.log(`  one absence never resolved: ${JSON.stringify(open)}`)
+    console.log('the room about the phone (seconds since the start): ' + roster.map((r) => `${r.present ? 'in' : 'GONE'} ${r.s}`).join(' -> '))
     const final = await look()
-    console.log(`at the end: phone present = ${final.present}, its document ${final.report?.len ?? '?'} of ${final.roomLen} characters, ${typed} characters typed by the room`)
-    if (process.env.OUT) writeFileSync(process.env.OUT, JSON.stringify({ absences, timeline }, null, 2))
+    const absences = phoneLog
+    console.log(`at the end: phone present = ${final.present}, its document ${final.report?.len ?? '?'} of ${final.roomLen} characters, ${typed} of them typed by the room`)
+    if (process.env.OUT) writeFileSync(process.env.OUT, JSON.stringify({ absences, roster, timeline }, null, 2))
   } finally {
     await browser.close().catch(() => {})
     signaling.kill('SIGKILL')

@@ -486,23 +486,98 @@ async function init() {
     color: randomColor,
   })
 
-  // `?phone`: the phone tells on itself through its presence - how long its document is, and
-  // every time it was hidden and for how long. The desktop peers of phone-session.mjs read it.
+  // `?phone`: the phone tells on itself through its presence - how long its document is, how
+  // many links it has, and one entry per absence that STAYS in the report (a later report must
+  // not overwrite it: the first session lost every "visible again" to the text report that
+  // followed within milliseconds). The phone measures its own recovery - its clock, no other:
+  // after how long it had its links back, and the first text it had missed.
+  // The desktop peers of phone-session.mjs read it.
   if (sessionName === 'phone') {
+    type Absence = {
+      hiddenForS: number
+      linksBefore: number
+      linksAtReturn: number
+      fewestLinks: number
+      linksBackMs?: number
+      firstTextMs?: number
+      /** what happened after the return, [ms since it, what] - from the transport's own log and the browser's online/offline */
+      events: [number, string][]
+    }
+    const absences: Absence[] = []
     let seq = 0
     let hiddenAt = 0
-    const report = (event: string, extra: object = {}) =>
-      provider.awareness.setLocalStateField('report', { seq: ++seq, event, len: yText.length, ...extra })
-    yText.observe(() => report('text'))
+    let linksAtHide = 0
+    let current: (Absence & { visibleAt: number }) | null = null
+    const publish = () =>
+      provider.awareness.setLocalStateField('report', {
+        seq: ++seq,
+        len: yText.length,
+        links: transport.connectedPeers,
+        hidden: document.visibilityState === 'hidden',
+        absences: absences.map(({ hiddenForS, linksBefore, linksAtReturn, fewestLinks, linksBackMs, firstTextMs, events }) => ({ hiddenForS, linksBefore, linksAtReturn, fewestLinks, linksBackMs, firstTextMs, events })),
+      })
+    const note = (what: string) => {
+      if (current && Date.now() - current.visibleAt < 90000 && current.events.length < 16) current.events.push([Date.now() - current.visibleAt, what])
+    }
+    // The transport's debug log is the timeline of a recovery: keep the lines that matter.
+    const consoleLog = console.log
+    let opened = 0
+    console.log = (...args: unknown[]) => {
+      consoleLog(...args)
+      const line = args.map(String).join(' ')
+      if (!line.includes('[SimplePeerTransport]')) return
+      if (line.includes('Page slept')) note('slept ' + (/slept (\d+)ms/.exec(line)?.[1] ?? '?') + ' ms')
+      else if (line.includes('Signaling connected')) note('signaling connected')
+      else if (line.includes('Signaling disconnected')) note('signaling closed')
+      else if (line.includes('Signaling reconnect')) note('retry ' + (/#(\d+).* in (\d+)ms/.exec(line)?.slice(1).join(' in ') ?? '') + ' ms')
+      else if (line.includes('Signaling connection timeout')) note('signaling connect TIMEOUT')
+      else if (line.includes('Signaling error')) note('signaling error')
+      else if (line.includes('Peer channel open') && current) {
+        opened++
+        if (opened === 1 || opened === current.linksBefore) note(`link ${opened} open`)
+      }
+    }
+    window.addEventListener('online', () => note('browser: online'))
+    window.addEventListener('offline', () => note('browser: offline'))
+    yText.observe(() => {
+      if (current && current.firstTextMs === undefined) {
+        current.firstTextMs = Date.now() - current.visibleAt
+        note('first text')
+      }
+      publish()
+    })
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'hidden') {
         hiddenAt = Date.now()
-        report('hidden')
-      } else {
-        report('visible', { hiddenForS: Math.round((Date.now() - hiddenAt) / 100) / 10 })
+        linksAtHide = transport.connectedPeers
+        publish()
+        return
       }
+      // Unlocking flips the visibility twice within a second: not an absence (the second
+      // session's entries were ruined by one of 0.9 s).
+      if (Date.now() - hiddenAt < 3000) return
+      opened = 0
+      const entry: Absence & { visibleAt: number } = {
+        hiddenForS: Math.round((Date.now() - hiddenAt) / 100) / 10,
+        linksBefore: linksAtHide,
+        linksAtReturn: transport.connectedPeers,
+        fewestLinks: transport.connectedPeers, // below linksBefore = the links were rebuilt, not kept
+        events: [[0, `online=${navigator.onLine}`]],
+        visibleAt: Date.now(),
+      }
+      current = entry
+      absences.push(entry)
+      publish()
+      // Links back = as many as before it hid; give up after 2 min.
+      const watch = setInterval(() => {
+        const waited = Date.now() - entry.visibleAt
+        entry.fewestLinks = Math.min(entry.fewestLinks, transport.connectedPeers)
+        if (entry.linksBefore > 0 && transport.connectedPeers >= entry.linksBefore && (entry.fewestLinks < entry.linksBefore || waited > 5000)) entry.linksBackMs = waited
+        if (entry.linksBackMs !== undefined || waited > 120000) clearInterval(watch)
+        publish()
+      }, 500)
     })
-    report('joined')
+    publish()
   }
 
   // Update awareness on user input

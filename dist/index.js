@@ -2196,7 +2196,7 @@ export class GenericProvider extends Observable {
      * suppression) and drop the new one. Measured in
      * test/dummy/bench-join-after-burst.ts.
      */
-    _scheduleSyncReply(reply, isAck = false, targetSv = null, requester = null) {
+    _scheduleSyncReply(reply, isAck = false, targetSv = null, requester = null, late = false) {
         if (this._pendingSyncReplyTimeoutId !== undefined && this._pendingSyncReply !== null) {
             if (bytesEqual(this._pendingSyncReply, reply)) {
                 return; // identical answer already scheduled
@@ -2266,7 +2266,7 @@ export class GenericProvider extends Observable {
         // 6,039 -> 15,147 at Gun N=100, join-after-burst Matrix 147 -> 686.
         const delay = isAck
             ? Math.random() * this._replySuppressionMaxDelay()
-            : this._replyDelay(requester);
+            : this._replyDelay(requester) + (late ? this._replyHorizon() : 0);
         this._pendingSyncReplyTimeoutId = setTimeout(() => {
             this._pendingSyncReplyTimeoutId = undefined;
             if (this._pendingSyncReply) {
@@ -2304,20 +2304,29 @@ export class GenericProvider extends Observable {
      * by the MESSAGE_SYNC, MESSAGE_SYNC_VERIFIED and MESSAGE_SYNC_DIGEST cases.
      */
     _replyToSyncRequest(reply, isAck = false, targetSv = null, toClientID) {
-        // A peer that knows it is incomplete does not answer. A SyncStep2 is
-        // encoded from integrated structs only, so with structs (or a delete
-        // set) still pending ours would be provably partial - and the
-        // requester's response wait ends on the first SyncStep2 it gets, so a
-        // partial answer strands it until its next trigger (phase-1c gates:
-        // 5 s resync backoff, or a stall with syncInterval 0). In relay mode a
-        // partial broadcast also cancels the complete replies other peers had
-        // pending. Let them answer; the requester retries if nobody does, and
-        // in unicast mode the rank bucket rotates the responders every 2 s.
-        // An ack from us would likewise confirm a state we do not trust.
-        if (this.doc.store.pendingStructs !== null ||
-            this.doc.store.pendingDs !== null) {
+        // A peer that knows it is incomplete (structs or a delete set still
+        // pending) answers LAST, and never with an ack - an ack from us would
+        // confirm a state we do not trust. Its SyncStep2 is provably partial,
+        // the requester's response wait ends on the first SyncStep2 it gets
+        // (a partial answer strands it until its next trigger: 5 s resync
+        // backoff, or a stall with syncInterval 0 - phase-1c gates), and in
+        // relay mode a partial broadcast cancels the complete replies other
+        // peers had pending. So the complete peers get the whole suppression
+        // window to themselves, and their reply, overheard, cancels ours.
+        //
+        // It used to not answer at all ("let them answer"), which assumed that
+        // somebody IS complete. A backend that refuses a publish (Ably over 50
+        // messages/s on a channel, code 42913) loses it for every receiver at
+        // once: two typists, one refused keystroke each, and everybody holds a
+        // later struct it cannot integrate - each typist waits for the other's
+        // keystroke while holding the only copy of its own. Nobody answered,
+        // for ever, `synced` true on all (25 browsers on Ably: 17 resync
+        // attempts per peer in 80 s; bench-rate-limited-channel part 1: NEVER).
+        // The same silence met every later joiner of a room whose typist left
+        // after a refused keystroke - that gap never closes, for anybody.
+        const incomplete = this.doc.store.pendingStructs !== null || this.doc.store.pendingDs !== null;
+        if (incomplete && isAck)
             return;
-        }
         // Unicast path (transport has sendTo and we know the requester's
         // address): nobody overhears a unicast, so the delay-and-cancel
         // suppression below cannot thin the replies. Instead each candidate
@@ -2328,6 +2337,15 @@ export class GenericProvider extends Observable {
         if (toClientID !== undefined && this._canUnicast(toClientID)) {
             if (!this._selectedResponder(toClientID))
                 return;
+            if (incomplete) {
+                // Nobody overhears a unicast, so nothing cancels this one: it only
+                // arrives after the complete answers of the other responders.
+                setTimeout(() => {
+                    if (!this._destroying && this._tryReserveReplySlot())
+                        this._sendDirect(toClientID, reply);
+                }, this._replySuppressionMaxDelay());
+                return;
+            }
             if (!this._tryReserveReplySlot())
                 return;
             this._sendDirect(toClientID, reply);
@@ -2339,8 +2357,8 @@ export class GenericProvider extends Observable {
         // 40,915 deliveries were immediate acks). Everything else goes through
         // suppression once there is someone else who could answer - counted
         // from beacon/update senders as well as awareness, see _peerCount().
-        if (isAck || this._peerCount() >= 3) {
-            this._scheduleSyncReply(reply, isAck, targetSv, toClientID ?? null);
+        if (isAck || incomplete || this._peerCount() >= 3) {
+            this._scheduleSyncReply(reply, isAck, targetSv, toClientID ?? null, incomplete);
         }
         else {
             this._sendSyncReply(reply);
@@ -2403,6 +2421,19 @@ export class GenericProvider extends Observable {
      * avalanche. Without an RTT sample or a requester id (legacy SyncStep1)
      * the uniform window stays.
      */
+    /**
+     * The latest moment a COMPLETE peer answers a request (rank 8 and above,
+     * see _replyDelay): an incomplete peer's answer waits this long on top of
+     * its own rank, so that a complete reply - if anybody has one - is on the
+     * wire first and cancels it. ~0.7 s on a 40 ms link, ~5 s on Matrix.
+     */
+    _replyHorizon() {
+        const window = this._replySuppressionMaxDelay();
+        const rtt = this._rttMinMs();
+        if (rtt === null)
+            return window;
+        return 8 * Math.max(this._syncReplySuppressionMs, 0.75 * rtt) + window;
+    }
     _replyDelay(requester) {
         const window = this._replySuppressionMaxDelay();
         const rtt = this._rttMinMs();

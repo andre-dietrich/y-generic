@@ -819,6 +819,13 @@ export declare class GenericProvider extends Observable<string> {
      * avalanche. Without an RTT sample or a requester id (legacy SyncStep1)
      * the uniform window stays.
      */
+    /**
+     * The latest moment a COMPLETE peer answers a request (rank 8 and above,
+     * see _replyDelay): an incomplete peer's answer waits this long on top of
+     * its own rank, so that a complete reply - if anybody has one - is on the
+     * wire first and cancels it. ~0.7 s on a 40 ms link, ~5 s on Matrix.
+     */
+    private _replyHorizon;
     private _replyDelay;
     /**
      * Send one already-encoded message to a single peer over

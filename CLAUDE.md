@@ -114,14 +114,30 @@ transports against scripted backends under plain Node - `test/providers/repro-si
 fake can (`test/simple-peer/e2e-resume.mjs`, `test/peerjs/e2e-handover.mjs`: headless Chrome via
 `puppeteer-core`, real WebRTC; their headers name what they need) - the second one is what found
 that Chrome parks a vanished peer's link in ICE `disconnected` forever.
-`test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket>` runs a classroom-sized room
-(25 Chrome contexts, local servers) through join / concurrent typing / a killed tab / five frozen
-pages / a reload / a server restart / (peerjs) a killed coordinator; `DIAG=1` names who is missing
-from whose roster. Every failure it found was invisible with 2-3 peers: `maxConns` cutting the mesh,
-a resuming peer's removal broadcast emptying bystanders' rosters, Trystero not re-subscribing, and
-three ways `verifyUpdates:false` (y-websocket mode) left a hole in the server's copy of the document. Two rules they enforce: never assign
+`test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket|ably|pubnub|nostr|gun>` runs a
+classroom-sized room (25 Chrome contexts) through join / concurrent typing / a killed tab / five
+frozen pages / a reload / a server restart with one peer typing meanwhile / (peerjs) a killed
+coordinator; `DIAG=1` names who is missing from whose roster, and every frame the room sends is
+counted. Local servers, except `ably` and `pubnub` (the real services, keys in the gitignored `.env`:
+`node --env-file=.env ...`) and `LIVE=1` (`nostr`, `gun` against the public relays named there) - what
+cannot be restarted is reached through a CONNECT proxy that the "restart" cuts. Every failure it
+found was invisible with 2-3 peers: `maxConns` cutting the mesh, a resuming peer's removal broadcast
+emptying bystanders' rosters, Trystero not re-subscribing, three ways `verifyUpdates:false`
+(y-websocket mode) left a hole in the server's copy of the document; on the relays and hosted
+backends (third pass of the spec) a Nostr subscription and a Gun relay link that never came back,
+Ably's rate limit failing a join, and two core bugs: peers that are ALL incomplete never answered a
+sync request, and the last joiner's roster. Two rules they enforce: never assign
 `peer._pc.on*statechange` (simple-peer owns those properties), and a connection's `close`/`error`
 handler may only remove its own entry, never "whatever is under this peer id now".
+What the harness finds gets a fast gate under plain Node before the fix:
+`test/nostr/repro-relay-restart.mjs` and `test/gun/repro-relay-restart.mjs` (a relay that went away;
+the library's path is an env var, see their headers), `test/providers/repro-ably-lifecycle.ts` (a
+scripted Ably `Realtime`: its own reconnect, a channel over its message rate),
+`test/dummy/bench-rate-limited-channel.ts` (a backend that REFUSES a publish loses it for every
+receiver at once) and `test/dummy/bench-last-joiner-roster.ts` (presence on demand). A relay
+transport whose link comes BACK by itself tells the provider through `onPeerConnect` (websocket,
+nostr, ably, gun) - never for the first connect.
+
 `src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds
 `Date.now()` far ahead of its last tick), used by both mesh transports to re-join under a new id.
 

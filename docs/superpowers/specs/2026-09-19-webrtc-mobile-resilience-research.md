@@ -154,6 +154,85 @@ For the edrys fork (`dev`): F4-F7 are in the path it uses - its `syncMode:
 'pull'` and app-awareness opcode differ from `main`, so they want a run of
 `room-scenarios.mjs websocket` on that branch.
 
+## Third pass: the hosted backends and the relays, 25 peers (2026-09-20)
+
+André: "can you test that with ably, nostr, pubnub and gundb as well?" - the
+same classroom, `test/e2e/room-scenarios.mjs <ably|pubnub|nostr|gun>`. Ably
+and PubNub run against the real services (keys in `.env`,
+`node --env-file=.env`), Nostr and Gun against a local relay (the harness'
+NIP-01 relay, `Docker/gun/relay.js`) and, with `LIVE=1`, against the public
+relays named in `.env`. What nobody here can restart is reached through a
+CONNECT proxy of the harness, and "restart" cuts that proxy for 5 s: every
+socket of every peer dies at once - a network outage. New in the harness:
+one peer types WHILE the server is down; every WebSocket frame (and PubNub
+publish request) the room sends is counted through the DevTools protocol,
+because a hosted backend meters exactly that; a peer that fails to join is
+a result, not a crash; rosters that are incomplete after 10 s say who is
+missing from whose.
+
+Two of the eight findings are in the core and affect every transport.
+
+| # | Where | Found at 25 peers | Cause | After the fix |
+|---|---|---|---|---|
+| T1 | nostr | after a relay restart text reached nobody (1 of 4 editors, rosters 1-2), a frozen page never got the missed text | nostr-tools closes a relay's subscriptions for good when its socket closes, while `publish()` re-opens the socket each time: after the restart the relay saw 24 connections, 67 EVENTs - and ONE REQ, the new peer's. The pool's own `enableReconnect` gives up on a socket that reports `error` before `close`, which is what a killed relay produces. A relay that is down at `connect()` is reported the same way, and `connect()` resolves | one subscription per relay, subscribed again when the relay closes it (1 s, doubling to 30 s), events deduplicated by id. `test/nostr/repro-relay-restart.mjs`: never -> 1.0 s, down at join never -> 1.0 s. E2E: 428 ms |
+| T2 | nostr | hearing again is not knowing what was said: the five frozen pages had the missed text after 21.9 s, with the next beacon somebody happened to send | nobody asks | `onPeerConnect` when a relay holds the subscription again after NONE did (nostr-tools reports a failed attempt as EOSE, then close, in one tick - only an EOSE still open a microtask later counts). 21.9 s -> 1.2 s |
+| T3 | ably | 1 of 25 peers failed to join, in both runs | Ably rejects what exceeds a channel's message rate - free tier 50 messages/s, error 42913 "nonfatal" - and the room peaks at 56-84 frames/s while 25 peers join within 8 s. A refused `presence.enter()` was thrown out of `connect()` | the enter is tried again until it holds and never fails `connect()`: 25 of 25 |
+| T4 | ably | by reading, then scripted (`test/providers/repro-ably-lifecycle.ts`): after ably-js's own reconnect the transport receives and never sends again | `connection.once('connected')` set the flag that `'disconnected'` clears | `on('connected')`, and the provider is told (`onPeerConnect`). E2E, 5 s outage: text typed during it everywhere 15.2 s after the network is back (ably-js retries every 15 s), typed afterwards 413 ms. Not measured on the unfixed code: its run ended at T3 |
+| T5 | ably | a refused publish was logged - and lost for every receiver at once. A refused presence: 21 of 25 rosters incomplete for 172 s (half of the 5 min lease). A refused keystroke: see C1 | the transport is told (the promise rejects) and did nothing | refused is not failed: published again after 1-2 s, further each time, five times. Rosters of a join with 33 refusals complete after 828 ms, five typists' 60 characters everywhere after 2.3 s |
+| C1 | **core** | five peers typing at once on Ably (82-103 frames/s): the text was everywhere after 2.5 s, 6.6 s - or not within 80 s, 17 resync attempts on every peer, `synced` true on all | a peer with pending structs answered no sync request ("let a complete peer answer"). A refused publish is lost for ALL receivers: two typists, one refused keystroke each, and everybody holds a later struct it cannot integrate - each typist waits for the other's keystroke while holding the only copy of its own. Nobody is complete, nobody answers, for ever. The same silence would meet every later joiner of a room whose typist left after a refused keystroke | an incomplete peer answers LAST (after the whole reply horizon of the complete ones, whose reply cancels it) and never with an ack. `bench-rate-limited-channel` part 1 (4 peers, two refused keystrokes): never -> 1,068 ms; part 2 (25 peers, 50/s limit): converged in 3 of 6 runs -> 6 of 6 (1.8-10.4 s) |
+| C2 | **core** | every few runs the LAST joiner's roster lacked 7-8 of 24 peers - every third one - for half a lease: 80 s and 73 s on Nostr, 27 s on PubNub. Earlier joiners have the same gap and never show it: the answers to the next JOIN heal them | presence on demand marked a peer "covered by the relayed table" once per response timer, not per requester: a timer still running took the next JOIN in, covered by a table sent before that joiner was subscribed - and when the 2 s relayer role had just moved on, nobody relayed for it either. Needs a response window longer than the gap between joins (an RTT hint: Nostr, Gun, Matrix; or a slow link) | a table answers the JOINs heard before it, no others. `bench-last-joiner-roster`: incomplete in 11 of 12 runs -> 0 of 12. E2E: 6 of 6 joins complete in 0.4-0.8 s. `bench-join-census`: a late join still costs 2 awareness sends |
+| T6 | gun | five frozen pages never heard or reached anybody again; after a 5 s relay restart EVERY peer was alone (rosters 1/1/1, editors different) | gun 0.2020.1241, browser websocket adapter: `wire.onclose` calls `reconnect(peer)` - one attempt in 2 s - and then `mesh.bye(peer)`, whose handler deletes the peer from `opt.peers`; when that attempt fails, `reconnect()` returns at `if(!opt.peers[peer.url])`. Gun tries once | the transport puts the relay back and dials (3 s, doubling to 30 s) and tells the provider when it said hi again. `test/gun/repro-relay-restart.mjs` (that adapter under Node, relay down 6 s): never -> 3.3 s. E2E: frozen pages 3.7 s, text typed during the outage 5.8 s |
+
+Open, found and not fixed: a reloaded Gun page leaves a ghost in every
+roster for one lease (124 s) - Gun writes through several timers, the
+presence removal of `beforeunload` does not reach the wire (by reading, not
+by experiment). Gun's own protocol sent ~7,500 frames for a 25-peer join and
+~50 frames/s when idle (Ably, PubNub, Nostr: 2-6 frames in 10 idle seconds).
+PubNub needed no change; its SDK polls a lost network every 3 s.
+
+Results on the final code, 25 peers (ms):
+
+| Scenario | ably (live) | pubnub (live) | nostr (local / public relays) | gun (local) |
+|---|---|---|---|---|
+| join: rosters complete | 828 (33 refused sends) | 413 | 412-817 in 6 runs / 535 | 408 |
+| frames sent during the join: total, peak per second | 353, 67 | 200, 55 | 194, 35 / 540, 128 | 7,493, 2,769 |
+| frames in 10 idle seconds | 2 | 2 | 2 / 6 | 533 |
+| 60 characters of 5 concurrent typists everywhere | 2,318 | 1,132 | 607 / 1,038 | 2,184 |
+| killed tab dropped from every roster | 15,161 | 30,344 (no presence: the 30 s lease) | 120,898 / 120,827 (120 s lease) | 120,436 (120 s lease) |
+| 5 pages frozen 20 s: missed text / rosters complete | 405 / 407 | 418 / 423 | 1,211 / 1,214 - 1,575 / 1,780 | 3,681 / 3,691 |
+| reload: rosters complete | 778 | 709 | 588 / 556 | 124,338 (open, above) |
+| outage 5 s: text typed DURING it everywhere, since it ended | 15,198 | 5,312 | 2,172 / 5,077 | 5,816 |
+| text typed afterwards / a new peer in every roster | 413 / 1,058 | 459 / 979 | 416 / 880 - 412 / 1,272 | 407 / 953 |
+| final: editors identical, rosters | yes, 25/25 | yes, 25/25 | yes, 25/25 / yes, 25/25 | yes, 25/25 |
+| sends the backend refused, whole run | 42 | 22 (during the outage) | 0 / 0 | 0 |
+
+Gun against the public relays of `.env` (`LIVE=1`) is not in the table:
+nothing arrived (rosters 0 of 25 complete, text in 1 of 25 editors), and it
+is the relays - plain Gun, two Node processes, no y-generic:
+`gun.defucc.me` never says hi, `relay.peer.ooo` says hi and does not pass a
+live write from one process to the other (12 s watched). The README's
+warning about public Gun relays stands; a classroom wants its own
+(`test/gun/relay.sh`).
+
+Regression gates of the two core changes: `bench-packet-loss`,
+`bench-corruption-storm`, `bench-late-join` all converged, messages within
+run-to-run noise (late join at 3 % loss, 12 samples per cell instead of 3,
+because a 3-sample mean looked slower: 289 / 451 / 227 / 201 ms before,
+202 / 219 / 226 / 370 ms after - outliers on both builds);
+`bench-mesh-join-burst` 233 / 924 / 2,565 -> 215 / 905 / 2,565 messages;
+`bench-join-census` awareness 100/2 and 200/2 per late join on both builds;
+the round-8 gates unchanged (`bench-presence-after-relink` 79 ms,
+`bench-wake-false-timeout` and `bench-resume-roster` 0 lost,
+`bench-reconnect-push` 3-4 deliveries). No wire-format change.
+
+What the numbers say about Ably's free tier: a join of 25 within 8 s and
+five simultaneous typists are both above 50 messages/s. The room survives it
+now, at the price of seconds; a class that types all at once wants a plan
+with a higher channel rate.
+
+Still not tested: a real phone, any browser but Chrome, Supabase and Matrix
+in this harness, rooms larger than 25, the edrys fork (`dev`).
+
 > Everything from here on describes the code **as found** (`main` @ 209a103,
 > before the fixes); line numbers and the quoted repro output refer to that
 > state. What changed, and the numbers after, are in the Status table above.

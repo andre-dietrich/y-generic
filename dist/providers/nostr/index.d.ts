@@ -215,6 +215,7 @@ export declare class NostrTransport implements Transport {
     private _hearing;
     private _deaf;
     private _peerConnectCallback?;
+    private _stopPageWatch?;
     private relays;
     private secretKey;
     private pubkey;
@@ -251,6 +252,18 @@ export declare class NostrTransport implements Transport {
      * kind replays what was missed (and what was not - Yjs does not mind).
      */
     private _subscribe;
+    /**
+     * A subscription is waiting in its backoff - subscribe now. A real phone
+     * (Chrome on Android, test/e2e/phone-session.mjs nostr): with the display
+     * off every attempt fails and the backoff climbs to 30 s; the page came
+     * back 0.2 s before an attempt failed once more - "again in 30000 ms" -
+     * and had the first missed text after 30.3 s, against 0.4 s when a timer
+     * happened to be due (test/nostr/repro-relay-restart.mjs, part 4: 13.2 s).
+     * The counters start over as well: an attempt that is in the air at that
+     * moment and fails is repeated after 1 s, not after what the dark had
+     * run up.
+     */
+    private _resubscribeNow;
     send(data: Uint8Array): Promise<void>;
     private _queueSnapshotPublish;
     /**

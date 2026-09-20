@@ -65,6 +65,13 @@ subscription again after NONE did, `GenericProvider` is told
 (`onPeerConnect`) and syncs. Events arrive once per relay and are
 deduplicated by id.
 
+In a browser the backoff is not sat out once somebody looks at the page
+again (`visibilitychange`) or the network is back (`online`): a phone with
+the display off fails every attempt, and came back with up to 30 s of
+waiting ahead of it - first missed text after 30.3 s, against 0.4 s when a
+retry happened to be due (`test/e2e/phone-session.mjs nostr`; part 4 of the
+repro: 13.2 s -> 1.0 s).
+
 End-to-end over damus + nos.lol + nostr.mom + purplerelay (two peers in
 Node, then a third): both synced after 278 ms, small updates 240-340 ms,
 a 120,000-character insert (compressed to 90 KB, sent as 3 events of

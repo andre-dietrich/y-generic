@@ -23,7 +23,16 @@
 //                 had the missed text 21.9 s after the unfreeze, with the
 //                 next beacon somebody happened to send. Want: never at the
 //                 first subscription, once per return.
-// 1 and 2 must be a number, 3 must hold. Exit code 1 otherwise (30 s watched).
+//  4 wake        the relay is away for 17 s - a phone with the display off:
+//                 every attempt fails, the backoff is at 16 s - and back one
+//                 second before the page becomes visible again. A real phone
+//                 (test/e2e/phone-session.mjs nostr, 2026-09-20): hidden for
+//                 107 s, "subscription closed, again in 30000 ms" 0.2 s after
+//                 the return, the first missed text after 30.3 s; 5.7 s and
+//                 0.4 s the other times - wherever in the backoff it woke.
+//                 Ms from `visibilitychange` until A hears B; want < 5 s.
+// 1 and 2 must be a number, 3 must hold, 4 under 5 s. Exit code 1 otherwise
+// (30 s watched).
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { fork } from 'node:child_process'
@@ -34,6 +43,16 @@ const req = createRequire(join(root, 'package.json'))
 const PORT = Number(process.env.NOSTR_RELAY_PORT ?? 8767)
 const WATCH_MS = Number(process.env.WATCH_MS ?? 30000)
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// The page of part 4: the transport listens for `visibilitychange` and `online` where there
+// is a document and a window.
+const pageListeners = { visibilitychange: new Set(), online: new Set() }
+const listenable = {
+  addEventListener: (type, fn) => pageListeners[type]?.add(fn),
+  removeEventListener: (type, fn) => pageListeners[type]?.delete(fn),
+}
+globalThis.document = { visibilityState: 'visible', ...listenable }
+globalThis.window = listenable
 
 const tools = process.env.NOSTR_TOOLS ?? 'nostr-tools'
 let pure, pool
@@ -106,6 +125,14 @@ console.log(`2 down at join: C hears B after ${fmt(downAtJoin)}`)
 const told = toldAtFirst === 0 && a.told === 2 && c.told === 1
 console.log(`3 told: A at its first subscription ${toldAtFirst} (want 0), after two relay restarts ${a.told} (want 2), C ${c.told} (want 1)`)
 
+stopRelay()
+await sleep(17000) // attempts after 1, 3, 7 and 15 s; the next one is due after 31 s
+await startRelay()
+await sleep(500)
+for (const fn of pageListeners.visibilitychange) fn()
+const wake = await untilHeard(b, a, 4)
+console.log(`4 wake: A hears B ${fmt(wake)} after the page became visible (relay back 1 s before; want < 5000 ms)`)
+
 for (const p of [a, b, c]) p.t.disconnect()
 stopRelay()
-process.exit(restart < 0 || downAtJoin < 0 || !told ? 1 : 0)
+process.exit(restart < 0 || downAtJoin < 0 || !told || wake < 0 || wake >= 5000 ? 1 : 0)

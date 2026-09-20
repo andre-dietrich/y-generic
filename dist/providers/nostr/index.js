@@ -266,6 +266,21 @@ export class NostrTransport {
         this._connected = true;
         for (const url of this.relays)
             this._subscribe(url);
+        // Somebody looks at the page again, or the network is back: not the
+        // moment to sit out a backoff (see _resubscribeNow). Browser only.
+        if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+            const visible = () => {
+                if (document.visibilityState === 'visible')
+                    this._resubscribeNow();
+            };
+            const online = () => this._resubscribeNow();
+            document.addEventListener('visibilitychange', visible);
+            window.addEventListener('online', online);
+            this._stopPageWatch = () => {
+                document.removeEventListener('visibilitychange', visible);
+                window.removeEventListener('online', online);
+            };
+        }
         // Persistent mode: fetch the durable snapshot (if any) and start
         // publishing new ones on doc changes. Additive to the live subscription
         // above, never a replacement for it.
@@ -308,6 +323,8 @@ export class NostrTransport {
     }
     disconnect() {
         this._connected = false; // first: closing a subscription fires its onclose
+        this._stopPageWatch?.();
+        this._stopPageWatch = undefined;
         for (const timer of this._resubscribeTimers.values())
             clearTimeout(timer);
         this._resubscribeTimers.clear();
@@ -427,10 +444,37 @@ export class NostrTransport {
                     console.log('[NostrTransport] Subscription closed by', url, reasons, '- again in', delay, 'ms');
                 }
                 clearTimeout(this._resubscribeTimers.get(url));
-                this._resubscribeTimers.set(url, setTimeout(() => this._subscribe(url), delay));
+                this._resubscribeTimers.set(url, setTimeout(() => {
+                    this._resubscribeTimers.delete(url); // what is in the map is waiting
+                    this._subscribe(url);
+                }, delay));
             },
         });
         this.subs.set(url, sub);
+    }
+    /**
+     * A subscription is waiting in its backoff - subscribe now. A real phone
+     * (Chrome on Android, test/e2e/phone-session.mjs nostr): with the display
+     * off every attempt fails and the backoff climbs to 30 s; the page came
+     * back 0.2 s before an attempt failed once more - "again in 30000 ms" -
+     * and had the first missed text after 30.3 s, against 0.4 s when a timer
+     * happened to be due (test/nostr/repro-relay-restart.mjs, part 4: 13.2 s).
+     * The counters start over as well: an attempt that is in the air at that
+     * moment and fails is repeated after 1 s, not after what the dark had
+     * run up.
+     */
+    _resubscribeNow() {
+        if (!this._connected)
+            return;
+        this._resubscribeAttempts.clear();
+        const waiting = Array.from(this._resubscribeTimers.keys());
+        for (const url of waiting) {
+            clearTimeout(this._resubscribeTimers.get(url));
+            this._resubscribeTimers.delete(url);
+            if (this._debug)
+                console.log('[NostrTransport] Page is back - subscribing now', url);
+            this._subscribe(url);
+        }
     }
     async send(data) {
         if (!this._connected || !this.pool) {

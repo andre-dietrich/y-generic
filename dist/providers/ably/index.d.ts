@@ -150,6 +150,8 @@ export declare class AblyTransport implements Transport {
     private debug;
     private messageCallback?;
     private _peerDisconnectCallback?;
+    private _peerConnectCallback?;
+    private _enterTimer?;
     private messageBuffer;
     private chunkBuffer;
     private persistentMode;
@@ -165,6 +167,15 @@ export declare class AblyTransport implements Transport {
     constructor(options: AblyTransportOptions);
     get isConnected(): boolean;
     connect(config: AblyConfig): Promise<void>;
+    /**
+     * Presence is what lets the room drop us the moment we leave - not a
+     * reason to refuse the room. Ably rejects an enter like any message while
+     * the channel is over its rate (42913, "nonfatal"; free tier: 50
+     * messages/s): of 25 peers joining within 5 s, one failed to connect for
+     * good (test/e2e/room-scenarios.mjs ably, twice in two runs). Never
+     * throws; tries again until it holds, 1 s doubling up to 30 s, jittered.
+     */
+    private _enterPresence;
     disconnect(): Promise<void>;
     send(data: Uint8Array): void;
     /** Peek the message type byte from CRC32-wrapped data (byte 4, after the 4-byte CRC32 header). */
@@ -189,9 +200,29 @@ export declare class AblyTransport implements Transport {
      */
     private loadSnapshot;
     private sendChunked;
+    /**
+     * Publish, and publish again what Ably REFUSED: over the channel's message
+     * rate (free tier: 50/s) it rejects the publish - 42913 "Rate limit
+     * exceeded; request rejected (nonfatal)", statusCode 429 - and tells us.
+     * That is not a failed send to log: the message is lost for every receiver
+     * at once, and only we can send it again. 25 browsers on one channel peak
+     * at 56-84 messages/s while joining and 82-103 with five typing at once
+     * (30-95 refusals per run): a refused keystroke took the room 2.5-10.6 s
+     * to repair, a refused presence up to half a lease (172 s until all
+     * rosters of a join were complete). The rate is per second, so the next
+     * try is 1-2 s away, further each time, five times at most. Order does not
+     * matter to Yjs updates or awareness states. Anything else is logged, as
+     * before (a dropped connection: the provider's reconnect sync covers it).
+     */
+    private _publish;
     private handleChunkedMessage;
     private handleMessage;
     private deliver;
+    /**
+     * Transport.onPeerConnect: fires when Ably's connection comes BACK
+     * (never at the first connect) - see connect().
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
      * Transport.onPeerDisconnect: Ably presence 'leave' on the channel. Peer
      * ids are Ably clientIds, the same `from` onMessage passes.

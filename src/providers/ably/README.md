@@ -164,6 +164,21 @@ Get list of connected peer client IDs.
    presence after its connection TTL.
 4. **Chunking**: Messages above ~55 KB (base64-encoded) are split into chunks and reassembled on receipt
 5. **Echo Suppression**: `echoMessages: false` prevents a client from receiving its own publishes
+6. **Reconnects**: ably-js reconnects by itself (a network blip, a frozen
+   page, a phone out of the background). The transport follows its
+   connection state and tells `GenericProvider` when the connection came
+   BACK (`onPeerConnect`): the provider announces itself again and pushes
+   what it wrote meanwhile. Ably retries a lost connection every 15 s, so
+   that is how long text typed during an outage takes to arrive.
+7. **Rate limit**: Ably rejects what exceeds a channel's message rate - 50
+   messages/s on the free tier - with error 42913 ("nonfatal"). A refused
+   publish is sent again after 1-2 s (further each time, five times), a
+   refused `presence.enter()` until it holds; neither fails `connect()`.
+   Measured with 25 browsers on one free-tier channel
+   (`test/e2e/room-scenarios.mjs ably`): the room peaks at 56-84 messages/s
+   while 25 peers join within 8 s and at 82-103 with five peers typing at
+   once - above the limit. It converges, but a classroom that types all at
+   once wants a plan with a higher channel rate.
 
 ## Pros & Cons
 

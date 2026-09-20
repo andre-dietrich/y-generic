@@ -252,6 +252,8 @@ export class AblyTransport implements Transport {
   private debug: boolean = false
   private messageCallback?: (data: Uint8Array, from?: string) => void
   private _peerDisconnectCallback?: (peerId: string) => void
+  private _peerConnectCallback?: (peerId: string) => void
+  private _enterTimer?: ReturnType<typeof setTimeout>
   private messageBuffer: Array<{ data: Uint8Array; from?: string }> = []
   private chunkBuffer: Map<string, Map<number, string>> = new Map()
   // No preferredCompressMinBytes: this transport strips the CRC32 header
@@ -351,10 +353,20 @@ export class AblyTransport implements Transport {
         reject(new Error('Ably connection timeout'))
       }, 10000)
 
-      this.client!.connection.once('connected', () => {
+      // on, not once: ably-js reconnects by itself (a network blip, a frozen
+      // page, a phone out of the background) and 'disconnected' below clears
+      // the flag - with once() the transport kept receiving and never sent
+      // again (test/providers/repro-ably-lifecycle.ts).
+      let everConnected = false
+      this.client!.connection.on('connected', () => {
         clearTimeout(timeout)
         this._isConnected = true
         this.log('Connected to Ably')
+        // Back after an outage: what we produced meanwhile was not sent, and
+        // after 15 s Ably reported our leave to the room. The provider
+        // announces itself again and pushes what the room has not confirmed.
+        if (everConnected) this._peerConnectCallback?.('ably')
+        everConnected = true
         resolve()
       })
 
@@ -386,7 +398,7 @@ export class AblyTransport implements Transport {
       // `from` - the same id a presence leave reports (onPeerDisconnect).
       this.handleMessage(message.data, message.clientId)
     })
-    await this.channel.presence.enter()
+    await this._enterPresence()
     // Presence leave: a clean leave, or Ably's own removal after a dropped
     // connection's TTL. Delivered to every subscriber, so GenericProvider
     // drops the member's awareness without a broadcast burst and lets the
@@ -412,8 +424,30 @@ export class AblyTransport implements Transport {
     }
   }
 
+  /**
+   * Presence is what lets the room drop us the moment we leave - not a
+   * reason to refuse the room. Ably rejects an enter like any message while
+   * the channel is over its rate (42913, "nonfatal"; free tier: 50
+   * messages/s): of 25 peers joining within 5 s, one failed to connect for
+   * good (test/e2e/room-scenarios.mjs ably, twice in two runs). Never
+   * throws; tries again until it holds, 1 s doubling up to 30 s, jittered.
+   */
+  private async _enterPresence(attempt = 0): Promise<void> {
+    const channel = this.channel
+    if (!channel) return
+    try {
+      await channel.presence.enter()
+    } catch (error) {
+      if (this.channel !== channel) return // disconnect() meanwhile
+      const delay = Math.min(30000, 1000 * 2 ** attempt) * (0.5 + Math.random())
+      this.log('presence.enter refused, again in', Math.round(delay), 'ms:', error)
+      this._enterTimer = setTimeout(() => this._enterPresence(attempt + 1), delay)
+    }
+  }
+
   async disconnect(): Promise<void> {
     this.log('Disconnecting...')
+    clearTimeout(this._enterTimer)
 
     if (this.persistTimer) {
       clearTimeout(this.persistTimer)
@@ -464,9 +498,7 @@ export class AblyTransport implements Transport {
     if (base64Data.length > MAX_MESSAGE_SIZE) {
       this.sendChunked(base64Data, payload.length)
     } else {
-      this.channel.publish(EVENT_NAME, base64Data).catch((error) => {
-        this.log('Publish error:', error)
-      })
+      this._publish(base64Data)
     }
 
     // Only real doc updates trigger a snapshot save, not every awareness
@@ -647,10 +679,38 @@ export class AblyTransport implements Transport {
     )
 
     chunks.forEach((chunk, index) => {
-      const message = { chunked: true, id: chunkId, index, total: chunks.length, data: chunk }
-      this.channel!.publish(EVENT_NAME, message).catch((error) => {
-        this.log(`Failed to send chunk ${index + 1}:`, error)
-      })
+      this._publish({ chunked: true, id: chunkId, index, total: chunks.length, data: chunk })
+    })
+  }
+
+  /**
+   * Publish, and publish again what Ably REFUSED: over the channel's message
+   * rate (free tier: 50/s) it rejects the publish - 42913 "Rate limit
+   * exceeded; request rejected (nonfatal)", statusCode 429 - and tells us.
+   * That is not a failed send to log: the message is lost for every receiver
+   * at once, and only we can send it again. 25 browsers on one channel peak
+   * at 56-84 messages/s while joining and 82-103 with five typing at once
+   * (30-95 refusals per run): a refused keystroke took the room 2.5-10.6 s
+   * to repair, a refused presence up to half a lease (172 s until all
+   * rosters of a join were complete). The rate is per second, so the next
+   * try is 1-2 s away, further each time, five times at most. Order does not
+   * matter to Yjs updates or awareness states. Anything else is logged, as
+   * before (a dropped connection: the provider's reconnect sync covers it).
+   */
+  private _publish(message: unknown, attempt = 0): void {
+    const channel = this.channel
+    if (!channel) return
+    channel.publish(EVENT_NAME, message).catch((error: any) => {
+      const refused = error?.code === 42913 || error?.statusCode === 429
+      if (!refused || attempt >= 5 || this.channel !== channel) {
+        this.log('Publish error:', error)
+        return
+      }
+      const delay = (1000 + Math.random() * 1000) * (attempt + 1)
+      this.log('Publish refused (rate limit), again in', Math.round(delay), 'ms')
+      setTimeout(() => {
+        if (this.channel === channel) this._publish(message, attempt + 1) // not into another room
+      }, delay)
     })
   }
 
@@ -713,6 +773,17 @@ export class AblyTransport implements Transport {
       this.messageCallback(data, from)
     } else {
       this.messageBuffer.push({ data, from })
+    }
+  }
+
+  /**
+   * Transport.onPeerConnect: fires when Ably's connection comes BACK
+   * (never at the first connect) - see connect().
+   */
+  onPeerConnect(callback: (peerId: string) => void): () => void {
+    this._peerConnectCallback = callback
+    return () => {
+      this._peerConnectCallback = undefined
     }
   }
 

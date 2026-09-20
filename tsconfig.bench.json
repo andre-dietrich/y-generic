@@ -47,6 +47,7 @@
     "test/providers/check-chunking.ts",
     "test/providers/repro-simple-peer-sleep.ts",
     "test/providers/repro-peerjs-coordinator.ts",
+    "test/providers/repro-ably-lifecycle.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]
 }

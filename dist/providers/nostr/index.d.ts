@@ -97,6 +97,7 @@ export interface NostrTransportOptions {
         subscribeMany(relays: string[], filter: object, handlers: {
             onevent?: (event: NostrEvent) => void;
             oneose?: () => void;
+            onclose?: (reasons: unknown[]) => void;
         }): {
             close(): void;
         };
@@ -205,7 +206,15 @@ export declare class NostrTransport implements Transport {
     private _buffer;
     private _chunks;
     private pool;
-    private sub;
+    private subs;
+    private _resubscribeTimers;
+    private _resubscribeAttempts;
+    private _seenEventIds;
+    private _filter;
+    private _debug;
+    private _hearing;
+    private _deaf;
+    private _peerConnectCallback?;
     private relays;
     private secretKey;
     private pubkey;
@@ -225,6 +234,23 @@ export declare class NostrTransport implements Transport {
     get isConnected(): boolean;
     connect(config: NostrConfig): Promise<void>;
     disconnect(): void;
+    /**
+     * Subscribe to the room on ONE relay, and again whenever that relay closes
+     * the subscription. nostr-tools closes a relay's subscriptions for good
+     * when its socket closes - a relay restart, a frozen page (Chrome closes
+     * its WebSockets), a network switch - and reports a relay that was not
+     * reachable at connect the same way, while publish() re-opens the socket
+     * each time: the peer kept sending and never heard anybody again
+     * (test/nostr/repro-relay-restart.mjs; the pool's own enableReconnect
+     * gives up on a socket that reports `error` before `close`, which is what
+     * a killed relay produces). Per relay, because one subscription over all
+     * relays reports a close only once EVERY relay has closed it - until then
+     * the room's redundancy shrinks silently. The price: each event arrives
+     * once per relay, so the ids are deduplicated here instead of in the pool.
+     * The filter's `since` stays that of connect(): a relay that stores the
+     * kind replays what was missed (and what was not - Yjs does not mind).
+     */
+    private _subscribe;
     send(data: Uint8Array): Promise<void>;
     private _queueSnapshotPublish;
     /**
@@ -236,6 +262,15 @@ export declare class NostrTransport implements Transport {
      * left stale alongside a newer one under a different address.
      */
     private _publishSnapshot;
+    /**
+     * Transport.onPeerConnect: fires when a relay holds our subscription again
+     * after NONE did (relay restart, frozen page, no relay reachable at
+     * connect) - not at the first subscription, not while another relay kept
+     * delivering. The provider then announces itself and syncs: 5 of 25 pages
+     * frozen for 20 s had the missed text 21.9 s after the unfreeze without
+     * it, with whatever beacon came next.
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     onMessage(callback: (data: Uint8Array) => void): () => void;
     private _deliver;
 }

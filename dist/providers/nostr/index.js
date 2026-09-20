@@ -141,6 +141,12 @@ async function hashPassword(password) {
 // peers joining later can catch up on missed updates.
 // ---------------------------------------------------------------------------
 const DEFAULT_KIND = 27370;
+// A relay closed our subscription: subscribe again after 1 s, doubling up to
+// 30 s while it keeps failing (see _subscribe()).
+const RESUBSCRIBE_MIN_MS = 1000;
+const RESUBSCRIBE_MAX_MS = 30000;
+// Event ids remembered to drop the copies the other relays deliver.
+const MAX_SEEN_EVENT_IDS = 2000;
 // Default public relays used when no `relays` list is provided in config.
 const DEFAULT_RELAYS = [
     'wss://relay.damus.io',
@@ -188,7 +194,16 @@ export class NostrTransport {
         this._buffer = [];
         this._chunks = new ChunkAssembler();
         this.pool = null;
-        this.sub = null;
+        // One subscription per relay, see _subscribe()
+        this.subs = new Map();
+        this._resubscribeTimers = new Map();
+        this._resubscribeAttempts = new Map();
+        this._seenEventIds = new Set();
+        this._filter = {};
+        this._debug = false;
+        // Relays that hold our subscription right now; none left = deaf
+        this._hearing = new Set();
+        this._deaf = false;
         this.relays = [];
         this.pubkey = '';
         this.roomTag = '';
@@ -246,44 +261,11 @@ export class NostrTransport {
         if (debug) {
             console.log('[NostrTransport] Connecting. relays:', this.relays, 'room:', this.roomTag, 'kind:', this.eventKind, 'filter.since:', since);
         }
-        // Subscribe to events matching our room. The subscription delivers both
-        // stored (historical) events first, then real-time new events.
-        this.sub = this.pool.subscribeMany(this.relays, filter, {
-            onevent: (event) => {
-                // Ignore events published by this client to avoid echo
-                if (event.pubkey === this.pubkey)
-                    return;
-                if (debug) {
-                    console.log('[NostrTransport] Received event', event.id.substring(0, 8), 'from', event.pubkey.substring(0, 8));
-                }
-                try {
-                    let content = event.content;
-                    if (content.startsWith('{')) {
-                        const parsed = JSON.parse(content);
-                        if (!isChunk(parsed))
-                            return;
-                        const whole = this._chunks.push(parsed);
-                        if (whole === null)
-                            return;
-                        content = whole;
-                    }
-                    // The frame goes through untouched (CRC32 wrapper, and the
-                    // compression flag when compressionThresholdBytes is on): a
-                    // transport that strips and re-adds the header cannot carry a
-                    // compressed frame.
-                    this._deliver(base64ToUint8Array(content));
-                }
-                catch (err) {
-                    console.warn('[NostrTransport] Failed to decode event content:', err);
-                }
-            },
-            oneose: () => {
-                if (debug) {
-                    console.log('[NostrTransport] EOSE — stored events delivered');
-                }
-            },
-        });
+        this._filter = filter;
+        this._debug = debug;
         this._connected = true;
+        for (const url of this.relays)
+            this._subscribe(url);
         // Persistent mode: fetch the durable snapshot (if any) and start
         // publishing new ones on doc changes. Additive to the live subscription
         // above, never a replacement for it.
@@ -325,10 +307,17 @@ export class NostrTransport {
         }
     }
     disconnect() {
-        if (this.sub) {
-            this.sub.close();
-            this.sub = null;
-        }
+        this._connected = false; // first: closing a subscription fires its onclose
+        for (const timer of this._resubscribeTimers.values())
+            clearTimeout(timer);
+        this._resubscribeTimers.clear();
+        this._resubscribeAttempts.clear();
+        for (const sub of this.subs.values())
+            sub.close();
+        this.subs.clear();
+        this._seenEventIds.clear();
+        this._hearing.clear();
+        this._deaf = false;
         if (this.snapshotSub) {
             this.snapshotSub.close();
             this.snapshotSub = null;
@@ -350,6 +339,98 @@ export class NostrTransport {
         }
         this._connected = false;
         this._buffer = [];
+    }
+    /**
+     * Subscribe to the room on ONE relay, and again whenever that relay closes
+     * the subscription. nostr-tools closes a relay's subscriptions for good
+     * when its socket closes - a relay restart, a frozen page (Chrome closes
+     * its WebSockets), a network switch - and reports a relay that was not
+     * reachable at connect the same way, while publish() re-opens the socket
+     * each time: the peer kept sending and never heard anybody again
+     * (test/nostr/repro-relay-restart.mjs; the pool's own enableReconnect
+     * gives up on a socket that reports `error` before `close`, which is what
+     * a killed relay produces). Per relay, because one subscription over all
+     * relays reports a close only once EVERY relay has closed it - until then
+     * the room's redundancy shrinks silently. The price: each event arrives
+     * once per relay, so the ids are deduplicated here instead of in the pool.
+     * The filter's `since` stays that of connect(): a relay that stores the
+     * kind replays what was missed (and what was not - Yjs does not mind).
+     */
+    _subscribe(url) {
+        if (!this._connected || !this.pool)
+            return;
+        let closed = false;
+        const sub = this.pool.subscribeMany([url], this._filter, {
+            onevent: (event) => {
+                // Ignore events published by this client to avoid echo
+                if (event.pubkey === this.pubkey)
+                    return;
+                if (this._seenEventIds.has(event.id))
+                    return;
+                this._seenEventIds.add(event.id);
+                if (this._seenEventIds.size > MAX_SEEN_EVENT_IDS) {
+                    this._seenEventIds.delete(this._seenEventIds.values().next().value);
+                }
+                if (this._debug) {
+                    console.log('[NostrTransport] Received event', event.id.substring(0, 8), 'from', event.pubkey.substring(0, 8));
+                }
+                try {
+                    let content = event.content;
+                    if (content.startsWith('{')) {
+                        const parsed = JSON.parse(content);
+                        if (!isChunk(parsed))
+                            return;
+                        const whole = this._chunks.push(parsed);
+                        if (whole === null)
+                            return;
+                        content = whole;
+                    }
+                    // The frame goes through untouched (CRC32 wrapper, and the
+                    // compression flag when compressionThresholdBytes is on): a
+                    // transport that strips and re-adds the header cannot carry a
+                    // compressed frame.
+                    this._deliver(base64ToUint8Array(content));
+                }
+                catch (err) {
+                    console.warn('[NostrTransport] Failed to decode event content:', err);
+                }
+            },
+            // nostr-tools reports a close - a relay it could not even reach - as
+            // an EOSE first, then as the close, in the same tick: only an EOSE
+            // that is still open a microtask later is the relay answering.
+            oneose: () => queueMicrotask(() => {
+                if (closed || !this._connected)
+                    return;
+                this._resubscribeAttempts.delete(url); // back to the short delay
+                this._hearing.add(url);
+                if (this._debug) {
+                    console.log('[NostrTransport] EOSE — stored events delivered', url);
+                }
+                // We hear the room again, which is not knowing what it said
+                // meanwhile (an ephemeral kind is not stored): the provider asks.
+                if (this._deaf) {
+                    this._deaf = false;
+                    this._peerConnectCallback?.(url);
+                }
+            }),
+            onclose: (reasons) => {
+                closed = true;
+                if (!this._connected || this.subs.get(url) !== sub)
+                    return; // disconnect(), or replaced
+                this._hearing.delete(url);
+                if (this._hearing.size === 0)
+                    this._deaf = true;
+                const attempt = this._resubscribeAttempts.get(url) ?? 0;
+                this._resubscribeAttempts.set(url, attempt + 1);
+                const delay = Math.min(RESUBSCRIBE_MAX_MS, RESUBSCRIBE_MIN_MS * 2 ** attempt);
+                if (this._debug) {
+                    console.log('[NostrTransport] Subscription closed by', url, reasons, '- again in', delay, 'ms');
+                }
+                clearTimeout(this._resubscribeTimers.get(url));
+                this._resubscribeTimers.set(url, setTimeout(() => this._subscribe(url), delay));
+            },
+        });
+        this.subs.set(url, sub);
     }
     async send(data) {
         if (!this._connected || !this.pool) {
@@ -425,6 +506,20 @@ export class NostrTransport {
             if (this.publishPending)
                 this._queueSnapshotPublish();
         }
+    }
+    /**
+     * Transport.onPeerConnect: fires when a relay holds our subscription again
+     * after NONE did (relay restart, frozen page, no relay reachable at
+     * connect) - not at the first subscription, not while another relay kept
+     * delivering. The provider then announces itself and syncs: 5 of 25 pages
+     * frozen for 20 s had the missed text 21.9 s after the unfreeze without
+     * it, with whatever beacon came next.
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        return () => {
+            this._peerConnectCallback = undefined;
+        };
     }
     onMessage(callback) {
         this._callback = callback;

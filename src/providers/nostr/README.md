@@ -52,6 +52,19 @@ cases, since relay storage then grows without bound for as long as the
 room is edited; persistent mode is the recommended path for durable
 catch-up instead.
 
+**Relays that go away.** The transport holds one subscription per relay
+and subscribes again whenever a relay closes it (1 s, doubling up to 30 s
+while it keeps failing) - a relay restart, a frozen page (Chrome closes its
+WebSockets), a relay that was not reachable at `connect()`. nostr-tools
+closes a relay's subscriptions for good with its socket while `publish()`
+re-opens the socket each time, so without this a peer kept sending and
+never heard anybody again (`test/nostr/repro-relay-restart.mjs`; the pool's
+own `enableReconnect` gives up on a socket that reports `error` before
+`close`, which is what a killed relay produces). When a relay holds the
+subscription again after NONE did, `GenericProvider` is told
+(`onPeerConnect`) and syncs. Events arrive once per relay and are
+deduplicated by id.
+
 End-to-end over damus + nos.lol + nostr.mom + purplerelay (two peers in
 Node, then a third): both synced after 278 ms, small updates 240-340 ms,
 a 120,000-character insert (compressed to 90 KB, sent as 3 events of

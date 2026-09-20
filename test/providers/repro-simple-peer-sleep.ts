@@ -26,6 +26,23 @@
  *  Part 6 - the page was suspended: Date.now() jumps by 60 s
  *           (resumeAfterMs: 15000). Does the transport drop its links and
  *           re-announce under a new peer id?
+ *  Part 8 - a background tab, not a sleeping page: the timers come 17 s late
+ *           (default options). Firefox delays the timers of a HIDDEN tab in a
+ *           busy room by up to ~15 s, measured with 3 Firefox peers among 25:
+ *           ticks 5.6, 9.0, 15.3, 17.6 s late (monotonic clock the same), the
+ *           visible Firefox tab none - and with the old default of 15 s every
+ *           such tick was taken for a sleep: all links dropped, the room joined
+ *           again under a new id, once a minute, for every Firefox user with
+ *           the tab in the background. A link survives 30 s of silence, so
+ *           nothing shorter needs repairing. Are the links left alone?
+ *  Part 9 - the same, beyond any threshold: no tick for 40 s while the link
+ *           delivers a message every second (24 s late was measured on a busy
+ *           test machine - a margin is not a design). A page that handles what
+ *           its links deliver has not slept. Are the links left alone?
+ *  Part 10 - and the trap in that: a page that DID sleep 40 s handles, as the
+ *           first thing when it wakes, a message that queued before it fell
+ *           asleep (seen with pages frozen through the DevTools protocol). Its
+ *           links are dead by then. Is that still a sleep?
  *  Part 7 - a link that cannot send: simple-peer has fired 'connect', and the
  *           channel's send() throws "readyState is not 'open'". Seen with 50
  *           real browsers on the answering side of a link (Chrome 151, a busy
@@ -349,6 +366,56 @@ async function main() {
     )
     r.transport.disconnect()
   }
+  console.log("\nPart 8 - a hidden tab's timers come 17 s late (default options)")
+  {
+    const firstSocket = FakeWebSocket.all.length - 1 // this transport's socket, and any it opens from here on
+    const r = await transportPeer('ice-first')
+    const realNow = Date.now
+    Date.now = () => realNow() + 17000
+    await sleep(3000)
+    Date.now = realNow
+    const ids = new Set(
+      FakeWebSocket.all
+        .slice(firstSocket + 1)
+        .flatMap((w) => w.sent)
+        .filter((m) => m.msg.type === 'publish' && !(m.msg as any).signal)
+        .map((m) => (m.msg as any).from as string),
+    )
+    ids.delete(r.ownId)
+    console.log(`  3 s after the late tick: links dropped = ${r.seen.disconnect > 0}, connectedPeers = ${r.transport.connectedPeers}, announces under a new peer id = ${ids.size > 0}`)
+    r.transport.disconnect()
+  }
+
+  const frame = () => ({ data: new Uint8Array([0, 1, 2, 3]).buffer }) // [MSG_TYPE_COMPLETE, payload]
+  console.log('\nPart 9 - no tick for 40 s while the link delivers a message every second (default options)')
+  {
+    const r = await transportPeer('ice-first')
+    const realNow = Date.now
+    let ahead = 0
+    Date.now = () => realNow() + ahead
+    for (let second = 0; second < 40; second++) {
+      ahead += 1000 // the clock moves on, the (real) 1 s ticks in between see only the last message's time
+      r.pc.channel!.onmessage?.(frame())
+      await sleep(5)
+    }
+    await sleep(1500)
+    Date.now = realNow
+    console.log(`  afterwards: links dropped = ${r.seen.disconnect > 0}, connectedPeers = ${r.transport.connectedPeers}`)
+    r.transport.disconnect()
+  }
+
+  console.log('\nPart 10 - the page slept 40 s, and the first thing it handles is a message that queued before (default options)')
+  {
+    const r = await transportPeer('ice-first')
+    const realNow = Date.now
+    Date.now = () => realNow() + 40000
+    r.pc.channel!.onmessage?.(frame())
+    await sleep(200)
+    Date.now = realNow
+    console.log(`  afterwards: links dropped = ${r.seen.disconnect > 0}, connectedPeers = ${r.transport.connectedPeers}`)
+    r.transport.disconnect()
+  }
+
   console.log("\nPart 7 - 'connect' has fired, and the channel's send() throws: readyState is not 'open'")
   for (const how of ['sendTo', 'send'] as const) {
     const s = await transportAnsweringPeer()

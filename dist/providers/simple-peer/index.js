@@ -97,7 +97,7 @@ export class SimplePeerTransport {
             maxConns: options.maxConns ?? 64,
             peerOpts,
             connectTimeout: options.connectTimeout ?? 30000,
-            resumeAfterMs: options.resumeAfterMs ?? 15000,
+            resumeAfterMs: options.resumeAfterMs ?? 30000,
             debug: options.debug ?? false,
         };
         // Generate unique peer ID
@@ -670,6 +670,7 @@ export class SimplePeerTransport {
             // Data flowing proves the channel is open — handle the race where 'data' fires
             // before 'connect' (seen on Chrome when the remote initiator sends immediately).
             onChannelOpen('data');
+            this._stopResumeWatch?.alive(); // a page that handles this has not slept, however late its timers are
             if (!this._callback)
                 return;
             try {

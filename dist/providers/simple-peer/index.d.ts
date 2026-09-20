@@ -130,7 +130,13 @@ export interface SimplePeerTransportOptions {
      * laptop. The other side dropped a silent link after ~30 s, this side
      * would still read it as connected for ~30 s after waking up.
      * 0 disables.
-     * @default 15000
+     * Not below ~30 s: a link survives that much silence, so a shorter sleep
+     * has nothing to repair - and Firefox delays the timers of a HIDDEN tab
+     * in a busy room by up to ~15-20 s (measured; its budget throttling caps
+     * at 15 s), which the old default of 15000 took for a sleep: a full
+     * re-join about once a minute for every Firefox user with the tab in the
+     * background (test/providers/repro-simple-peer-sleep.ts, part 8).
+     * @default 30000
      */
     resumeAfterMs?: number;
     /**

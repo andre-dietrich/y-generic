@@ -76,7 +76,8 @@ await provider.connect({ room: 'my-room' })
 - `peerOpts`: Options passed to simple-peer
 - `connectTimeout`: ms a peer connection may take to open before its entry is dropped (default: 30000)
 - `resumeAfterMs`: rebuild all links under a new peer id when the page did not run for this
-  long - a phone browser in the background, a suspended laptop (default: 15000, 0 disables)
+  long - a phone browser in the background, a suspended laptop (default: 30000, 0 disables; not below
+  ~30 s - a link survives that much silence, and Firefox delays a hidden tab's timers by up to ~20 s)
 - `debug`: Enable debug logging
 
 **Phones:** a backgrounded page is suspended; its peers drop the silent link after ~30 s.
@@ -136,7 +137,7 @@ await provider.connect({ room: 'my-room' })
   (default: 15000) - Chrome never reports `failed` for a peer that vanished, and PeerJS closes
   on `failed` only
 - `resumeAfterMs`: leave and re-join the room when the page did not run for this long
-  (default: 15000, 0 disables)
+  (default: 30000, 0 disables; not below ~30 s, see simple-peer above)
 - `debug`: Enable debug logging
 
 **Known limit:** peers find each other through one coordinator, the peer holding the id

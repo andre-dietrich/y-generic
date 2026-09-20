@@ -30,7 +30,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
-import { watchResume } from '../resume'
+import { watchResume, type ResumeWatch } from '../resume'
 
 /**
  * Trystero room instance type.
@@ -195,7 +195,11 @@ export interface TrysteroTransportOptions {
    * Without `getRelaySockets`: leave and re-join the room when the page did
    * not run for this long (ms), a few seconds after it woke up (Trystero's
    * first socket retry takes 3.3 s). 0 disables.
-   * @default 15000
+   * Not below ~30 s: a link survives that much silence, so a shorter sleep
+   * has nothing to repair - and Firefox delays the timers of a HIDDEN tab
+   * in a busy room by up to ~15-20 s, which the old default of 15000 took
+   * for a sleep (see SimplePeerTransport's option of the same name).
+   * @default 30000
    */
   resumeAfterMs?: number
 
@@ -225,7 +229,7 @@ export class TrysteroTransport implements Transport {
   private _peerDisconnectCallback?: (peerId: string) => void
   private _joinedSockets: Map<string, WebSocket> = new Map() // relay sockets our subscriptions live on
   private _socketWatch?: ReturnType<typeof setInterval>
-  private _stopResumeWatch?: () => void
+  private _stopResumeWatch?: ResumeWatch
   private _rejoining: boolean = false
 
   constructor(options: TrysteroTransportOptions) {
@@ -279,8 +283,8 @@ export class TrysteroTransport implements Transport {
 
     if (this.options.getRelaySockets) {
       this._socketWatch = setInterval(() => this.checkRelaySockets(), 2000)
-    } else if ((this.options.resumeAfterMs ?? 15000) > 0) {
-      this._stopResumeWatch = watchResume(this.options.resumeAfterMs ?? 15000, () => {
+    } else if ((this.options.resumeAfterMs ?? 30000) > 0) {
+      this._stopResumeWatch = watchResume(this.options.resumeAfterMs ?? 30000, () => {
         setTimeout(() => this.rejoin('the page slept'), 5000)
       })
     }
@@ -331,6 +335,7 @@ export class TrysteroTransport implements Transport {
 
     // Listen for incoming updates
     receive((data: ArrayBuffer, peerId: string) => {
+      this._stopResumeWatch?.alive() // see watchResume: a page that handles this has not slept
       this.log(`Received update from ${peerId} (${data.byteLength} bytes)`)
       if (joined !== this.room) return // a room we already left (rejoin)
       if (this._callback) {

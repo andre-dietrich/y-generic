@@ -163,7 +163,11 @@ export interface TrysteroTransportOptions {
      * Without `getRelaySockets`: leave and re-join the room when the page did
      * not run for this long (ms), a few seconds after it woke up (Trystero's
      * first socket retry takes 3.3 s). 0 disables.
-     * @default 15000
+     * Not below ~30 s: a link survives that much silence, so a shorter sleep
+     * has nothing to repair - and Firefox delays the timers of a HIDDEN tab
+     * in a busy room by up to ~15-20 s, which the old default of 15000 took
+     * for a sleep (see SimplePeerTransport's option of the same name).
+     * @default 30000
      */
     resumeAfterMs?: number;
     /**

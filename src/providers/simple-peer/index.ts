@@ -30,7 +30,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
-import { watchResume } from '../resume'
+import { watchResume, type ResumeWatch } from '../resume'
 
 /**
  * SimplePeer constructor type (from simple-peer library).
@@ -141,7 +141,13 @@ export interface SimplePeerTransportOptions {
    * laptop. The other side dropped a silent link after ~30 s, this side
    * would still read it as connected for ~30 s after waking up.
    * 0 disables.
-   * @default 15000
+   * Not below ~30 s: a link survives that much silence, so a shorter sleep
+   * has nothing to repair - and Firefox delays the timers of a HIDDEN tab
+   * in a busy room by up to ~15-20 s (measured; its budget throttling caps
+   * at 15 s), which the old default of 15000 took for a sleep: a full
+   * re-join about once a minute for every Firefox user with the tab in the
+   * background (test/providers/repro-simple-peer-sleep.ts, part 8).
+   * @default 30000
    */
   resumeAfterMs?: number
 
@@ -226,7 +232,7 @@ export class SimplePeerTransport implements Transport {
   private _shouldConnect: boolean = false
   private signalingAttempts: Map<string, number> = new Map()
   private signalingTimers: Map<string, ReturnType<typeof setTimeout>> = new Map()
-  private _stopResumeWatch?: () => void
+  private _stopResumeWatch?: ResumeWatch
   private _resetting: boolean = false // handleResume(): removePeer() must not announce the old id
 
   /**
@@ -267,7 +273,7 @@ export class SimplePeerTransport implements Transport {
       maxConns: options.maxConns ?? 64,
       peerOpts,
       connectTimeout: options.connectTimeout ?? 30000,
-      resumeAfterMs: options.resumeAfterMs ?? 15000,
+      resumeAfterMs: options.resumeAfterMs ?? 30000,
       debug: options.debug ?? false,
     }
 
@@ -946,6 +952,7 @@ export class SimplePeerTransport implements Transport {
       // Data flowing proves the channel is open — handle the race where 'data' fires
       // before 'connect' (seen on Chrome when the remote initiator sends immediately).
       onChannelOpen('data')
+      this._stopResumeWatch?.alive() // a page that handles this has not slept, however late its timers are
 
       if (!this._callback) return
 

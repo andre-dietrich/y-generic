@@ -81,7 +81,7 @@ export class PeerJSTransport {
             maxConns: options.maxConns ?? 64,
             connectTimeout: options.connectTimeout ?? 30000,
             iceDisconnectTimeout: options.iceDisconnectTimeout ?? 15000,
-            resumeAfterMs: options.resumeAfterMs ?? 15000,
+            resumeAfterMs: options.resumeAfterMs ?? 30000,
             debug: options.debug ?? false,
         };
     }
@@ -679,6 +679,7 @@ export class PeerJSTransport {
                     });
                     // Handle messages from coordinator
                     conn.on('data', (data) => {
+                        this._stopResumeWatch?.alive(); // see watchResume: a page that handles this has not slept
                         // Try to decode as coordination message first
                         const uint8Data = data instanceof Uint8Array ? data : new Uint8Array(data);
                         const coordMessage = this.tryDecodeCoordinationMessage(uint8Data);
@@ -1143,6 +1144,7 @@ export class PeerJSTransport {
             this._peerConnectCallback?.(remotePeerId);
         });
         conn.on('data', (data) => {
+            this._stopResumeWatch?.alive(); // see watchResume: a page that handles this has not slept
             // Convert to Uint8Array if needed
             const uint8Data = data instanceof Uint8Array ? data : new Uint8Array(data);
             // Try to decode as JSON coordination message

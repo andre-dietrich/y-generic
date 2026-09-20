@@ -42,7 +42,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
-import { watchResume } from '../resume'
+import { watchResume, type ResumeWatch } from '../resume'
 
 /**
  * PeerJS constructor type (from peerjs library).
@@ -123,7 +123,11 @@ export interface PeerJSTransportOptions {
    * suspended laptop. The other side dropped a silent link after ~30 s,
    * this side would still read it as open for ~30 s after waking up.
    * 0 disables.
-   * @default 15000
+   * Not below ~30 s: a link survives that much silence, so a shorter sleep
+   * has nothing to repair - and Firefox delays the timers of a HIDDEN tab
+   * in a busy room by up to ~15-20 s, which the old default of 15000 took
+   * for a sleep (see SimplePeerTransport's option of the same name).
+   * @default 30000
    */
   resumeAfterMs?: number
 
@@ -172,7 +176,7 @@ export class PeerJSTransport implements Transport {
   private _epoch: number = 0
   private _reconnectAttempts: number = 0 // signaling reconnect backoff
   private _reconnectTimer?: ReturnType<typeof setTimeout>
-  private _stopResumeWatch?: () => void
+  private _stopResumeWatch?: ResumeWatch
   private _replacingPeer?: string // handleIncomingConnection(): this peer's close is not a departure
 
   /**
@@ -196,7 +200,7 @@ export class PeerJSTransport implements Transport {
       maxConns: options.maxConns ?? 64,
       connectTimeout: options.connectTimeout ?? 30000,
       iceDisconnectTimeout: options.iceDisconnectTimeout ?? 15000,
-      resumeAfterMs: options.resumeAfterMs ?? 15000,
+      resumeAfterMs: options.resumeAfterMs ?? 30000,
       debug: options.debug ?? false,
     }
   }
@@ -841,6 +845,7 @@ export class PeerJSTransport implements Transport {
 
           // Handle messages from coordinator
           conn.on('data', (data: any) => {
+            this._stopResumeWatch?.alive() // see watchResume: a page that handles this has not slept
             // Try to decode as coordination message first
             const uint8Data =
               data instanceof Uint8Array ? data : new Uint8Array(data)
@@ -1350,6 +1355,7 @@ export class PeerJSTransport implements Transport {
     })
 
     conn.on('data', (data: any) => {
+      this._stopResumeWatch?.alive() // see watchResume: a page that handles this has not slept
       // Convert to Uint8Array if needed
       const uint8Data = data instanceof Uint8Array ? data : new Uint8Array(data)
 

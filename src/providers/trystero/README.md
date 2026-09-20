@@ -161,7 +161,7 @@ const transport = new TrysteroTransport({
   of several does not count). Measured with 25 browsers: a page frozen for 20 s never connected to a
   peer that joined afterwards, and after a relay restart nobody could join; with the option 2.5 s / 0.8 s
 - **`resumeAfterMs`** `number` - without `getRelaySockets`: re-join a few seconds after the page slept
-  this long (default: `15000`, `0` disables)
+  this long (default: `30000`, `0` disables; not below ~30 s - Firefox delays a hidden tab's timers by up to ~20 s)
 - **`debug`** `boolean` - Enable debug logging (default: `false`)
 
 ## Additional Methods

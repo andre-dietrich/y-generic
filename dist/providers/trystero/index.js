@@ -82,8 +82,8 @@ export class TrysteroTransport {
         if (this.options.getRelaySockets) {
             this._socketWatch = setInterval(() => this.checkRelaySockets(), 2000);
         }
-        else if ((this.options.resumeAfterMs ?? 15000) > 0) {
-            this._stopResumeWatch = watchResume(this.options.resumeAfterMs ?? 15000, () => {
+        else if ((this.options.resumeAfterMs ?? 30000) > 0) {
+            this._stopResumeWatch = watchResume(this.options.resumeAfterMs ?? 30000, () => {
                 setTimeout(() => this.rejoin('the page slept'), 5000);
             });
         }
@@ -130,6 +130,7 @@ export class TrysteroTransport {
         this.sendUpdate = send;
         // Listen for incoming updates
         receive((data, peerId) => {
+            this._stopResumeWatch?.alive(); // see watchResume: a page that handles this has not slept
             this.log(`Received update from ${peerId} (${data.byteLength} bytes)`);
             if (joined !== this.room)
                 return; // a room we already left (rejoin)

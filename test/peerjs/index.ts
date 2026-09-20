@@ -265,6 +265,7 @@ async function initWithConfig(config: {
 
   // Create provider
   const provider = new GenericProvider(doc, transport)
+  ;(window as any).__provider = provider // test/e2e/room-scenarios.mjs reads presence clocks through it (DIAG=1)
 
   // Listen to status changes
   provider.on('status', (event: any) => {

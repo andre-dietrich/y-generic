@@ -550,7 +550,7 @@ async function main() {
 
   /** DIAG=1: who is missing from whose roster, links and (simple-peer) maxConns per peer. */
   const diag = async (label) => {
-    if (!process.env.DIAG) return
+    if (!process.env.DIAG || peers.length === 0) return
     // No name field (nostr): rosters cannot say WHO is missing, only how many.
     if (!(await peers[0].page.$('#user-name'))) {
       console.log(`  [diag ${label}] roster sizes: ${(await Promise.all(peers.map(roster))).join(' ')}`)
@@ -564,6 +564,7 @@ async function main() {
       }, `p${p.id}`)
     const rosters = await Promise.all(peers.map(names))
     const linkCounts = await Promise.all(peers.map(links))
+    const presenceViews = []
     console.log(`  [diag ${label}] peer: links / roster size / maxConns / missing`)
     peers.forEach((p, i) => {
       const missing = peers.map((q) => `p${q.id}`).filter((n) => !rosters[i].includes(n))
@@ -571,15 +572,41 @@ async function main() {
       if (missing.length > 0 || (adapter.mesh && linkCounts[i] < peers.length - 1))
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
       // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
+      if (adapter.mesh && missing.length > 0 && missing.length <= 2) presenceViews.push({ p, missing })
       if (adapter.mesh && missing.length > 0 && missing.length <= 2) {
         for (const name of missing) {
           const id = peers.find((q) => `p${q.id}` === name)?.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
           if (!id) continue
           console.log(`      p${p.id}'s log about ${name} (${id}):`)
-          for (const l of p.logs.filter((l) => l.includes(id) && !/signal=candidate/.test(l)).slice(0, 30)) console.log('        ' + l.slice(0, 200))
+          // (signaling lines carry the first 8 characters of an id only)
+          for (const l of p.logs.filter((l) => l.includes(id.slice(0, 8)) && !/signal=candidate/.test(l)).slice(0, 40)) console.log('        ' + l.slice(0, 200))
+          // ... and the other side: did THEIR link to this peer get replaced, or open twice?
+          const mine = p.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
+          const q = peers.find((x) => `p${x.id}` === name)
+          if (!mine || !q) continue
+          console.log(`      ${name}'s log about p${p.id} (${mine}):`)
+          for (const l of q.logs.filter((l) => l.includes(mine.slice(0, 8)) && !/signal=candidate/.test(l)).slice(0, 40)) console.log('        ' + l.slice(0, 200))
         }
       }
     })
+    // ... and what its core holds for them, next to their own clock (playgrounds that expose __provider):
+    // no meta = their presence never arrived; a clock >= theirs without a state = it arrived and lost.
+    for (const { p, missing } of presenceViews) {
+      for (const name of missing) {
+        const q = peers.find((x) => `p${x.id}` === name)
+        const theirs = await q?.page.evaluate(() => {
+          const pr = window.__provider
+          return pr ? { id: pr.doc.clientID, clock: pr.awareness.meta.get(pr.doc.clientID)?.clock, user: pr.awareness.getLocalState()?.user?.name } : null
+        })
+        if (!theirs) continue
+        const held = await p.page.evaluate((id) => {
+          const pr = window.__provider
+          const meta = pr.awareness.meta.get(id)
+          return { clock: meta?.clock, ageMs: meta ? Date.now() - meta.lastUpdated : undefined, hasState: pr.awareness.getStates().has(id), user: pr.awareness.getStates().get(id)?.user?.name, address: pr._peerAddress.get(id) }
+        }, theirs.id)
+        console.log(`      ${name} itself: ${JSON.stringify(theirs)} - p${p.id} holds: ${JSON.stringify(held)}`)
+      }
+    }
     const seenBy = peers.map((q) => rosters.filter((r) => r.includes(`p${q.id}`)).length)
     const short = peers.filter((_, i) => seenBy[i] < peers.length)
     console.log(`    listed in fewer than ${peers.length} rosters: ${short.map((q) => `p${q.id}(${seenBy[peers.indexOf(q)]})`).join(' ') || 'nobody'}`)

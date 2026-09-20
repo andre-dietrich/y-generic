@@ -134,9 +134,15 @@ What the harness finds gets a fast gate under plain Node before the fix:
 the library's path is an env var, see their headers), `test/providers/repro-ably-lifecycle.ts` (a
 scripted Ably `Realtime`: its own reconnect, a channel over its message rate),
 `test/dummy/bench-rate-limited-channel.ts` (a backend that REFUSES a publish loses it for every
-receiver at once) and `test/dummy/bench-last-joiner-roster.ts` (presence on demand). A relay
+receiver at once), `test/dummy/bench-last-joiner-roster.ts` (presence on demand) and
+`test/dummy/bench-renewal-under-churn.ts` (what goes to ONE peer must not count as a presence
+renewal to the room - found at 50 browsers only because that run outlived a 300 s lease). A relay
 transport whose link comes BACK by itself tells the provider through `onPeerConnect` (websocket,
-nostr, ably, gun) - never for the first connect.
+nostr, ably, gun) - never for the first connect. Two opt-in scenarios of the harness: `linger`
+(outlives a presence lease under churn - a passing standard run is over before one is) and
+`bandwidth` (bytes per peer from `getStats()`). Why the mesh stays full and what a relay under the
+core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.md`
+(`test/dummy/probe-partial-mesh.ts`).
 
 `src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds
 `Date.now()` far ahead of its last tick), used by both mesh transports to re-join under a new id.

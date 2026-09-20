@@ -530,11 +530,20 @@ playground's `?phone` mode connects by itself) - comes back every time:
 
 The resume path (a new `Peer`, a new socket) is the fast one. The 4.5 s case is
 the pattern simple-peer had: the page came back while PeerJS's reconnect sat in
-its backoff ("reconnect 3" only 1.9 s after the return). The transport already
-reconnects on the browser's `online`; doing the same when the tab becomes visible
-would take ~2 s off. Not done. What was typed on the phone arrived (16 of 180
-characters); the phone's last report said 177 of 180 - taken for report lag at the
-end of the session, not checked.
+its backoff ("reconnect 3" only 1.9 s after the return). What was typed on the
+phone arrived (16 of 180 characters); the phone's last report said 177 of 180 -
+taken for report lag at the end of the session, not checked.
+
+`PeerJSTransport.reconnectNow()`: when the tab becomes visible again, or the
+browser says `online`, a reconnect that is waiting in its backoff is done at once
+(`repro-peerjs-coordinator`, part 13: next `reconnect()` after 1.0-2.1 s -> 20 ms;
+part 8, a server that stays down, still 4 attempts in 10 s; desktop check with 12
+browsers incl. server restart and killed coordinator passes). On the phone the
+case did not come up again - both returns of that session went other ways and were
+fast (158 s hidden: all links back after 1.5 s; 133 s: 2.0 s) - so there it is
+neither confirmed nor refuted. And once more a forgotten tab (the previous PeerJS
+session's) came back into the new room by itself, across a restart of the PeerJS
+server, and its 177 characters merged into the new document.
 
 Also seen by accident: a tab forgotten in Chrome for 2,907 s (48 min), on the OLD
 code, across a restart of the signaling server, came back into the new room by

@@ -128,6 +128,21 @@ export class PeerJSTransport {
         if (this.options.resumeAfterMs > 0 && !this._stopResumeWatch) {
             this._stopResumeWatch = watchResume(this.options.resumeAfterMs, (sleptMs) => this.handleResume(sleptMs));
         }
+        // Somebody looks at the page again, or the network is back: not the
+        // moment to sit out a backoff (see reconnectNow). Browser only.
+        if (!this._stopPageWatch && typeof window !== 'undefined' && typeof document !== 'undefined') {
+            const visible = () => {
+                if (document.visibilityState === 'visible')
+                    this.reconnectNow();
+            };
+            const online = () => this.reconnectNow();
+            document.addEventListener('visibilitychange', visible);
+            window.addEventListener('online', online);
+            this._stopPageWatch = () => {
+                document.removeEventListener('visibilitychange', visible);
+                window.removeEventListener('online', online);
+            };
+        }
         // Strategy: Try to claim the coordinator ID first
         // If taken, we'll get an error and become a regular peer
         return new Promise((resolve, reject) => {
@@ -296,6 +311,8 @@ export class PeerJSTransport {
         this._reconnectAttempts = 0;
         this._stopResumeWatch?.();
         this._stopResumeWatch = undefined;
+        this._stopPageWatch?.();
+        this._stopPageWatch = undefined;
         if (!this._connected) {
             if (this.peer) {
                 try {
@@ -429,6 +446,24 @@ export class PeerJSTransport {
                 this.rebuildAsRegularPeer();
             }
         }, delay);
+    }
+    /**
+     * A reconnect to the PeerJS server is waiting in its backoff - do it now.
+     * A real phone (Chrome on Android, 67 s in the background, the page kept
+     * running so no sleep was reported) came back between two attempts:
+     * "server link lost 16 | reconnect 3 at 1948 | connected to coordinator
+     * 3974" - all links back after 4.5 s, against 1.5 s when the resume path
+     * ran (test/e2e/phone-session.mjs; repro-peerjs-coordinator, part 13).
+     * Nothing to do while no backoff is pending: the first attempt after a
+     * disconnect is immediate anyway.
+     */
+    reconnectNow() {
+        if (this._destroying || !this._reconnectTimer)
+            return;
+        clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = undefined;
+        this._reconnectAttempts = 0;
+        this._handlePeerServerDisconnect();
     }
     /** The server accepted us (again): re-open what the outage cost. */
     onSignalingReopened() {

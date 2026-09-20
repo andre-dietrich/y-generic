@@ -34,6 +34,12 @@
  *            the entry expire so the peer can be dialed again?
  *  Part 8  - signaling server down, every reconnect() fails after 5 ms:
  *            reconnect() calls in 10 s.
+ *  Part 13 - the page comes back while the transport sits in that backoff: the
+ *            server is there again, and the tab becomes visible. A real phone
+ *            (Chrome on Android, 67 s in the background, no sleep reported):
+ *            "server link lost 16 | reconnect 3 at 1948 | connected to
+ *            coordinator 3974" - all links back after 4.5 s, against 1.5 s
+ *            when the resume path ran. How long until the next reconnect()?
  *  Part 9  - a non-coordinator peer sends 'peer-left' for a third peer: do
  *            we close our healthy link to it?
  *  Part 10 - the first connection to the coordinator times out: is it
@@ -55,6 +61,15 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 // The transport checks navigator.onLine before it reconnects.
 Object.defineProperty(globalThis, 'navigator', { value: { onLine: true }, configurable: true })
+// ... and listens for the tab becoming visible and the browser's `online` (part 13).
+const pageListeners: Record<string, Set<() => void>> = {}
+const eventTarget = {
+  addEventListener: (type: string, fn: () => void) => (pageListeners[type] ??= new Set()).add(fn),
+  removeEventListener: (type: string, fn: () => void) => pageListeners[type]?.delete(fn),
+}
+Object.defineProperty(globalThis, 'document', { value: { visibilityState: 'visible', ...eventTarget }, configurable: true })
+Object.defineProperty(globalThis, 'window', { value: eventTarget, configurable: true })
+const pageEvent = (type: string) => pageListeners[type]?.forEach((fn) => fn())
 
 type Handler = (...args: any[]) => void
 
@@ -296,6 +311,21 @@ async function main() {
     await sleep(10000)
     console.log(`  reconnect() calls in 10 s: ${Server.reconnects}`)
     Server.serverDown = false
+    transport.disconnect()
+  }
+
+  console.log('\nPart 13 - the tab becomes visible while a reconnect waits in its backoff (the server is back)')
+  {
+    const { transport, regular } = await regularPeer([])
+    Server.serverDown = true
+    regular.dropSignaling()
+    await sleep(6000) // attempts 1-4 have failed, the next one is seconds away
+    const before = Server.reconnects
+    Server.serverDown = false
+    const t0 = Date.now()
+    pageEvent('visibilitychange')
+    while (Server.reconnects === before && Date.now() - t0 < 12000) await sleep(20)
+    console.log(`  next reconnect() after: ${Server.reconnects === before ? 'NEVER (12 s)' : Date.now() - t0 + ' ms'}`)
     transport.disconnect()
   }
 

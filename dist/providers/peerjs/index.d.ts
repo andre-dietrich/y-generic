@@ -153,6 +153,7 @@ export declare class PeerJSTransport implements Transport {
     private _reconnectAttempts;
     private _reconnectTimer?;
     private _stopResumeWatch?;
+    private _stopPageWatch?;
     private _replacingPeer?;
     /**
      * Create a new PeerJS transport.
@@ -200,6 +201,17 @@ export declare class PeerJSTransport implements Transport {
      * in repro-peerjs-coordinator part 8.
      */
     private _handlePeerServerDisconnect;
+    /**
+     * A reconnect to the PeerJS server is waiting in its backoff - do it now.
+     * A real phone (Chrome on Android, 67 s in the background, the page kept
+     * running so no sleep was reported) came back between two attempts:
+     * "server link lost 16 | reconnect 3 at 1948 | connected to coordinator
+     * 3974" - all links back after 4.5 s, against 1.5 s when the resume path
+     * ran (test/e2e/phone-session.mjs; repro-peerjs-coordinator, part 13).
+     * Nothing to do while no backoff is pending: the first attempt after a
+     * disconnect is immediate anyway.
+     */
+    private reconnectNow;
     /** The server accepted us (again): re-open what the outage cost. */
     private onSignalingReopened;
     /**

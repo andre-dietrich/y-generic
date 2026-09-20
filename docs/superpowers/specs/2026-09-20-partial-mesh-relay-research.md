@@ -9,7 +9,10 @@ full mesh with 50" — found a presence bug of the core that has nothing to do w
 room size; that one **is fixed** (`src/index.ts`, `dist/` rebuilt, gate
 `test/dummy/bench-renewal-under-churn.ts`), see "The full mesh with 50 browsers".
 `test/e2e/room-scenarios.mjs` gained the opt-in scenarios `bandwidth` and `linger`
-and a roster diagnosis. Commits: b0b681a (harness), d94be58 (core), then this document.
+and a roster diagnosis. Commits: b0b681a (harness), d94be58 (core), then this document;
+later the same day de11ced / 5a30380 (diagnosis), dc17849 (simple-peer) and 6dbfe5a
+(trystero, the `oneway` scenario) for the link that delivers one way. **Version 1.8.1** -
+three fixes, no new API, no wire-format change: v1.5.0 to v1.8.1 share a room.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in

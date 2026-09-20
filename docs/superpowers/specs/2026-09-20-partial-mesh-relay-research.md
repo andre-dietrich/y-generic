@@ -353,8 +353,14 @@ free RAM, 12 cores; 43 s until all pages were loaded).
   after (50 peers, joins 60 ms apart), **the condition was hit in 4 of 9 joins and every
   roster was complete within 69-255 ms in all 9**, 49 links everywhere. It was
   NOT the network (caught on cable only, no interface change in `ip monitor`)
-  and not the core. Open for Trystero (same picture, its transport never sees
-  the exception) and PeerJS (not examined).
+  and not the core. **PeerJS** needs nothing - its `DataConnection` closes
+  itself on a send error and our transport re-dials (2 hits in 9 joins, both
+  healed). **Trystero** calls `channel.send()` without a net and kept the dead
+  direction for good; its transport now sends per peer and closes the
+  connection of a peer it cannot send to (`repro-trystero-oneway`). The new
+  opt-in scenario `oneway` makes the condition on purpose: until the peer that
+  cannot be reached sees a rename - simple-peer never -> 0.4 s, Trystero never
+  -> 2.0 s, PeerJS 3.3 s.
 - **As first written - one roster short of one peer right after the join**, in 2 of 7 runs
   (once at 50, once at 25; both on the unfixed code, which proves nothing - the
   fix does not touch the join): peer A never shows peer B although their link is up;

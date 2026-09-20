@@ -38,10 +38,27 @@ Real browsers: before the transport fix 6 of 56 simple-peer joins (25-50 peers) 
 a roster one short for good; after it the condition was hit in 4 of 9 joins and
 every roster was complete within 69-255 ms in all 9.
 
-**Still open:** Trystero showed the same picture (catch #4) and manages its
-channels itself - its transport never sees the exception; a broadcast that rejects
-does not say for whom. PeerJS (#3, the stale form) was not caught with the
-diagnosis and not examined.
+**The other two mesh transports** - checked with a scenario that makes the
+condition on purpose (`SCENARIOS=join,oneway`: in B's page every data channel of
+its connection to A gets a `send()` that throws what Chrome's throws; B renames
+itself; until A's roster shows the new name):
+
+| | before | after |
+|---|---|---|
+| simple-peer | **never** (60 s) | 422 ms |
+| PeerJS 1.5.5 | 3.3 s - nothing to fix: its `DataConnection` closes itself on a send error (`_trySend`), our transport re-dials the pair. In 9 joins with 50 peers the real condition came up twice, both healed (rosters complete after 0.9 and 8.8 s) | - |
+| Trystero | **never** (60 s): it calls `channel.send()` without a net, the action's promise rejects, the link stays | 2.0 s |
+
+Trystero's fix is in `TrysteroTransport`: one send per peer instead of Trystero's
+broadcast (a `Promise.all` that rejects as a whole and does not say for whom), and
+a send that rejects closes that peer's `RTCPeerConnection` (`room.getPeers()`), so
+Trystero reports the peer gone on both sides and dials it again at its next
+announce. Gate: `test/providers/repro-trystero-oneway.ts` (connection closed
+false -> true, the healthy peers untouched and served exactly once). The real
+condition itself was not seen again on Trystero (0 of 8 joins at 35 peers).
+
+**Still open:** the one PeerJS sighting of the *stale* form (#3, at the end of a
+full scenario run) - not reproduced in 9 joins, not explained by the above.
 
 [sp480]: https://github.com/feross/simple-peer/issues/480
 [ff148]: https://connect.mozilla.org/t5/discussions/firefox-148-datachannel-send-fails-with-invalidstateerror-after/td-p/119543

@@ -221,9 +221,35 @@ export class TrysteroTransport {
             this.log('⚠️ Not connected, cannot send', 'warn');
             return;
         }
-        // Send to all peers (null = broadcast)
+        // One send per peer, not Trystero's broadcast (target null): that one is
+        // a Promise.all over the peers - it rejects as a whole and does not say
+        // for whom, and we have to know (see dropUnsendable).
         this.log(`Sending update (${data.byteLength} bytes) to ${this.peers.size} peers`);
-        await this.sendUpdate(data, null);
+        const send = this.sendUpdate;
+        await Promise.all(Array.from(this.peers).map((peerId) => send(data, peerId).catch((error) => this.dropUnsendable(peerId, error))));
+    }
+    /**
+     * A send to this peer rejected: close its RTCPeerConnection. Trystero
+     * calls channel.send() without a net, the rejection was all that happened,
+     * and the link stayed - one-way, for good. Chrome can leave an
+     * RTCDataChannel object at readyState 'connecting' after its own 'open'
+     * event (the answering side of a link, a busy machine, about once per
+     * 50-peer join): it receives, and every send() throws. With 35 real
+     * browsers one peer held nothing of another - no presence, no address -
+     * although both counted the link (test/e2e/room-scenarios.mjs, DIAG=1; the
+     * `oneway` scenario makes the condition on purpose;
+     * test/providers/repro-trystero-oneway.ts). With the connection closed
+     * Trystero reports the peer gone on both sides and dials it again at its
+     * next announce. A peer that is leaving anyway loses nothing by it.
+     */
+    dropUnsendable(peerId, error) {
+        this.log(`♻️ Cannot send to ${peerId} (${error?.message ?? error}) — closing its connection so Trystero dials again`, 'warn');
+        try {
+            this.room?.getPeers()[peerId]?.close();
+        }
+        catch {
+            // already gone
+        }
     }
     /**
      * Transport.sendTo: deliver to one peer (Trystero's action send accepts
@@ -235,7 +261,12 @@ export class TrysteroTransport {
             return;
         if (!this.peers.has(peerId))
             return;
-        await this.sendUpdate(data, peerId);
+        try {
+            await this.sendUpdate(data, peerId);
+        }
+        catch (error) {
+            this.dropUnsendable(peerId, error);
+        }
     }
     onMessage(callback) {
         this._callback = callback;

@@ -138,9 +138,14 @@ receiver at once), `test/dummy/bench-last-joiner-roster.ts` (presence on demand)
 `test/dummy/bench-renewal-under-churn.ts` (what goes to ONE peer must not count as a presence
 renewal to the room - found at 50 browsers only because that run outlived a 300 s lease). A relay
 transport whose link comes BACK by itself tells the provider through `onPeerConnect` (websocket,
-nostr, ably, gun) - never for the first connect. Two opt-in scenarios of the harness: `linger`
-(outlives a presence lease under churn - a passing standard run is over before one is) and
-`bandwidth` (bytes per peer from `getStats()`). Why the mesh stays full and what a relay under the
+nostr, ably, gun) - never for the first connect. Opt-in scenarios of the harness: `linger`
+(outlives a presence lease under churn - a passing standard run is over before one is),
+`bandwidth` (bytes per peer from `getStats()`) and `oneway` (a link that receives and cannot send,
+made on purpose - Chrome does that by itself about once per 50-peer join: an `RTCDataChannel`
+object that stays at `connecting` after its own `open`; a transport must rebuild a link whose
+`send()` throws, never just log it - `repro-simple-peer-sleep` part 7, `repro-trystero-oneway`;
+`docs/superpowers/specs/2026-09-20-join-presence-miss-note.md`). `DIAG=1` pairs two pages'
+`RTCPeerConnection`s by ICE ufrag and prints what each end sent and received. Why the mesh stays full and what a relay under the
 core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.md`
 (`test/dummy/probe-partial-mesh.ts`).
 

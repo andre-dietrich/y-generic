@@ -208,6 +208,21 @@ export declare class TrysteroTransport implements Transport {
     disconnect(): void;
     send(data: Uint8Array): Promise<void>;
     /**
+     * A send to this peer rejected: close its RTCPeerConnection. Trystero
+     * calls channel.send() without a net, the rejection was all that happened,
+     * and the link stayed - one-way, for good. Chrome can leave an
+     * RTCDataChannel object at readyState 'connecting' after its own 'open'
+     * event (the answering side of a link, a busy machine, about once per
+     * 50-peer join): it receives, and every send() throws. With 35 real
+     * browsers one peer held nothing of another - no presence, no address -
+     * although both counted the link (test/e2e/room-scenarios.mjs, DIAG=1; the
+     * `oneway` scenario makes the condition on purpose;
+     * test/providers/repro-trystero-oneway.ts). With the connection closed
+     * Trystero reports the peer gone on both sides and dials it again at its
+     * next announce. A peer that is leaving anyway loses nothing by it.
+     */
+    private dropUnsendable;
+    /**
      * Transport.sendTo: deliver to one peer (Trystero's action send accepts
      * a target peer id). Used by GenericProvider for replies, acks and
      * presence responses.

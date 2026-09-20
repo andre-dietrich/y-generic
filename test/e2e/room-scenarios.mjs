@@ -14,6 +14,14 @@
  *              (20) idle, then TYPISTS (5) peers typing a character every
  *              KEY_MS (200). Per typist / listener: data-channel payload and an
  *              estimate of the bytes on an IPv4 wire (see netRate), kB/s.
+ *  oneway      (opt-in, WebRTC transports) a link that cannot send, made on
+ *              purpose: in peer B's page every data channel of its connection
+ *              to peer A gets a send() that throws "readyState is not 'open'"
+ *              - what Chrome's RTCDataChannel does by itself on the answering
+ *              side of a link about once per 50-peer join (its object stays at
+ *              'connecting' after its own 'open'). Then B renames itself. Until
+ *              A's roster shows the new name: only if somebody notices the
+ *              dead direction and the pair dials again.
  *  linger      (opt-in) LINGER_MS (420 s: longer than the 300 s presence lease of
  *              a mesh transport) with one peer reloading every 60 s. Rosters are
  *              checked 55 s after each reload. A run of the other scenarios
@@ -710,7 +718,9 @@ async function main() {
     record('join', 'sends the backend refused (console)', peers.reduce((n, p) => n + refused(p), 0))
     // A data channel that opened and cannot send (simple-peer: repro-simple-peer-sleep part 7) - and was the link rebuilt?
     if (adapter.mesh) {
-      const threw = peers.filter((p) => p.logs.some((l) => /sendTo failed|Send failed/.test(l)))
+      // simple-peer transport / PeerJS itself (its DataConnection closes on it) / our peerjs transport /
+      // the core, for a transport whose send() rejects (trystero)
+      const threw = peers.filter((p) => p.logs.some((l) => /sendTo failed|Send failed|Error when sending|Error sending to peer|Error sending data/.test(l)))
       record('join', 'peers with a send that threw on an open link (console)', threw.length === 0 ? 0 : threw.map((p) => `p${p.id}`).join(' '))
     }
     await type(peers[0], 'hello-from-0 ')
@@ -743,6 +753,33 @@ async function main() {
       record('typing', 'frames sent by the whole room', wire(t0))
       const same = await untilAll([peers[0]], async () => new Set(await Promise.all(peers.map(text))).size === 1, 30000)
       record('typing', 'editors identical', same.ms >= 0)
+    }
+
+    // ---- oneway (opt-in, WebRTC transports): a link that cannot send, made on purpose
+    if (wanted.includes('oneway') && adapter.mesh) {
+      console.log('oneway (one peer cannot send to one other, then renames itself)')
+      const [a, b] = [peers[2], peers[3]]
+      const [aPcs, bPcs] = await Promise.all([pcView(a), pcView(b)])
+      const mine = bPcs.filter((x) => x.remote && x.conn === 'connected' && aPcs.some((y) => y.local === x.remote))
+      record('oneway', `connections between p${a.id} and p${b.id}`, mine.length)
+      await b.page.evaluate((indexes) => {
+        for (const i of indexes) {
+          for (const ch of window.__pcs[i].__channels) {
+            ch.send = () => {
+              throw new DOMException("Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel.readyState is not 'open'", 'InvalidStateError')
+            }
+          }
+        }
+      }, mine.map((x) => x.i))
+      const renamed = `p${b.id}-renamed`
+      const t0 = Date.now()
+      await fill(b.page, '#user-name', renamed)
+      const sees = (p) =>
+        p.page.evaluate((name) => Array.from(document.querySelectorAll('#user-list .user-badge span, #users-list li span')).some((el) => el.textContent.includes(name)), renamed)
+      record('oneway', 'a third peer sees the new name', await untilAll([peers[4]], sees, 30000))
+      const seen = await untilAll([a], sees, 60000)
+      record('oneway', `p${a.id} - the one it cannot send to - sees the new name`, seen.ms < 0 ? seen : { ...seen, ms: Date.now() - t0 })
+      record('oneway', 'links per peer afterwards', stats(await Promise.all(peers.map(links))))
     }
 
     // ---- bandwidth (opt-in, WebRTC transports): bytes per peer and second, from getStats()

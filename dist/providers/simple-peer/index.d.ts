@@ -211,6 +211,23 @@ export declare class SimplePeerTransport implements Transport {
      */
     sendTo(peerId: string, data: Uint8Array): void;
     /**
+     * send() threw on a link simple-peer has reported connected: rebuild it.
+     * Logging it and keeping the entry lost the frame for good - and with it
+     * the link, in one direction. Seen with 50 real browsers, about one join
+     * in six, always on the ANSWERING side of a link (Chrome 151, a busy
+     * machine): the RTCDataChannel object says readyState 'connecting' after
+     * its own 'open' event - minutes later still - while getStats() calls the
+     * channel open and messages arrive on it, and every send() throws
+     * "readyState is not 'open'". The first frame lost that way is the one
+     * that carries our presence to a new link: that peer never learned us,
+     * its roster stayed one short and our edits reached it only through third
+     * peers' beacons (test/e2e/room-scenarios.mjs, DIAG=1: "sent 0 rcvd 2";
+     * test/providers/repro-simple-peer-sleep.ts, part 7). Dropping the entry
+     * reports the link gone and announces, so the pair dials again; the
+     * other side sees the close. Only ever our own entry (see removeOwnEntry).
+     */
+    private dropUnsendable;
+    /**
      * Register callback for new peer data-channel connections.
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;

@@ -1,6 +1,52 @@
-# Open: a peer misses one presence update of a peer that joined in the same second (note)
+# A link that delivers one way: a peer never gets anything from one other peer (note)
 
-## Status
+## Root cause (found 2026-09-20, simple-peer fixed; the rest of this note is the way there)
+
+**Chrome. On the ANSWERING side of a link the `RTCDataChannel` object can stay at
+`readyState: 'connecting'` after its own `open` event has fired** - minutes later
+still - while `getStats()` calls the channel open and messages arrive on it.
+`send()` checks the object's state and throws *"RTCDataChannel.readyState is not
+'open'"* every time. Such a peer receives and can never send on that link.
+Chrome 151 headless, a busy machine (50 contexts on 12 cores), about one 50-peer
+join in six; cable only, no interface change during the run (`ip monitor`) - the
+network theory below is refuted. The symptom has an entry in simple-peer's tracker
+([#480][sp480], title only - not read), and Firefox 148 has a [report][ff148] of
+`send()` failing right after `onopen`.
+
+What the diagnosis printed for the pair (B = the answering side):
+
+```
+B's log:  ✅ Peer channel open (connect): A
+          ❌ sendTo failed for A: Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel.readyState is not 'open'
+          ❌ Send failed to A: ...        (again 5 s and 2 min 40 s later)
+table entry B -> A: {"connected":true,"channel":"connecting","sp":{"initiator":false,"_connected":true,"_channelReady":true}}
+connections A <-> B: 1
+  A#23 connected/connected [open sent 2 rcvd 0] js 1:open  <->  B#41 connected/connected [open sent 0 rcvd 2] js 1:connecting
+```
+
+One connection, one channel; simple-peer's `_channelReady` is only ever set by the
+channel's `onopen`; the JS object says `connecting`, the stats say `open`.
+
+**What the library did wrong: it logged the exception and kept the entry.** The
+first frame lost that way is the one that carries B's presence to the new link
+(`_schedulePeerConnectSync`), and in an idle room B sends nothing else - so A never
+learned B. Fixed in `SimplePeerTransport`: a send that throws on a connected entry
+drops that entry (`dropUnsendable`) - the link is reported gone and announced, the
+pair dials again. Gate: `test/providers/repro-simple-peer-sleep.ts`, part 7 (link
+reported gone false -> true, re-announced false -> true, for `sendTo` and `send`).
+Real browsers: before the transport fix 6 of 56 simple-peer joins (25-50 peers) left
+a roster one short for good; after it the condition was hit in 4 of 9 joins and
+every roster was complete within 69-255 ms in all 9.
+
+**Still open:** Trystero showed the same picture (catch #4) and manages its
+channels itself - its transport never sees the exception; a broadcast that rejects
+does not say for whom. PeerJS (#3, the stale form) was not caught with the
+diagnosis and not examined.
+
+[sp480]: https://github.com/feross/simple-peer/issues/480
+[ff148]: https://connect.mozilla.org/t5/discussions/firefox-148-datachannel-send-fails-with-invalidstateerror-after/td-p/119543
+
+## Status (as first written)
 
 **Not root-caused, not reproducible on demand - but narrowed down: it is a link
 that delivers in ONE direction only, below the core** (catch #4). Seen four times on 2026-09-20
@@ -51,6 +97,10 @@ prints B's log about A). In simple-peer roles are deterministic (`this.peerId >
 msg.from` initiates), so glare is not expected there - but "signal from unknown
 peer -> creating non-initiator connection" and "a fresh offer replaces a connected
 entry" are paths that create a second object for the same id.
+
+(Correction, same day: the counts in this paragraph were read too early - the
+12th run of the 60 ms series DID show it, so there never was a "0 of 35 on the
+fixed core", and the build made no difference. Over the whole day: 6 of 56.)
 
 **Hunted afterwards, not caught again: 45 joins in a row without it.** simple-peer
 on the fixed core: 0 of 35 (8 at N=50 with joins 200 ms apart; 12 at N=50 and 10

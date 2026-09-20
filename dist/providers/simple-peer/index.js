@@ -222,6 +222,7 @@ export class SimplePeerTransport {
             : data;
         // Send to all connected peers
         let sentCount = 0;
+        const unsendable = [];
         for (const peerConn of this.peers.values()) {
             if (peerConn.connected) {
                 try {
@@ -230,9 +231,12 @@ export class SimplePeerTransport {
                 }
                 catch (error) {
                     this.log(`❌ Send failed to ${peerConn.peerId}:`, error.message);
+                    unsendable.push(peerConn);
                 }
             }
         }
+        for (const peerConn of unsendable)
+            this.dropUnsendable(peerConn);
         // Only log when the picture is non-trivial (missing peers or no peers at all)
         if (sentCount === 0) {
             this.log(`⚠️ Send: 0 peers connected — ${data.length}B dropped`);
@@ -339,7 +343,31 @@ export class SimplePeerTransport {
         }
         catch (error) {
             this.log(`❌ sendTo failed for ${peerId}:`, error.message);
+            this.dropUnsendable(peerConn);
         }
+    }
+    /**
+     * send() threw on a link simple-peer has reported connected: rebuild it.
+     * Logging it and keeping the entry lost the frame for good - and with it
+     * the link, in one direction. Seen with 50 real browsers, about one join
+     * in six, always on the ANSWERING side of a link (Chrome 151, a busy
+     * machine): the RTCDataChannel object says readyState 'connecting' after
+     * its own 'open' event - minutes later still - while getStats() calls the
+     * channel open and messages arrive on it, and every send() throws
+     * "readyState is not 'open'". The first frame lost that way is the one
+     * that carries our presence to a new link: that peer never learned us,
+     * its roster stayed one short and our edits reached it only through third
+     * peers' beacons (test/e2e/room-scenarios.mjs, DIAG=1: "sent 0 rcvd 2";
+     * test/providers/repro-simple-peer-sleep.ts, part 7). Dropping the entry
+     * reports the link gone and announces, so the pair dials again; the
+     * other side sees the close. Only ever our own entry (see removeOwnEntry).
+     */
+    // ponytail: one rebuild per failed send, no backoff - a link that keeps coming up unsendable flaps at handshake speed; count and give up if that is ever seen.
+    dropUnsendable(peerConn) {
+        if (this.peers.get(peerConn.peerId) !== peerConn)
+            return;
+        this.log(`♻️ Link to ${peerConn.peerId} cannot send — dropping it so the pair dials again`);
+        this.removePeer(peerConn.peerId);
     }
     /**
      * Register callback for new peer data-channel connections.

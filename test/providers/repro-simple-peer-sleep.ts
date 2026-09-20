@@ -26,6 +26,16 @@
  *  Part 6 - the page was suspended: Date.now() jumps by 60 s
  *           (resumeAfterMs: 15000). Does the transport drop its links and
  *           re-announce under a new peer id?
+ *  Part 7 - a link that cannot send: simple-peer has fired 'connect', and the
+ *           channel's send() throws "readyState is not 'open'". Seen with 50
+ *           real browsers on the answering side of a link (Chrome 151, a busy
+ *           machine, about one join in six): the RTCDataChannel object said
+ *           'connecting' ten seconds after its own 'open' event, getStats()
+ *           said open, messages arrived - and every send threw. The transport
+ *           logged it and kept the entry: the peer's first frame (its presence)
+ *           and everything after it never reached the other side, which kept
+ *           a peer in its roster's blind spot for good. Is the link reported
+ *           gone and re-announced, so that the pair dials again?
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-simple-peer-sleep.js
  *      WAIT_MS=11000 overrides part 3's observation window.
@@ -338,6 +348,24 @@ async function main() {
       `  4 s after the jump: links dropped = ${r.seen.disconnect > 0}, connectedPeers = ${r.transport.connectedPeers}, announces under a new peer id = ${ids.size > 0}`,
     )
     r.transport.disconnect()
+  }
+  console.log("\nPart 7 - 'connect' has fired, and the channel's send() throws: readyState is not 'open'")
+  for (const how of ['sendTo', 'send'] as const) {
+    const s = await transportAnsweringPeer()
+    if (s.transport.connectedPeers !== 1) throw new Error('setup: answering peer not connected')
+    s.pc.channel!.readyState = 'connecting'
+    s.pc.channel!.send = () => {
+      throw new Error("Failed to execute 'send' on 'RTCDataChannel': RTCDataChannel.readyState is not 'open'")
+    }
+    const announces = () => s.ws.sent.filter((m) => m.msg.type === 'publish' && !(m.msg as any).signal).length
+    const announcesBefore = announces()
+    if (how === 'sendTo') s.transport.sendTo('zzzz-desk', new Uint8Array([1, 2, 3]))
+    else s.transport.send(new Uint8Array([1, 2, 3]))
+    await sleep(50)
+    console.log(
+      `  ${how.padEnd(7)} link reported gone = ${s.seen.disconnect > 0}, connectedPeers = ${s.transport.connectedPeers}, re-announced = ${announces() > announcesBefore}`,
+    )
+    s.transport.disconnect()
   }
   process.exit(0)
 }

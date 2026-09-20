@@ -76,6 +76,7 @@ const { WebSocketServer } = require('ws')
 const TRANSPORT = process.argv[2]
 const N = Number(process.env.N ?? 25)
 const FREEZE_MS = Number(process.env.FREEZE_MS ?? 20000)
+const DIAG_MAX_MISSING = Number(process.env.DIAG_MAX_MISSING ?? 2) // DIAG=1: up to how many missing peers a roster's details are printed for
 const JOIN_GAP_MS = Number(process.env.JOIN_GAP_MS ?? 200) // between two joins; smaller = more pairs that join in the same second
 const CHROME = process.env.CHROME ?? '/usr/bin/google-chrome'
 const APP_PORT = Number(process.env.APP_PORT ?? 3450)
@@ -387,6 +388,15 @@ const METER = () => {
   window.RTCPeerConnection = function (...args) {
     const pc = new Native(...args)
     window.__pcs.push(pc)
+    // Every data channel of the connection, made here or announced by the other end (see pcView).
+    pc.__channels = []
+    const create = pc.createDataChannel.bind(pc)
+    pc.createDataChannel = (...a) => {
+      const ch = create(...a)
+      pc.__channels.push(ch)
+      return ch
+    }
+    pc.addEventListener('datachannel', (e) => pc.__channels.push(e.channel))
     return pc
   }
   window.RTCPeerConnection.prototype = Native.prototype
@@ -439,6 +449,8 @@ const pcView = (p) =>
     const out = []
     for (const [i, pc] of (window.__pcs ?? []).entries()) {
       const v = { i, conn: pc.connectionState, ice: pc.iceConnectionState, local: ufrag(pc.localDescription?.sdp), remote: ufrag(pc.remoteDescription?.sdp), dc: [] }
+      // What the JS objects say, next to what getStats() says below: `js: <id>:<readyState>` per channel.
+      v.js = (pc.__channels ?? []).map((ch) => `${ch.id}:${ch.readyState}`).join(',')
       if (pc.connectionState !== 'closed') {
         ;(await pc.getStats()).forEach((r) => {
           if (r.type === 'data-channel') v.dc.push(`${r.state} sent ${r.messagesSent} rcvd ${r.messagesReceived}`)
@@ -595,20 +607,22 @@ async function main() {
       if (missing.length > 0 || (adapter.mesh && linkCounts[i] < peers.length - 1))
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
       // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
-      if (adapter.mesh && missing.length > 0 && missing.length <= 2) presenceViews.push({ p, missing })
-      if (adapter.mesh && missing.length > 0 && missing.length <= 2) {
+      if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) presenceViews.push({ p, missing })
+      if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) {
         for (const name of missing) {
           const id = peers.find((q) => `p${q.id}` === name)?.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
           if (!id) continue
           console.log(`      p${p.id}'s log about ${name} (${id}):`)
-          // (signaling lines carry the first 8 characters of an id only)
-          for (const l of p.logs.filter((l) => l.includes(id.slice(0, 8)) && !/signal=candidate/.test(l)).slice(0, 40)) console.log('        ' + l.slice(0, 200))
-          // ... and the other side: did THEIR link to this peer get replaced, or open twice?
+          // Lines with the other's full id, and the signaling lines between the two
+          // (those carry the first 8 characters of both ids, and of nobody else's).
           const mine = p.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
           const q = peers.find((x) => `p${x.id}` === name)
           if (!mine || !q) continue
+          const about = (other, self) => (l) => !/signal=candidate/.test(l) && (l.includes(other) || (l.includes(other.slice(0, 8)) && l.includes(self.slice(0, 8))))
+          for (const l of p.logs.filter(about(id, mine)).slice(0, 60)) console.log('        ' + l.slice(0, 200))
+          // ... and the other side: did THEIR link to this peer get replaced, open twice, fail to send?
           console.log(`      ${name}'s log about p${p.id} (${mine}):`)
-          for (const l of q.logs.filter((l) => l.includes(mine.slice(0, 8)) && !/signal=candidate/.test(l)).slice(0, 40)) console.log('        ' + l.slice(0, 200))
+          for (const l of q.logs.filter(about(mine, id)).slice(0, 60)) console.log('        ' + l.slice(0, 200))
         }
       }
     })
@@ -628,13 +642,32 @@ async function main() {
           return { clock: meta?.clock, ageMs: meta ? Date.now() - meta.lastUpdated : undefined, hasState: pr.awareness.getStates().has(id), user: pr.awareness.getStates().get(id)?.user?.name, address: pr._peerAddress.get(id) }
         }, theirs.id)
         console.log(`      ${name} itself: ${JSON.stringify(theirs)} - p${p.id} holds: ${JSON.stringify(held)}`)
+        // What each transport's table holds for the other (simple-peer's internals where there are any).
+        const transportId = (x) => x.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
+        const entry = (page, remote) =>
+          page.evaluate((remote) => {
+            const t = window.__provider?.transport
+            const e = t?.peers?.get?.(remote)
+            if (!e) return { entry: false, tableSize: t?.peers?.size }
+            const sp = e.peer
+            return {
+              connected: e.connected,
+              pc: window.__pcs?.indexOf(sp?._pc),
+              channel: sp?._channel?.readyState,
+              sp: sp && { initiator: sp.initiator, destroyed: sp.destroyed, destroying: sp.destroying, _connected: sp._connected, _connecting: sp._connecting, _pcReady: sp._pcReady, _channelReady: sp._channelReady },
+            }
+          }, remote)
+        if (transportId(p) && transportId(q)) {
+          console.log(`      table entry p${p.id} -> ${name}: ${JSON.stringify(await entry(p.page, transportId(q)))}`)
+          console.log(`      table entry ${name} -> p${p.id}: ${JSON.stringify(await entry(q.page, transportId(p)))}`)
+        }
         // The WebRTC connections between the two, paired by ICE ufrag: one or more? what was sent, what arrived?
         const [mine, theirPcs] = await Promise.all([pcView(p), pcView(q)])
         const pairs = mine.filter((a) => a.remote && theirPcs.some((b) => b.local === a.remote))
         console.log(`      connections p${p.id} <-> ${name}: ${pairs.length} (of ${mine.length} / ${theirPcs.length} RTCPeerConnections in the two pages)`)
         for (const a of pairs) {
           const b = theirPcs.find((x) => x.local === a.remote)
-          console.log(`        p${p.id}#${a.i} ${a.conn}/${a.ice} [${a.dc.join('; ')}]  <->  ${name}#${b.i} ${b.conn}/${b.ice} [${b.dc.join('; ')}]`)
+          console.log(`        p${p.id}#${a.i} ${a.conn}/${a.ice} [${a.dc.join('; ')}] js ${a.js}  <->  ${name}#${b.i} ${b.conn}/${b.ice} [${b.dc.join('; ')}] js ${b.js}`)
         }
       }
     }
@@ -675,6 +708,11 @@ async function main() {
     await diag('after join')
     record('join', 'frames sent by the whole room during the join', wire(tJoin))
     record('join', 'sends the backend refused (console)', peers.reduce((n, p) => n + refused(p), 0))
+    // A data channel that opened and cannot send (simple-peer: repro-simple-peer-sleep part 7) - and was the link rebuilt?
+    if (adapter.mesh) {
+      const threw = peers.filter((p) => p.logs.some((l) => /sendTo failed|Send failed/.test(l)))
+      record('join', 'peers with a send that threw on an open link (console)', threw.length === 0 ? 0 : threw.map((p) => `p${p.id}`).join(' '))
+    }
     await type(peers[0], 'hello-from-0 ')
     record('join', 'text of one peer in every editor', await untilAll(peers, async (p) => (await text(p)).includes('hello-from-0'), 60000))
     const tIdle = Date.now()

@@ -340,8 +340,22 @@ free RAM, 12 cores; 43 s until all pages were loaded).
     host candidates; loopback does not count), and nobody joined at all (Trystero
     follows the browser's `online`/`offline` events and opens no relay socket
     while offline). Repeated with the network back: fine.
-- **Open: one roster short of one peer right after the join** (own note with the
-  hypotheses and how to catch it: `2026-09-20-join-presence-miss-note.md`), in 2 of 7 runs
+- **Found and fixed for simple-peer: a link that delivers one way** (the whole
+  story: `2026-09-20-join-presence-miss-note.md`). On the answering side of a
+  link Chrome's `RTCDataChannel` object can stay at `readyState: 'connecting'`
+  after its own `open` event - for minutes - while `getStats()` calls it open and
+  messages arrive; every `send()` throws. The transport logged that and kept the
+  entry, so the peer's first frame - its presence - never went out, and the other
+  side never learned it. `SimplePeerTransport` now drops such an entry: the link
+  is reported gone, announced and dialled again
+  (`repro-simple-peer-sleep`, part 7: reported gone false -> true). Real browsers,
+  25-50 peers: before, 6 of 56 joins left one roster a peer short for good;
+  after (50 peers, joins 60 ms apart), **the condition was hit in 4 of 9 joins and every
+  roster was complete within 69-255 ms in all 9**, 49 links everywhere. It was
+  NOT the network (caught on cable only, no interface change in `ip monitor`)
+  and not the core. Open for Trystero (same picture, its transport never sees
+  the exception) and PeerJS (not examined).
+- **As first written - one roster short of one peer right after the join**, in 2 of 7 runs
   (once at 50, once at 25; both on the unfixed code, which proves nothing - the
   fix does not touch the join): peer A never shows peer B although their link is up;
   B is in everybody else's roster. A's transport log about B is clean — one

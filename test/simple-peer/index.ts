@@ -76,8 +76,17 @@ const defaultConfig: {
   ],
 }
 
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless
+// room mates) take the signaling server from the page's own host - one room over the LAN,
+// nothing to set up on the phone - and no STUN: everybody is on that LAN.
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
+
 // Load configuration from localStorage or use defaults
 function loadConfig(): typeof defaultConfig {
+  if (sessionName !== null) {
+    return { signaling: [`ws://${location.hostname}:${session.get('sig') ?? '4470'}`], iceServers: [] }
+  }
   try {
     const stored = localStorage.getItem(CONFIG_STORAGE_KEY)
     if (stored) {
@@ -468,14 +477,33 @@ async function init() {
   const randomColor =
     randomColors[Math.floor(Math.random() * randomColors.length)]
 
-  userNameInput.value = randomName
+  userNameInput.value = sessionName ?? randomName
   userColorInput.value = randomColor
 
   // Set initial awareness state
   provider.awareness.setLocalStateField('user', {
-    name: randomName,
+    name: sessionName ?? randomName,
     color: randomColor,
   })
+
+  // `?phone`: the phone tells on itself through its presence - how long its document is, and
+  // every time it was hidden and for how long. The desktop peers of phone-session.mjs read it.
+  if (sessionName === 'phone') {
+    let seq = 0
+    let hiddenAt = 0
+    const report = (event: string, extra: object = {}) =>
+      provider.awareness.setLocalStateField('report', { seq: ++seq, event, len: yText.length, ...extra })
+    yText.observe(() => report('text'))
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now()
+        report('hidden')
+      } else {
+        report('visible', { hiddenForS: Math.round((Date.now() - hiddenAt) / 100) / 10 })
+      }
+    })
+    report('joined')
+  }
 
   // Update awareness on user input
   userNameInput.addEventListener('input', () => {

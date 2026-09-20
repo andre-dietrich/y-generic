@@ -48,6 +48,8 @@
     "test/dummy/bench-last-joiner-roster.ts",
     "test/dummy/probe-partial-mesh.ts",
     "test/dummy/bench-renewal-under-churn.ts",
+    "test/dummy/bench-unload-removal.ts",
+    "test/dummy/bench-relay-return-roster.ts",
     "test/providers/check-chunking.ts",
     "test/providers/repro-simple-peer-sleep.ts",
     "test/providers/repro-trystero-oneway.ts",

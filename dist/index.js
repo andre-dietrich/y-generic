@@ -1395,10 +1395,31 @@ export class GenericProvider extends Observable {
             // mesh without sendTo. Same reason for the bump as above - the
             // server removed our presence when the old socket closed, at the
             // clock we would re-send.
+            //
+            // And we ask for the room's presence (JOIN): on a relay nobody
+            // noticed that we were away, so nobody sends theirs. A page that ran
+            // on behind a dead link heard no renewal and expired its roster
+            // entry by entry from half a lease on - a real phone back from 129 s
+            // with the display off showed two of nine users, the rest came with
+            // their renewals, up to half a lease later
+            // (test/dummy/bench-relay-return-roster.ts). The sweep does the same
+            // for a page that slept (see _startAwarenessSweep).
+            //
+            // Asking as a joiner means remembering as little as one: y-protocols
+            // keeps the clock of a peer it expired and ignores a state at an
+            // equal clock. A peer that writes (or beacons) keeps its lease alive
+            // with that and never renews its presence - its clock stands still,
+            // and the table that answers us carries it at the clock we remember.
+            // The phone had eight of nine at once and the ninth 55 s later; with
+            // a writer in the room the gate never got it back.
+            for (const id of Array.from(this.awareness.meta.keys())) {
+                if (id !== this.doc.clientID && !this.awareness.getStates().has(id))
+                    this.awareness.meta.delete(id);
+            }
             const state = this.awareness.getLocalState();
             if (state !== null && this._ownsAwareness)
                 this.awareness.setLocalState(state);
-            this._syncNow(0);
+            this._syncNow(DIGEST_FLAG_JOIN);
         }, this._peerConnectDebounceMs);
     }
     /**
@@ -1547,6 +1568,18 @@ export class GenericProvider extends Observable {
                 this._scheduleAwarenessRemoval(changedClients, origin);
                 return;
             }
+            // A page that unloads may never run another timer, and the throttle
+            // is one (`setTimeout(0)` at best). Chrome and a visible Firefox tab
+            // still fire it; a HIDDEN Firefox tab clamps its timers to 1 s and
+            // more and is gone before - its old entry stayed in every roster
+            // until the lease ran out (25 browsers on Nostr, reload: rosters
+            // complete after 613 ms in Chrome, 111 s with hidden Firefox tabs;
+            // test/dummy/bench-unload-removal.ts). Past the throttle; a timer it
+            // may be holding repeats the removal if it still fires, nothing more.
+            if (origin === 'window unload') {
+                this._sendAwarenessNow(changedClients);
+                return;
+            }
             this._broadcastAwareness(changedClients);
         };
         // Round 5, item 8: broadcast on 'change' (y-protocols filters updates
@@ -1561,6 +1594,10 @@ export class GenericProvider extends Observable {
         // Cleanup: mark as offline and disconnect BC when page unloads
         if (typeof window !== 'undefined') {
             this._beforeUnloadHandler = () => {
+                // Nothing this page still owes the room may wait for a timer: the
+                // update batch first, then the removal (sent at once, see the
+                // 'window unload' branch of the handler above).
+                this._flushPendingUpdate();
                 awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'window unload');
                 // Disconnect BroadcastChannel to notify other tabs
                 this._disconnectBroadcastChannel();

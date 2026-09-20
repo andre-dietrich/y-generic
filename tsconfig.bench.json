@@ -46,6 +46,7 @@
     "test/dummy/bench-resume-roster.ts",
     "test/dummy/bench-rate-limited-channel.ts",
     "test/dummy/bench-last-joiner-roster.ts",
+    "test/dummy/bench-renewal-under-churn.ts",
     "test/providers/check-chunking.ts",
     "test/providers/repro-simple-peer-sleep.ts",
     "test/providers/repro-peerjs-coordinator.ts",

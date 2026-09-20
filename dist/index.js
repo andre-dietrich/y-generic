@@ -1278,9 +1278,9 @@ export class GenericProvider extends Observable {
         arm();
     }
     /**
-     * A digest, verified update or ack from `clientID` (or one we are about
-     * to send, for our own id) is proof of presence: refresh the lease the
-     * sweep above checks. Only for ids with a state - a departed peer's
+     * A digest, verified update or ack from `clientID` (or one we are sending
+     * TO THE ROOM, for our own id - see _send) is proof of presence: refresh
+     * the lease the sweep above checks. Only for ids with a state - a departed peer's
      * `meta` entry survives its removal (y-protocols keeps it for the clock)
      * and must not be revived by a late message.
      */
@@ -1366,11 +1366,24 @@ export class GenericProvider extends Observable {
                 // Only on an awareness we own - an app-supplied one renews through
                 // y-protocols every 15 s, and its 'update' listener would turn the
                 // bump into a room-wide broadcast.
+                //
+                // The bump is for the new link alone, so it must not count as a
+                // renewal: setLocalState() also stamps `lastUpdated`, the age the
+                // sweep renews at half a lease. With a join, a reload or a resume
+                // more often than that, a settled peer never renewed to the room
+                // and everybody but the newcomers expired it - 50 browsers, eight
+                // minutes in: most peers listed in two rosters, their own and the
+                // newest peer's (test/dummy/bench-renewal-under-churn.ts).
                 const messages = [this._encodeSyncStep1(0)];
                 const state = this.awareness.getLocalState();
                 if (state !== null) {
-                    if (this._ownsAwareness)
+                    if (this._ownsAwareness) {
+                        const renewedAt = this.awareness.meta.get(this.doc.clientID)?.lastUpdated;
                         this.awareness.setLocalState(state); // equal state: no 'change', no broadcast
+                        const mine = this.awareness.meta.get(this.doc.clientID);
+                        if (mine !== undefined && renewedAt !== undefined)
+                            mine.lastUpdated = renewedAt;
+                    }
                     messages.push(this._encodeAwareness([this.doc.clientID]));
                 }
                 const frame = wrapMessageWithChecksum(messages.length === 1 ? messages[0] : this._encodeBatch(messages));
@@ -3033,7 +3046,6 @@ export class GenericProvider extends Observable {
     _encodeSyncStep1(flags = 0) {
         if (this._confirmed)
             flags |= DIGEST_FLAG_SETTLED;
-        this._touchPeer(this.doc.clientID);
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST);
         encoding.writeVarUint(encoder, DIGEST_VERSION);
@@ -3049,7 +3061,6 @@ export class GenericProvider extends Observable {
      * of ours (see DIGEST_FLAG_ACK for why it must never carry our own state).
      */
     _encodeAck(ackedSv, ackedDsHash) {
-        this._touchPeer(this.doc.clientID);
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_SYNC_DIGEST);
         encoding.writeVarUint(encoder, DIGEST_VERSION);
@@ -3085,7 +3096,6 @@ export class GenericProvider extends Observable {
     _encodeUpdate(update) {
         const encoder = encoding.createEncoder();
         if (this._verifyUpdates) {
-            this._touchPeer(this.doc.clientID);
             // Use verified sync protocol with sequence number and hash
             encoding.writeVarUint(encoder, MESSAGE_SYNC_VERIFIED);
             // Include sequence number and clientID for causal ordering
@@ -3432,6 +3442,19 @@ export class GenericProvider extends Observable {
         }
         this._send(this._encodeBatch(messages));
     }
+    /** Is this a message (or a batch with one) whose receivers _touchPeer() its sender? */
+    _provesPresence(message) {
+        const proves = (m) => m[0] === MESSAGE_SYNC_VERIFIED || m[0] === MESSAGE_SYNC_DIGEST;
+        if (message[0] !== MESSAGE_BATCH)
+            return proves(message);
+        const decoder = decoding.createDecoder(message);
+        decoding.readVarUint(decoder);
+        while (decoding.hasContent(decoder)) {
+            if (proves(decoding.readVarUint8Array(decoder)))
+                return true;
+        }
+        return false;
+    }
     /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */
     _encodeBatch(messages) {
         const encoder = encoding.createEncoder();
@@ -3447,6 +3470,13 @@ export class GenericProvider extends Observable {
      * This ensures updates reach both local tabs and remote peers with corruption detection.
      */
     _send(data) {
+        // A digest or a verified update refreshes our presence lease at every
+        // receiver (_touchPeer there), so it counts as a renewal here too - but
+        // only on THIS path, to the room. The encoders used to do it, also for
+        // what then went to one peer (the beacon a new link gets, the ack to a
+        // joiner) or was suppressed: see _schedulePeerConnectSync.
+        if (this._provesPresence(data))
+            this._touchPeer(this.doc.clientID);
         // Wrap message with CRC32 checksum
         const wrappedData = wrapMessageWithChecksum(data);
         // Send via BroadcastChannel to other tabs first.

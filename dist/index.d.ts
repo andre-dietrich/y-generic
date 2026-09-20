@@ -581,9 +581,9 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _startAwarenessSweep;
     /**
-     * A digest, verified update or ack from `clientID` (or one we are about
-     * to send, for our own id) is proof of presence: refresh the lease the
-     * sweep above checks. Only for ids with a state - a departed peer's
+     * A digest, verified update or ack from `clientID` (or one we are sending
+     * TO THE ROOM, for our own id - see _send) is proof of presence: refresh
+     * the lease the sweep above checks. Only for ids with a state - a departed peer's
      * `meta` entry survives its removal (y-protocols keeps it for the clock)
      * and must not be revived by a late message.
      */
@@ -1175,6 +1175,8 @@ export declare class GenericProvider extends Observable<string> {
      *   through here - no separate BC-specific batching logic needed.
      */
     private _sendBatch;
+    /** Is this a message (or a batch with one) whose receivers _touchPeer() its sender? */
+    private _provesPresence;
     /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */
     private _encodeBatch;
     /**

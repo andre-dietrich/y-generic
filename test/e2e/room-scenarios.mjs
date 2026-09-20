@@ -9,6 +9,15 @@
  *              until a text typed by one peer is in every editor.
  *  typing      5 peers type at the same time, 12 characters each. Until all N
  *              editors hold all 60 characters and are identical.
+ *  bandwidth   (opt-in: SCENARIOS=join,bandwidth; WebRTC transports) what a
+ *              peer's links carry, from RTCPeerConnection.getStats(): BW_SECONDS
+ *              (20) idle, then TYPISTS (5) peers typing a character every
+ *              KEY_MS (200). Per typist / listener: data-channel payload and an
+ *              estimate of the bytes on an IPv4 wire (see netRate), kB/s.
+ *  linger      (opt-in) LINGER_MS (420 s: longer than the 300 s presence lease of
+ *              a mesh transport) with one peer reloading every 60 s. Rosters are
+ *              checked 55 s after each reload. A run of the other scenarios
+ *              that passes is over before a lease is.
  *  vanish      one tab is killed (no unload handler - a discarded tab, a
  *              phone that never came back). Until every roster dropped it.
  *  sleep       5 peers are frozen through the DevTools protocol for
@@ -364,9 +373,80 @@ async function untilAll(peers, pred, timeoutMs) {
 }
 const fmt = (r) => (r.ms < 0 ? `NEVER (${r.ok} of ${r.of} in time)` : `${r.ms} ms`)
 
-async function type(peer, str) {
+async function type(peer, str, delay = 0) {
   await peer.page.click('.ql-editor')
-  await peer.page.keyboard.type(str)
+  await peer.page.keyboard.type(str, { delay })
+}
+
+/** Runs in the page before its scripts: keep every RTCPeerConnection it creates, for netStats(). */
+const METER = () => {
+  const Native = window.RTCPeerConnection
+  if (!Native) return
+  window.__pcs = []
+  window.RTCPeerConnection = function (...args) {
+    const pc = new Native(...args)
+    window.__pcs.push(pc)
+    return pc
+  }
+  window.RTCPeerConnection.prototype = Native.prototype
+  Object.setPrototypeOf(window.RTCPeerConnection, Native)
+}
+
+/**
+ * What a page's WebRTC links have carried so far, summed over its open
+ * connections: data-channel payload, what the ICE transport moved (payload +
+ * SCTP + DTLS, no IP/UDP headers, no connectivity checks - the spec's
+ * definition), its packets, and the STUN checks of the nominated pairs.
+ */
+const netStats = (p) =>
+  p.page.evaluate(async () => {
+    const s = { t: Date.now(), links: 0, payloadOut: 0, payloadIn: 0, msgsOut: 0, msgsIn: 0, dtlsOut: 0, dtlsIn: 0, pktsOut: 0, pktsIn: 0, stunReqOut: 0, stunRespOut: 0, stunReqIn: 0, stunRespIn: 0 }
+    for (const pc of window.__pcs ?? []) {
+      if (pc.connectionState !== 'connected') continue
+      s.links++
+      ;(await pc.getStats()).forEach((r) => {
+        if (r.type === 'data-channel') {
+          s.payloadOut += r.bytesSent
+          s.payloadIn += r.bytesReceived
+          s.msgsOut += r.messagesSent
+          s.msgsIn += r.messagesReceived
+        } else if (r.type === 'transport') {
+          s.dtlsOut += r.bytesSent
+          s.dtlsIn += r.bytesReceived
+          s.pktsOut += r.packetsSent
+          s.pktsIn += r.packetsReceived
+        } else if (r.type === 'candidate-pair' && r.nominated) {
+          s.stunReqOut += r.requestsSent
+          s.stunRespOut += r.responsesSent
+          s.stunReqIn += r.requestsReceived
+          s.stunRespIn += r.responsesReceived
+        }
+      })
+    }
+    return s
+  })
+
+/**
+ * Per-second rates between two netStats() samples. "wire" is an ESTIMATE of
+ * what an IPv4 network carries: + 28 bytes IP/UDP per packet, + the STUN
+ * checks at 128 bytes per request (100 of STUN with libwebrtc's ICE
+ * attributes) and 92 per response (64), IP/UDP included.
+ */
+function netRate(a, b) {
+  const secs = (b.t - a.t) / 1000
+  const d = (k) => (b[k] - a[k]) / secs
+  const stunOut = 128 * d('stunReqOut') + 92 * d('stunRespOut')
+  const stunIn = 128 * d('stunReqIn') + 92 * d('stunRespIn')
+  return {
+    links: b.links,
+    payloadOut: d('payloadOut'),
+    payloadIn: d('payloadIn'),
+    msgsOut: d('msgsOut'),
+    msgsIn: d('msgsIn'),
+    wireOut: d('dtlsOut') + 28 * d('pktsOut') + stunOut,
+    wireIn: d('dtlsIn') + 28 * d('pktsIn') + stunIn,
+    stunOut,
+  }
 }
 
 const stats = (xs) => {
@@ -452,12 +532,20 @@ async function main() {
       d.dismiss().catch(() => {})
     })
     await adapter.prepare(page)
+    await page.evaluateOnNewDocument(METER)
     await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load' })
     await adapter.join(page)
     await page.waitForSelector('.ql-editor', { timeout: 60000 })
     // A name per peer, so a roster says WHO is missing (see diag()).
     await fill(page, '#user-name', `p${peer.id}`).catch(() => {})
     return peer
+  }
+
+  const reload = async (p) => {
+    await p.page.reload({ waitUntil: 'load' })
+    await adapter.join(p.page)
+    await p.page.waitForSelector('.ql-editor', { timeout: 60000 })
+    await fill(p.page, '#user-name', `p${p.id}`).catch(() => {})
   }
 
   /** DIAG=1: who is missing from whose roster, links and (simple-peer) maxConns per peer. */
@@ -482,6 +570,15 @@ async function main() {
       const maxConns = p.logs.map((l) => /maxConns: (\d+)/.exec(l)?.[1]).find(Boolean) ?? '-'
       if (missing.length > 0 || (adapter.mesh && linkCounts[i] < peers.length - 1))
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
+      // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
+      if (adapter.mesh && missing.length > 0 && missing.length <= 2) {
+        for (const name of missing) {
+          const id = peers.find((q) => `p${q.id}` === name)?.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
+          if (!id) continue
+          console.log(`      p${p.id}'s log about ${name} (${id}):`)
+          for (const l of p.logs.filter((l) => l.includes(id) && !/signal=candidate/.test(l)).slice(0, 30)) console.log('        ' + l.slice(0, 200))
+        }
+      }
     })
     const seenBy = peers.map((q) => rosters.filter((r) => r.includes(`p${q.id}`)).length)
     const short = peers.filter((_, i) => seenBy[i] < peers.length)
@@ -552,6 +649,46 @@ async function main() {
       record('typing', 'editors identical', same.ms >= 0)
     }
 
+    // ---- bandwidth (opt-in, WebRTC transports): bytes per peer and second, from getStats()
+    if (wanted.includes('bandwidth') && adapter.mesh) {
+      const TYPISTS = Number(process.env.TYPISTS ?? 5)
+      const SECONDS = Number(process.env.BW_SECONDS ?? 20)
+      const KEY_MS = Number(process.env.KEY_MS ?? 200) // 5 characters per second, a fast typist
+      console.log(`bandwidth (${SECONDS} s idle, then ${TYPISTS} peers typing a character every ${KEY_MS} ms for ${SECONDS} s)`)
+      const typists = peers.slice(1, 1 + TYPISTS)
+      const mean = (xs) => xs.reduce((a, b) => a + b, 0) / Math.max(1, xs.length)
+      const kB = (x) => Math.round(x / 10.24) / 100
+      const phase = async (label, work) => {
+        const before = await Promise.all(peers.map(netStats))
+        await work()
+        const after = await Promise.all(peers.map(netStats))
+        const rates = peers.map((_, i) => netRate(before[i], after[i]))
+        for (const [who, group] of [['typist', rates.filter((_, i) => typists.includes(peers[i]))], ['listener', rates.filter((_, i) => !typists.includes(peers[i]))]]) {
+          if (label === 'idle' && who === 'typist') continue
+          record('bandwidth', `${label}, per ${label === 'idle' ? 'peer' : who} (${group.length}), kB/s`, {
+            links: Math.round(mean(group.map((r) => r.links))),
+            'payload up': kB(mean(group.map((r) => r.payloadOut))),
+            'payload down': kB(mean(group.map((r) => r.payloadIn))),
+            'wire up (est.)': kB(mean(group.map((r) => r.wireOut))),
+            'wire down (est.)': kB(mean(group.map((r) => r.wireIn))),
+            'wire up, worst peer': kB(Math.max(...group.map((r) => r.wireOut))),
+            'of wire up: STUN keep-alive': kB(mean(group.map((r) => r.stunOut))),
+            'messages up /s': Math.round(mean(group.map((r) => r.msgsOut))),
+            'messages down /s': Math.round(mean(group.map((r) => r.msgsIn))),
+          })
+        }
+      }
+      await phase('idle', () => sleep(SECONDS * 1000))
+      const line = 'the quick brown fox jumps over the lazy dog '.repeat(Math.ceil((SECONDS * 1000) / KEY_MS / 44)).slice(0, Math.round((SECONDS * 1000) / KEY_MS))
+      let typedMs = 0
+      await phase('typing', async () => {
+        const t0 = Date.now()
+        await Promise.all(typists.map((p) => type(p, line, KEY_MS)))
+        typedMs = Date.now() - t0
+      })
+      record('bandwidth', 'characters per typist and second, as typed', Math.round((line.length / (typedMs / 1000)) * 10) / 10)
+    }
+
     // ---- vanish
     if (wanted.includes('vanish')) {
       console.log('vanish')
@@ -586,13 +723,29 @@ async function main() {
       console.log('rejoin (one peer reloads)')
       const p = peers[Math.min(11, peers.length - 1)]
       const t0 = Date.now()
-      await p.page.reload({ waitUntil: 'load' })
-      await adapter.join(p.page)
-      await p.page.waitForSelector('.ql-editor', { timeout: 60000 })
-      await fill(p.page, '#user-name', `p${p.id}`).catch(() => {})
+      await reload(p)
       record('rejoin', 'the reloaded peer has the room text', await untilAll([p], async (x) => (await text(x)).includes('hello-from-0'), 60000))
       const full = await untilAll(peers, async (x) => (await roster(x)) === peers.length, 150000)
       record('rejoin', 'every roster complete (since the reload)', full.ms < 0 ? full : { ...full, ms: Date.now() - t0 })
+      if (full.ms < 0) await diag('after rejoin')
+    }
+
+    // ---- linger (opt-in): outlive a presence lease while peers keep coming and going
+    if (wanted.includes('linger')) {
+      const LINGER_MS = Number(process.env.LINGER_MS ?? 420000)
+      console.log(`linger (${LINGER_MS / 1000} s, one peer reloads every 60 s)`)
+      const t0 = Date.now()
+      const short = []
+      for (let k = 0; Date.now() - t0 < LINGER_MS; k++) {
+        await reload(peers[(12 + k) % peers.length])
+        await sleep(55000)
+        // Just before the next reload every roster has had 55 s to settle.
+        const sizes = await Promise.all(peers.map(roster))
+        const incomplete = sizes.filter((n) => n !== peers.length).length
+        if (incomplete > 0) short.push(`${Math.round((Date.now() - t0) / 1000)} s: ${incomplete} rosters, smallest ${Math.min(...sizes)}`)
+      }
+      record('linger', 'moments with an incomplete roster (55 s after each reload)', short.length === 0 ? 'none' : short)
+      if (short.length > 0) await diag('after linger')
     }
 
     // ---- restart

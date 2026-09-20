@@ -46,7 +46,17 @@
  *              then a new peer joins. Until every roster is complete.
  *
  * Usage: node test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket|ably|pubnub|nostr|gun>
- *   N=25 FREEZE_MS=20000 SCENARIOS=join,typing,... OUT=results.json override.
+ *   N=25 FREEZE_MS=40000 SCENARIOS=join,typing,... OUT=results.json override.
+ *   FIREFOX=10: that many of the N peers run in a headless Firefox (FIREFOX_BIN,
+ *   default /usr/bin/firefox) - the peers with an odd number, so three of the five
+ *   typists, the peer that reloads and the `oneway` peer that cannot send are
+ *   Firefox, its counterpart is Chrome. Firefox has no DevTools protocol: its peers
+ *   are not frozen (`sleep` takes Chrome peers) and their signaling frames are not
+ *   counted. FIREFOX_EACH=1: one Firefox PROCESS per Firefox peer (several hundred MB
+ *   each) instead of one Firefox with a tab per peer. Every such page is then the
+ *   visible tab of its own window - a user with the tab in front. In the shared
+ *   Firefox all tabs but the last are HIDDEN, and Firefox delays a hidden tab's
+ *   timers in a busy room by up to ~15-20 s: a user with the tab in the background.
  *
  * ably and pubnub run against the real service with the keys of .env
  * (node --env-file=.env test/e2e/room-scenarios.mjs ably); nostr and gun
@@ -83,7 +93,8 @@ const { WebSocketServer } = require('ws')
 
 const TRANSPORT = process.argv[2]
 const N = Number(process.env.N ?? 25)
-const FREEZE_MS = Number(process.env.FREEZE_MS ?? 20000)
+const FREEZE_MS = Number(process.env.FREEZE_MS ?? 40000) // longer than the transports' resumeAfterMs (30 s), or no resume path runs
+const FIREFOX = Number(process.env.FIREFOX ?? 0)
 const DIAG_MAX_MISSING = Number(process.env.DIAG_MAX_MISSING ?? 2) // DIAG=1: up to how many missing peers a roster's details are printed for
 const JOIN_GAP_MS = Number(process.env.JOIN_GAP_MS ?? 200) // between two joins; smaller = more pairs that join in the same second
 const CHROME = process.env.CHROME ?? '/usr/bin/google-chrome'
@@ -384,12 +395,47 @@ async function untilAll(peers, pred, timeoutMs) {
 const fmt = (r) => (r.ms < 0 ? `NEVER (${r.ok} of ${r.of} in time)` : `${r.ms} ms`)
 
 async function type(peer, str, delay = 0) {
+  if (peer.firefox) {
+    // Not through puppeteer's keyboard: over WebDriver BiDi 13 characters took 11-16 s, and
+    // for that long the page's timers did not run - the transports' sleep detector
+    // (src/providers/resume.ts) took it for a suspended page and re-joined the room.
+    // Paced from here, not by a timer in the page: a background tab's timers tick once a second.
+    const insert = (text) =>
+      peer.page.evaluate((text) => {
+        const editor = document.querySelector('.ql-editor')
+        editor.focus()
+        getSelection().selectAllChildren(editor)
+        getSelection().collapseToEnd()
+        for (const ch of text) document.execCommand('insertText', false, ch)
+      }, text)
+    if (!delay) return insert(str)
+    for (const ch of str) {
+      await insert(ch)
+      await sleep(delay)
+    }
+    return
+  }
   await peer.page.click('.ql-editor')
   await peer.page.keyboard.type(str, { delay })
 }
 
 /** Runs in the page before its scripts: keep every RTCPeerConnection it creates, for netStats(). */
 const METER = () => {
+  // Did this page's timers stand still? A 1 s interval notes every tick that came more than 5 s
+  // late - by the wall clock and by the monotonic one (a clock that jumped is not a page that
+  // slept) - with what the tab thought of itself, and every change of its visibility.
+  window.__gaps = []
+  window.__visibility = [`${new Date().toISOString().slice(14, 23)} ${document.visibilityState}`]
+  document.addEventListener('visibilitychange', () => window.__visibility.push(`${new Date().toISOString().slice(14, 23)} ${document.visibilityState}`))
+  let wall = Date.now()
+  let mono = performance.now()
+  setInterval(() => {
+    const w = Date.now()
+    const m = performance.now()
+    if (w - wall > 5000) window.__gaps.push(`${new Date(w).toISOString().slice(14, 23)} late by ${w - wall - 1000} ms (monotonic ${Math.round(m - mono - 1000)} ms), ${document.visibilityState}, focus ${document.hasFocus()}`)
+    wall = w
+    mono = m
+  }, 1000)
   const Native = window.RTCPeerConnection
   if (!Native) return
   window.__pcs = []
@@ -456,15 +502,20 @@ const pcView = (p) =>
     const ufrag = (sdp) => /a=ice-ufrag:(\S+)/.exec(sdp ?? '')?.[1]
     const out = []
     for (const [i, pc] of (window.__pcs ?? []).entries()) {
-      const v = { i, conn: pc.connectionState, ice: pc.iceConnectionState, local: ufrag(pc.localDescription?.sdp), remote: ufrag(pc.remoteDescription?.sdp), dc: [] }
-      // What the JS objects say, next to what getStats() says below: `js: <id>:<readyState>` per channel.
-      v.js = (pc.__channels ?? []).map((ch) => `${ch.id}:${ch.readyState}`).join(',')
-      if (pc.connectionState !== 'closed') {
-        ;(await pc.getStats()).forEach((r) => {
-          if (r.type === 'data-channel') v.dc.push(`${r.state} sent ${r.messagesSent} rcvd ${r.messagesReceived}`)
-        })
+      // Firefox throws on almost anything asked of a closed connection (Chrome answers): skip those.
+      try {
+        const v = { i, conn: pc.connectionState, ice: pc.iceConnectionState, local: ufrag(pc.localDescription?.sdp), remote: ufrag(pc.remoteDescription?.sdp), dc: [] }
+        // What the JS objects say, next to what getStats() says below: `js: <id>:<readyState>` per channel.
+        v.js = (pc.__channels ?? []).map((ch) => `${ch.id}:${ch.readyState}`).join(',')
+        if (pc.connectionState !== 'closed') {
+          ;(await pc.getStats()).forEach((r) => {
+            if (r.type === 'data-channel') v.dc.push(`${r.state} sent ${r.messagesSent} rcvd ${r.messagesReceived}`)
+          })
+        }
+        out.push(v)
+      } catch {
+        out.push({ i, conn: 'closed', dc: [] })
       }
-      out.push(v)
     }
     return out
   })
@@ -542,6 +593,30 @@ async function main() {
     ],
   })
 
+  // FIREFOX=n: a second browser. Host candidates as they are, as for Chrome above (the
+  // room is on one machine); background tabs' timers left alone, as for Chrome above.
+  const launchFirefox = () =>
+      puppeteer.launch({
+          browser: 'firefox',
+          executablePath: process.env.FIREFOX_BIN ?? '/usr/bin/firefox',
+          headless: true,
+          protocolTimeout: 240000,
+          // FIREFOX_PREFS='{"pref":value}' replaces the two timer prefs ('{}' = Firefox as it ships).
+          extraPrefsFirefox: {
+            'media.peerconnection.ice.obfuscate_host_addresses': false,
+            ...(process.env.FIREFOX_PREFS
+              ? JSON.parse(process.env.FIREFOX_PREFS)
+              : { 'dom.min_background_timeout_value': 4, 'dom.timeout.enable_budget_timer_throttling': false }),
+          },
+        })
+  const firefoxes = [] // every Firefox launched, for the cleanup
+  const newFirefox = async () => {
+    const f = await launchFirefox()
+    firefoxes.push(f)
+    return f
+  }
+  const firefox = FIREFOX > 0 && !process.env.FIREFOX_EACH ? await newFirefox() : null
+
   // What the room puts on the wire: every WebSocket frame a page sends (and
   // PubNub's publish requests), timestamped. A hosted backend meters exactly
   // this - Ably's free tier rejects what exceeds 50 messages/s on a channel.
@@ -558,14 +633,20 @@ async function main() {
   const refused = (p) => p.logs.filter((l) => /Protocol\.onNack|\[PubNubTransport\] ❌/.test(l)).length
 
   let serial = 0
+  let firefoxPeers = 0
   const open = async () => {
-    const context = await browser.createBrowserContext()
+    const id = serial++
+    const inFirefox = FIREFOX > 0 && id % 2 === 1 && firefoxPeers < FIREFOX
+    if (inFirefox) firefoxPeers++
+    const context = await (inFirefox ? (firefox ?? (await newFirefox())) : browser).createBrowserContext()
     const page = await context.newPage()
-    const peer = { id: serial++, page, logs: [] }
-    const cdp = await page.createCDPSession()
-    await cdp.send('Network.enable')
-    cdp.on('Network.webSocketFrameSent', () => sent.push(Date.now()))
-    cdp.on('Network.requestWillBeSent', (e) => /\/publish\//.test(e.request.url) && sent.push(Date.now()))
+    const peer = { id, page, logs: [], firefox: inFirefox }
+    if (!inFirefox) {
+      const cdp = await page.createCDPSession()
+      await cdp.send('Network.enable')
+      cdp.on('Network.webSocketFrameSent', () => sent.push(Date.now()))
+      cdp.on('Network.requestWillBeSent', (e) => /\/publish\//.test(e.request.url) && sent.push(Date.now()))
+    }
     page.on('console', (m) => peer.logs.push(`${new Date().toISOString().slice(14, 23)} [${m.type()}] ${m.text()}`))
     page.on('pageerror', (e) => peer.logs.push(`${new Date().toISOString().slice(14, 23)} [pageerror] ${e.message}`))
     // The playgrounds alert() a failed connect - an open dialog blocks every evaluate().
@@ -590,6 +671,11 @@ async function main() {
     await p.page.waitForSelector('.ql-editor', { timeout: 60000 })
     await fill(p.page, '#user-name', `p${p.id}`).catch(() => {})
   }
+
+  // A transport that finds its page has slept drops its links and joins again under a new id
+  // (src/providers/resume.ts). Right for a frozen page; for one that was merely starved of
+  // timers it is a false alarm that costs the room a whole re-join.
+  const resumed = () => peers.filter((p) => p.logs.some((l) => l.includes('Page slept'))).map((p) => `p${p.id}${p.firefox ? '(ff)' : ''}`)
 
   /** DIAG=1: who is missing from whose roster, links and (simple-peer) maxConns per peer. */
   const diag = async (label) => {
@@ -702,6 +788,7 @@ async function main() {
     peers = opened.filter((o) => o.status === 'fulfilled').map((o) => o.value)
     if (peers.length < N) record('join', 'peers that FAILED to join', `${N - peers.length} of ${N}`)
     record('join', 'all pages loaded and connected after', { ms: Date.now() - tJoin, ok: peers.length, of: N })
+    if (FIREFOX > 0) record('join', process.env.FIREFOX_EACH ? 'peers in a Firefox of their own' : 'peers in Firefox (tabs of one)', peers.filter((p) => p.firefox).map((p) => `p${p.id}`).join(' '))
     // Rosters that are not complete within 10 s wait for a presence renewal (half a lease): say who is missing.
     const complete = async (p) => (await roster(p)) === peers.length
     let rosters = await untilAll(peers, complete, 10000)
@@ -728,6 +815,8 @@ async function main() {
     const tIdle = Date.now()
     await sleep(10000)
     record('join', 'frames sent by the whole room in 10 idle seconds', wire(tIdle))
+    // IDLE_MS: leave the room entirely alone for that long - no evaluate(), nothing (the console is heard passively).
+    if (process.env.IDLE_MS) await sleep(Number(process.env.IDLE_MS))
 
     // ---- typing
     if (wanted.includes('typing')) {
@@ -780,6 +869,8 @@ async function main() {
       const seen = await untilAll([a], sees, 60000)
       record('oneway', `p${a.id} - the one it cannot send to - sees the new name`, seen.ms < 0 ? seen : { ...seen, ms: Date.now() - t0 })
       record('oneway', 'links per peer afterwards', stats(await Promise.all(peers.map(links))))
+      record('oneway', 'peers whose transport said the page had slept, so far', resumed().join(' ') || 'nobody')
+      await fill(b.page, '#user-name', `p${b.id}`) // the roster diagnosis goes by name
     }
 
     // ---- bandwidth (opt-in, WebRTC transports): bytes per peer and second, from getStats()
@@ -834,7 +925,9 @@ async function main() {
     // ---- sleep
     if (wanted.includes('sleep')) {
       console.log(`sleep (5 peers frozen for ${FREEZE_MS} ms)`)
-      const sleepers = peers.length > 11 ? peers.slice(6, 11) : peers.slice(1, 2) // small N: one sleeper
+      // Chrome peers only: the freeze goes through the DevTools protocol.
+      const chrome = peers.filter((p) => !p.firefox)
+      const sleepers = peers.length > 11 ? chrome.filter((p) => p.id >= 6).slice(0, 5) : chrome.slice(1, 2) // small N: one sleeper
       const sessions = await Promise.all(sleepers.map((p) => p.page.createCDPSession()))
       await Promise.all(sessions.map((s) => s.send('Page.setWebLifecycleState', { state: 'frozen' })))
       await type(peers[0], 'typed-while-five-slept ')
@@ -920,6 +1013,18 @@ async function main() {
     // ---- final state
     console.log('final')
     await sleep(3000)
+    if (adapter.mesh) {
+      record('final', 'peers whose transport said the page had slept (the frozen ones should, nobody else)', resumed().join(' ') || 'nobody')
+      // When, and by how much: every such line of the peers that were never frozen (DIAG=1).
+      if (process.env.DIAG) {
+        for (const p of peers.filter((q) => q.firefox)) {
+          for (const l of p.logs.filter((l) => l.includes('Page slept'))) console.log(`    p${p.id}(ff) ${l.slice(0, 150)}`)
+          // ... and what the page's own probe saw (see METER)
+          const probe = await p.page.evaluate(() => ({ gaps: window.__gaps, visibility: window.__visibility })).catch(() => null)
+          if (probe) console.log(`    p${p.id}(ff) timer gaps > 5 s: ${probe.gaps.join(' | ') || 'none'}   visibility: ${probe.visibility.join(' -> ')}`)
+        }
+      }
+    }
     // DUMP_LOGS=p6,p11: the last console lines of those peers (warnings, errors, transport debug).
     for (const name of (process.env.DUMP_LOGS ?? '').split(',').filter(Boolean)) {
       const p = peers.find((q) => `p${q.id}` === name)
@@ -929,12 +1034,29 @@ async function main() {
     await diag('final')
     const texts = await Promise.all(peers.map(text))
     record('final', 'editors identical', new Set(texts).size === 1)
+    // The editors are what a user sees, but innerText is the browser's rendering (a Firefox
+    // editor typed into here ends three newlines short of the same document in Chrome):
+    // where the playground exposes its provider, compare the shared text itself.
+    const docs = await Promise.all(peers.map((p) => p.page.evaluate(() => window.__provider?.doc.getText('quill').toString() ?? null)))
+    if (docs.every((d) => d !== null)) record('final', 'documents identical (Y.Text)', new Set(docs).size === 1)
+    if (new Set(texts).size > 1) {
+      // Who holds which text: length, and the first place where it differs from the most common one.
+      const groups = new Map()
+      texts.forEach((t, i) => groups.set(t, [...(groups.get(t) ?? []), `p${peers[i].id}${peers[i].firefox ? '(ff)' : ''}`]))
+      const [common] = [...groups.entries()].sort((a, b) => b[1].length - a[1].length)[0]
+      for (const [t, who] of groups) {
+        let at = 0
+        while (at < t.length && at < common.length && t[at] === common[at]) at++
+        console.log(`    ${who.length} peer(s), ${t.length} characters${t === common ? '' : `, differs at ${at}: ${JSON.stringify(t.slice(at, at + 24))} vs ${JSON.stringify(common.slice(at, at + 24))}`}: ${who.join(' ')}`)
+      }
+    }
     record('final', 'sends the backend refused (console, whole run)', peers.reduce((n, p) => n + refused(p), 0))
     record('final', 'rosters', stats(await Promise.all(peers.map(roster))))
     if (adapter.mesh) record('final', 'links per peer', stats(await Promise.all(peers.map(links))))
   } finally {
     if (process.env.OUT) writeFileSync(process.env.OUT, JSON.stringify(results, null, 2))
     await browser.close().catch(() => {})
+    await Promise.all(firefoxes.map((f) => f.close().catch(() => {})))
     server.stop()
     parcel.kill('SIGKILL')
   }

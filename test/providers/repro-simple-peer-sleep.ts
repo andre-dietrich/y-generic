@@ -43,6 +43,20 @@
  *           first thing when it wakes, a message that queued before it fell
  *           asleep (seen with pages frozen through the DevTools protocol). Its
  *           links are dead by then. Is that still a sleep?
+ *  Part 11 - the page slept and its signaling socket is DEAD: close() is not
+ *           answered, onclose comes 8 s later (a browser waits that long for
+ *           the closing handshake of a connection that is gone). A real phone,
+ *           Chrome on Android, 8 desktop peers: after 42 s in the background
+ *           all links were back 1.5 s after the return - after 87 s and 206 s
+ *           with the display off, 9.5 s and 11.0 s. How long until the
+ *           transport announces itself under its new id?
+ *  Part 12 - the page slept while the transport was BETWEEN two signaling
+ *           retries: the socket had died in the background, four reconnects had
+ *           failed, the fifth was due in ~6 s. The phone's own timeline, 203 s
+ *           with the display off: "retry 5 in 5841 ms | slept 142293 ms |
+ *           signaling connected after 6051 ms" - the sleep was noticed after
+ *           0.16 s and nothing was dialled, because there was no open socket to
+ *           replace. How long until the transport announces itself?
  *  Part 7 - a link that cannot send: simple-peer has fired 'connect', and the
  *           channel's send() throws "readyState is not 'open'". Seen with 50
  *           real browsers on the answering side of a link (Chrome 151, a busy
@@ -175,9 +189,17 @@ class FakeWebSocket {
   onmessage: ((e: { data: string }) => void) | null = null
   onerror: ((e: unknown) => void) | null = null
   onclose: (() => void) | null = null
+  /** true: no server - every new socket fails like a refused connection. */
+  static refuse = false
   constructor(public url: string) {
     FakeWebSocket.all.push(this)
     setTimeout(() => {
+      if (FakeWebSocket.refuse) {
+        this.readyState = FakeWebSocket.CLOSED
+        this.onerror?.(new Error('refused'))
+        this.onclose?.()
+        return
+      }
       this.readyState = FakeWebSocket.OPEN
       this.onopen?.()
     }, 1)
@@ -185,8 +207,18 @@ class FakeWebSocket {
   send(data: string): void {
     this.sent.push({ at: Date.now(), msg: JSON.parse(data) })
   }
+  /** > 0: a dead connection - close() is not answered, onclose comes this much later. */
+  static closeDelayMs = 0
   close(): void {
-    if (this.readyState === FakeWebSocket.CLOSED) return
+    if (this.readyState === FakeWebSocket.CLOSED || this.readyState === FakeWebSocket.CLOSING) return
+    if (FakeWebSocket.closeDelayMs > 0) {
+      this.readyState = FakeWebSocket.CLOSING
+      setTimeout(() => {
+        this.readyState = FakeWebSocket.CLOSED
+        this.onclose?.()
+      }, FakeWebSocket.closeDelayMs)
+      return
+    }
     this.readyState = FakeWebSocket.CLOSED
     this.onclose?.()
   }
@@ -413,6 +445,48 @@ async function main() {
     await sleep(200)
     Date.now = realNow
     console.log(`  afterwards: links dropped = ${r.seen.disconnect > 0}, connectedPeers = ${r.transport.connectedPeers}`)
+    r.transport.disconnect()
+  }
+
+  console.log('\nPart 11 - the page slept, and the signaling socket is dead: onclose comes 8 s after close()')
+  {
+    const r = await transportPeer('ice-first')
+    const firstSocket = FakeWebSocket.all.length
+    FakeWebSocket.closeDelayMs = 8000
+    const realNow = Date.now
+    const wokeAt = realNow()
+    Date.now = () => realNow() + 60000
+    let announcedAfter: number | undefined
+    while (announcedAfter === undefined && realNow() - wokeAt < 12000) {
+      await sleep(50)
+      const fresh = FakeWebSocket.all.slice(firstSocket).flatMap((w) => w.sent)
+      if (fresh.some((m) => m.msg.type === 'publish' && !(m.msg as any).signal && (m.msg as any).from !== r.ownId)) announcedAfter = realNow() - wokeAt
+    }
+    Date.now = realNow
+    FakeWebSocket.closeDelayMs = 0
+    console.log(`  announced under a new id on a new socket after: ${announcedAfter === undefined ? 'NEVER (12 s)' : announcedAfter + ' ms'}`)
+    r.transport.disconnect()
+  }
+
+  console.log('\nPart 12 - the page slept between two signaling retries (the socket died, reconnects failed, backoff at several seconds)')
+  {
+    const r = await transportPeer('ice-first')
+    FakeWebSocket.refuse = true
+    r.ws.close() // the OS kills the socket; retries 1, 2, 3 ... fail, the backoff doubles
+    await sleep(7500)
+    const firstSocket = FakeWebSocket.all.length
+    FakeWebSocket.refuse = false // the network is back - and the page wakes up
+    const realNow = Date.now
+    const wokeAt = realNow()
+    Date.now = () => realNow() + 60000
+    let announcedAfter: number | undefined
+    while (announcedAfter === undefined && realNow() - wokeAt < 12000) {
+      await sleep(50)
+      const fresh = FakeWebSocket.all.slice(firstSocket).flatMap((w) => w.sent)
+      if (fresh.some((m) => m.msg.type === 'publish' && !(m.msg as any).signal && (m.msg as any).from !== r.ownId)) announcedAfter = realNow() - wokeAt
+    }
+    Date.now = realNow
+    console.log(`  announced under a new id after: ${announcedAfter === undefined ? 'NEVER (12 s)' : announcedAfter + ' ms'}`)
     r.transport.disconnect()
   }
 

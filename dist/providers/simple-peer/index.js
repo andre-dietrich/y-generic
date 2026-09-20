@@ -70,6 +70,10 @@ export class SimplePeerTransport {
         this._shouldConnect = false;
         this.signalingAttempts = new Map();
         this.signalingTimers = new Map();
+        /** Signaling sockets handleResume() replaced: their late onclose must not dial again. */
+        this._abandonedSockets = new Set();
+        /** Signaling sockets that have not opened yet (see dialSignalingNow). */
+        this._dialingSockets = new Set();
         this._resetting = false; // handleResume(): removePeer() must not announce the old id
         if (!options.peer) {
             throw new Error('SimplePeerTransport requires the "peer" option. ' +
@@ -141,6 +145,22 @@ export class SimplePeerTransport {
         if (this.options.resumeAfterMs > 0) {
             this._stopResumeWatch = watchResume(this.options.resumeAfterMs, (sleptMs) => this.handleResume(sleptMs));
         }
+        // The network is back, or somebody looks at the page again: not the
+        // moment to sit out a backoff (a sleep shorter than resumeAfterMs kills
+        // a signaling socket just as well). Browser only.
+        if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+            const online = () => this.dialSignalingNow();
+            const visible = () => {
+                if (document.visibilityState === 'visible')
+                    this.dialSignalingNow();
+            };
+            window.addEventListener('online', online);
+            document.addEventListener('visibilitychange', visible);
+            this._stopNetworkWatch = () => {
+                window.removeEventListener('online', online);
+                document.removeEventListener('visibilitychange', visible);
+            };
+        }
     }
     /**
      * The page slept (see watchResume): every link is dead on the other side
@@ -160,8 +180,48 @@ export class SimplePeerTransport {
         for (const id of Array.from(this.peers.keys()))
             this.removePeer(id);
         this._resetting = false;
-        for (const ws of this.signalingConns.slice())
+        // Not "close and let onclose reconnect": a socket that died while the
+        // page slept does not answer the closing handshake, and the browser
+        // reports it closed only seconds later. A real phone (Chrome on Android,
+        // display off for 87 s / 206 s) had its links back 9.5 / 11.0 s after
+        // the return - 1.5 s after 42 s in the background, when the socket was
+        // still alive (test/e2e/phone-session.mjs; repro-simple-peer-sleep, part
+        // 11). Give the old sockets up and dial at once.
+        for (const ws of this.signalingConns.slice()) {
+            this._abandonedSockets.add(ws);
+            this.signalingConns.splice(this.signalingConns.indexOf(ws), 1);
             ws.close();
+        }
+        this.dialSignalingNow();
+    }
+    /**
+     * Dial every signaling server we have no open socket to, NOW - not when
+     * the backoff says so. The second thing the real phone showed: with the
+     * display off for 203 s the socket died in the background, four reconnects
+     * failed, and the page woke up with "retry 5 in 5841 ms" pending - the
+     * sleep was noticed after 0.16 s, there was no open socket to replace, and
+     * nothing happened for six seconds (repro-simple-peer-sleep, part 12). An
+     * attempt still in flight is given up with the timers: on a network that
+     * was down it hangs until its 10 s timeout. Also called when the browser
+     * says the network is back, and when the tab becomes visible again.
+     */
+    dialSignalingNow() {
+        if (!this._shouldConnect)
+            return;
+        for (const timer of this.signalingTimers.values())
+            clearTimeout(timer);
+        this.signalingTimers.clear();
+        this.signalingAttempts.clear();
+        for (const ws of this._dialingSockets) {
+            this._abandonedSockets.add(ws);
+            ws.close();
+        }
+        this._dialingSockets.clear();
+        const open = new Set(this.signalingConns.map((ws) => ws.url));
+        for (const url of this.options.signaling) {
+            if (!open.has(url) && !open.has(url + '/'))
+                this.connectSignaling(url).catch(() => { });
+        }
     }
     /** Publish our peer id to the room on every open signaling connection. */
     announce() {
@@ -189,6 +249,8 @@ export class SimplePeerTransport {
         this.log(`🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`);
         this._stopResumeWatch?.();
         this._stopResumeWatch = undefined;
+        this._stopNetworkWatch?.();
+        this._stopNetworkWatch = undefined;
         // Stop re-announce interval
         if (this.announceInterval) {
             clearInterval(this.announceInterval);
@@ -403,6 +465,7 @@ export class SimplePeerTransport {
     async connectSignaling(url) {
         return new Promise((resolve, reject) => {
             const ws = new WebSocket(url);
+            this._dialingSockets.add(ws);
             let resolved = false;
             // Liveness, as lib0's WebsocketClient does it for y-webrtc: a ping
             // every 15 s, and a socket that has been silent for 30 s is closed -
@@ -411,6 +474,11 @@ export class SimplePeerTransport {
             let lastMessageAt = Date.now();
             let pingTimer;
             ws.onopen = () => {
+                this._dialingSockets.delete(ws);
+                if (this._abandonedSockets.has(ws)) {
+                    ws.close(); // given up while it was connecting: its successor speaks for us
+                    return;
+                }
                 this.log(`🟢 Signaling connected: ${url}`);
                 this.signalingAttempts.delete(url);
                 lastMessageAt = Date.now();
@@ -468,6 +536,7 @@ export class SimplePeerTransport {
                 }
             };
             ws.onclose = () => {
+                this._dialingSockets.delete(ws);
                 this.log(`🔴 Signaling disconnected: ${url}`);
                 if (pingTimer)
                     clearInterval(pingTimer);
@@ -475,6 +544,9 @@ export class SimplePeerTransport {
                 if (index > -1) {
                     this.signalingConns.splice(index, 1);
                 }
+                // A socket handleResume() gave up has its successor already.
+                if (this._abandonedSockets.delete(ws))
+                    return;
                 this.scheduleSignalingReconnect(url);
             };
             // Timeout after 10 seconds

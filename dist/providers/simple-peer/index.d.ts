@@ -165,6 +165,11 @@ export declare class SimplePeerTransport implements Transport {
     private signalingAttempts;
     private signalingTimers;
     private _stopResumeWatch?;
+    /** Signaling sockets handleResume() replaced: their late onclose must not dial again. */
+    private _abandonedSockets;
+    /** Signaling sockets that have not opened yet (see dialSignalingNow). */
+    private _dialingSockets;
+    private _stopNetworkWatch?;
     private _resetting;
     /**
      * Create a new SimplePeer transport.
@@ -186,6 +191,18 @@ export declare class SimplePeerTransport implements Transport {
      * opens (onPeerConnect).
      */
     private handleResume;
+    /**
+     * Dial every signaling server we have no open socket to, NOW - not when
+     * the backoff says so. The second thing the real phone showed: with the
+     * display off for 203 s the socket died in the background, four reconnects
+     * failed, and the page woke up with "retry 5 in 5841 ms" pending - the
+     * sleep was noticed after 0.16 s, there was no open socket to replace, and
+     * nothing happened for six seconds (repro-simple-peer-sleep, part 12). An
+     * attempt still in flight is given up with the timers: on a network that
+     * was down it hangs until its 10 s timeout. Also called when the browser
+     * says the network is back, and when the tab becomes visible again.
+     */
+    private dialSignalingNow;
     /** Publish our peer id to the room on every open signaling connection. */
     private announce;
     /**

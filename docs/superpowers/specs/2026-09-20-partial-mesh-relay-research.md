@@ -13,6 +13,10 @@ and a roster diagnosis. Commits: b0b681a (harness), d94be58 (core), then this do
 later the same day de11ced / 5a30380 (diagnosis), dc17849 (simple-peer) and 6dbfe5a
 (trystero, the `oneway` scenario) for the link that delivers one way. **Version 1.8.1** -
 three fixes, no new API, no wire-format change: v1.5.0 to v1.8.1 share a room.
+**Version 1.8.2** the same evening: what Firefox and a real phone found (the
+sections "Firefox in the room" and "A real phone in the room") - again no new
+API (`resumeAfterMs` was and is an option, its default went from 15 s to 30 s)
+and no wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in

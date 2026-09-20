@@ -227,6 +227,15 @@ without TURN, not a capture. Full mesh, local signaling, headless Chrome 151.
 | listener — wire | 4.7 / 6.4 | 8.6 / 9.6 |
 | typed, characters per second and typist | 4.8 | 3.8 |
 
+PeerJS (same scenario, its own server locally) is the same within the run-to-run
+noise — it is the same WebRTC underneath: idle 2.1 / 2.1 and 4.0 / 4.1, a typist
+18.3 / 11.3 and 35.7 / 25.5 (3.4 characters/s), a listener 4.3 / 6.1 and 9.6 / 10.7.
+
+Trystero (nostr strategy, relay in the harness) at 25 and **40** peers: idle 2.1 /
+2.1 and 3.4 / 3.4, a typist 20.0 / 11.9 and 31.3 / 17.8 (4.5 characters/s), a
+listener 4.6 / 6.7 and 7.0 / 8.9. Its messages are larger - ~59 bytes of payload
+against ~46: Trystero's own header on every frame.
+
 So: **tens of kilobytes per second, not megabytes** — a typist in a 50-peer room
 uploads ~33 kB/s (0.26 Mbit/s), a listener moves < 10 kB/s each way.
 
@@ -295,7 +304,44 @@ free RAM, 12 cores; 43 s until all pages were loaded).
   `bench-last-joiner-roster` 0 of 12, `bench-wake-false-timeout`,
   `bench-resume-roster`, `bench-idle-room`, `bench-periodic-awareness`,
   `bench-mesh-join-burst`, `bench-reload-phantoms` all pass.
-- **Open: one roster short of one peer right after the join**, in 2 of 7 runs
+- **PeerJS with 50 browsers** (on the fixed core, `peer` 1.x server locally): all
+  scenarios pass - 49 links on every peer, rosters complete 10.2 s after the join
+  (simple-peer: 0.1 s; the single coordinator hands out the room), text everywhere
+  after 628 ms, five concurrent typists identical everywhere after 8.3 s
+  (simple-peer 1.2-3.1 s), killed tab gone after 20.5 s, rosters complete 5.1 s
+  after five frozen pages resume (up to 51 links on a peer for a while: the
+  sleepers' old ids until `iceDisconnectTimeout`), 2.0 s after a reload, 2.2 s
+  after a join that follows a 5 s server restart; **coordinator killed**: gone
+  from every roster after 23.7 s, a new peer has the text after 1.9 s, every
+  roster complete 26.2 s after the kill. `linger` (420 s, a reload every 60 s):
+  no incomplete roster, 50 of 50 at the end.
+- **Trystero does not reach 50 on this machine - it holds to 45** (fixed core,
+  nostr strategy, the harness' own NIP-01 relay; 12 cores):
+  - **50 peers, twice**: the join never completes. After 190 s: 1 of 50 rosters
+    complete, links per peer 4-49 (median 45), the text of one peer in 48 of 50
+    editors; the first time one peer had 0 links and never got the text. It is
+    the LAST joiners that stay outside. 1-minute load 12-13.7 on 12 cores, against
+    ~6 for simple-peer with 50 - the machine is saturated, so this says "Trystero
+    costs far more per peer", not yet "a classroom of 50 real machines fails".
+  - **45**: complete, but slowly - every roster after 66.6 s (10 s in, the last
+    two joiners were in nobody's roster), 44 links, text after 551 ms, load 8.
+  - **40**: rosters complete 38-886 ms after the join (four runs), 39 links. All
+    scenarios pass: five typists identical after 3.8 s, killed tab gone after
+    7.5 s, five frozen pages have the text after 128 ms, a reload complete after
+    8.0 s, text typed during a 5 s relay outage everywhere 16 ms after it; a peer
+    that joins after the restart has the text after 15 s and is in every roster
+    only after **88.5 s**. `linger` (420 s): no incomplete roster, 40 of 40.
+  - Why it is heavier, from the bundled Trystero: a **pool of 20 pre-made offers**
+    per peer - 20 `RTCPeerConnection`s on top of the links, recycled every 57 s -
+    and an announce every 5.3 s that every other peer answers to. 50 contexts are
+    ~3,500 peer connections on one machine.
+  - Test-bed lesson: two runs failed as a whole while the machine's WiFi was down
+    - zero links on every peer (without a network interface Chrome gathers no
+    host candidates; loopback does not count), and nobody joined at all (Trystero
+    follows the browser's `online`/`offline` events and opens no relay socket
+    while offline). Repeated with the network back: fine.
+- **Open: one roster short of one peer right after the join** (own note with the
+  hypotheses and how to catch it: `2026-09-20-join-presence-miss-note.md`), in 2 of 7 runs
   (once at 50, once at 25; both on the unfixed code, which proves nothing - the
   fix does not touch the join): peer A never shows peer B although their link is up;
   B is in everybody else's roster. A's transport log about B is clean — one
@@ -303,8 +349,20 @@ free RAM, 12 cores; 43 s until all pages were loaded).
   so it is not the transport. Both joined within the same second. Not found yet;
   it did not heal within the 180 s the harness waits (unfixed code, where B's
   renewal was being postponed — with the fix B's renewal at half a lease should
-  bring it, not verified). `DIAG=1` now prints A's log lines about B when it
-  happens.
+  bring it, not verified). The milder form showed once on PeerJS, on the fixed
+  core: at the end of the 50-peer run one peer held a STALE state of two others
+  (their state from before the name was set) - so it is one presence update that
+  one peer of a pair misses, and the pairs had always joined within the same
+  second. Six more 50-peer joins on the fixed core did not show it (0 of 8 there
+  against 2 of 5 before - no mechanism by which the lease fix would touch a
+  join, so: rare, not fixed). `DIAG=1` now prints, when it happens, A's transport
+  log about B and - through `window.__provider`, which the three mesh playgrounds
+  expose - B's own presence clock next to the clock, state and address A holds
+  for B: no `meta` = B's presence never arrived, a clock >= B's without a state
+  = it arrived and lost. **Caught that way on Trystero (35 peers): A holds
+  nothing at all for B - no state, no clock, no address - while B's clock stood
+  at 12 and both count the link: a link that delivers one way, below the core.**
+  Details and what to look at next: the note.
 
 ## If it is built — order of work
 

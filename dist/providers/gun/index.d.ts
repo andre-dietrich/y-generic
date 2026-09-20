@@ -168,6 +168,8 @@ export declare class GunTransport implements Transport {
     private persistDoc;
     private persistDebounceMs;
     private persistTimer?;
+    private _redialTimers;
+    private _peerConnectCallback?;
     private isWritingToGun;
     private savePending;
     /** Data loaded from Gun snapshot before onMessage callback is registered */
@@ -192,6 +194,30 @@ export declare class GunTransport implements Transport {
      * Process all pending updates at once.
      */
     private processPendingUpdates;
+    /**
+     * Bring a lost relay back. gun 0.2020.1241's browser websocket adapter
+     * tries ONCE: wire.onclose calls reconnect(peer) - one attempt, 2 s later -
+     * and then mesh.bye(peer), whose handler deletes the peer from opt.peers;
+     * when that one attempt fails, reconnect() returns at
+     * `if(!opt.peers[peer.url])` and nothing ever dials again. A relay down
+     * for more than ~2 s, a page frozen for 20 s (Chrome closes its sockets, and
+     * the one attempt runs into the freeze): the peer neither hears nor reaches
+     * anybody again, with no error anywhere - 25 browsers after a 5 s relay
+     * restart: every roster at 1, editors different
+     * (test/e2e/room-scenarios.mjs gun, test/gun/repro-relay-restart.mjs).
+     *
+     * So on every 'bye' of one of OUR relays: put it back into opt.peers and
+     * dial, 3 s later, doubling up to 30 s while it keeps failing (a failed
+     * dial ends in another 'bye'). Gun re-sends its subscriptions by itself on
+     * 'hi'; the provider is told as well (onPeerConnect), for what it wrote and
+     * missed meanwhile.
+     */
+    private _watchRelays;
+    /**
+     * Transport.onPeerConnect: fires when a relay that was lost says hi again
+     * (never at the first connect) - see _watchRelays().
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
      * Disconnect from Gun and cleanup.
      */

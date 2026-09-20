@@ -121,6 +121,7 @@ export class GunTransport {
         this.persistentMode = false;
         this.persistDoc = null;
         this.persistDebounceMs = 2000;
+        this._redialTimers = new Map();
         this.isWritingToGun = false;
         this.savePending = false;
         /** Data loaded from Gun snapshot before onMessage callback is registered */
@@ -189,7 +190,9 @@ export class GunTransport {
             gunConfig.peers = peers;
             this.log('📡 Connecting to peers:', peers);
         }
+        const relayUrls = [...(gunConfig.peers ?? [])]; // Gun turns the array it is given into an object
         this.gun = new this.options.gun(gunConfig);
+        this._watchRelays(this.gun, relayUrls);
         // Navigate to room node
         this.roomNode = this.gun.get(`yjs-room-${this._room}`);
         this.log('✅ Gun initialized for room:', this._room);
@@ -368,12 +371,80 @@ export class GunTransport {
         }
     }
     /**
+     * Bring a lost relay back. gun 0.2020.1241's browser websocket adapter
+     * tries ONCE: wire.onclose calls reconnect(peer) - one attempt, 2 s later -
+     * and then mesh.bye(peer), whose handler deletes the peer from opt.peers;
+     * when that one attempt fails, reconnect() returns at
+     * `if(!opt.peers[peer.url])` and nothing ever dials again. A relay down
+     * for more than ~2 s, a page frozen for 20 s (Chrome closes its sockets, and
+     * the one attempt runs into the freeze): the peer neither hears nor reaches
+     * anybody again, with no error anywhere - 25 browsers after a 5 s relay
+     * restart: every roster at 1, editors different
+     * (test/e2e/room-scenarios.mjs gun, test/gun/repro-relay-restart.mjs).
+     *
+     * So on every 'bye' of one of OUR relays: put it back into opt.peers and
+     * dial, 3 s later, doubling up to 30 s while it keeps failing (a failed
+     * dial ends in another 'bye'). Gun re-sends its subscriptions by itself on
+     * 'hi'; the provider is told as well (onPeerConnect), for what it wrote and
+     * missed meanwhile.
+     */
+    _watchRelays(gun, urls) {
+        const transport = this;
+        const lost = new Map(); // url -> failed dials since the relay went
+        // `function`, and this.to.next(): Gun's listeners are a chain, and one
+        // that does not pass the event on ends it for everybody registered later.
+        gun.on('bye', function (peer) {
+            this.to.next(peer);
+            const url = peer?.url;
+            if (transport.gun !== gun || !urls.includes(url) || transport._redialTimers.has(url))
+                return;
+            const attempt = lost.get(url) ?? 0;
+            lost.set(url, attempt + 1);
+            const delay = Math.min(30000, 3000 * 2 ** attempt);
+            transport.log('🔌 Relay gone:', url, '- dialing again in', delay, 'ms');
+            transport._redialTimers.set(url, setTimeout(() => {
+                transport._redialTimers.delete(url);
+                if (transport.gun !== gun)
+                    return;
+                try {
+                    if (gun._.opt.peers[url]?.wire)
+                        return; // Gun's own attempt made it
+                    gun.opt({ peers: [url] });
+                    gun._.opt.mesh.hi(gun._.opt.peers[url]); // no wire yet: this dials
+                }
+                catch (error) {
+                    transport.log('❌ Redial failed:', error);
+                }
+            }, delay));
+        });
+        gun.on('hi', function (peer) {
+            this.to.next(peer);
+            if (transport.gun !== gun || !lost.delete(peer?.url))
+                return;
+            transport.log('🤝 Relay is back:', peer.url);
+            transport._peerConnectCallback?.(peer.url);
+        });
+    }
+    /**
+     * Transport.onPeerConnect: fires when a relay that was lost says hi again
+     * (never at the first connect) - see _watchRelays().
+     */
+    onPeerConnect(callback) {
+        this._peerConnectCallback = callback;
+        return () => {
+            this._peerConnectCallback = undefined;
+        };
+    }
+    /**
      * Disconnect from Gun and cleanup.
      */
     disconnect() {
         if (!this._connected)
             return;
         this.log('👋 Disconnecting...');
+        for (const timer of this._redialTimers.values())
+            clearTimeout(timer);
+        this._redialTimers.clear();
         // Clear batch timeout
         if (this.batchTimeout) {
             clearTimeout(this.batchTimeout);

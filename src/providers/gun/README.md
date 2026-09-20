@@ -286,6 +286,27 @@ Updates are batched to reduce network overhead:
    - Use public relays or host your own
    - Local-only mode works without relays
 
+4. **Gun gives up on a lost relay after one retry** (gun 0.2020.1241, browser
+   websocket adapter: its `bye` handler deletes the peer that `reconnect()`
+   then looks for). A relay down for more than ~2 s, or a page frozen for
+   20 s, left the peer deaf and mute for good. The transport puts the relay
+   back and dials again (3 s, doubling up to 30 s) and tells
+   `GenericProvider` when it said hi again (`onPeerConnect`). 25 browsers
+   (`test/e2e/room-scenarios.mjs gun`), relay down for 5 s: every roster at
+   1 of 25 and different editors before; text typed during the outage
+   everywhere 5.8 s after the relay was back now
+   (`test/gun/repro-relay-restart.mjs`).
+
+5. **A reloaded page leaves a ghost for one presence lease** (124 s at the
+   playground's 120 s lease): Gun writes asynchronously, through several
+   timers, so the presence removal of `beforeunload` does not reach the
+   wire. Not fixed.
+
+6. **Gun's own protocol is chatty**: 25 browsers on one relay sent ~7,500
+   WebSocket frames while joining and ~50 frames/s when idle (Ably or
+   PubNub: 1-3 frames in 10 idle seconds) - acks and relayed gets, not
+   this transport's messages.
+
 ## Public Gun Relays
 
 ```typescript
@@ -297,6 +318,10 @@ const PUBLIC_RELAYS = [
 ```
 
 > **Note**: Public relays may have rate limits or availability issues. For production, consider hosting your own Gun relay server.
+> Probed 2026-09-20 with plain Gun, two Node processes: `gun.defucc.me` never said hi, `relay.peer.ooo`
+> said hi and did not pass a live write from one process to the other (12 s watched) - a room of 25
+> on those two never saw a single roster complete. Check a public relay with two tabs before a class
+> depends on it; `test/gun/relay.sh` starts your own.
 
 ## Running Your Own Relay
 

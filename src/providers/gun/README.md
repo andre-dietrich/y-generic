@@ -132,15 +132,14 @@ docker logs gun-relay        # prints the address to enter
 
 ### With Relay Servers
 
-For cross-device synchronization, use public Gun relays:
+For cross-device synchronization, name one or more relays - your own, or
+a public one that works today (see [Public Gun Relays](#public-gun-relays):
+most of the ones found in tutorials are gone):
 
 ```typescript
 const transport = new GunTransport({
   gun: Gun,
-  peers: [
-    'https://gun-relay.herokuapp.com/gun',
-    'https://gun-us.herokuapp.com/gun',
-  ],
+  peers: ['https://gun.rig.airfaas.com/gun'],
   debug: true,
 })
 ```
@@ -240,7 +239,7 @@ const transport = new GunTransport({
 // Add relay servers for cross-device sync
 const transport = new GunTransport({
   gun: Gun,
-  peers: ['https://gun-relay.herokuapp.com/gun'],
+  peers: ['https://gun.rig.airfaas.com/gun'],
 })
 ```
 
@@ -309,19 +308,37 @@ Updates are batched to reduce network overhead:
 
 ## Public Gun Relays
 
-```typescript
-const PUBLIC_RELAYS = [
-  'https://gun-relay.herokuapp.com/gun',
-  'https://gun-us.herokuapp.com/gun',
-  'https://gun-eu.herokuapp.com/gun',
-]
+Public relays are run by volunteers and come and go - test before a class
+depends on one:
+
+```
+GUN=/path/to/node_modules/gun node test/gun/probe-relays.mjs                  # the volunteer list as it is now
+GUN=... node test/gun/probe-relays.mjs https://host/gun                        # or relays of your choice
 ```
 
-> **Note**: Public relays may have rate limits or availability issues. For production, consider hosting your own Gun relay server.
-> Probed 2026-09-20 with plain Gun, two Node processes: `gun.defucc.me` never said hi, `relay.peer.ooo`
-> said hi and did not pass a live write from one process to the other (12 s watched) - a room of 25
-> on those two never saw a single roster complete. Check a public relay with two tabs before a class
-> depends on it; `test/gun/relay.sh` starts your own.
+It runs Gun's browser adapter in three processes per relay: does the relay
+say hi, does a write of one peer reach another (three times, with the
+latency), does a late reader get the value. Accepting a socket is not
+relaying.
+
+Survey of 2026-09-20 - the 4 relays of
+[volunteer.dht](https://github.com/amark/gun/wiki/volunteer.dht) (the list
+the `gun-relays` and `shogun-relays` packages read) plus every relay that
+page ever named, 40 in all:
+
+| relay | hi | live writes | late reader |
+|---|---|---|---|
+| `https://gun.rig.airfaas.com/gun` | 0.2-0.4 s | 3 of 3, 30-47 ms | 0.2 s |
+| `https://relay.peer.ooo/gun` | 0.4-0.6 s | **0 of 3** | nothing |
+| the other 38, among them `gun.o8.is`, `gun.defucc.me`, `shogun-relay.scobrudot.dev` (on the current list) and every `*.herokuapp.com` | never - no WebSocket handshake at all | - | - |
+
+So one public relay worked, and it is not on the current list.
+`test/e2e/room-scenarios.mjs gun` with `LIVE=1` against it, 25 browsers:
+rosters complete 1.7 s after the join, five typists' 60 characters everywhere
+after 3.7 s, frozen pages have the missed text after 3.7 s, text typed during
+a 5 s outage everywhere 6.9 s after it, editors identical. One volunteer's
+server is a single point of failure: for a classroom, run your own (below,
+or `test/gun/relay.sh`).
 
 ## Running Your Own Relay
 

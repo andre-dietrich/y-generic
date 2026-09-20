@@ -52,10 +52,23 @@ msg.from` initiates), so glare is not expected there - but "signal from unknown
 peer -> creating non-initiator connection" and "a fresh offer replaces a connected
 entry" are paths that create a second object for the same id.
 
-Not seen in: 8 joins at N=50 on the fixed core (simple-peer: two full runs, six
-join-only), 3 joins on the old core, 3 PeerJS joins (the "nothing" form). 2 of 5
-on the old core against 0 of 8 on the fixed one looks like a cure, but the lease
-fix touches renewals, not joins, and #3 is on the fixed core: read it as *rare*.
+**Hunted afterwards, not caught again: 45 joins in a row without it.** simple-peer
+on the fixed core: 0 of 35 (8 at N=50 with joins 200 ms apart; 12 at N=50 and 10
+at N=30 with joins 60 ms apart, the last 21 with both rooms running at once,
+1-minute load 16-29 on 12 cores) - against 2 of 5 on the old core. Trystero at
+N=35, the setup of catch #4: 0 of 10. That is too lopsided for chance, and yet
+the lease fix sends the same bytes at a join as the old code did - so the
+difference is more likely in the CONDITIONS of those runs than in the build.
+One candidate: **the test machine's network.** It is multi-homed (eth0 and WiFi
+in the same subnet, so Chrome offers host candidates on both), and its WiFi went
+down some minutes after catch #4 (10:12; by ~10:20 whole runs failed for lack of
+an interface). A flapping interface under links whose candidate pair uses its
+address would explain a link that is up on paper and dead in one direction -
+and would make this a property of the test bed, not of the library. Not
+verified: nobody watched the interface during #1-#3.
+
+What would settle it: `ip monitor address` (or a 1 s `ip -br addr` log) running
+next to the hunt, and the connection comparison below on the next catch.
 
 ## What is known about the mechanics
 
@@ -117,10 +130,22 @@ As first written (kept for the reasoning):
 ## How to catch it
 
 `DIAG=1` prints, for a roster that lacks one or two peers on a mesh transport:
-A's transport log about B **and B's about A**, and - through `window.__provider`,
-which the simple-peer / peerjs / trystero playgrounds expose - B's own clock next
-to `{clock, ageMs, hasState, user, address}` as A holds them. It fires 10 s into
-the join, so a hunt can stop there:
+A's transport log about B **and B's about A**; through `window.__provider`, which
+the simple-peer / peerjs / trystero playgrounds expose, B's own clock next to
+`{clock, ageMs, hasState, user, address}` as A holds them; and - transport
+independent - **the WebRTC connections between the two pages, paired by ICE
+ufrag, with what each end's data channel sent and received**:
+
+```
+connections p1 <-> p0: 1 (of 2 / 2 RTCPeerConnections in the two pages)
+  p1#0 connected/connected [open sent 3 rcvd 17]  <->  p0#0 connected/connected [open sent 17 rcvd 3]
+```
+
+(a healthy pair). Two lines = two connection objects for one pair; `sent 17` on
+one side against `rcvd 0` on the other = lost below the transport; `sent 0` =
+the transport never sends to that peer. `JOIN_GAP_MS` (200) sets the time between
+two joins; smaller puts more pairs into the same second. It fires 10 s into the
+join, so a hunt can stop there:
 
 ```
 for run in 1 2 3 4 5 6 7 8; do

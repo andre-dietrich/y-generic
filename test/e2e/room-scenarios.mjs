@@ -76,6 +76,7 @@ const { WebSocketServer } = require('ws')
 const TRANSPORT = process.argv[2]
 const N = Number(process.env.N ?? 25)
 const FREEZE_MS = Number(process.env.FREEZE_MS ?? 20000)
+const JOIN_GAP_MS = Number(process.env.JOIN_GAP_MS ?? 200) // between two joins; smaller = more pairs that join in the same second
 const CHROME = process.env.CHROME ?? '/usr/bin/google-chrome'
 const APP_PORT = Number(process.env.APP_PORT ?? 3450)
 const SERVER_PORT = Number(process.env.SERVER_PORT ?? 4470)
@@ -427,6 +428,28 @@ const netStats = (p) =>
   })
 
 /**
+ * Every RTCPeerConnection of a page (see METER): its states, the ICE ufrags of
+ * both ends - what pairs it with a connection in ANOTHER page - and what its
+ * data channels have carried. For diag(): how many connections does a pair
+ * have, and does what one end sent arrive at the other?
+ */
+const pcView = (p) =>
+  p.page.evaluate(async () => {
+    const ufrag = (sdp) => /a=ice-ufrag:(\S+)/.exec(sdp ?? '')?.[1]
+    const out = []
+    for (const [i, pc] of (window.__pcs ?? []).entries()) {
+      const v = { i, conn: pc.connectionState, ice: pc.iceConnectionState, local: ufrag(pc.localDescription?.sdp), remote: ufrag(pc.remoteDescription?.sdp), dc: [] }
+      if (pc.connectionState !== 'closed') {
+        ;(await pc.getStats()).forEach((r) => {
+          if (r.type === 'data-channel') v.dc.push(`${r.state} sent ${r.messagesSent} rcvd ${r.messagesReceived}`)
+        })
+      }
+      out.push(v)
+    }
+    return out
+  })
+
+/**
  * Per-second rates between two netStats() samples. "wire" is an ESTIMATE of
  * what an IPv4 network carries: + 28 bytes IP/UDP per packet, + the STUN
  * checks at 128 bytes per request (100 of STUN with libwebrtc's ICE
@@ -605,6 +628,14 @@ async function main() {
           return { clock: meta?.clock, ageMs: meta ? Date.now() - meta.lastUpdated : undefined, hasState: pr.awareness.getStates().has(id), user: pr.awareness.getStates().get(id)?.user?.name, address: pr._peerAddress.get(id) }
         }, theirs.id)
         console.log(`      ${name} itself: ${JSON.stringify(theirs)} - p${p.id} holds: ${JSON.stringify(held)}`)
+        // The WebRTC connections between the two, paired by ICE ufrag: one or more? what was sent, what arrived?
+        const [mine, theirPcs] = await Promise.all([pcView(p), pcView(q)])
+        const pairs = mine.filter((a) => a.remote && theirPcs.some((b) => b.local === a.remote))
+        console.log(`      connections p${p.id} <-> ${name}: ${pairs.length} (of ${mine.length} / ${theirPcs.length} RTCPeerConnections in the two pages)`)
+        for (const a of pairs) {
+          const b = theirPcs.find((x) => x.local === a.remote)
+          console.log(`        p${p.id}#${a.i} ${a.conn}/${a.ice} [${a.dc.join('; ')}]  <->  ${name}#${b.i} ${b.conn}/${b.ice} [${b.dc.join('; ')}]`)
+        }
       }
     }
     const seenBy = peers.map((q) => rosters.filter((r) => r.includes(`p${q.id}`)).length)
@@ -623,7 +654,7 @@ async function main() {
     const opening = []
     for (let i = 0; i < N; i++) {
       opening.push(open())
-      await sleep(i === 0 ? 3000 : 200) // the first peer opens the room (PeerJS: claims the coordinator id)
+      await sleep(i === 0 ? 3000 : JOIN_GAP_MS) // the first peer opens the room (PeerJS: claims the coordinator id)
     }
     // A peer that could not join (the service refused it) is a result, not a crash.
     const opened = await Promise.allSettled(opening)

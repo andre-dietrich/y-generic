@@ -46,8 +46,11 @@ export function log(message: string, type: LogType = 'info'): void {
  * Update connection status indicator
  */
 export function updateStatus(status: ConnectionStatus, message: string): void {
-  const indicator = document.getElementById('connection-indicator')
-  const statusEl = document.getElementById('connection-status')
+  // Two families of ids among the playgrounds: the badges of websocket, ably, pubnub and
+  // matrix carry the second one and had never been updated - "Disconnected / Not Synced" for
+  // good, on a page that was connected and synced.
+  const indicator = document.getElementById('connection-indicator') ?? document.getElementById('status-indicator')
+  const statusEl = document.getElementById('connection-status') ?? document.getElementById('status-text') ?? document.getElementById('status-badge')
 
   if (indicator) {
     indicator.className = `status-indicator ${status}`
@@ -72,7 +75,7 @@ export function updatePeerCount(count: number): void {
  * Update sync status indicator
  */
 export function updateSyncStatus(synced: boolean): void {
-  const syncStatusEl = document.getElementById('sync-status')
+  const syncStatusEl = document.getElementById('sync-status') ?? document.getElementById('sync-badge')
   if (syncStatusEl) {
     if (synced) {
       syncStatusEl.innerHTML = '✅ Synced'
@@ -88,7 +91,7 @@ export function updateSyncStatus(synced: boolean): void {
  * Update storage/save status indicator
  */
 export function updateStorageStatus(synced: boolean): void {
-  const syncStatusEl = document.getElementById('sync-status')
+  const syncStatusEl = document.getElementById('sync-status') ?? document.getElementById('sync-badge')
   if (syncStatusEl) {
     if (synced) {
       syncStatusEl.innerHTML = '✅ Saved'

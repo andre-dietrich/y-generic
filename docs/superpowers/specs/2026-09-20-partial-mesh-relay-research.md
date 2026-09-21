@@ -775,13 +775,32 @@ desktop peers, one types every 4 s; the phone now stamps its own network changes
 | **81.2 s** | socket connected - **12.9 s** after the network was there |
 | 81.5 s | roster 9 of 9, 0.3 s after the socket (the two core fixes of v1.8.3) |
 
-**Found, open: the WebSocket transport sits out its backoff** (2 s doubling to
+**Found: the WebSocket transport sits out its backoff** (2 s doubling to
 10 s, x0.5-1.5) - it has no "do it now" as simple-peer, PeerJS and Nostr have, and
 those three would not have helped here either: with the display on there is no
 `visibilitychange`, and a phone that falls back to mobile data says `online` when
 the WiFi GOES, not when it comes back. `navigator.connection`'s `change` does say
 it, on this Chrome. By André's eye ~30 s from the switch, the WiFi's own start
-included. Display off for 113 s: the socket survived, the text went on, roster 9 ->
+included.
+
+Fix: `watchPageBack()` in `src/providers/resume.ts` - `visibilitychange` to
+visible, `online`, and `change` on `navigator.connection` - replaces the three
+identical blocks of simple-peer, PeerJS and Nostr, which so gain the third sign,
+and gives the WebSocket transport its `reconnectNow()`: a retry that waits is made
+at once, an attempt that is in the air over a network that is gone is given up (its
+handlers first, and its 10 s timeout can no longer close the socket that replaced
+it), the backoff starts over. Gate `test/providers/repro-websocket-wake.ts` (the
+real transport on a stub socket and a stub page): waiting in the backoff 2,346 ms
+-> 6 ms, an attempt that hangs 10,119 ms -> 6 ms, nothing dialled while connected
+or after disconnect(). The three transports' own gates as before (simple-peer
+parts 11/12: 707 / 202 ms, PeerJS part 13: 20 ms, Nostr part 4: 1,024 ms). On the
+phone, the same test again: `network wifi 4g` at 66.2 s, `socket connected` at
+66.2 s, roster 9 at 66.2 s - the same tenth of a second, against 12.9 s; by
+André's eye "at once, 2 s after the WiFi was there". (While the WiFi was away each
+network change - wifi, none, cellular - started the backoff over: "retry 1" three
+times. Intended.)
+
+Display off for 113 s: the socket survived, the text went on, roster 9 ->
 9, first missed text after 2.1 s. The tab closed with the X: gone from the rosters
 40.5 s later (the 30 s lease).
 
@@ -811,6 +830,14 @@ had stayed out until their next real change.
 An idle room's volume is unchanged (`bench-idle-room`, N=20: 247 deliveries in
 both, no presence among them). 25 peers with ten hidden Firefox tabs again: killed
 tab 500 ms, reload 2,198 ms, editors and Y.Text identical, 25/25.
+On the phone with this fix: no change of its roster at all in the 280 s after its
+return, with the same typist in the room - against a fall to 3-6 of 9 every 30 s.
+
+Seen on the phone and not the library: the playground said "Disconnected / Not
+Synced" throughout. The shared `updateStatus()` / `updateSyncStatus()` wrote to ids
+that the pages of websocket, ably, pubnub and matrix do not have - their badges had
+never been updated. The provider said `connected`, `synced: true`, also after a
+dropped socket.
 
 ## If it is built — order of work
 

@@ -171,6 +171,11 @@ core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.
 
 `src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds
 `Date.now()` far ahead of its last tick), used by both mesh transports to re-join under a new id.
+`watchPageBack` next to it is the shared "the page has its network again" - `visibilitychange`
+to visible, `online`, and `change` on `navigator.connection` (a phone that falls back to mobile
+data says `online` when the WiFi GOES, not when it is back): simple-peer, PeerJS, Nostr and
+WebSocket do not sit out a reconnect backoff then (`test/providers/repro-websocket-wake.ts`; a
+"do it now" must also give up an attempt that is in the air over the network that is gone).
 
 ### Design docs
 

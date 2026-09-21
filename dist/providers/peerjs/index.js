@@ -40,7 +40,7 @@
  * await provider.connect({ room: 'my-room' })
  * ```
  */
-import { watchResume } from '../resume';
+import { watchResume, watchPageBack } from '../resume';
 /**
  * PeerJS transport implementation.
  * Creates direct peer-to-peer connections using PeerJS library.
@@ -130,19 +130,8 @@ export class PeerJSTransport {
         }
         // Somebody looks at the page again, or the network is back: not the
         // moment to sit out a backoff (see reconnectNow). Browser only.
-        if (!this._stopPageWatch && typeof window !== 'undefined' && typeof document !== 'undefined') {
-            const visible = () => {
-                if (document.visibilityState === 'visible')
-                    this.reconnectNow();
-            };
-            const online = () => this.reconnectNow();
-            document.addEventListener('visibilitychange', visible);
-            window.addEventListener('online', online);
-            this._stopPageWatch = () => {
-                document.removeEventListener('visibilitychange', visible);
-                window.removeEventListener('online', online);
-            };
-        }
+        if (!this._stopPageWatch)
+            this._stopPageWatch = watchPageBack(() => this.reconnectNow());
         // Strategy: Try to claim the coordinator ID first
         // If taken, we'll get an error and become a regular peer
         return new Promise((resolve, reject) => {

@@ -62,6 +62,7 @@ export declare class WebSocketTransport implements Transport {
     private _everOpened;
     private _peerConnectCallback?;
     private reconnectTimer?;
+    private _stopPageWatch?;
     private intentionalDisconnect;
     private messageQueue;
     private receivedBuffer;
@@ -99,6 +100,19 @@ export declare class WebSocketTransport implements Transport {
      * Flush queued messages
      */
     private flushMessageQueue;
+    /**
+     * The socket is gone and the page has its network again: connect now. A
+     * real phone (Chrome on Android, display on, WiFi off for a minute and on
+     * again - test/e2e/phone-session.mjs websocket): `navigator.connection` said
+     * "wifi" at 68.3 s, the socket was connected at 81.2 s. 4.3 s of that an
+     * attempt that had started over mobile data and could only time out, 8.6 s
+     * the backoff after it. So a retry that is waiting is made at once, an
+     * attempt that is in the air is given up (its handlers first, or its close
+     * would schedule a retry of its own), and the backoff starts over
+     * (test/providers/repro-websocket-wake.ts: 2.3 s and 10.1 s -> a few ms).
+     * Nothing to do while the socket is open.
+     */
+    private reconnectNow;
     /**
      * Attempt to reconnect
      */

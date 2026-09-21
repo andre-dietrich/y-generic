@@ -30,7 +30,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
-import { watchResume, type ResumeWatch } from '../resume'
+import { watchResume, watchPageBack, type ResumeWatch } from '../resume'
 
 /**
  * SimplePeer constructor type (from simple-peer library).
@@ -352,18 +352,7 @@ export class SimplePeerTransport implements Transport {
     // The network is back, or somebody looks at the page again: not the
     // moment to sit out a backoff (a sleep shorter than resumeAfterMs kills
     // a signaling socket just as well). Browser only.
-    if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-      const online = () => this.dialSignalingNow()
-      const visible = () => {
-        if (document.visibilityState === 'visible') this.dialSignalingNow()
-      }
-      window.addEventListener('online', online)
-      document.addEventListener('visibilitychange', visible)
-      this._stopNetworkWatch = () => {
-        window.removeEventListener('online', online)
-        document.removeEventListener('visibilitychange', visible)
-      }
-    }
+    this._stopNetworkWatch = watchPageBack(() => this.dialSignalingNow())
   }
 
   /**

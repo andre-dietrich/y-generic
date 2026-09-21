@@ -42,7 +42,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
-import { watchResume, type ResumeWatch } from '../resume'
+import { watchResume, watchPageBack, type ResumeWatch } from '../resume'
 
 /**
  * PeerJS constructor type (from peerjs library).
@@ -257,18 +257,7 @@ export class PeerJSTransport implements Transport {
 
     // Somebody looks at the page again, or the network is back: not the
     // moment to sit out a backoff (see reconnectNow). Browser only.
-    if (!this._stopPageWatch && typeof window !== 'undefined' && typeof document !== 'undefined') {
-      const visible = () => {
-        if (document.visibilityState === 'visible') this.reconnectNow()
-      }
-      const online = () => this.reconnectNow()
-      document.addEventListener('visibilitychange', visible)
-      window.addEventListener('online', online)
-      this._stopPageWatch = () => {
-        document.removeEventListener('visibilitychange', visible)
-        window.removeEventListener('online', online)
-      }
-    }
+    if (!this._stopPageWatch) this._stopPageWatch = watchPageBack(() => this.reconnectNow())
 
     // Strategy: Try to claim the coordinator ID first
     // If taken, we'll get an error and become a regular peer

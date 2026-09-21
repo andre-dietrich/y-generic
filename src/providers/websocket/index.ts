@@ -1,4 +1,5 @@
 import type { Transport, ConnectionConfig } from '../../transport'
+import { watchPageBack } from '../resume'
 
 // ---------------------------------------------------------------------------
 // CRC32 translation helpers
@@ -107,6 +108,7 @@ export class WebSocketTransport implements Transport {
   private _everOpened: boolean = false // the next onopen is a RE-connect
   private _peerConnectCallback?: (peerId: string) => void
   private reconnectTimer?: ReturnType<typeof setTimeout>
+  private _stopPageWatch?: () => void
   private intentionalDisconnect: boolean = false
   private messageQueue: Uint8Array[] = [] // Queue messages until connected
   private receivedBuffer: Uint8Array[] = [] // Buffer messages received before callback registered
@@ -145,12 +147,18 @@ export class WebSocketTransport implements Transport {
     return new Promise((resolve, reject) => {
       try {
         // Create WebSocket connection with room in URL (y-websocket style)
-        this.ws = new WebSocket(wsUrl, config.protocols)
+        const ws = new WebSocket(wsUrl, config.protocols)
+        this.ws = ws
         this.ws.binaryType = 'arraybuffer'
+        // Somebody looks at the page again, or the network is back or another
+        // one: not the moment to sit out a backoff (see reconnectNow).
+        if (!this._stopPageWatch) this._stopPageWatch = watchPageBack(() => this.reconnectNow())
 
         const timeout = setTimeout(() => {
-          if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
-            this.ws.close()
+          // `ws`, not `this.ws`: an attempt that reconnectNow() gave up must
+          // not close the socket that replaced it.
+          if (this.ws === ws && ws.readyState !== WebSocket.OPEN) {
+            ws.close()
             reject(new Error('WebSocket connection timeout'))
           }
         }, 10000)
@@ -224,6 +232,8 @@ export class WebSocketTransport implements Transport {
    */
   disconnect(): void {
     this.intentionalDisconnect = true
+    this._stopPageWatch?.()
+    this._stopPageWatch = undefined
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
@@ -336,6 +346,40 @@ export class WebSocketTransport implements Transport {
     }
 
     this.messageQueue = []
+  }
+
+  /**
+   * The socket is gone and the page has its network again: connect now. A
+   * real phone (Chrome on Android, display on, WiFi off for a minute and on
+   * again - test/e2e/phone-session.mjs websocket): `navigator.connection` said
+   * "wifi" at 68.3 s, the socket was connected at 81.2 s. 4.3 s of that an
+   * attempt that had started over mobile data and could only time out, 8.6 s
+   * the backoff after it. So a retry that is waiting is made at once, an
+   * attempt that is in the air is given up (its handlers first, or its close
+   * would schedule a retry of its own), and the backoff starts over
+   * (test/providers/repro-websocket-wake.ts: 2.3 s and 10.1 s -> a few ms).
+   * Nothing to do while the socket is open.
+   */
+  private reconnectNow(): void {
+    if (this.intentionalDisconnect || !this.config || this._isConnected) return
+    if (!(this.config.autoReconnect ?? true)) return
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = undefined
+    }
+    const stale = this.ws
+    if (stale) {
+      stale.onopen = stale.onmessage = stale.onerror = stale.onclose = null
+      try {
+        stale.close()
+      } catch {
+        // a socket that never opened
+      }
+      this.ws = null
+    }
+    this.reconnectAttempts = 0
+    this.log('🔄 The page has its network again - connecting now')
+    this.connect(this.config).catch(() => {}) // a failure ends in onclose and its backoff, as ever
   }
 
   /**

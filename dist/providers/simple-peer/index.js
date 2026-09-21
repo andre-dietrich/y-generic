@@ -28,7 +28,7 @@
  * await provider.connect({ room: 'my-room' })
  * ```
  */
-import { watchResume } from '../resume';
+import { watchResume, watchPageBack } from '../resume';
 /**
  * Maximum chunk size for WebRTC DataChannel messages.
  * Most browsers support up to 256KB, but we use 64KB for safety.
@@ -148,19 +148,7 @@ export class SimplePeerTransport {
         // The network is back, or somebody looks at the page again: not the
         // moment to sit out a backoff (a sleep shorter than resumeAfterMs kills
         // a signaling socket just as well). Browser only.
-        if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-            const online = () => this.dialSignalingNow();
-            const visible = () => {
-                if (document.visibilityState === 'visible')
-                    this.dialSignalingNow();
-            };
-            window.addEventListener('online', online);
-            document.addEventListener('visibilitychange', visible);
-            this._stopNetworkWatch = () => {
-                window.removeEventListener('online', online);
-                document.removeEventListener('visibilitychange', visible);
-            };
-        }
+        this._stopNetworkWatch = watchPageBack(() => this.dialSignalingNow());
     }
     /**
      * The page slept (see watchResume): every link is dead on the other side

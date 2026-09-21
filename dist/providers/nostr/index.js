@@ -53,6 +53,7 @@
 import * as Y from 'yjs';
 import * as encoding from 'lib0/encoding';
 import { splitChunks, isChunk, ChunkAssembler } from '../chunking';
+import { watchPageBack } from '../resume';
 // Common relays (strfry default) cap an event at 64 KiB; content is the
 // base64 payload, tags and signature add a few hundred bytes.
 const MAX_CONTENT_CHARS = 60000;
@@ -268,19 +269,7 @@ export class NostrTransport {
             this._subscribe(url);
         // Somebody looks at the page again, or the network is back: not the
         // moment to sit out a backoff (see _resubscribeNow). Browser only.
-        if (typeof window !== 'undefined' && typeof document !== 'undefined') {
-            const visible = () => {
-                if (document.visibilityState === 'visible')
-                    this._resubscribeNow();
-            };
-            const online = () => this._resubscribeNow();
-            document.addEventListener('visibilitychange', visible);
-            window.addEventListener('online', online);
-            this._stopPageWatch = () => {
-                document.removeEventListener('visibilitychange', visible);
-                window.removeEventListener('online', online);
-            };
-        }
+        this._stopPageWatch = watchPageBack(() => this._resubscribeNow());
         // Persistent mode: fetch the durable snapshot (if any) and start
         // publishing new ones on doc changes. Additive to the live subscription
         // above, never a replacement for it.

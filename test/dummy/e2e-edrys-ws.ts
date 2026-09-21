@@ -26,6 +26,16 @@
  *      the server's own - empty - SyncStep2, nobody refilled the server's
  *      doc, and every later update stayed pending there.)
  *
+ *   6. the room is left alone for IDLE_S seconds (default 40): for how long did
+ *      one of the three not list another? A y-websocket server runs
+ *      y-protocols' own awareness with its fixed 30 s timeout - it expires
+ *      every entry 30 s after its last update and tells the room. With the
+ *      default lease (30 s, a renewal every 15 s) nobody notices. With
+ *      LEASE_MS=120000, the playgrounds' choice for relays WITHOUT a leave
+ *      signal, the renewal comes after 60 s: 25 browsers left alone for 45 s
+ *      had rosters of 2-3 of 24 (test/e2e/room-scenarios.mjs websocket,
+ *      IDLE_MS=45000). EXTRA=22 adds that many idle clients to the three.
+ *
  * Before the handshake in WebSocketTransport.onopen, push-pull failed both
  * (2026-09-11): the provider only sends digest beacons, which the server
  * relays but never answers, so a joiner never pulled the server's document
@@ -69,6 +79,7 @@ function mk(id: string) {
     verifyUpdates: false, // the server does not speak MESSAGE_SYNC_VERIFIED
     syncMode: MODE, // fork-only option; excess key is harmless upstream
     localId: id,
+    ...(process.env.LEASE_MS ? { awarenessTimeoutMs: Number(process.env.LEASE_MS) } : {}),
   } as any)
   return { doc, p, transport }
 }
@@ -151,9 +162,43 @@ async function main() {
     console.log(`relay restarted empty: text typed afterwards arrived after ${arrived < 0 ? 'NEVER (30 s)' : arrived + ' ms'}`)
   }
 
-  for (const x of [a, b, c]) x.p.destroy()
+  // 6. the room is left alone
+  const IDLE_S = Number(process.env.IDLE_S ?? 40)
+  const all = [a, b, c]
+  for (let i = 0; i < Number(process.env.EXTRA ?? 0); i++) {
+    const x = mk('X' + i)
+    await x.p.connect({ room, serverUrl: url } as any)
+    x.p.awareness.setLocalStateField('user', { name: 'x' + i })
+    all.push(x)
+    await sleep(100)
+  }
+  const wholeNow = () => all.every((x) => all.every((y) => x === y || lists(x, y)))
+  const shortest = () => Math.min(...all.map((x) => x.p.awareness.getStates().size))
+  await until(wholeNow, 20000)
+  const idleFrom = Date.now()
+  let missingSince = 0
+  let longestGap = 0
+  let firstGapAt = -1
+  let smallest = all.length
+  while (Date.now() - idleFrom < IDLE_S * 1000) {
+    const whole = wholeNow()
+    smallest = Math.min(smallest, shortest())
+    if (!whole && missingSince === 0) {
+      missingSince = Date.now()
+      if (firstGapAt < 0) firstGapAt = Date.now() - idleFrom
+    }
+    if (missingSince !== 0) longestGap = Math.max(longestGap, Date.now() - missingSince)
+    if (whole) missingSince = 0
+    await sleep(50)
+  }
+  const idleOk = longestGap < 2000
+  console.log(
+    `left alone for ${IDLE_S} s (lease ${process.env.LEASE_MS ?? 'default'}): ${longestGap === 0 ? 'every roster whole the whole time' : `a roster was short for up to ${longestGap} ms, first ${Math.round(firstGapAt / 1000)} s in, the shortest had ${smallest} of ${all.length}`}`,
+  )
+
+  for (const x of all) x.p.destroy()
   relay?.kill('SIGKILL')
-  setTimeout(() => process.exit(lateJoin && laterEdit && typed && back >= 0 && afterRestart ? 0 : 1), 300)
+  setTimeout(() => process.exit(lateJoin && laterEdit && typed && back >= 0 && afterRestart && idleOk ? 0 : 1), 300)
 }
 
 main()

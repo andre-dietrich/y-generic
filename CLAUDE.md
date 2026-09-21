@@ -157,7 +157,12 @@ still owes the room when it unloads (its presence removal, a pending update batc
 wait for a timer - a hidden Firefox tab runs none before it is gone:
 `test/dummy/bench-unload-removal.ts`; a relay peer back from a dead link asks the room for its
 presence and forgets the clocks of whoever it expired (`bench-relay-return-roster.ts` - on a
-relay nobody noticed that it was away); and never edit a playground's source while a harness
+relay nobody noticed that it was away); a peer that is told it is gone says at once that it
+is not, at WHATEVER presence clock the removal comes - an editor binding's equal-state re-sets
+raise the local clock without a broadcast (`bench-removed-at-old-clock.ts`); a y-websocket
+server is a peer with a fixed 30 s lease (keep the default `awarenessTimeoutMs` with one; check
+6 of `e2e-edrys-ws.ts`); the harness's "0 of N" says a roster is not N long, not why - `DIAG=1`
+prints the sizes; and never edit a playground's source while a harness
 run serves it (parcel rebuilds under the run). Why the mesh stays full and what a relay under the
 core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.md`
 (`test/dummy/probe-partial-mesh.ts`).

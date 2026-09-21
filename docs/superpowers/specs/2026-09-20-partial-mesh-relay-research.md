@@ -699,6 +699,62 @@ during the outage everywhere 2,268 ms after it (2,172), a new peer in every rost
 847 ms (880), editors and Y.Text identical, 0 refused sends. The relay counted 88
 EVENTs from its restart to the end of the run, a new peer's join included.
 
+## Firefox and the relay transports: WebSocket (2026-09-21)
+
+The same room on the WebSocket playground against the edrys relay (a y-websocket
+fork), `FIREFOX=10` as hidden tabs. First run: "killed tab dropped from every
+roster" 42,616 ms against 454 ms in round 8 - and it was not the killed tab.
+
+**Found: a peer that is told it is gone does not hear it.** "0 of 24" in the
+harness's wait line only says that a roster is not 24 long; with the roster sizes
+printed (`DIAG=1`, new) it read 6-7 of 24, back to 24 over 40 s. The server's own
+trace (a scratch copy that logs who brings which entry): the killed tab's
+connection held one entry, its own - but 9 s BEFORE the kill the server had
+expired nineteen idle entries by itself. A y-websocket server runs y-protocols'
+awareness with its fixed 30 s timeout; the playground renewed every 60 s (the
+120 s lease of the relays without a leave signal). Firefox is not needed: 25
+Chrome peers left alone for 45 s (`IDLE_MS`) had rosters of 2-3 of 24. It had
+stayed invisible because every roster check of the harness fell within 30 s of
+some activity; the Firefox run waited 27 s longer in `typing`.
+
+The core has a path for a wrong removal: y-protocols never deletes the local
+state on a remote removal, it raises the clock and reports it, and the provider
+re-announces itself. Looked at from inside a peer (a scratch script on the
+playground): in a room where nobody had typed it works, also in the browser - own
+removal heard at 30.7 s, 97 bytes sent in the same millisecond. After somebody
+typed twelve characters the idle peers' presence clock stood at 13 instead of 2:
+y-quill re-sets the cursor with every remote edit, an equal state, which the
+provider rightly does not broadcast since round 5 (item 8) - so the local clock
+runs ahead of the room's. The removal at the room's clock is older than the local
+one, y-protocols ignores it, the peer is never told, and everybody else drops it
+until its next renewal. Every transport, every app whose binding re-sets its
+cursor.
+
+Gate `test/dummy/bench-removed-at-old-clock.ts`: B re-sets its unchanged state
+12 times, A tells the room that B is gone at the clock the room knows. Back in
+every roster: 10,997 ms (the renewal, lease 20 s) -> 203 ms; the control without
+re-sets 204 -> 202 ms. Fix: the wire-level scan of every presence message already
+names who is removed - our own id there, at whatever clock, and we say that we are
+here. Browser, six peers, one typed first: rosters after 40 s `[1,2,2,2,2,2]` ->
+six times 6. `bench-awareness-echo` still N-1 messages.
+
+And the playground is back at the default lease: a y-websocket server is a peer of
+the room with a lease nobody can set, and it needs no long one - it removes a
+closed connection's entries at once (`src/providers/websocket/README.md`).
+edrys-Lite passes no lease, so it has the default; check 6 of
+`test/dummy/e2e-edrys-ws.ts` (the room left alone for 40 s, `EXTRA=22` for 25
+clients) holds there - without an editor binding, so it does not show the clock
+running ahead.
+
+On the final code, 25 peers with ten hidden Firefox tabs (round 8, Chrome only):
+killed tab 501 ms (454), five pages frozen 40 s 2,857 / 2,906 ms (2,834 / 2,841),
+reload 2,220 ms (548 - the hidden-tab remainder seen on Nostr), a new peer in
+every roster after the restart 886 ms (775), editors and Y.Text identical, 25/25.
+"editors identical: false" right after `typing` is the `innerText` difference of
+the three Firefox typists (three trailing newlines), now with the Y.Text
+comparison next to it. Not looked into: text typed DURING the 5 s outage is
+everywhere only ~10 s after the restart (both runs; no reference).
+
 ## If it is built — order of work
 
 1. Turn the probe into a gate: `bench-partial-mesh.ts` that fails on an incomplete

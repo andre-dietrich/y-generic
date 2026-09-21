@@ -238,7 +238,7 @@ const ADAPTERS = {
   websocket: {
     entry: 'test/websocket/index.html',
     mesh: false,
-    vanishTimeoutMs: 150000, // the playground's 120 s presence lease - this transport cannot report departures
+    vanishTimeoutMs: 90000, // the server removes a closed connection's presence at once; its ping finds a silent one within 60 s
     server: () =>
       spawned('node', [process.env.WS_SERVER_JS ?? 'server.js'], {
         PORT: String(SERVER_PORT),
@@ -324,7 +324,8 @@ const links = (p) => p.page.evaluate(() => Number(document.getElementById('peer-
 const text = (p) => p.page.evaluate(() => document.querySelector('.ql-editor').innerText)
 
 /** ms until pred holds for every peer; -1 on timeout (and how many were short of it). */
-async function untilAll(peers, pred, timeoutMs) {
+/** `note`: what the DIAG progress line adds - "0 of 24" does not say whether a roster is too long or too short. */
+async function untilAll(peers, pred, timeoutMs, note = undefined) {
   const t0 = Date.now()
   let ok = 0
   let said = t0
@@ -334,7 +335,7 @@ async function untilAll(peers, pred, timeoutMs) {
     if (ok === peers.length) return { ms: Date.now() - t0, ok, of: peers.length }
     if (process.env.DIAG && Date.now() - said >= 5000) {
       said = Date.now()
-      console.log(`    ... ${ok} of ${peers.length} after ${Math.round((said - t0) / 1000)} s`)
+      console.log(`    ... ${ok} of ${peers.length} after ${Math.round((said - t0) / 1000)} s${note ? ` - ${await note()}` : ''}`)
     }
     await sleep(400)
   }
@@ -720,6 +721,13 @@ async function main() {
 
   let peers = []
   const others = (...gone) => peers.filter((p) => !gone.includes(p))
+  // DIAG, for a wait on the rosters: how long they are right now, and which peers have the shortest.
+  const rosterNote = async () => {
+    const sizes = await Promise.all(peers.map((p) => roster(p).catch(() => NaN)))
+    const min = Math.min(...sizes)
+    const shortest = peers.filter((_, i) => sizes[i] === min).map((p) => `p${p.id}${p.firefox ? '(ff)' : ''}`)
+    return `rosters ${JSON.stringify(stats(sizes))}, want ${peers.length}; shortest: ${shortest.slice(0, 8).join(' ')}${shortest.length > 8 ? ' ...' : ''}`
+  }
   try {
     console.log(`${TRANSPORT}: ${N} peers, room ${ROOM}`)
 
@@ -867,7 +875,7 @@ async function main() {
       const gone = peers[peers.length - 1]
       await gone.page.close()
       peers = others(gone)
-      record('vanish', `every roster dropped the killed tab (${peers.length} users)`, await untilAll(peers, async (p) => (await roster(p)) === peers.length, adapter.vanishTimeoutMs))
+      record('vanish', `every roster dropped the killed tab (${peers.length} users)`, await untilAll(peers, async (p) => (await roster(p)) === peers.length, adapter.vanishTimeoutMs, rosterNote))
     }
 
     // ---- sleep
@@ -899,7 +907,7 @@ async function main() {
       const t0 = Date.now()
       await reload(p)
       record('rejoin', 'the reloaded peer has the room text', await untilAll([p], async (x) => (await text(x)).includes('hello-from-0'), 60000))
-      const full = await untilAll(peers, async (x) => (await roster(x)) === peers.length, 150000)
+      const full = await untilAll(peers, async (x) => (await roster(x)) === peers.length, 150000, rosterNote)
       record('rejoin', 'every roster complete (since the reload)', full.ms < 0 ? full : { ...full, ms: Date.now() - t0 })
       if (full.ms < 0) await diag('after rejoin')
     }

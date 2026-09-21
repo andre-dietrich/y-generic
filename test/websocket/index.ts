@@ -174,16 +174,18 @@ async function initWithConfig(config: {
   // IMPORTANT: verifyUpdates must be false for y-websocket compatibility
   // y-websocket uses message type 3 for "messageQueryAwareness" but GenericProvider
   // uses type 3 for "MESSAGE_SYNC_VERIFIED" when verifyUpdates=true
-  // Presence lease (round 5): this transport cannot report departures, so
-  // peers renew their presence every lease/2; 120 s instead of y-protocols'
-  // 30 s cuts those renewals by three quarters (80 % of an idle room's
-  // messages once the beacons have backed off) at the price of a cursor that
-  // lingers up to 2 min after a tab is killed. Clean closes are still
-  // announced at once. Every peer of a room must use the same value.
+  // The presence lease stays at its default (30 s, a renewal every 15 s) - NOT the 120 s of
+  // the Gun and Nostr playgrounds. A y-websocket server is a peer of the room with a lease
+  // nobody can set: it runs y-protocols' awareness with its fixed 30 s timeout, expires every
+  // entry 30 s after its last update and tells the room. With a renewal every 60 s every
+  // idle user was out of every roster from second 30 to second 60, again and again
+  // (25 browsers: rosters of 2-3 of 24). And it needs no long lease: it removes a closed
+  // connection's entries at once (a killed tab is gone after 0.45 s).
   const provider = new GenericProvider(doc, transport, {
     verifyUpdates: false, // Required for y-websocket server compatibility
-    awarenessTimeoutMs: 120000,
   })
+
+  ;(window as any).__provider = provider // test/e2e/room-scenarios.mjs compares the documents through it
 
   // Listen to status changes
   provider.on('status', (event: any) => {

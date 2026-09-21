@@ -81,6 +81,16 @@ these was a way to leave the server's copy with a hole, after which typed text r
 transport tells the provider (`onPeerConnect`), which announces its presence again and pushes what
 the room has not confirmed.
 
+**Leave `awarenessTimeoutMs` at its default (30 s) with such a server.** It is a peer of the room
+with a lease nobody can set: it runs y-protocols' awareness with its fixed 30 s timeout, expires
+every entry 30 s after its last update and tells the room. A longer lease means a renewal that
+comes too late - with 120 s (a renewal every 60 s) every idle user was out of every roster from
+second 30 to second 60, again and again (25 browsers: rosters of 2-3 of 24). A peer that is told
+it is gone says at once that it is not, at whatever presence clock the removal comes
+(`test/dummy/bench-removed-at-old-clock.ts`), so the room heals within milliseconds - but it would
+do so every 30 s, with one announcement per idle user. The server needs no long lease anyway: it
+removes a closed connection's entries at once, and its ping finds a silent one within a minute.
+
 ### With Auto-reconnect
 
 ```typescript

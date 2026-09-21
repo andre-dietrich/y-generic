@@ -271,9 +271,26 @@ export declare class GunTransport implements Transport {
     private sendAwareness;
     /**
      * Setup listener for awareness updates (separate from doc sync).
-     * Uses .map() so every existing per-client slot is replayed on subscribe
-     * (late joiners learn about already-present peers), not just the most
-     * recently written one.
+     * `.map().on()` fires for every per-client slot: the ones the relay
+     * holds when we subscribe (replayed, each as the answer to our own get -
+     * gun sets `@`, the id of that get, on an answer and nothing on a live
+     * write), and every write from then on.
+     *
+     * Presence from the replay is history and dropped: a slot's last value is
+     * the last thing that connection wrote, and a page killed without a word
+     * (a closed laptop, a crashed tab) left its presence there. To a joiner
+     * it looked like a live peer - written when, the joiner cannot tell
+     * without trusting the writer's clock - so the joiner listed it for a
+     * whole lease of its own, long after the room had expired it: with 25
+     * browsers the page that reloaded after a killed tab was alone at 25 for
+     * 122 s (test/e2e/room-scenarios.mjs gun, rejoin after vanish). Round 7's
+     * five-minute bound (AWARENESS_MAX_AGE_MS) cut the phantoms of hours-old
+     * slots, not this one. Who is here now, a joiner learns from the room:
+     * its JOIN is answered with a live presence table (round 5, presence on
+     * demand; the reloaded page's roster was whole in 0.4 s from that). A
+     * re-subscribe after a relay restart gets answers the same way, and the
+     * provider asks the room for its presence then too (onPeerConnect).
+     * Gate: test/gun/repro-unload-removal.mjs, the late joiner C.
      */
     private setupAwarenessListener;
     /**

@@ -27,19 +27,26 @@
 //               playground's own beforeunload adds: provider.disconnect(); and a
 //               browser runs a task or two between beforeunload and pagehide (seen
 //               in a wire trace: gun's own queue drained itself 2 ms after the
-//               handler, 6 ms before pagehide). Heard live by A like the others -
-//               and by C, who joins AFTER the leaver is gone and gets every presence
-//               slot replayed: the slot must still carry the removal then.
+//               handler, 6 ms before pagehide). Heard live by A like the others.
 //               disconnect() nulled the slot (round 7: "take our presence slot with
-//               us"), so a reloaded page's replay had no removal for its old id, and
-//               a stale presence table in another peer's slot put it back: the
-//               reloaded page itself held its own ghost for a lease (25 browsers:
-//               127.9 s with flush() alone - the other 24 rosters were whole at once).
-// A watches the room and prints which of them it heard, in ms after the
+//               us") and so erased the removal in it - the first half of why the
+//               reloaded page held its own ghost (below); the slot keeps it now.
+//   vanish      presence, then gone without a word 2 s later     - a killed tab
+// Then C joins, after every leaver is gone, and gets every presence slot the
+// relay holds replayed as the answer to its own get. That replay is history:
+// the slot of a killed tab says "here" for as long as the relay keeps it, and a
+// reloaded page listed the tab killed minutes before for a lease of its own
+// (25 browsers: 122 s, alone at 25 - and, before the slot kept its removal, its
+// own old id, put back by a seconds-old presence table in another peer's slot:
+// 127.9 s). Since round 10 the transport hands NO replayed presence up - a
+// joiner's roster comes from the room's answer to its JOIN - so C must hear
+// none of the leavers' presence or removals, and must hear the presence A sends
+// live once C is subscribed.
+// A watches the room and prints which departures it heard, in ms after the
 // leaver's process was gone. Exit code 1 when the departure WITH flush() was
-// not heard, or when C did not hear the removal of the disconnect part; the
-// one without flush() is the bug this measured first (never heard, 8 s
-// watched - gun's turn queue is drained by a task the page never runs).
+// not heard, when C was replayed any presence, or when C missed the live one;
+// the departure without flush() is the bug this measured first (never heard,
+// 8 s watched - gun's turn queue is drained by a task the page never runs).
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { fork, spawn } from 'node:child_process'
@@ -64,7 +71,9 @@ const PARTS = [
   { marker: 21, mode: 'macrotask', label: 'gone in setTimeout(0)' },
   { marker: 31, mode: '50 ms', label: 'gone 50 ms later (control)' },
   { marker: 61, mode: 'disconnect', label: 'flush(), disconnect(), gone in setTimeout(0)' },
+  { marker: 71, mode: 'vanish', label: 'presence, gone without a word 2 s later' },
 ]
+const LIVE_MARKER = 81 // what A sends once C is subscribed
 
 if (!role) {
   const cwd = mkdtempSync(join(tmpdir(), 'gun-unload-'))
@@ -92,10 +101,14 @@ if (!role) {
     })
     await sleep(WATCH_MS) // the removal has this long to arrive
   }
-  // C joins now, after every leaver is gone: what the relay replays to it
+  // C joins now, after every leaver is gone: what the relay replays to it,
+  // and then what A says live
   const late = fork(fileURLToPath(import.meta.url), ['C', room], { stdio: ['ignore', 'pipe', 'inherit', 'ipc'] })
   late.stdout.on('data', (d) => process.stdout.write(String(d)))
-  const lateHeard = await new Promise((resolve) => late.on('message', resolve))
+  const lateReplayed = await new Promise((resolve) => late.once('message', resolve))
+  const lateLive = new Promise((resolve) => late.once('message', resolve))
+  watcher.send('say')
+  const lateHeard = await lateLive
   late.kill('SIGKILL')
   watcher.send('report')
   const heard = await report
@@ -109,12 +122,14 @@ if (!role) {
     )
   }
   console.log(`[repro] everything A heard (marker: ms after the relay started): ${JSON.stringify(Object.fromEntries(Object.entries(heard).map(([m, at]) => [m, at - t0])))}`)
+  const replayedPresence = lateReplayed.filter((m) => m.type === 1).map((m) => m.marker)
   console.log(
-    `[repro] C, joined after all of them, was replayed the removal of the disconnect part: ${lateHeard.includes(61) ? 'YES' : 'NO - the slot was nulled'} (heard markers ${JSON.stringify(lateHeard)})`,
+    `[repro] C, joined after all of them, was replayed as presence: ${replayedPresence.length === 0 ? 'nothing' : replayedPresence.join(' ') + ' - history taken for peers'} (every frame replayed: ${JSON.stringify(lateReplayed.map((m) => m.marker))})`,
   )
+  console.log(`[repro] C heard the presence A sent live once C was subscribed: ${lateHeard.includes(LIVE_MARKER) ? 'YES' : 'NO'}`)
   watcher.kill('SIGKILL')
   relay.kill('SIGKILL')
-  process.exit(heard[41] === undefined || heard[51] === undefined || heard[61] === undefined || !lateHeard.includes(61) ? 1 : 0)
+  process.exit(heard[41] === undefined || heard[51] === undefined || heard[61] === undefined || replayedPresence.length > 0 || !lateHeard.includes(LIVE_MARKER) ? 1 : 0)
 }
 
 const room = process.argv[3]
@@ -136,10 +151,12 @@ const transport = new GunTransport({
 
 if (role === 'C') {
   const heard = []
-  transport.onMessage((d) => heard.push(d[5]))
+  transport.onMessage((d) => heard.push({ marker: d[5], type: d[4] }))
   await transport.connect({ room })
   await sleep(4000) // the replay of every slot
-  process.send(heard)
+  process.send(heard.splice(0, heard.length))
+  await sleep(1500) // A's live presence
+  process.send(heard.map((m) => m.marker))
   await sleep(600000)
 }
 
@@ -149,7 +166,10 @@ if (role === 'A') {
     if (heard[d[5]] === undefined) heard[d[5]] = Date.now()
   })
   await transport.connect({ room })
-  process.on('message', (m) => m === 'report' && process.send(heard))
+  process.on('message', (m) => {
+    if (m === 'report') process.send(heard)
+    if (m === 'say') transport.send(frame(LIVE_MARKER)) // a live presence for C
+  })
   await sleep(600000)
   process.exit(0)
 }
@@ -158,7 +178,7 @@ if (role === 'A') {
 const [, , , , mode, markerArg, typeArg] = process.argv
 const marker = Number(markerArg)
 await transport.connect({ room })
-transport.send(frame(marker - 1))
+if (mode !== 'vanish') transport.send(frame(marker - 1))
 // A page that types has typed before: the first write to a gun node is the one
 // that needs an answer from the relay, later ones are local state.
 if (Number(typeArg) === 0) transport.send(frame(marker - 2, 0)) // a page that types has typed before
@@ -173,6 +193,7 @@ if (mode === 'disconnect') {
   transport.disconnect() // ... and what a playground's own beforeunload adds
   setTimeout(() => process.exit(0)) // the task or two a browser still runs
 }
+if (mode === 'vanish') { await sleep(2000); process.exit(0) } // its presence was the marker; no removal, ever
 if (mode === 'same tick') process.exit(0)
 else if (mode === 'macrotask') setTimeout(() => process.exit(0))
 else setTimeout(() => process.exit(0), 50)

@@ -10,7 +10,11 @@
  * joiner received all of them - each one a presence entry for a peer that
  * is gone, a phantom in `_knownPeers`, and a lease-timeout removal 30 s
  * later. Round 7 skips slots older than AWARENESS_MAX_AGE_MS on receipt
- * and nulls the own slot on disconnect().
+ * and nulled the own slot on disconnect(); round 10 drops the replay as
+ * presence altogether (an answer to the subscriber's own get is history: a
+ * killed tab's minutes-old slot was a phantom for a lease) - the joiner's
+ * roster comes from the room's answer to its JOIN. Expected now: 0
+ * phantoms, RECENT or not; the live peers through their answer.
  *
  * Runs the REAL GunTransport against the in-memory fake Gun graph from
  * repro-gun-batch-corruption.ts (copied: that file runs its repro on
@@ -43,12 +47,13 @@ const RECENT_AGE_MS = Number(process.env.RECENT_AGE_MS ?? 120_000)
 // existing children to a new `.map().on()` subscriber.
 // ---------------------------------------------------------------------------
 class FakeGunNode {
+  static seq = 0
   key: string
   parent: FakeGunNode | null
   value: any = undefined
   children: Map<string, FakeGunNode> = new Map()
-  private onListeners: Array<(value: any, key: string) => void> = []
-  private mapListeners: Array<(value: any, key: string) => void> = []
+  private onListeners: Array<(value: any, key: string, msg?: any) => void> = []
+  private mapListeners: Array<(value: any, key: string, msg?: any) => void> = []
 
   constructor(parent: FakeGunNode | null, key: string) {
     this.parent = parent
@@ -62,34 +67,39 @@ class FakeGunNode {
     return this.children.get(subkey)!
   }
 
+  // Gun hands a callback the wire message as its third argument: a live
+  // write carries its own id (`#`), an answer to the subscriber's own get -
+  // the replay of what the relay holds - carries `@`, the id of that get.
   put(value: any): void {
     this.value = value
-    for (const fn of this.onListeners) queueMicrotask(() => fn(value, this.key))
+    const live = { '#': `w${++FakeGunNode.seq}` }
+    for (const fn of this.onListeners) queueMicrotask(() => fn(value, this.key, live))
     if (this.parent) {
       for (const fn of this.parent.mapListeners) {
-        queueMicrotask(() => fn(value, this.key))
+        queueMicrotask(() => fn(value, this.key, live))
       }
     }
   }
 
-  on(cb: (value: any, key: string) => void): void {
+  on(cb: (value: any, key: string, msg?: any) => void): void {
     this.onListeners.push(cb)
-    if (this.value !== undefined) queueMicrotask(() => cb(this.value, this.key))
+    if (this.value !== undefined) queueMicrotask(() => cb(this.value, this.key, { '@': `g${++FakeGunNode.seq}` }))
   }
 
-  once(cb: (value: any, key: string) => void): void {
-    queueMicrotask(() => cb(this.value, this.key))
+  once(cb: (value: any, key: string, msg?: any) => void): void {
+    queueMicrotask(() => cb(this.value, this.key, { '@': `g${++FakeGunNode.seq}` }))
   }
 
-  map(): { on(cb: (value: any, key: string) => void): void } {
+  map(): { on(cb: (value: any, key: string, msg?: any) => void): void } {
     const self = this
     return {
-      on(cb: (value: any, key: string) => void) {
+      on(cb: (value: any, key: string, msg?: any) => void) {
         self.mapListeners.push(cb)
         // Gun replays every existing property of the node to a new map
         // subscriber - this is what hands a joiner the whole history.
+        const answer = { '@': `g${++FakeGunNode.seq}` }
         for (const [key, child] of self.children) {
-          if (child.value !== undefined) queueMicrotask(() => cb(child.value, key))
+          if (child.value !== undefined) queueMicrotask(() => cb(child.value, key, answer))
         }
       },
     }

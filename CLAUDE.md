@@ -159,7 +159,9 @@ wait for a timer - a hidden Firefox tab runs none before it is gone:
 presence and forgets the clocks of whoever it expired (`bench-relay-return-roster.ts` - on a
 relay nobody noticed that it was away); a peer that is told it is gone says at once that it
 is not, at WHATEVER presence clock the removal comes - an editor binding's equal-state re-sets
-raise the local clock without a broadcast (`bench-removed-at-old-clock.ts`); a y-websocket
+raise the local clock without a broadcast, and they stamp `lastUpdated`: the sweep renews by
+when the ROOM last heard us, never by that stamp (`bench-removed-at-old-clock.ts`, parts 1 and
+2); a y-websocket
 server is a peer with a fixed 30 s lease (keep the default `awarenessTimeoutMs` with one; check
 6 of `e2e-edrys-ws.ts`); the harness's "0 of N" says a roster is not N long, not why - `DIAG=1`
 prints the sizes; and never edit a playground's source while a harness

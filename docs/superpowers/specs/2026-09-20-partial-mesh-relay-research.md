@@ -758,6 +758,60 @@ the three Firefox typists (three trailing newlines), now with the Y.Text
 comparison next to it. Not looked into: text typed DURING the 5 s outage is
 everywhere only ~10 s after the restart (both runs; no reference).
 
+### The real phone on WebSocket
+
+`phone-session.mjs websocket` (`?phone` / `?desk` in the playground, the edrys
+relay on all interfaces; the one "link" is the socket). Chrome on Android, eight
+desktop peers, one types every 4 s; the phone now stamps its own network changes
+(`navigator.connection`) and logs the transport's lines over its whole life.
+
+| page time | the phone's own log - display on, WiFi off and on again |
+|---|---|
+| 15.5 s | socket closed 1006, retry 1 in 1289 ms - `network wifi` -> `none` -> `cellular` (and `online`) |
+| 16.8 / 28.8 / 48.0 s | reconnect FAILED, retry 2 in 2072, 3 in 9191, 4 in 14551 ms |
+| 32.6 - 44.6 s | roster 4, 3, 2, 1 (the 30 s lease) |
+| **68.3 s** | **`network wifi 4g`** - the WiFi is back. No `online`: the page never was offline |
+| 72.6 s | reconnect FAILED (the attempt had started over mobile data), retry 5 in 8567 ms |
+| **81.2 s** | socket connected - **12.9 s** after the network was there |
+| 81.5 s | roster 9 of 9, 0.3 s after the socket (the two core fixes of v1.8.3) |
+
+**Found, open: the WebSocket transport sits out its backoff** (2 s doubling to
+10 s, x0.5-1.5) - it has no "do it now" as simple-peer, PeerJS and Nostr have, and
+those three would not have helped here either: with the display on there is no
+`visibilitychange`, and a phone that falls back to mobile data says `online` when
+the WiFi GOES, not when it comes back. `navigator.connection`'s `change` does say
+it, on this Chrome. By André's eye ~30 s from the switch, the WiFi's own start
+included. Display off for 113 s: the socket survived, the text went on, roster 9 ->
+9, first missed text after 2.1 s. The tab closed with the X: gone from the rosters
+40.5 s later (the 30 s lease).
+
+**Found: the presence renewal starves while somebody types.** After its return
+the phone's roster fell to 3-6 of 9 every 30 s and was whole again 0.1-0.2 s
+later - the server's timeout again, now with the DEFAULT lease. The sweep renewed
+by `awareness.meta`'s `lastUpdated` of the own entry, and y-protocols stamps that
+with EVERY setLocalState(), also an equal one that is never broadcast: y-quill
+re-sets the cursor with every remote edit, so while somebody typed every reader
+believed it had just renewed and the room heard nothing of it. Towards a
+y-websocket server a digest or an update counted as a renewal as well, which such
+a server does not read. Not y-websocket alone: in part 2 of
+`bench-removed-at-old-clock.ts` (B re-sets its unchanged state once a second for
+three leases and does nothing else) A dropped B in BOTH modes. Fix: the sweep
+renews by when the ROOM last heard us (`_presenceHeardAt`, stamped in `_send`: our
+own presence entry, or - not with a y-websocket server - a digest / verified
+update). The 0.1 s healing was this morning's fix at work; before it, those peers
+had stayed out until their next real change.
+
+| | v1.8.4 | fixed |
+|---|---|---|
+| gate, y-websocket mode: longest silence of B at A (lease 6 s) | 6,356 ms, B dropped | 3,608 ms, listed throughout |
+| gate, verified mode | B dropped | listed throughout |
+| the real relay, 9 Node clients, one types, 70 s: entries the server expired | 2 (the typist, every 30 s) | 0 |
+| 6 Chrome peers with y-quill, one types, 70 s | 2 (3 and 4 of the 6 peers) | 0 |
+
+An idle room's volume is unchanged (`bench-idle-room`, N=20: 247 deliveries in
+both, no presence among them). 25 peers with ten hidden Firefox tabs again: killed
+tab 500 ms, reload 2,198 ms, editors and Y.Text identical, 25/25.
+
 ## If it is built — order of work
 
 1. Turn the probe into a gate: `bench-partial-mesh.ts` that fails on an incomplete

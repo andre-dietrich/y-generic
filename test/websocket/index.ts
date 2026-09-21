@@ -11,6 +11,14 @@ import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
 import { GenericProvider } from '../../src/index'
 import { WebSocketTransport } from '../../src/providers/websocket/index'
+import { installPhoneReport } from '../e2e/phone-report'
+
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless room
+// mates) take the server from the page's own host and connect by themselves, with the
+// transport's debug log on - the phone's timeline is made of its lines.
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
+
 import {
   registerMediaBlots,
   imageHandler as sharedImageHandler,
@@ -284,14 +292,33 @@ async function initWithConfig(config: {
   const randomColor =
     randomColors[Math.floor(Math.random() * randomColors.length)]
 
-  userNameInput.value = randomName
+  userNameInput.value = sessionName ?? randomName
   userColorInput.value = randomColor
 
   // Set initial awareness state
   provider.awareness.setLocalStateField('user', {
-    name: randomName,
+    name: sessionName ?? randomName,
     color: randomColor,
   })
+
+  // `?phone`: the phone tells on itself through its presence (test/e2e/phone-report.ts).
+  // Its one "link" is the socket to the server.
+  if (sessionName === 'phone') {
+    installPhoneReport({
+      awareness: provider.awareness,
+      yText,
+      links: () => (transport.isConnected ? 1 : 0),
+      logTag: '[WebSocketTransport]',
+      timeline: [
+        { match: 'WebSocket closed', label: (l) => `socket closed ${/code=(\d+)/.exec(l)?.[1] ?? ''}` },
+        { match: 'Attempting reconnection', label: (l) => `retry ${/#(\d+) in (\d+)ms/.exec(l)?.slice(1).join(' in ') ?? ''} ms` },
+        { match: 'WebSocket connected', label: () => 'socket connected' },
+        { match: 'Reconnection failed', label: () => 'reconnect FAILED' },
+        { match: 'WebSocket error', label: () => 'socket error' },
+        { match: 'Max reconnection attempts', label: () => 'GAVE UP' },
+      ],
+    })
+  }
 
   // Update awareness on user input
   userNameInput.addEventListener('input', () => {
@@ -409,9 +436,18 @@ function setupConnectionForm() {
   })
 }
 
+function start() {
+  setupConnectionForm()
+  if (sessionName === null) return
+  ;(document.getElementById('config-server-url') as HTMLInputElement).value = `ws://${location.hostname}:${session.get('sig') ?? '4470'}`
+  ;(document.getElementById('config-room') as HTMLInputElement).value = session.get('room') ?? 'phone-room'
+  ;(document.getElementById('config-debug') as HTMLInputElement).checked = true
+  ;(document.getElementById('config-form') as HTMLFormElement).requestSubmit()
+}
+
 // Start when DOM is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', setupConnectionForm)
+  document.addEventListener('DOMContentLoaded', start)
 } else {
-  setupConnectionForm()
+  start()
 }

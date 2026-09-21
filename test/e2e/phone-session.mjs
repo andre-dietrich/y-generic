@@ -33,8 +33,10 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr|websocket]
  *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
+ *   websocket needs a y-websocket style server: WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js;
+ *   its one "link" is the socket to that server
  *   nostr: the NIP-01 relay of this process (nostr-relay.mjs); "links" are then the relays a
  *   peer holds a subscription on (one), and the room drops a silent peer only after the
  *   playground's 120 s presence lease - the phone and the desktop peers need the internet
@@ -69,6 +71,11 @@ const BACKENDS = {
     entry: 'test/peerjs/index.html',
     // npm install peer (not a dependency of this package): PEERJS_BIN=/path/to/node_modules/.bin/peerjs
     server: (port) => spawned(process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(port), '--host', '0.0.0.0']),
+  },
+  websocket: {
+    entry: 'test/websocket/index.html',
+    // a y-websocket style server: WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js (see room-scenarios.mjs)
+    server: (port) => spawned('node', [process.env.WS_SERVER_JS ?? 'server.js'], { PORT: String(port), HOST: '0.0.0.0' }),
   },
   nostr: {
     entry: 'test/nostr/index.html',

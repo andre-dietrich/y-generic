@@ -34,7 +34,9 @@
  *      LEASE_MS=120000, the playgrounds' choice for relays WITHOUT a leave
  *      signal, the renewal comes after 60 s: 25 browsers left alone for 45 s
  *      had rosters of 2-3 of 24 (test/e2e/room-scenarios.mjs websocket,
- *      IDLE_MS=45000). EXTRA=22 adds that many idle clients to the three.
+ *      IDLE_MS=45000). EXTRA=22 adds that many idle clients to the three;
+ *      TYPIST=1 lets A type every 4 s meanwhile (a peer whose updates speak
+ *      for it - to other GenericProviders, not to the server).
  *
  * Before the handshake in WebSocketTransport.onopen, push-pull failed both
  * (2026-09-11): the provider only sends digest beacons, which the server
@@ -180,6 +182,7 @@ async function main() {
   let longestGap = 0
   let firstGapAt = -1
   let smallest = all.length
+  const typist = process.env.TYPIST ? setInterval(() => a.doc.getText('t').insert(0, '.'), 4000) : undefined
   while (Date.now() - idleFrom < IDLE_S * 1000) {
     const whole = wholeNow()
     smallest = Math.min(smallest, shortest())
@@ -191,6 +194,7 @@ async function main() {
     if (whole) missingSince = 0
     await sleep(50)
   }
+  clearInterval(typist)
   const idleOk = longestGap < 2000
   console.log(
     `left alone for ${IDLE_S} s (lease ${process.env.LEASE_MS ?? 'default'}): ${longestGap === 0 ? 'every roster whole the whole time' : `a roster was short for up to ${longestGap} ms, first ${Math.round(firstGapAt / 1000)} s in, the shortest had ${smallest} of ${all.length}`}`,

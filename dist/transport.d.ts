@@ -68,6 +68,19 @@ export interface Transport {
      */
     onPeerDisconnect?(callback: (peerId: string) => void): () => void;
     /**
+     * Optional: put whatever is queued on the wire NOW, in the calling task.
+     * The provider calls this when the page is unloading, after the pending
+     * update batch and the presence removal (which it sends without any timer
+     * since v1.8.3) - a page that goes away runs no further task, so a
+     * transport that hands its writes to something that defers them loses
+     * exactly the message the room needs most. Gun does: every write travels
+     * through its own turn queue, drained through a MessageChannel task, and a
+     * reloaded page stayed a ghost in every roster for the whole presence
+     * lease (128 s of 25 browsers; test/gun/repro-unload-removal.mjs).
+     * Transports that send straight into an open socket leave this undefined.
+     */
+    flush?(): void;
+    /**
      * Check if the transport is currently connected.
      */
     readonly isConnected: boolean;

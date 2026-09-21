@@ -2107,6 +2107,9 @@ export class GenericProvider extends Observable<string> {
           [this.doc.clientID],
           'window unload',
         )
+        // ... and a transport that defers its writes puts them on the wire
+        // now, in this task - there is no later one (Transport.flush).
+        this.transport.flush?.()
         // Disconnect BroadcastChannel to notify other tabs
         this._disconnectBroadcastChannel()
       }

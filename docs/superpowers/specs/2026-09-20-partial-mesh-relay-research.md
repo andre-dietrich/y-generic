@@ -982,6 +982,13 @@ editor 462 / 547 ms, reload 539 / 2,882 ms, a new peer after the restart with
 the room text 402 / 809 ms, editors and Y.Text identical, 25/25 - the
 document path changed and nothing moved.
 
+And the one scenario no relay transport had been through, `linger` (v1.8.8,
+`SCENARIOS=join,linger`: 420 s, three and a half of the playground's 120 s
+leases, one peer reloading every 60 s, the rosters checked 55 s after each
+reload): no moment with an incomplete roster, Chrome and ten Firefox tabs
+alike, editors and Y.Text identical, 25/25 at the end. A reload that left a
+ghost for a lease would have failed every one of those seven checks.
+
 ### The real phone on Gun
 
 `phone-session.mjs gun` (`?phone` / `?desk` in the playground, `Docker/gun/relay.js`

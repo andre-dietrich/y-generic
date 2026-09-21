@@ -528,11 +528,20 @@ export class GunTransport {
         this.processPendingUpdates();
         // Flush any pending updates
         this.flushBatch();
-        // Take our presence slot with us; a crashed tab's slot ages out at the
-        // receivers instead (AWARENESS_MAX_AGE_MS).
-        if (this.ownAwarenessId && this.roomNode) {
-            this.roomNode.get('awareness').get(this.ownAwarenessId).put(null);
-        }
+        // Our presence slot stays, with the removal the provider wrote into it
+        // just before (it removes the local state before it disconnects the
+        // transport). Round 7 nulled the slot here, "to take it with us" - and
+        // took the removal with it: a page's beforeunload wrote the removal,
+        // the playground's own handler called disconnect(), and gun's queue
+        // sent the null two tasks later, before pagehide. Live peers had the
+        // removal by then; a page that joined afterwards - the reloaded page
+        // itself - was replayed an empty slot, and a presence table a peer had
+        // written into ITS slot seconds earlier put the old client back. The
+        // reloaded page held its own ghost for a lease while every other
+        // roster was whole (25 browsers: 127.9 s). The slot ages out at the
+        // receivers as any other (AWARENESS_MAX_AGE_MS); a replayed removal of
+        // a client nobody knows costs y-protocols one clock entry.
+        // Gate: test/gun/repro-unload-removal.mjs, the disconnect part.
         // Remove listeners
         if (this.updateListener) {
             // Gun doesn't have a clear off() method for map listeners
@@ -662,7 +671,9 @@ export class GunTransport {
                 if (this._callback) {
                     this._callback(decoded);
                 }
-                this.log('📥 Received awareness update', awareness.encrypted ? '(decrypted)' : '');
+                this.log('📥 Received awareness update', awareness.encrypted ? '(decrypted)' : '', 'slot', awareness.id, 'written', typeof awareness.timestamp === 'number'
+                    ? `${Date.now() - awareness.timestamp} ms ago`
+                    : 'unknown');
             }
             catch (error) {
                 this.log('❌ Error processing awareness:', error);

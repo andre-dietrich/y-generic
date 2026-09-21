@@ -641,6 +641,14 @@ export class GenericProvider extends Observable<string> {
   // this. See docs/superpowers/specs/2026-09-04-sync-optimization-round-3-ideas.md
   // item 7 and test/dummy/bench-awareness-removal-burst.ts.
   private _pendingAwarenessRemoval: number[] | null = null
+  // When the ROOM last heard that we are here (see _send): what the sweep
+  // renews by. Not awareness.meta's `lastUpdated` of our own entry -
+  // y-protocols stamps that with every setLocalState(), also an equal one
+  // that is never broadcast, and an editor binding re-sets its cursor with
+  // every remote edit: while somebody typed, every reader believed it had
+  // just renewed and the room heard nothing of it for leases
+  // (test/dummy/bench-removed-at-old-clock.ts, part 2).
+  private _presenceHeardAt = 0
   private _pendingAwarenessRemovalTimeoutId?: ReturnType<typeof setTimeout>
 
   // onPeerConnect debounce: coalesces a burst of near-simultaneous
@@ -1705,7 +1713,7 @@ export class GenericProvider extends Observable<string> {
         if (
           this.awareness.getLocalState() !== null &&
           mine !== undefined &&
-          lease / 2 <= now - mine.lastUpdated
+          lease / 2 <= now - this._presenceHeardAt
         ) {
           this.awareness.setLocalState(this.awareness.getLocalState()) // renew: bumps the clock
           this._broadcastAwareness([this.doc.clientID]) // 'change' does not fire for an equal state (item 8)
@@ -4191,6 +4199,23 @@ export class GenericProvider extends Observable<string> {
     this._send(this._encodeBatch(messages))
   }
 
+  /** Is this a presence message (or a batch with one) that carries our own, non-null state? */
+  private _carriesOwnPresence(message: Uint8Array): boolean {
+    const carries = (m: Uint8Array) => {
+      if (m[0] !== MESSAGE_AWARENESS) return false
+      const decoder = decoding.createDecoder(m)
+      decoding.readVarUint(decoder)
+      return this._scanAwarenessPayload(decoding.readVarUint8Array(decoder)).present.includes(this.doc.clientID)
+    }
+    if (message[0] !== MESSAGE_BATCH) return carries(message)
+    const decoder = decoding.createDecoder(message)
+    decoding.readVarUint(decoder)
+    while (decoding.hasContent(decoder)) {
+      if (carries(decoding.readVarUint8Array(decoder))) return true
+    }
+    return false
+  }
+
   /** Is this a message (or a batch with one) whose receivers _touchPeer() its sender? */
   private _provesPresence(message: Uint8Array): boolean {
     const proves = (m: Uint8Array) => m[0] === MESSAGE_SYNC_VERIFIED || m[0] === MESSAGE_SYNC_DIGEST
@@ -4224,7 +4249,16 @@ export class GenericProvider extends Observable<string> {
     // only on THIS path, to the room. The encoders used to do it, also for
     // what then went to one peer (the beacon a new link gets, the ack to a
     // joiner) or was suppressed: see _schedulePeerConnectSync.
-    if (this._provesPresence(data)) this._touchPeer(this.doc.clientID)
+    //
+    // Not with a y-websocket server (`verifyUpdates: false`): it is a peer
+    // of the room that reads presence messages only, with y-protocols' fixed
+    // 30 s timeout. A peer whose updates or beacons spoke for it was expired
+    // there every 30 s and the removal told to the room - a real phone saw
+    // its roster fall to 3-6 of 9 twice a minute. There only our own
+    // presence entry counts.
+    if ((this._verifyUpdates && this._provesPresence(data)) || this._carriesOwnPresence(data)) {
+      this._presenceHeardAt = Date.now()
+    }
 
     // Wrap message with CRC32 checksum
     const wrappedData = wrapMessageWithChecksum(data)

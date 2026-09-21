@@ -171,6 +171,7 @@ export declare class GenericProvider extends Observable<string> {
     private _presencePending;
     private _presenceResponseTimer?;
     private _pendingAwarenessRemoval;
+    private _presenceHeardAt;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
     private _pendingPeerConnectSyncTimeoutId?;
@@ -1175,6 +1176,8 @@ export declare class GenericProvider extends Observable<string> {
      *   through here - no separate BC-specific batching logic needed.
      */
     private _sendBatch;
+    /** Is this a presence message (or a batch with one) that carries our own, non-null state? */
+    private _carriesOwnPresence;
     /** Is this a message (or a batch with one) whose receivers _touchPeer() its sender? */
     private _provesPresence;
     /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */

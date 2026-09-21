@@ -20,6 +20,9 @@ and no wire-format change.
 **Version 1.8.3**, later that night: what the same two tests found on a relay
 transport ("Firefox and the relay transports: Nostr") - two fixes in the core,
 one in the Nostr transport, no new API, no wire-format change.
+**Version 1.8.4**, the next morning: the same test on WebSocket ("Firefox and the
+relay transports: WebSocket") - one more fix in the core, again no new API and no
+wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in

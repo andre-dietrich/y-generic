@@ -294,7 +294,11 @@ Updates are batched to reduce network overhead:
    (`test/e2e/room-scenarios.mjs gun`), relay down for 5 s: every roster at
    1 of 25 and different editors before; text typed during the outage
    everywhere 5.8 s after the relay was back now
-   (`test/gun/repro-relay-restart.mjs`).
+   (`test/gun/repro-relay-restart.mjs`). And a page whose network is back
+   - visible again, `online`, a change of `navigator.connection` - dials
+   at once instead of sitting out that backoff (a phone with its display
+   off loses the socket again and again, the wait at 12 s by the time it
+   comes back): `test/gun/repro-page-back.mjs`, 1.0 s against 8.0 s.
 
 5. **A reloaded page left a ghost for one presence lease** (124 s at the
    playground's 120 s lease, 128.5 s of 25 browsers in round 10). Three

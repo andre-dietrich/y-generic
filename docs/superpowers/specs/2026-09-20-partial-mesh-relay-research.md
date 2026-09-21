@@ -33,6 +33,10 @@ a reloaded Gun page a ghost for a lease ("Firefox and the relay transports: Gun"
 three findings in the Gun transport, measured one after the other, and one new
 optional hook, `Transport.flush()`, that the provider calls when the page unloads.
 No wire-format change.
+**Version 1.8.7**, the same evening: the real phone on Gun ("The real phone on Gun")
+found nothing wrong and one gap - Gun was the one relay transport that sat out its
+reconnect backoff when the page's network came back. No new API, no wire-format
+change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in
@@ -967,6 +971,40 @@ sync covers it (the reloaded peer had the room text in 0.4-0.8 s). And of
 three updates a fresh transport sent right after `connect()` resolved, a live
 witness heard the second and third. Neither is what a classroom does; both
 belong to a Gun round of their own.
+
+### The real phone on Gun
+
+`phone-session.mjs gun` (`?phone` / `?desk` in the playground, `Docker/gun/relay.js`
+on all interfaces; the one "link" is the socket to the relay). Chrome on Android,
+eight desktop peers, one types every 4 s. The phone reached the room only at
+260 s of the run: `ufw` on this machine had no rule for the playground's and the
+relay's ports - nothing of the library, and the address answered from the
+machine itself; the phone then had 8.5 of the 12 minutes.
+
+| absence | socket at return | roster whole after | first missed text after |
+|---|---|---|---|
+| another app in front, 48 s | gone; back after 1.0 s | 0.5 s | 1.4 s |
+| display off, 84 s | there | 0.5 s | 1.3 s |
+| display off, 200 s | there | 0.5 s | 0.8 s |
+
+The room dropped the phone after the 120 s lease of the long absence (GONE at
+618 s) and had it back in every roster the moment it returned (693 s); at the
+end its document was the room's, 183 of 183 characters. Nothing wrong with the
+library this time.
+
+One thing to read in the phone's own timeline: while the display was off the
+relay socket died again and again ("relay gone, dialing again" at 33 s and 72 s
+of the 84 s absence, at 28 s and 67 s of the 200 s one), and the transport's
+backoff doubled, 3 s, 6 s, 12 s. That the relay was back 0.2 s after the display
+came on was the pending timer firing on wake. Gun was the one relay transport
+without `watchPageBack`: a backoff set right before the WiFi goes, display on,
+would have been waited out in full - the case the WebSocket phone found the day
+before (12.9 s). Fixed the same way (v1.8.7); gate `test/gun/repro-page-back.mjs`:
+relay killed, back 13 s later with the transport in a 12 s wait, the page visible
+1 s after that - relay back at the transport 1,009 ms after its return, the
+control with nobody saying anything 8,022 ms. The playground's "links" (relays
+with an open `wire`) said 5 s for the two display-off absences where the
+transport's own "relay back" said 0.2 s: the getter, not the library.
 
 ## If it is built — order of work
 

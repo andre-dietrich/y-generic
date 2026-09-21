@@ -23,6 +23,11 @@ one in the Nostr transport, no new API, no wire-format change.
 **Version 1.8.4**, the next morning: the same test on WebSocket ("Firefox and the
 relay transports: WebSocket") - one more fix in the core, again no new API and no
 wire-format change.
+**Version 1.8.5**, the same day: what the real phone found on WebSocket ("The real
+phone on WebSocket") - the presence renewal that starved while somebody typed
+(core), and the reconnect backoff that was sat out although the network was back
+(the WebSocket transport, and a third sign for simple-peer, PeerJS and Nostr). No
+new API, no wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in

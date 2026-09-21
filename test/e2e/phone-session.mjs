@@ -33,7 +33,7 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr|websocket]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr|websocket|gun]
  *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
  *   websocket needs a y-websocket style server: WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js;
  *   its one "link" is the socket to that server
@@ -41,6 +41,9 @@
  *   peer holds a subscription on (one), and the room drops a silent peer only after the
  *   playground's 120 s presence lease - the phone and the desktop peers need the internet
  *   for the nostr-tools bundle of the playground (a CDN)
+ *   gun needs the gun package for Docker/gun/relay.js: NODE_PATH=/path/to/node_modules (npm
+ *   install gun somewhere); the phone needs the internet for the gun bundle of the playground
+ *   (a CDN), and the room drops a silent peer only after the playground's 120 s presence lease
  *   PEERS=8 MINUTES=12 TYPE_MS=4000 LAN_IP=192.168.x.y APP_PORT=3450 SERVER_PORT=4470 OUT=timeline.json
  */
 
@@ -58,8 +61,8 @@ const puppeteer = require(process.env.PUPPETEER ?? 'puppeteer-core')
 const TRANSPORT = process.argv[2] ?? 'simple-peer'
 // What serves the room: the playground to build, and the server the peers meet at - on ALL
 // interfaces, the phone comes over the LAN.
-const spawned = (cmd, args, env = {}) => {
-  const child = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore' })
+const spawned = (cmd, args, env = {}, cwd = undefined) => {
+  const child = spawn(cmd, args, { env: { ...process.env, ...env }, stdio: 'ignore', cwd })
   return { stop: () => child.kill('SIGKILL') }
 }
 const BACKENDS = {
@@ -84,6 +87,13 @@ const BACKENDS = {
       relay.start()
       return relay
     },
+  },
+  gun: {
+    entry: 'test/gun/index.html',
+    // Docker/gun/relay.js, on all interfaces; it needs the gun package where Node finds
+    // it: NODE_PATH=/path/to/node_modules. Its one "link" is the socket to that relay.
+    server: (port) =>
+      spawned('node', [join(process.cwd(), 'Docker/gun/relay.js')], { PORT: String(port) }, mkdtempSync(join(tmpdir(), 'ygen-phone-gun-'))),
   },
 }
 const backend = BACKENDS[TRANSPORT]

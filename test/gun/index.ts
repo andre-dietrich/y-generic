@@ -17,6 +17,13 @@ import {
   videoHandler as sharedVideoHandler,
 } from '../shared/quill-media'
 import { log, updateStatus, updateSyncStatus } from '../shared/ui-helpers'
+import { installPhoneReport } from '../e2e/phone-report'
+
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless
+// room mates) take the relay from the page's own host and connect by themselves - one room
+// over the LAN, nothing to set up on the phone.
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
 
 // Gun is loaded from CDN as a global variable
 declare const Gun: any
@@ -120,6 +127,15 @@ async function initWithConfig(config: {
     awarenessTimeoutMs: 120000,
   })
 
+  ;(window as any).__provider = provider // test/e2e/phone-session.mjs reads the room through it
+  // What this transport calls its links: the relays whose socket is open (no public getter
+  // for it - a playground may look).
+  const links = (): number =>
+    Object.values((transport as any).gun?._?.opt?.peers ?? {}).filter(
+      (peer: any) => peer?.wire,
+    ).length
+  ;(window as any).__links = links
+
   // Listen to status changes
   provider.on('status', (event: any) => {
     const status = event.state
@@ -200,14 +216,29 @@ async function initWithConfig(config: {
   const randomColor =
     randomColors[Math.floor(Math.random() * randomColors.length)]
 
-  userNameInput.value = randomName
+  userNameInput.value = sessionName ?? randomName
   userColorInput.value = randomColor
 
   // Set initial awareness state
   provider.awareness.setLocalStateField('user', {
-    name: randomName,
+    name: userNameInput.value,
     color: randomColor,
   })
+
+  // `?phone`: the phone tells on itself through its presence (test/e2e/phone-report.ts).
+  if (sessionName === 'phone') {
+    installPhoneReport({
+      awareness: provider.awareness,
+      yText,
+      links,
+      logTag: '[GunTransport]',
+      timeline: [
+        { match: 'Relay gone', label: (l) => `relay gone, dialing again in ${/in (\d+) ms/.exec(l)?.[1] ?? '?'} ms` },
+        { match: 'Relay is back', label: () => 'relay back' },
+        { match: 'Page is back', label: () => 'page back: dialing now' },
+      ],
+    })
+  }
 
   // Update awareness on user input
   userNameInput.addEventListener('input', () => {
@@ -370,6 +401,13 @@ function setupConnectionForm() {
   const configPersistent = document.getElementById(
     'config-persistent',
   ) as HTMLInputElement
+
+  if (sessionName !== null) {
+    configRoom.value = session.get('room') ?? 'phone-room'
+    configPeers.value = `http://${location.hostname}:${session.get('sig') ?? '4470'}/gun`
+    configDebug.checked = true // the phone's report reads the transport's log lines
+    setTimeout(() => connectBtn.click())
+  }
 
   connectBtn.addEventListener('click', async () => {
     // Validate room name

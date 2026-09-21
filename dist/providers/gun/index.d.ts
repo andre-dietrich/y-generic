@@ -219,6 +219,34 @@ export declare class GunTransport implements Transport {
      */
     onPeerConnect(callback: (peerId: string) => void): () => void;
     /**
+     * Transport.flush: run gun's own pending work in THIS task.
+     *
+     * gun 0.2020.1241 hands every write to its turn queue
+     * (`setTimeout.turn`, gun.js's shim), which is drained by a MessageChannel
+     * task in the browser and by setImmediate under Node - synchronously only
+     * while the last drain is less than 9 ms old (`setTimeout.hold`). A page
+     * that unloads runs no further task, so the presence removal the provider
+     * sends from `beforeunload` never reached the wire: a reloaded page stayed
+     * a ghost in every roster until the presence lease ran out - 124 s in round
+     * 8, 128.5 s of 25 browsers in round 10 (test/e2e/room-scenarios.mjs gun).
+     *
+     * So we run what gun queued, now: its own functions, one task earlier.
+     * Each one may queue the next layer (chain -> root.on('out') -> mesh.say ->
+     * wire.send), hence the rounds; the cap is there so a queue that refills
+     * itself cannot hold the page. Gate: test/gun/repro-unload-removal.mjs.
+     *
+     * Our own debounce (`batchInterval`) is a timer of exactly the same kind,
+     * so the queued document updates go first - the words a page typed just
+     * before it was closed - and into UNLOAD_SLOT, the one update node warmed
+     * at connect: gun asks the relay about a node it has not written before
+     * and puts only when the answer is in, which is a round trip this page
+     * does not have (measured in the wire trace: a put to a fresh slot sends a
+     * `get` and nothing else). With a password they do not make it either way:
+     * the encryption of flushBatch() is asynchronous, and nothing after an
+     * `await` runs in a page that is already gone.
+     */
+    flush(): void;
+    /**
      * Disconnect from Gun and cleanup.
      */
     disconnect(): void;

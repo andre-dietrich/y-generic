@@ -83,6 +83,11 @@ function addCRC32Header(data: Uint8Array): Uint8Array {
 const MESSAGE_SYNC = 0
 const MESSAGE_AWARENESS = 1
 
+// The one update slot a page that unloads writes into - warmed at connect, so
+// that write needs no round trip (flush()). Not one of the circular buffer's
+// slots, so it overwrites nothing a peer may still be missing.
+const UNLOAD_SLOT = 'slot-unload'
+
 // A presence slot older than this is ignored on receipt: the relay keeps
 // every slot ever written and `.map().on()` replays all of them to a
 // joiner, so without a bound a joiner inherited one phantom presence per
@@ -380,6 +385,16 @@ export class GunTransport implements Transport {
 
     this._connected = true
 
+    // Warm the slot a page that unloads writes its last words into (see
+    // flush()): gun sends a `get` for a node it does not know yet and puts
+    // only when the answer is in - a round trip a page that is going away
+    // does not have. A node it HAS written once is put in the calling task.
+    // `data: null` is ignored by every receiver (setupUpdateListener).
+    this.roomNode
+      .get('updates')
+      .get(UNLOAD_SLOT)
+      .put({ data: null, timestamp: Date.now() })
+
     // Persistence: load existing snapshot or clear it for a fresh session
     this.snapshotLoaded = false
     if (this.persistentMode) {
@@ -601,6 +616,53 @@ export class GunTransport implements Transport {
     this._peerConnectCallback = callback
     return () => {
       this._peerConnectCallback = undefined
+    }
+  }
+
+  /**
+   * Transport.flush: run gun's own pending work in THIS task.
+   *
+   * gun 0.2020.1241 hands every write to its turn queue
+   * (`setTimeout.turn`, gun.js's shim), which is drained by a MessageChannel
+   * task in the browser and by setImmediate under Node - synchronously only
+   * while the last drain is less than 9 ms old (`setTimeout.hold`). A page
+   * that unloads runs no further task, so the presence removal the provider
+   * sends from `beforeunload` never reached the wire: a reloaded page stayed
+   * a ghost in every roster until the presence lease ran out - 124 s in round
+   * 8, 128.5 s of 25 browsers in round 10 (test/e2e/room-scenarios.mjs gun).
+   *
+   * So we run what gun queued, now: its own functions, one task earlier.
+   * Each one may queue the next layer (chain -> root.on('out') -> mesh.say ->
+   * wire.send), hence the rounds; the cap is there so a queue that refills
+   * itself cannot hold the page. Gate: test/gun/repro-unload-removal.mjs.
+   *
+   * Our own debounce (`batchInterval`) is a timer of exactly the same kind,
+   * so the queued document updates go first - the words a page typed just
+   * before it was closed - and into UNLOAD_SLOT, the one update node warmed
+   * at connect: gun asks the relay about a node it has not written before
+   * and puts only when the answer is in, which is a round trip this page
+   * does not have (measured in the wire trace: a put to a fresh slot sends a
+   * `get` and nothing else). With a password they do not make it either way:
+   * the encryption of flushBatch() is asynchronous, and nothing after an
+   * `await` runs in a page that is already gone.
+   */
+  flush(): void {
+    if (this.batchTimeout) {
+      clearTimeout(this.batchTimeout)
+      this.batchTimeout = undefined
+    }
+    this.flushBatch(UNLOAD_SLOT)
+    const turn = (setTimeout as unknown as { turn?: { s?: (() => void)[] } })
+      .turn
+    if (!turn?.s) return
+    for (let round = 0; round < 50 && turn.s.length > 0; round++) {
+      for (const pending of turn.s.splice(0, turn.s.length)) {
+        try {
+          pending()
+        } catch (error) {
+          this.log('❌ Flush failed:', error)
+        }
+      }
     }
   }
 
@@ -856,7 +918,7 @@ export class GunTransport implements Transport {
    * Flush batched updates to Gun.
    * Called after debounce period (no new updates for batchInterval ms).
    */
-  private async flushBatch(): Promise<void> {
+  private async flushBatch(slotId?: string): Promise<void> {
     if (this.updateBatch.length === 0) return
 
     // Frame each queued update with a 4-byte big-endian length prefix so
@@ -880,7 +942,7 @@ export class GunTransport implements Transport {
     }
 
     // Create update object with circular buffer slot
-    const updateId = this.generateUpdateId()
+    const updateId = slotId ?? this.generateUpdateId()
     const timestamp = Date.now()
     const sequence = Math.floor(timestamp / 100) // Sequence number per 100ms
 

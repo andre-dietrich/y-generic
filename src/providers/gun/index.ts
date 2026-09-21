@@ -863,8 +863,29 @@ export class GunTransport implements Transport {
       .map()
       .on(async (awareness: any, _key: string, msg: any) => {
         if (!awareness || !awareness.data) return
-        // An answer to our own get - the relay's history, not a peer's word
-        if (msg && msg['@'] !== undefined) return
+        // Only a wire message with its own id (`#`) and no `@` is a peer's
+        // live write. An answer to our own get has `@`. And gun re-emits a
+        // whole node key by key ("convert from old format", gun.js `input`)
+        // with the original message under VIA - in the browser that wave
+        // came 60 ms after the answers, when the page wrote its own slot,
+        // with neither `#` nor `@` on the converted message: the same
+        // stale slots again, a killed tab's 180 s old presence among them.
+        let wire = msg
+        while (wire && (wire.VIA || wire.via)) wire = wire.VIA || wire.via
+        if (!wire || wire['#'] === undefined || wire['@'] !== undefined) {
+          this.log(
+            '🕰️ Replayed presence dropped: slot',
+            awareness.id,
+            'written',
+            typeof awareness.timestamp === 'number'
+              ? `${Date.now() - awareness.timestamp} ms ago`
+              : 'unknown',
+            'message keys',
+            msg ? Object.keys(msg).join(',') : '-',
+            wire !== msg ? `via ${wire ? Object.keys(wire).join(',') : '-'}` : '',
+          )
+          return
+        }
 
         // Skip our own awareness updates
         if (awareness.id === this.lastAwarenessId) return
@@ -901,6 +922,8 @@ export class GunTransport implements Transport {
             typeof awareness.timestamp === 'number'
               ? `${Date.now() - awareness.timestamp} ms ago`
               : 'unknown',
+            'message keys',
+            msg ? Object.keys(msg).join(',') : '-',
           )
         } catch (error) {
           this.log('❌ Error processing awareness:', error)

@@ -15,7 +15,12 @@
 // does not. Prints, for two old slots, one new slot and one rewrite, what the
 // callback sees. Expected: the two old slots with `@`; the new slot twice, live
 // (no `@`) first and then as the answer to the get gun sends for a node it has
-// not seen; the rewrite live only.
+// not seen; the rewrite live only. What this probe does NOT show, seen in
+// Chrome with 25 pages (the transport's debug log, DUMP_LOGS of the E2E
+// harness): 60 ms after the answers, when the page wrote its own slot, gun
+// re-emitted every slot once more "converted from old format" (gun.js
+// `input`) - a message with neither `#` nor `@` and the original under VIA.
+// The transport looks through VIA and takes only `#` without `@` as live.
 import { createRequire } from 'node:module'
 import { spawn } from 'node:child_process'
 import { mkdtempSync } from 'node:fs'
@@ -58,11 +63,20 @@ subscriber
   .get('awareness')
   .map()
   .on((data, key, msg) => {
+    // gun re-emits a whole node key by key ("convert from old format", gun.js
+    // `input`), and the message the callback gets then is a converted one, the
+    // original under VIA (or via): look through.
+    let wire = msg
+    while (wire && (wire.VIA || wire.via)) wire = wire.VIA || wire.via
+    const kind = wire?.['@'] !== undefined ? 'an answer to our get: REPLAY' : wire?.['#'] !== undefined ? 'a LIVE write' : 'neither # nor @: internal'
     console.log(
-      `[subscriber] +${Date.now() - t0} ms ${key} data=${data?.data} ${msg?.['@'] !== undefined ? `@=${msg['@']} - an answer to our get: REPLAY` : `#=${msg?.['#']} - a LIVE write`}`,
+      `[subscriber] +${Date.now() - t0} ms ${key} data=${data?.data} keys=${Object.keys(msg ?? {}).join(',')}${wire !== msg ? ` -> ${Object.keys(wire ?? {}).join(',')}` : ''}: ${kind}`,
     )
   })
 await sleep(2500)
+console.log('[subscriber] writes a slot of its own, as the transport does at connect')
+subscriber.get(room).get('awareness').get('slot-mine').put({ data: 'mine', timestamp: Date.now() })
+await sleep(1500)
 console.log('[writer] a new slot, live')
 writer.get(room).get('awareness').get('slot-live-3').put({ data: 'live3', timestamp: Date.now() })
 await sleep(1500)

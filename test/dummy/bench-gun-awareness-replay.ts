@@ -77,6 +77,13 @@ class FakeGunNode {
     if (this.parent) {
       for (const fn of this.parent.mapListeners) {
         queueMicrotask(() => fn(value, this.key, live))
+        // ... and, as gun did in the browser 60 ms after a page wrote its own
+        // slot: every sibling once more, "converted from old format", with
+        // neither `#` nor `@` on the message and the original under VIA.
+        for (const [key, sibling] of this.parent.children) {
+          if (sibling !== this && sibling.value !== undefined)
+            queueMicrotask(() => fn(sibling.value, key, { $: 1, put: {}, VIA: { '@': `g${++FakeGunNode.seq}` } }))
+        }
       }
     }
   }

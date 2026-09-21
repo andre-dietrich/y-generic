@@ -54,8 +54,21 @@ export function installPhoneReport(options: {
   const loadedAt = Date.now()
   const life: [number, string][] = []
   const live = (what: string) => {
+    if (life.length > 0 && life[life.length - 1][1] === what) return // eight "link open" in a row are one
     life.push([Date.now() - loadedAt, what])
-    if (life.length > 60) life.shift()
+    if (life.length > 100) life.shift()
+  }
+  // WiFi <-> mobile data: the one thing that tells a page with the display on that its
+  // network changed - this phone says `online` 1 s after the WiFi went (mobile data took
+  // over, the LAN is gone all the same) and NOTHING when the WiFi comes back.
+  const connection = (navigator as any).connection
+  const network = () => `network ${connection?.type ?? '?'} ${connection?.effectiveType ?? ''}`.trim()
+  if (connection?.addEventListener) {
+    live(network())
+    connection.addEventListener('change', () => {
+      live(network())
+      publish()
+    })
   }
   let lastRoster = -1
   const publish = () =>
@@ -78,6 +91,7 @@ export function installPhoneReport(options: {
     if (!line.includes(logTag)) return
     const hit = timeline.find((t) => line.includes(t.match))
     if (!hit) return
+    live(hit.label(line)) // the whole life of the page, not only the 90 s after a return
     if (hit.count) {
       counted++
       if (current && (counted === 1 || counted === current.linksBefore)) note(`${hit.label(line)} ${counted}`)

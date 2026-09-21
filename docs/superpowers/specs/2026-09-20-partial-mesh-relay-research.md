@@ -37,6 +37,9 @@ No wire-format change.
 found nothing wrong and one gap - Gun was the one relay transport that sat out its
 reconnect backoff when the page's network came back. No new API, no wire-format
 change.
+**Version 1.8.8**, the same evening: the two Gun findings left open above, one
+cause - the update listener's initial load - and one fix; a joiner in a room whose
+peers are all gone has the document again. No new API, no wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in
@@ -962,15 +965,22 @@ roster whole: a one-off, and the converted messages seen in those logs wrapped a
 chain object (`via`: gun's own `at`), no wire message at all - the slots had
 come live before, with `#`.
 
-Seen on the way and not fixed, the same on v1.8.5 (a worktree, the same probe):
-a room whose peers are ALL gone gives a joiner no document from the relay's
-replay - the update listener skips every `.map()` answer that arrives before
-its `.once()` initial load calls back (gun's `once` waits 99 ms), and the
-initial load itself sees links, not data; with a peer in the room the core's
-sync covers it (the reloaded peer had the room text in 0.4-0.8 s). And of
-three updates a fresh transport sent right after `connect()` resolved, a live
-witness heard the second and third. Neither is what a classroom does; both
-belong to a Gun round of their own.
+Seen on the way, the same on v1.8.5 (a worktree, the same probe), and fixed
+after the phone (v1.8.8): a room whose peers are ALL gone gave a joiner no
+document from the relay's replay - the update listener skipped every `.map()`
+answer that arrived before its `.once()` initial load called back (gun's
+`once` waits 99 ms, the slots' answers are in by then), and the initial load
+itself saw the node's links, not the slots' data; with a peer in the room the
+core's sync had covered it (the reloaded peer had the room text in 0.4-0.8 s),
+alone there was nothing. The same skip lost the FIRST update of a fresh room to
+a peer that had subscribed a moment before: a witness 50 ms in the room heard
+the second and third of three updates, one 3 s in the room all three (v1.8.5,
+both). One listener for what the relay holds and what comes later, deduped;
+gate `test/gun/repro-lone-joiner.mjs`: the lone joiner NOTHING -> all three.
+25 peers with that, Chrome / ten Firefox tabs: text of one peer in every
+editor 462 / 547 ms, reload 539 / 2,882 ms, a new peer after the restart with
+the room text 402 / 809 ms, editors and Y.Text identical, 25/25 - the
+document path changed and nothing moved.
 
 ### The real phone on Gun
 

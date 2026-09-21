@@ -337,7 +337,16 @@ Updates are batched to reduce network overhead:
      one: only a message with `#` and no `@`, looked through `VIA`, is a
      peer's live write. 25 browsers, reload: 529 ms.
 
-6. **Gun's own protocol is chatty**: 25 browsers on one relay sent ~7,500
+6. **A joiner in a room whose peers were all gone got no document** from
+   the relay (v1.8.8): the update listener loaded the node with `.once()`
+   first and skipped every slot that arrived before that had called back -
+   all of them, gun's `once` waits 99 ms - and the initial load itself saw
+   links, not data. The same skip lost the first update of a fresh room to
+   a peer that had subscribed a moment before it. One listener for
+   everything now (`test/gun/repro-lone-joiner.mjs`: the lone joiner
+   nothing -> all three updates).
+
+7. **Gun's own protocol is chatty**: 25 browsers on one relay sent ~7,500
    WebSocket frames while joining and ~50 frames/s when idle (Ably or
    PubNub: 1-3 frames in 10 idle seconds) - acks and relayed gets, not
    this transport's messages.

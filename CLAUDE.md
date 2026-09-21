@@ -131,7 +131,10 @@ sync request, and the last joiner's roster. Two rules they enforce: never assign
 handler may only remove its own entry, never "whatever is under this peer id now".
 What the harness finds gets a fast gate under plain Node before the fix:
 `test/nostr/repro-relay-restart.mjs` and `test/gun/repro-relay-restart.mjs` (a relay that went away;
-the library's path is an env var, see their headers), `test/providers/repro-ably-lifecycle.ts` (a
+the library's path is an env var, see their headers), `test/gun/repro-lone-joiner.mjs` (what a
+backend REPLAYS of the document must reach a joiner whose peers are all gone - an initial load
+that skips what arrives before it called back loses exactly that, and the first update of a fresh
+room too), `test/providers/repro-ably-lifecycle.ts` (a
 scripted Ably `Realtime`: its own reconnect, a channel over its message rate),
 `test/dummy/bench-rate-limited-channel.ts` (a backend that REFUSES a publish loses it for every
 receiver at once), `test/dummy/bench-last-joiner-roster.ts` (presence on demand) and

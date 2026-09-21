@@ -419,50 +419,24 @@ export class GunTransport implements Transport {
   private setupUpdateListener(): void {
     let lastProcessTime = 0
     const THROTTLE_MS = 300 // Process updates at most every 300ms
-    let hasLoadedInitial = false
 
-    // Best Practice: Use .once() for initial load, then .on() only for new inserts
-    // This prevents Gun from continuously syncing 1K+ historical records
-
-    // Step 1: Load initial state once
-    this.roomNode.get('updates').once((allUpdates: any) => {
-      if (!allUpdates) {
-        hasLoadedInitial = true
-        this.log('📭 No existing updates found')
-        return
-      }
-
-      this.log('📥 Loading initial state...')
-
-      // Process all existing updates once
-      Object.keys(allUpdates).forEach((key) => {
-        if (key === '_') return // Skip Gun metadata
-
-        const update = allUpdates[key]
-        if (!update || !update.data) return
-
-        const sequence = update.sequence || Math.floor(update.timestamp / 100)
-        const updateKey = `${key}-${sequence}`
-
-        if (!this.processedUpdates.has(updateKey)) {
-          this.pendingUpdates.set(updateKey, update)
-        }
-      })
-
-      // Process initial batch
-      this.processPendingUpdates()
-      hasLoadedInitial = true
-      this.log('✅ Initial state loaded')
-    })
-
-    // Step 2: Listen only for NEW inserts (not historical data)
+    // One listener for what the relay holds and what comes later: `.map().on()`
+    // fires for every update slot, the existing ones at subscribe (each as the
+    // answer to our own get) and every write from then on; processedUpdates
+    // dedupes. Until round 10 an initial load with `.once()` on the updates
+    // node came first and the map listener skipped everything that arrived
+    // before it had called back - which was every replayed slot: gun's once
+    // waits 99 ms for more answers, the slots' own answers are in by then,
+    // and the once callback itself sees the node's links, not the slots' data.
+    // A joiner in a room whose peers were all gone got no document at all
+    // (test/gun/repro-lone-joiner.mjs: three updates, a live witness heard
+    // them, the lone joiner nothing); with a peer in the room the core's
+    // sync had covered it. Yjs applies updates in any order, so the slots
+    // need none.
     this.updateListener = this.roomNode
       .get('updates')
       .map()
       .on((update: any, updateId: string) => {
-        // Skip until initial load is complete
-        if (!hasLoadedInitial) return
-
         if (!update || !update.data) return
 
         // Use sequence number for deduplication

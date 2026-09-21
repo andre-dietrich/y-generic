@@ -1815,6 +1815,23 @@ export class GenericProvider extends Observable {
                     if (id !== this.doc.clientID)
                         this._knownPeers.set(id, heardAt);
                 }
+                // Somebody says WE are gone. y-protocols never lets a remote removal
+                // delete the local state - it raises the clock and reports it, and
+                // the handler above re-announces us - but only when the removal
+                // arrives AT the clock we hold. An editor binding re-sets its cursor
+                // with every remote edit (y-quill: an idle peer's clock went from 2
+                // to 13 while somebody else typed twelve characters) - an equal
+                // state, not broadcast since round 5 (item 8) - so our clock runs
+                // ahead of the room's. The removal at the room's clock is then older
+                // than ours and ignored below, nobody told us, and we stayed out of
+                // every roster until our renewal: 25 browsers on a y-websocket
+                // server (its own 30 s timeout against a renewal every 60 s) had
+                // rosters of 2-3 of 24 for half of the time
+                // (test/dummy/bench-removed-at-old-clock.ts). At whatever clock:
+                // say that we are here. Coalesces with the handler's own broadcast.
+                if (scan.removed.includes(this.doc.clientID) && this.awareness.getLocalState() !== null) {
+                    this._broadcastAwareness([this.doc.clientID]);
+                }
                 // Somebody ELSE says a peer is gone that we hold a live link to: on
                 // a transport that reports link closes the link is the better
                 // witness. A peer that lost all its links (a phone resuming - the

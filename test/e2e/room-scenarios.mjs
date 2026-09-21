@@ -305,6 +305,7 @@ const ADAPTERS = {
     async join(page) {
       await fill(page, '#config-room', ROOM)
       await fill(page, '#config-peers', LIVE ? envList('gunDB_ServerURL').join('\n') : `http://127.0.0.1:${SERVER_PORT}/gun`)
+      await check(page, '#config-debug', true) // the transport's log, for DUMP_LOGS
       await page.click('#connect-btn')
     },
   },
@@ -726,7 +727,20 @@ async function main() {
     const sizes = await Promise.all(peers.map((p) => roster(p).catch(() => NaN)))
     const min = Math.min(...sizes)
     const shortest = peers.filter((_, i) => sizes[i] === min).map((p) => `p${p.id}${p.firefox ? '(ff)' : ''}`)
-    return `rosters ${JSON.stringify(stats(sizes))}, want ${peers.length}; shortest: ${shortest.slice(0, 8).join(' ')}${shortest.length > 8 ? ' ...' : ''}`
+    let note = `rosters ${JSON.stringify(stats(sizes))}, want ${peers.length}; shortest: ${shortest.slice(0, 8).join(' ')}${shortest.length > 8 ? ' ...' : ''}`
+    // A roster LONGER than the room: who is the extra (by name - a reloaded or killed
+    // tab's old entry says so), in the first such roster.
+    const max = Math.max(...sizes)
+    if (process.env.DIAG && max > peers.length) {
+      const i = sizes.indexOf(max)
+      const names = await peers[i].page
+        .evaluate(() => Array.from(document.querySelectorAll('#user-list .user-badge span')).map((el) => el.textContent.replace(' (You)', '').trim()))
+        .catch(() => [])
+      const live = new Set(peers.map((q) => `p${q.id}`))
+      const extra = names.filter((n) => !live.has(n))
+      note += `; longest p${peers[i].id}${peers[i].firefox ? '(ff)' : ''} (${max}) has extra: ${extra.join(' ') || '(a live name twice)'}`
+    }
+    return note
   }
   try {
     console.log(`${TRANSPORT}: ${N} peers, room ${ROOM}`)

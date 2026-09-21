@@ -151,11 +151,20 @@ Firefox delays a hidden tab's timers by up to ~20 s in a busy room; `FIREFOX_EAC
 and a visible tab each). That is why a late timer is not a sleep: `watchResume` reports one only
 when ticks AND links were silent for `resumeAfterMs` (30 s), at the first sign of life after the
 silence - never "a message means awake", a waking page handles its queued messages first
-(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|peerjs|nostr>`: a real
+(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|peerjs|nostr|websocket|gun>`: a real
 phone in a room of headless peers, reporting on itself through its presence. What a page
 still owes the room when it unloads (its presence removal, a pending update batch) must not
 wait for a timer - a hidden Firefox tab runs none before it is gone:
-`test/dummy/bench-unload-removal.ts`; a relay peer back from a dead link asks the room for its
+`test/dummy/bench-unload-removal.ts` - and a transport that defers its writes (Gun: its own
+turn queue, drained by a task the page never runs) must put them on the wire in that same
+task, `Transport.flush()`, called by the unload handler (`test/gun/repro-unload-removal.mjs`:
+never heard -> heard before the process is gone; the same gate: a transport's `disconnect()` must
+not erase the removal the provider just wrote, and what a backend REPLAYS to a joiner is history,
+not presence - a killed tab's slot said "here" for a lease of the joiner's own; Gun tells an
+answer to its own get (`@`) from a live write (`#`, looked through the `VIA` of a message gun
+converted "from old format" - it re-emits every slot that way when the page writes its own),
+`test/gun/probe-replay.mjs`, and hands no replayed presence up: the roster comes from the room's
+answer to the JOIN; 128.5 s -> 0.5 s of 25 browsers); a relay peer back from a dead link asks the room for its
 presence and forgets the clocks of whoever it expired (`bench-relay-return-roster.ts` - on a
 relay nobody noticed that it was away); a peer that is told it is gone says at once that it
 is not, at WHATEVER presence clock the removal comes - an editor binding's equal-state re-sets

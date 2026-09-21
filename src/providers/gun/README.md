@@ -296,10 +296,42 @@ Updates are batched to reduce network overhead:
    everywhere 5.8 s after the relay was back now
    (`test/gun/repro-relay-restart.mjs`).
 
-5. **A reloaded page leaves a ghost for one presence lease** (124 s at the
-   playground's 120 s lease): Gun writes asynchronously, through several
-   timers, so the presence removal of `beforeunload` does not reach the
-   wire. Not fixed.
+5. **A reloaded page left a ghost for one presence lease** (124 s at the
+   playground's 120 s lease, 128.5 s of 25 browsers in round 10). Three
+   findings, each with a gate under plain Node that was red first
+   (`test/gun/repro-unload-removal.mjs`: the real transport with gun's
+   browser websocket adapter, a watcher at the relay, seven departures, a
+   late joiner):
+   - gun hands every write to its own turn queue, drained by a
+     MessageChannel task - and a page that unloads runs no further task,
+     so the presence removal of `beforeunload` never left the page (a
+     removal sent and the process gone in the same tick: NEVER heard in
+     8 s). The transport's `flush()`, which the provider calls from its
+     unload handler, runs what gun queued in that same task: the removal
+     is heard 5 ms before the process is gone, and so is the last typed
+     batch (2 ms - it goes into one update node warmed at connect, a fresh
+     node would cost a round trip the page does not have). Not covered:
+     with a password the last batch is lost, its encryption is
+     asynchronous; the removal itself is not encrypted and makes it.
+   - `disconnect()` nulled the presence slot since round 7, and a
+     playground's own beforeunload calls `provider.disconnect()` right
+     after the provider's handler: gun's queue sent the null two tasks
+     later, before pagehide, and erased the removal. Live peers had it;
+     the reloaded page itself was replayed an empty slot, and a
+     seconds-old presence table in another peer's slot put its old id
+     back - it held its own ghost for a lease while every other roster
+     was whole (127.9 s of 25 browsers). The slot keeps the removal now.
+   - what the relay replays to a joiner is history, not presence: the
+     slot of a tab killed two minutes earlier said "here", and the
+     reloaded page listed it for a lease of its own (122 s). gun's
+     callback tells an answer to the subscriber's own get (`@` set) from
+     a live write (`test/gun/probe-replay.mjs`); replayed presence is
+     dropped, a joiner's roster comes from the room's answer to its JOIN
+     (0.4 s) - and gun re-emits the replayed slots a second time when
+     the page writes its own, "converted from old format" with the
+     original message under `VIA`, neither `#` nor `@` on the converted
+     one: only a message with `#` and no `@`, looked through `VIA`, is a
+     peer's live write. 25 browsers, reload: 529 ms.
 
 6. **Gun's own protocol is chatty**: 25 browsers on one relay sent ~7,500
    WebSocket frames while joining and ~50 frames/s when idle (Ably or

@@ -183,10 +183,18 @@ Two of the eight findings are in the core and affect every transport.
 | C2 | **core** | every few runs the LAST joiner's roster lacked 7-8 of 24 peers - every third one - for half a lease: 80 s and 73 s on Nostr, 27 s on PubNub. Earlier joiners have the same gap and never show it: the answers to the next JOIN heal them | presence on demand marked a peer "covered by the relayed table" once per response timer, not per requester: a timer still running took the next JOIN in, covered by a table sent before that joiner was subscribed - and when the 2 s relayer role had just moved on, nobody relayed for it either. Needs a response window longer than the gap between joins (an RTT hint: Nostr, Gun, Matrix; or a slow link) | a table answers the JOINs heard before it, no others. `bench-last-joiner-roster`: incomplete in 11 of 12 runs -> 0 of 12. E2E: 6 of 6 joins complete in 0.4-0.8 s. `bench-join-census`: a late join still costs 2 awareness sends |
 | T6 | gun | five frozen pages never heard or reached anybody again; after a 5 s relay restart EVERY peer was alone (rosters 1/1/1, editors different) | gun 0.2020.1241, browser websocket adapter: `wire.onclose` calls `reconnect(peer)` - one attempt in 2 s - and then `mesh.bye(peer)`, whose handler deletes the peer from `opt.peers`; when that attempt fails, `reconnect()` returns at `if(!opt.peers[peer.url])`. Gun tries once | the transport puts the relay back and dials (3 s, doubling to 30 s) and tells the provider when it said hi again. `test/gun/repro-relay-restart.mjs` (that adapter under Node, relay down 6 s): never -> 3.3 s. E2E: frozen pages 3.7 s, text typed during the outage 5.8 s |
 
-Open, found and not fixed: a reloaded Gun page leaves a ghost in every
-roster for one lease (124 s) - Gun writes through several timers, the
-presence removal of `beforeunload` does not reach the wire (by reading, not
-by experiment). Gun's own protocol sent ~7,500 frames for a 25-peer join and
+Open here, fixed the next day (v1.8.6, "Firefox and the relay transports:
+Gun" in the partial-mesh document): a reloaded Gun page left a ghost in
+every roster for one lease (124 s) - three things, each measured
+(`test/gun/repro-unload-removal.mjs`): gun's turn queue is drained by a
+task the unloading page never runs, so the presence removal of
+`beforeunload` never left the page (`Transport.flush()`, called by the
+provider's unload handler, runs it in that task); `disconnect()` nulled the
+slot and erased the removal for whoever joined next; and the relay's replay
+of every slot's last value is history, not presence (a killed tab's slot
+listed for a lease by the page that reloaded after it) - dropped, the
+roster comes from the room's answer to the JOIN.
+Gun's own protocol sent ~7,500 frames for a 25-peer join and
 ~50 frames/s when idle (Ably, PubNub, Nostr: 2-6 frames in 10 idle seconds).
 PubNub needed no change; its SDK polls a lost network every 3 s.
 
@@ -200,7 +208,7 @@ Results on the final code, 25 peers (ms):
 | 60 characters of 5 concurrent typists everywhere | 2,318 | 1,132 | 607 / 1,038 | 2,184 |
 | killed tab dropped from every roster | 15,161 | 30,344 (no presence: the 30 s lease) | 120,898 / 120,827 (120 s lease) | 120,436 (120 s lease) |
 | 5 pages frozen 20 s: missed text / rosters complete | 405 / 407 | 418 / 423 | 1,211 / 1,214 - 1,575 / 1,780 | 3,681 / 3,691 |
-| reload: rosters complete | 778 | 709 | 588 / 556 | 124,338 (open, above) |
+| reload: rosters complete | 778 | 709 | 588 / 556 | 124,338 (fixed the next day, above) |
 | outage 5 s: text typed DURING it everywhere, since it ended | 15,198 | 5,312 | 2,172 / 5,077 | 5,816 |
 | text typed afterwards / a new peer in every roster | 413 / 1,058 | 459 / 979 | 416 / 880 - 412 / 1,272 | 407 / 953 |
 | final: editors identical, rosters | yes, 25/25 | yes, 25/25 | yes, 25/25 / yes, 25/25 | yes, 25/25 |

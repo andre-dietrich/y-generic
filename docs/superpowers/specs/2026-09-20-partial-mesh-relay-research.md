@@ -28,6 +28,11 @@ phone on WebSocket") - the presence renewal that starved while somebody typed
 (core), and the reconnect backoff that was sat out although the network was back
 (the WebSocket transport, and a third sign for simple-peer, PeerJS and Nostr). No
 new API, no wire-format change.
+**Version 1.8.6**, the same afternoon: the one number the third pass had left open,
+a reloaded Gun page a ghost for a lease ("Firefox and the relay transports: Gun") -
+three findings in the Gun transport, measured one after the other, and one new
+optional hook, `Transport.flush()`, that the provider calls when the page unloads.
+No wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in
@@ -843,6 +848,125 @@ Synced" throughout. The shared `updateStatus()` / `updateSyncStatus()` wrote to 
 that the pages of websocket, ably, pubnub and matrix do not have - their badges had
 never been updated. The provider said `connected`, `synced: true`, also after a
 dropped socket.
+
+## Firefox and the relay transports: Gun (2026-09-21, afternoon)
+
+The same room on the Gun playground against `Docker/gun/relay.js`, `FIREFOX=10` as
+hidden tabs, and the one number the third pass had left open: a reloaded page
+was a ghost in every roster for a lease - 124.3 s in round 8, 128.5 s of 25
+Chrome peers on v1.8.5. Round 8 had read the cause ("Gun writes through several
+timers, the removal of `beforeunload` does not reach the wire") and not measured
+it. It took three findings, each with a gate under plain Node that was red first
+(`test/gun/repro-unload-removal.mjs`: the real GunTransport with gun's browser
+websocket adapter, a watcher at the relay, seven departures with a marker each,
+and a late joiner).
+
+**1. The removal never left the page.** gun 0.2020.1241 hands every write to
+its own turn queue (`setTimeout.turn`, gun's shim), drained by a MessageChannel
+task in the browser and synchronously only while the last drain is under 9 ms
+old. The provider's unload handler sends the removal without a timer since
+v1.8.3, and that is where the core's part ends: a page that unloads runs no
+further task of gun's. Measured: a removal sent and the process gone in the
+same tick - NEVER heard, 8 s watched; gone one macrotask later, heard 4 ms
+before the process was gone. Fix: `Transport.flush?()`, optional, called by the
+provider's unload handler after the batch and the removal - "put whatever is
+queued on the wire NOW, in the calling task". Gun's runs its own queued
+functions, in rounds (each layer queues the next: chain, `root.on('out')`,
+`mesh.say`, `wire.send`), capped at 50. The last typed batch goes first, into
+one update node warmed with `data: null` at connect: gun asks the relay about
+a node it has never written and puts only when the answer is in, a round trip
+the page does not have (a wire trace of a put to a fresh slot: a `get` and
+nothing else). With `flush()`: removal 5 ms, typed batch 2 ms before the
+process was gone. With a password the batch is lost either way, its encryption
+is asynchronous; the removal is not encrypted. Transports that send straight
+into an open socket leave `flush` undefined.
+
+25 Chrome peers with that: reload 127,944 ms. `DIAG=1` prints the roster sizes:
+`{"min":24,"median":24,"max":25}` from the first second - 24 rosters whole the
+moment the page reloaded, ONE at 25 for the lease. The removal had reached
+the room. A trace of 25 playground pages (a scratch script: the reloaded page
+decodes every presence it receives, the transport's log names the slot and
+the age of each) said who: the reloaded page itself, holding its OLD id at
+presence clock 2 - the presence, not the removal at clock 3 - added by a
+message of three clients out of ANOTHER peer's slot, written 3 s before the
+reload: a relayed presence table (round 5, presence on demand), the last thing
+that peer had written, replayed to the joiner as every slot's last value is.
+And the reloaded page's own old slot brought no removal, because:
+
+**2. `disconnect()` erased it.** A wire trace of the unloading page (every
+`wire.send` reported through `navigator.sendBeacon`, which survives a
+navigation): the provider's handler puts the removal on the wire in its own
+task; the playground's own `beforeunload` then calls `provider.disconnect()`,
+and `GunTransport.disconnect()` nulled the own slot since round 7 ("take our
+presence slot with us") - gun's queue sent that null 2 ms after the handler
+and 6 ms before `pagehide`: a browser still runs a task or two in between.
+Live peers had the removal by then; the page that joined next was replayed an
+empty slot. Gate, the disconnect part with the process gone in `setTimeout(0)`
+(the task a browser still runs), and a late joiner C: C's replay had no
+removal -> the removal. Fix: the slot stays, with the removal in it.
+
+25 Chrome peers with that: reload 122,042 ms; with ten Firefox tabs 123,722 ms.
+Still one roster at 25 - a different ghost, the tab killed in `vanish` two
+minutes earlier: its slot held its last presence, replayed to the reloaded page
+as fresh, listed for a lease of the reloaded page's own while the room had
+long expired it. Round 7's five-minute bound on a slot's age (a wall clock;
+the writer's) cuts the hours-old slots, not this one, and a bound the size of
+the lease would make a peer whose clock runs a minute off invisible.
+
+**3. The replay is history, not presence.** gun's `.map().on()` callback gets
+the wire message as its third argument, and it tells the two apart without a
+clock (`test/gun/probe-replay.mjs`): a slot replayed at subscribe comes as the
+answer to the subscriber's own get, with `@` set to that get's id; a peer's
+live write comes with its own id (`#`) and no `@` (a NEW slot comes both ways,
+live first). Since v1.8.6 the transport hands no replayed presence up. Who is
+here now, a joiner learns from the room's answer to its JOIN (a live presence
+table): the reloaded page's roster was whole in 0.4 s from that in every run.
+A re-subscribe after a relay restart gets answers the same way, and the
+provider asks the room for its presence then anyway (`onPeerConnect`). Gate:
+C joins after every leaver is gone - a tab that vanished without a word among
+them - and is replayed nothing of presence, and hears the presence A sends
+live once C is subscribed. `bench-gun-awareness-replay` (the round 7 bench,
+its fake gun now passes the message): 55 phantoms of 60 slots in round 7, 5
+recent ones after it, 0 now, the 5 live peers through the room's answer.
+
+With the `@` test alone, 25 Chrome peers: reload 127,265 ms, and the harness
+now names the extra (`DIAG=1`, the longest roster and the entries in it that
+are no live peer's): p24, the killed tab, held by the reloaded p11 - while ten
+Firefox tabs gave 6,459 ms, the reloaded page a Firefox one. p11's transport
+log, dumped (the Gun adapter ticks the playground's debug box now): the 25
+answers to its own get, all dropped; then, 60 ms later, as the page wrote its
+own slot, the same 25 slots once more with the message keys `$,put,VIA,seen,get`
+- neither `#` nor `@` - p24's 180 s old presence among them, taken for live.
+gun's chain `input` converts a whole node "from old format" key by key and
+hands the callback a converted message with the original under `VIA`; the Node
+probe with two slots never takes that path, Chrome with 25 pages does. The
+listener looks through `VIA` and takes only a message with `#` and no `@` as a
+peer's word. The fake gun of the bench re-emits every sibling under VIA when a
+slot is put, as seen: 0 phantoms still.
+
+On the final code, 25 peers (round 8 / v1.8.5 in brackets): reload 529 ms
+(124,338 / 128,555) - the number this pass was about; with ten hidden Firefox
+tabs 6,185 ms (the reloaded page a hidden tab, "the reloaded peer has the room
+text" 4,920 ms of it). Killed tab dropped from every roster 119,909 / 93,445 ms
+(the 120 s lease), five pages frozen 40 s 3,623 / 3,624 ms, text typed during
+the 5 s outage 4,846 / 6,713 ms, a new peer in every roster after the restart
+780 / 740 ms, editors and Y.Text identical, 25/25. Join 405 ms; one Firefox run
+of five had the first four hidden tabs missing from 13 rosters for 72 s (the
+others 0.8-2.8 s, and 1.3 s in the run after it with the receivers' logs dumped:
+every dropped presence an answer) - three more runs 931 / 1,380 / 932 ms, every
+roster whole: a one-off, and the converted messages seen in those logs wrapped a
+chain object (`via`: gun's own `at`), no wire message at all - the slots had
+come live before, with `#`.
+
+Seen on the way and not fixed, the same on v1.8.5 (a worktree, the same probe):
+a room whose peers are ALL gone gives a joiner no document from the relay's
+replay - the update listener skips every `.map()` answer that arrives before
+its `.once()` initial load calls back (gun's `once` waits 99 ms), and the
+initial load itself sees links, not data; with a peer in the room the core's
+sync covers it (the reloaded peer had the room text in 0.4-0.8 s). And of
+three updates a fresh transport sent right after `connect()` resolved, a live
+witness heard the second and third. Neither is what a classroom does; both
+belong to a Gun round of their own.
 
 ## If it is built — order of work
 

@@ -169,6 +169,8 @@ export declare class GunTransport implements Transport {
     private persistDebounceMs;
     private persistTimer?;
     private _redialTimers;
+    private _redialNow;
+    private _stopPageWatch?;
     private _peerConnectCallback?;
     private isWritingToGun;
     private savePending;
@@ -211,6 +213,16 @@ export declare class GunTransport implements Transport {
      * dial ends in another 'bye'). Gun re-sends its subscriptions by itself on
      * 'hi'; the provider is told as well (onPeerConnect), for what it wrote and
      * missed meanwhile.
+     *
+     * And the page's own signs that its network is back - visible again,
+     * `online`, a change of `navigator.connection` - dial at once instead of
+     * sitting out the backoff (watchPageBack, as simple-peer, PeerJS, Nostr
+     * and WebSocket do since round 10). A phone with its display off loses the
+     * relay socket again and again (a real phone on Gun, 2026-09-21: "relay
+     * gone" at 33 s and 72 s of a 84 s absence, the wait at 12 s by then);
+     * that it was back 0.2 s after the display came on was a pending timer
+     * that fired on wake - a backoff set right before the WiFi went, with the
+     * display on, would have been waited out. Gate: test/gun/repro-page-back.mjs.
      */
     private _watchRelays;
     /**

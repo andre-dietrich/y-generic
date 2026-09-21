@@ -41,6 +41,7 @@
  * })
  * ```
  */
+import { watchPageBack } from '../resume';
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
 // ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ export class GunTransport {
         this.persistDoc = null;
         this.persistDebounceMs = 2000;
         this._redialTimers = new Map();
+        this._redialNow = new Map(); // url -> dial it now (a backoff to skip)
         this.isWritingToGun = false;
         this.savePending = false;
         /** Data loaded from Gun snapshot before onMessage callback is registered */
@@ -403,10 +405,35 @@ export class GunTransport {
      * dial ends in another 'bye'). Gun re-sends its subscriptions by itself on
      * 'hi'; the provider is told as well (onPeerConnect), for what it wrote and
      * missed meanwhile.
+     *
+     * And the page's own signs that its network is back - visible again,
+     * `online`, a change of `navigator.connection` - dial at once instead of
+     * sitting out the backoff (watchPageBack, as simple-peer, PeerJS, Nostr
+     * and WebSocket do since round 10). A phone with its display off loses the
+     * relay socket again and again (a real phone on Gun, 2026-09-21: "relay
+     * gone" at 33 s and 72 s of a 84 s absence, the wait at 12 s by then);
+     * that it was back 0.2 s after the display came on was a pending timer
+     * that fired on wake - a backoff set right before the WiFi went, with the
+     * display on, would have been waited out. Gate: test/gun/repro-page-back.mjs.
      */
     _watchRelays(gun, urls) {
         const transport = this;
         const lost = new Map(); // url -> failed dials since the relay went
+        const dial = (url) => {
+            transport._redialTimers.delete(url);
+            transport._redialNow.delete(url);
+            if (transport.gun !== gun)
+                return;
+            try {
+                if (gun._.opt.peers[url]?.wire)
+                    return; // Gun's own attempt made it
+                gun.opt({ peers: [url] });
+                gun._.opt.mesh.hi(gun._.opt.peers[url]); // no wire yet: this dials
+            }
+            catch (error) {
+                transport.log('❌ Redial failed:', error);
+            }
+        };
         // `function`, and this.to.next(): Gun's listeners are a chain, and one
         // that does not pass the event on ends it for everybody registered later.
         gun.on('bye', function (peer) {
@@ -418,21 +445,20 @@ export class GunTransport {
             lost.set(url, attempt + 1);
             const delay = Math.min(30000, 3000 * 2 ** attempt);
             transport.log('🔌 Relay gone:', url, '- dialing again in', delay, 'ms');
-            transport._redialTimers.set(url, setTimeout(() => {
-                transport._redialTimers.delete(url);
-                if (transport.gun !== gun)
-                    return;
-                try {
-                    if (gun._.opt.peers[url]?.wire)
-                        return; // Gun's own attempt made it
-                    gun.opt({ peers: [url] });
-                    gun._.opt.mesh.hi(gun._.opt.peers[url]); // no wire yet: this dials
-                }
-                catch (error) {
-                    transport.log('❌ Redial failed:', error);
-                }
-            }, delay));
+            transport._redialTimers.set(url, setTimeout(() => dial(url), delay));
+            transport._redialNow.set(url, () => dial(url));
         });
+        if (!this._stopPageWatch) {
+            this._stopPageWatch = watchPageBack(() => {
+                if (transport.gun !== gun || transport._redialNow.size === 0)
+                    return;
+                transport.log('📱 Page is back: dialing now, not after the backoff');
+                for (const [url, now] of [...transport._redialNow]) {
+                    clearTimeout(transport._redialTimers.get(url));
+                    now();
+                }
+            });
+        }
         gun.on('hi', function (peer) {
             this.to.next(peer);
             if (transport.gun !== gun || !lost.delete(peer?.url))
@@ -509,6 +535,9 @@ export class GunTransport {
         for (const timer of this._redialTimers.values())
             clearTimeout(timer);
         this._redialTimers.clear();
+        this._redialNow.clear();
+        this._stopPageWatch?.();
+        this._stopPageWatch = undefined;
         // Clear batch timeout
         if (this.batchTimeout) {
             clearTimeout(this.batchTimeout);

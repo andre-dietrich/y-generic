@@ -28,7 +28,7 @@
  * await provider.connect({ room: 'my-room' })
  * ```
  */
-import { watchResume, watchPageBack } from '../resume';
+import { watchResume, watchPageBack, watchNetworkChange } from '../resume';
 import { SparseDial } from '../dial';
 /**
  * Maximum chunk size for WebRTC DataChannel messages.
@@ -155,6 +155,12 @@ export class SimplePeerTransport {
         // moment to sit out a backoff (a sleep shorter than resumeAfterMs kills
         // a signaling socket just as well). Browser only.
         this._stopNetworkWatch = watchPageBack(() => this.dialSignalingNow());
+        // The page's network CHANGED: every link runs over an address that is
+        // gone, and waiting for ICE to say so costs 15 s on Chrome and 25-30 s
+        // on Firefox (a real phone, WiFi off and on: test/e2e/phone-session.mjs
+        // simple-peer, repro-simple-peer-sleep parts 13-15). The same repair as
+        // after a sleep - the links are just as dead.
+        this._stopNetworkChangeWatch = watchNetworkChange((why) => this.rejoinRoom(why));
     }
     /**
      * The page slept (see watchResume): every link is dead on the other side
@@ -166,9 +172,17 @@ export class SimplePeerTransport {
      * opens (onPeerConnect).
      */
     handleResume(sleptMs) {
+        this.rejoinRoom(`Page slept ${sleptMs}ms`);
+    }
+    /**
+     * Every link is dead (the page slept, or its network changed under it) and
+     * the room holds entries under our peer id that would swallow our announces
+     * until their ICE times out. Start over under a new id and dial at once.
+     */
+    rejoinRoom(why) {
         if (!this._connected)
             return;
-        this.log(`⏰ Page slept ${sleptMs}ms — rebuilding all links under a new peer id`);
+        this.log(`⏰ ${why} — rebuilding all links under a new peer id`);
         this.peerId = this.generatePeerId();
         this._resetting = true;
         for (const id of Array.from(this.peers.keys()))
@@ -277,6 +291,8 @@ export class SimplePeerTransport {
         this._stopResumeWatch = undefined;
         this._stopNetworkWatch?.();
         this._stopNetworkWatch = undefined;
+        this._stopNetworkChangeWatch?.();
+        this._stopNetworkChangeWatch = undefined;
         // Stop re-announce interval
         if (this.announceInterval) {
             clearInterval(this.announceInterval);
@@ -589,7 +605,7 @@ export class SimplePeerTransport {
                     return;
                 this.scheduleSignalingReconnect(url);
             };
-            // Timeout after 10 seconds
+            // 10 s, or 4 s while the room is lost (see roomLost)
             setTimeout(() => {
                 if (!resolved) {
                     resolved = true;
@@ -597,7 +613,7 @@ export class SimplePeerTransport {
                     reject(new Error('Signaling connection timeout'));
                     ws.close(); // onclose schedules the next attempt
                 }
-            }, 10000);
+            }, this.roomLost ? 4000 : 10000);
         });
     }
     /**
@@ -613,13 +629,26 @@ export class SimplePeerTransport {
             return;
         const attempt = (this.signalingAttempts.get(url) ?? 0) + 1;
         this.signalingAttempts.set(url, attempt);
-        const delay = Math.round(Math.min(10000, 1000 * 2 ** (attempt - 1)) * (0.5 + Math.random()));
+        const delay = Math.round(Math.min(this.roomLost ? 3000 : 10000, 1000 * 2 ** (attempt - 1)) * (0.5 + Math.random()));
         this.log(`🔄 Signaling reconnect #${attempt} to ${url} in ${delay}ms`);
         this.signalingTimers.set(url, setTimeout(() => {
             this.signalingTimers.delete(url);
             if (this._shouldConnect)
                 this.connectSignaling(url).catch(() => { });
         }, delay));
+    }
+    /**
+     * Nothing left of the room: no signaling socket, no link. Then an attempt
+     * costs nothing and waiting costs everything - the 10 s connect timeout and
+     * a backoff up to 10 s are for a page that still has its peers. A phone
+     * whose WiFi comes back is told by no browser event in Firefox (no
+     * `navigator.connection`, no second `online`, see watchNetworkChange): only
+     * the next attempt finds the network, and the second WiFi cycle of a real
+     * phone took 60 s to get back into the room (phone-session.mjs simple-peer,
+     * Firefox; repro-simple-peer-sleep part 16).
+     */
+    get roomLost() {
+        return this.signalingConns.length === 0 && this.peers.size === 0;
     }
     /**
      * Handle messages from signaling server.

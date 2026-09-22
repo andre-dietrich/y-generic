@@ -68,6 +68,30 @@
  *           a peer in its roster's blind spot for good. Is the link reported
  *           gone and re-announced, so that the pair dials again?
  *
+ *  Part 13 - the phone's network CHANGED under the page: WiFi off, mobile data
+ *           takes over (`navigator.connection.type` wifi -> cellular; the browser
+ *           says so within a second). Every link runs over an address that is
+ *           gone. A real phone, Chrome on Android, 8 desktop peers
+ *           (phone-session.mjs simple-peer, 2026-09-22): the browser said
+ *           "cellular" 0.6 s after the switch, ICE said 'disconnected' after
+ *           5 s, and the links were closed 15 s after the switch - only then did
+ *           the page look for the room again. Are the links dropped and the room
+ *           joined again at once?
+ *  Part 14 - the same where there is no `navigator.connection` (Firefox, Safari):
+ *           `offline` and then `online`. Same question.
+ *  Part 16 - the room is lost (no signaling socket, no link) and the signaling
+ *           server does not answer: how long until the next attempt? Firefox on
+ *           Android says NOTHING when the WiFi comes back (no
+ *           `navigator.connection`, no second `online`), so only the retry finds
+ *           it - and a phone's second WiFi cycle took 60 s to get back into the
+ *           room: each attempt over the dead network ran into its 10 s timeout
+ *           and the backoff had reached 9.6 s (phone-session.mjs simple-peer,
+ *           Firefox, 2026-09-22). While there is nothing to lose the attempts
+ *           are cheap and must be quick; with links in hand they stay as they were.
+ *  Part 15 - and what must NOT do it: a `change` of the connection that is no
+ *           change of the network (Android fires one for every effectiveType
+ *           estimate). Are the links left alone?
+ *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-simple-peer-sleep.js
  *      WAIT_MS=11000 overrides part 3's observation window.
  */
@@ -78,6 +102,30 @@ import { SimplePeerTransport } from '../../src/providers/simple-peer/index'
 const Peer = require('simple-peer')
 
 const WAIT_MS = Number(process.env.WAIT_MS ?? 11000)
+
+// A page for watchPageBack / watchNetworkChange (src/providers/resume.ts).
+class FakeConnection extends EventTarget {
+  type = 'wifi'
+  effectiveType = '4g'
+  /** what a phone's browser reports for a switch: the type, and events of its own */
+  switchTo(type: string): void {
+    this.type = type
+    this.dispatchEvent(new Event('change'))
+  }
+}
+const page = new EventTarget()
+const pageDoc = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+const connection = new FakeConnection()
+;(globalThis as any).window = page
+;(globalThis as any).document = pageDoc
+Object.defineProperty(globalThis.navigator, 'connection', { value: connection, configurable: true, writable: true })
+/** The id the transport announces itself under (the transports of earlier parts still announce too). */
+const peerIdOf = (transport: unknown): string => (transport as { peerId: string }).peerId
+
+/** Put the page back to a plain WiFi network between the parts. */
+function resetNetwork(): void {
+  connection.type = 'wifi'
+}
 const ROOM = 'repro-room'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -184,6 +232,7 @@ class FakeWebSocket {
   static CLOSED = 3
   static all: FakeWebSocket[] = []
   readyState = 0
+  readonly createdAt = Date.now()
   sent: { at: number; msg: { type: string } }[] = []
   onopen: (() => void) | null = null
   onmessage: ((e: { data: string }) => void) | null = null
@@ -194,6 +243,7 @@ class FakeWebSocket {
   constructor(public url: string) {
     FakeWebSocket.all.push(this)
     setTimeout(() => {
+      if (FakeWebSocket.stall) return
       if (FakeWebSocket.refuse) {
         this.readyState = FakeWebSocket.CLOSED
         this.onerror?.(new Error('refused'))
@@ -207,6 +257,8 @@ class FakeWebSocket {
   send(data: string): void {
     this.sent.push({ at: Date.now(), msg: JSON.parse(data) })
   }
+  /** true: the network is gone - a new socket neither opens nor fails, it hangs. */
+  static stall = false
   /** > 0: a dead connection - close() is not answered, onclose comes this much later. */
   static closeDelayMs = 0
   close(): void {
@@ -261,10 +313,14 @@ async function barePeer(order: Order) {
   return { peer, pc, seen }
 }
 
+/** Every transport a part made: a part that measures dialling closes them first (they dial too). */
+const madeTransports: SimplePeerTransport[] = []
+
 async function makeTransport(extra: object = {}) {
   // options of later items are not in the type on older builds
   const options: any = { peer: Peer, signaling: ['wss://fake'], peerOpts: { wrtc }, ...extra }
   const transport = new SimplePeerTransport(options)
+  madeTransports.push(transport)
   const seen = { connect: 0, disconnect: 0 }
   transport.onPeerConnect(() => seen.connect++)
   transport.onPeerDisconnect(() => seen.disconnect++)
@@ -508,6 +564,68 @@ async function main() {
     )
     s.transport.disconnect()
   }
+  console.log('\nPart 13 - the network changed under the page: navigator.connection wifi -> cellular')
+  {
+    resetNetwork()
+    const r = await transportPeer('ice-first')
+    connection.switchTo('cellular')
+    await sleep(1500)
+    console.log(
+      `  1.5 s after the switch: links dropped = ${r.transport.connectedPeers === 0}, joined again under a new peer id = ${peerIdOf(r.transport) !== r.ownId}`,
+    )
+    r.transport.disconnect()
+  }
+
+  console.log("\nPart 14 - the same without navigator.connection (Firefox): 'offline', then 'online'")
+  {
+    resetNetwork()
+    const saved = (globalThis.navigator as any).connection
+    Object.defineProperty(globalThis.navigator, 'connection', { value: undefined, configurable: true, writable: true })
+    const r = await transportPeer('ice-first')
+    page.dispatchEvent(new Event('offline'))
+    await sleep(300)
+    page.dispatchEvent(new Event('online'))
+    await sleep(1500)
+    console.log(
+      `  1.5 s after the return: links dropped = ${r.transport.connectedPeers === 0}, joined again under a new peer id = ${peerIdOf(r.transport) !== r.ownId}`,
+    )
+    r.transport.disconnect()
+    Object.defineProperty(globalThis.navigator, 'connection', { value: saved, configurable: true, writable: true })
+  }
+
+  console.log('\nPart 16 - the room is lost and the signaling server does not answer: how quickly is it tried again?')
+  {
+    resetNetwork()
+    for (const t of madeTransports) t.disconnect() // the parts before dial on, on their own timers
+    const r = await transportPeer('ice-first')
+    // the network goes: the link is gone, the socket with it, and every new socket hangs
+    ;(r.transport as any).removePeer('0-phone')
+    FakeWebSocket.stall = true
+    // by index, not by time: parts 6, 11 and 12 move Date.now() by 60 s, and their sockets carry it
+    const from = FakeWebSocket.all.length
+    const at = Date.now()
+    r.ws.close()
+    while (FakeWebSocket.all.length < from + 2 && Date.now() - at < 25000) await sleep(100)
+    const second = FakeWebSocket.all[from + 1]
+    console.log(
+      `  no link, no socket: the second attempt came after ${second ? second.createdAt - at : '>25000'} ms (want < 9000)` +
+        ` [attempts at ${FakeWebSocket.all.slice(from).map((w) => w.createdAt - at).join(', ')} ms]`,
+    )
+    FakeWebSocket.stall = false
+    r.transport.disconnect()
+  }
+
+  console.log("\nPart 15 - a 'change' that is no change of the network (effectiveType only)")
+  {
+    resetNetwork()
+    const r = await transportPeer('ice-first')
+    connection.effectiveType = '3g'
+    connection.dispatchEvent(new Event('change'))
+    await sleep(1500)
+    console.log(`  1.5 s later: connectedPeers = ${r.transport.connectedPeers} (want 1), links dropped = ${r.seen.disconnect > 0} (want false)`)
+    r.transport.disconnect()
+  }
+
   process.exit(0)
 }
 

@@ -521,6 +521,10 @@ async function init() {
         { match: 'Signaling connection timeout', label: () => 'signaling connect TIMEOUT' },
         { match: 'Signaling error', label: () => 'signaling error' },
         { match: 'Peer channel open', label: () => 'link open', count: true },
+        // what ICE says of the links, the first of each kind per absence (a network switch)
+        { match: ': disconnected (gathering', label: () => 'ICE disconnected' },
+        { match: ': failed (gathering', label: () => 'ICE failed' },
+        { match: 'Peer channel closed', label: () => 'link closed' },
       ],
     })
   }

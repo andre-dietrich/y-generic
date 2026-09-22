@@ -194,6 +194,7 @@ export declare class SimplePeerTransport implements Transport {
     /** Signaling sockets that have not opened yet (see dialSignalingNow). */
     private _dialingSockets;
     private _stopNetworkWatch?;
+    private _stopNetworkChangeWatch?;
     private _resetting;
     /**
      * Create a new SimplePeer transport.
@@ -215,6 +216,12 @@ export declare class SimplePeerTransport implements Transport {
      * opens (onPeerConnect).
      */
     private handleResume;
+    /**
+     * Every link is dead (the page slept, or its network changed under it) and
+     * the room holds entries under our peer id that would swallow our announces
+     * until their ICE times out. Start over under a new id and dial at once.
+     */
+    private rejoinRoom;
     /**
      * Dial every signaling server we have no open socket to, NOW - not when
      * the backoff says so. The second thing the real phone showed: with the
@@ -312,6 +319,17 @@ export declare class SimplePeerTransport implements Transport {
      * onopen subscribes and announces again.
      */
     private scheduleSignalingReconnect;
+    /**
+     * Nothing left of the room: no signaling socket, no link. Then an attempt
+     * costs nothing and waiting costs everything - the 10 s connect timeout and
+     * a backoff up to 10 s are for a page that still has its peers. A phone
+     * whose WiFi comes back is told by no browser event in Firefox (no
+     * `navigator.connection`, no second `online`, see watchNetworkChange): only
+     * the next attempt finds the network, and the second WiFi cycle of a real
+     * phone took 60 s to get back into the room (phone-session.mjs simple-peer,
+     * Firefox; repro-simple-peer-sleep part 16).
+     */
+    private get roomLost();
     /**
      * Handle messages from signaling server.
      */

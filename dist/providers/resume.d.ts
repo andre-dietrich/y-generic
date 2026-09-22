@@ -54,5 +54,23 @@ export declare function watchResume(minSleepMs: number, onResume: (sleptMs: numb
  *    (test/providers/repro-websocket-wake.ts).
  * Returns the function that stops watching; does nothing outside a browser.
  */
+/**
+ * The page's NETWORK changed - not "the page is back", but "everything this
+ * page had an address for is gone": a phone whose WiFi goes and whose mobile
+ * data takes over, and the way back. Every WebRTC link of the old address is
+ * dead, and the browser knows it seconds before ICE does: a real phone
+ * (Chrome on Android, 8 peers) had `connection.type` "cellular" 0.6 s after
+ * the switch, ICE 'disconnected' after 5 s and its links closed after 15 s
+ * (test/e2e/phone-session.mjs simple-peer, 2026-09-22).
+ *  - `navigator.connection` (Chrome on Android): a `change` whose `type`
+ *    differs from the last one, and is not "none" - Android fires a change
+ *    for every `effectiveType` estimate too, and rebuilding every link for
+ *    one of those would be a room-wide cost for nothing.
+ *  - without it (Firefox, Safari): `online` after an `offline`.
+ * Calls within a second are one change (a switch is `offline`, "none",
+ * `online`, "cellular" within half a second). Returns the function that
+ * stops watching; does nothing outside a browser.
+ */
+export declare function watchNetworkChange(onChange: (why: string) => void): () => void;
 export declare function watchPageBack(onBack: () => void): () => void;
 //# sourceMappingURL=resume.d.ts.map

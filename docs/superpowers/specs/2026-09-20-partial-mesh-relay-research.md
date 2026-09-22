@@ -1239,3 +1239,61 @@ npx tsc -p tsconfig.bench.json && node bench-dist/test/dummy/probe-partial-mesh.
 [chromegc]: https://issues.chromium.org/issues/41378764
 [feross]: https://github.com/w3c/webrtc-pc/issues/230#issuecomment-391181990
 [stun]: https://webrtc.googlesource.com/src/+/refs/heads/main/p2p/base/p2p_constants.h
+
+## `storm`: the local transports under sustained load (2026-09-22)
+
+André asked for stress tests with more communication. New opt-in scenario of
+`room-scenarios.mjs`, `storm`, in four phases (`STORM=typing,cursor,bulk,faults`):
+ten Chrome peers type for 60 s, a character every 250 ms, each in its own paragraph
+(a relative position), in unique tokens `⟦t3.17⟧` - every page notes when it first
+saw each (its Y.Text scanned at most every 100 ms), so the lag typed -> seen
+elsewhere per (token, page), what is missing and when everything is everywhere;
+every peer changes its presence 5 times a second for 30 s; three 100 KB inserts
+while ten type; 90 s of typing with a reload, three pages frozen for 40 s, one
+typist offline for 20 s (DevTools protocol) and the server down for 5 s. The
+playgrounds expose their `Y` for the relative positions. 25 peers, local servers.
+
+| | websocket | nostr | gun (v1.9.3 -> after) | simple-peer | peerjs (v1.9.3 -> after) | trystero |
+|---|---|---|---|---|---|---|
+| typing: lag p50 / p95, ms | 106 / 116 | 260 / 271 | 13,270 / 52,503 -> 360 / 529 | 108 / 120 | 111 / 121 | 109 / 121 |
+| typing: frames/s of the room, mean | 44 | 49 | 123 -> 598 | 7 | 5 | 5 |
+| cursor: lag p50 / p95, ms | 24 / 39 | 59 / 99 | 50 / 93 | 32 / 43 | 42 / 67 | 37 / 56 |
+| bulk: each 100 KB everywhere, ms | 135-189 | 315-480 | 854-6,092 -> 533-671 | 241-248 | 232-366 | 151-223 |
+| faults: tokens missing at the end | 0 | 0 | 0 | 0 | 534 of 12,576 -> 0 | 0 |
+| faults: rosters complete afterwards | 2.0 s | 0 s | 0 s | 0 s | never -> 0 s | 0 s |
+
+Every presence change arrived (119.2 per peer and second = 24 others x 5): the
+awareness throttle coalesces nothing at 5 Hz. Two findings, and one of the harness:
+
+**Gun: concurrent writers overwrote each other's updates.** The update slots were
+one ring of 20 keys under the room's node, every writer counting from `slot-0`:
+concurrent writers put into the same key and gun keeps one; the receivers' dedupe
+key (slot, 100 ms window) made two writers one update. Nothing was lost in the end -
+the core's resync filled the holes, at 13 s median. `test/gun/repro-concurrent-writers.mjs`
+(real gun, a relay, one listener and N writer processes at 4 Hz): 1 writer 40 of 40,
+5 writers 60 of 200 heard live. Every writer owns a ring of 10 now
+(`slot-<writer>-<n>`; the writer id in the tab's sessionStorage, so the relay's graph
+grows by a ring per tab, not per reload), the unload slot per writer too, and the
+sequence is unique per write: 200 of 200, 10 writers 400 of 400; the other Gun
+gates as before (lone joiner [101,102,103], unload removal, relay restart 3.0 s,
+page back 1.0 s). The price: gun's acks and gets for every update that now
+arrives - the room sends ~600 frames/s while ten type (peak 9,624), ~120 before;
+not measured on a public relay.
+
+**PeerJS: a page that woke while the server was gone never came back.** In
+`faults` the three frozen pages are unfrozen while the server restarts: the
+transport found the sleep, left and re-joined - one `connect()`, refused
+("Unexpected error claiming coordinator"), "Re-join after resume failed", and
+nothing after it. The three stayed out for good: roster 1, documents apart (534
+tokens missing). A re-join is tried again now, 1 s doubling to 10 s, jittered, until
+it holds; the app's `disconnect()` ends it (`repro-peerjs-coordinator` part 14: the
+server refuses the first two Peers - red before, one open Peer after, and no further
+Peer after a disconnect). 12 browsers: three refused tries, back at the fourth; 25:
+nothing missing. simple-peer and Trystero had the same moment and were fine.
+
+**Harness: a block inserted where a typist types split a token.** The first `bulk`
+appended at the end, after the last character the inserter knew of - where the last
+typist was typing at that moment; Yjs ordered the two concurrent inserts by client
+id and a token lay on both sides of 100 KB: 24-72 "missing" with every document
+identical. The block goes to the very start now: 0 missing everywhere.
+

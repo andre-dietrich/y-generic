@@ -151,6 +151,14 @@ nostr, ably, gun, pubnub) - never for the first connect. Opt-in scenarios of the
 `LINGER_GAP_MS=5000` checks while a short lease's ghost is still there), `offline` (a page's
 network goes and comes back through the DevTools protocol - the browser fires `offline`/`online`,
 the proxy cut of `restart` never does; `OUTAGE_MS=` makes that cut outlast a lease),
+`storm` (sustained load, `STORM=typing,cursor,bulk,faults`: ten typists for a minute in unique
+tokens - every page notes when it first saw each, so lag p50/p95 and what is missing; a presence
+storm; 100 KB inserts while they type; a reload, frozen pages, an offline typist and a server
+restart while they type. It found what 2-3 peers and short bursts never do: Gun's update slots
+shared by every writer - `test/gun/repro-concurrent-writers.mjs`, a writer owns its slots - and a
+PeerJS page that woke while the server was gone giving up its re-join - `repro-peerjs-coordinator`
+part 14, a re-join tries until it holds. A block inserted where a typist types can split a
+token: CRDT order, not a loss - insert far from them),
 `bandwidth` (bytes per peer from `getStats()`) and `oneway` (a link that receives and cannot send,
 made on purpose - Chrome does that by itself about once per 50-peer join: an `RTCDataChannel`
 object that stays at `connecting` after its own `open`; a transport must rebuild a link whose

@@ -203,6 +203,10 @@ export class AblyTransport {
         const clientOptions = {
             clientId: this.clientId,
             echoMessages: this.persistentMode,
+            // A network that comes back silently is found only by ably-js's retry
+            // (see AblyConfig.disconnectedRetryTimeout; repro-ably-lifecycle part 9).
+            disconnectedRetryTimeout: config.disconnectedRetryTimeout ?? 5000,
+            suspendedRetryTimeout: config.suspendedRetryTimeout ?? 10000,
         };
         if (config.apiKey)
             clientOptions.key = config.apiKey;

@@ -49,6 +49,14 @@
  *           had seen 'connected' - and ably-js's retry kept the phone out of the
  *           room for 19.6 s. A 'disconnected' within seconds of the page's return
  *           must be dialed at once too; one long after it is ably-js's business.
+ *  Part 9 - a network that comes back and nobody says so (a server, a proxy, a
+ *           router that was gone): only ably-js's retry dials, at
+ *           disconnectedRetryTimeout x 1, 4/3, 5/3, then 2 (15 s by default:
+ *           15, 20, 25, 30 s). Text typed during a 5 s outage everywhere after
+ *           15.3 s, during a 45 s one after 28.6 s (room-scenarios.mjs ably,
+ *           OUTAGE_MS). The transport passes 5 s (-> at most 10 s, the WebSocket
+ *           transport's cap) and a suspended retry of 10 s instead of 30 s -
+ *           and what the config says, if it says so.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-ably-lifecycle.js
  * Exit code 1 if a part fails.
@@ -106,7 +114,9 @@ class ScriptedRealtime {
       },
     }),
   }
-  constructor() {
+  options: any
+  constructor(options?: any) {
+    this.options = options
     ScriptedRealtime.last = this
     setTimeout(() => this.emit('connected'), 5)
   }
@@ -186,6 +196,16 @@ async function main(): Promise<void> {
   const l = ScriptedRealtime.last
   results.push([`5 enter refused once (42913): connect() resolved ${connected} (want true), enter() calls ${l.enters} (want 2), present ${l.entered} (want true)`, connected && l.enters === 2 && l.entered])
   await late.disconnect()
+
+  const d = ScriptedRealtime.last.options ?? {}
+  const own = new AblyTransport({ Realtime: ScriptedRealtime as any })
+  await own.connect({ room: 'repro', apiKey: 'x.y:z', disconnectedRetryTimeout: 2000, suspendedRetryTimeout: 7000 } as any)
+  const o = ScriptedRealtime.last.options ?? {}
+  results.push([
+    `9 retry: disconnectedRetryTimeout ${d.disconnectedRetryTimeout}, suspendedRetryTimeout ${d.suspendedRetryTimeout} (want 5000, 10000); from the config ${o.disconnectedRetryTimeout}, ${o.suspendedRetryTimeout} (want 2000, 7000)`,
+    d.disconnectedRetryTimeout === 5000 && d.suspendedRetryTimeout === 10000 && o.disconnectedRetryTimeout === 2000 && o.suspendedRetryTimeout === 7000,
+  ])
+  await own.disconnect()
 
   for (const [line, ok] of results) console.log(`${ok ? 'ok  ' : 'FAIL'} ${line}`)
   await transport.disconnect()

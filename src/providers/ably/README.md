@@ -100,6 +100,8 @@ await provider.connect({
 | `persistent` | `boolean` | ❌ No | Save/restore full doc state via Ably LiveObjects (default: `false`) |
 | `doc` | `Y.Doc` | ⚠️ Required if `persistent: true` | The Y.Doc to snapshot |
 | `persistDebounceMs` | `number` | ❌ No | Debounce delay before writing a snapshot (default: `2000`) |
+| `disconnectedRetryTimeout` | `number` | ❌ No | ably-js's first retry after a lost connection, later ones up to twice that (default: `5000`; ably-js's own: `15000`) |
+| `suspendedRetryTimeout` | `number` | ❌ No | ably-js's retry after 2 min without a connection (default: `10000`; ably-js's own: `30000`) |
 
 ## Persistent Mode
 
@@ -168,8 +170,10 @@ Get list of connected peer client IDs.
    page, a phone out of the background). The transport follows its
    connection state and tells `GenericProvider` when the connection came
    BACK (`onPeerConnect`): the provider announces itself again and pushes
-   what it wrote meanwhile. Ably retries a lost connection every 15 s, so
-   that is how long text typed during an outage takes to arrive - unless
+   what it wrote meanwhile. ably-js retries a lost connection after
+   `disconnectedRetryTimeout`, later tries up to twice as far apart; the
+   transport sets 5 s (ably-js's own default is 15 s): text typed during a
+   45 s outage reached 25 browsers 7.3 s after it instead of 28.6 s - unless
    the browser says `online`: then ably-js dials at once (a page that was
    20 s without network had the room's text 0.4 s after it was back) - and
    when the page is back (visible again, `online`, another network) the

@@ -1145,8 +1145,15 @@ is on mobile data gets no `online`. The transport asks `connection.connect()` wh
 the page is back and the connection `disconnected` or `suspended` (part 7 of
 `repro-ably-lifecycle.ts`; in the `offline` scenario the transport dialed on
 `online` and was connected 92 ms later). The silent return of a network that the
-browser does not report (the proxy cut) keeps ably-js's retry; a shorter
-`disconnectedRetryTimeout` would be the lever, not changed here.
+browser does not report (the proxy cut) keeps ably-js's retry - `disconnectedRetryTimeout`
+x 1, 4/3, 5/3, then 2 (ably-js 2), 15 s by default: 15, 20, 25, 30 s. After the phone
+sessions (v1.9.3) the transport passes 5 s (at most 10 s between two tries, the
+WebSocket transport's cap) and a `suspendedRetryTimeout` of 10 s instead of 30 s, both
+in `AblyConfig` (`repro-ably-lifecycle` part 9). 25 Chrome peers: text typed during a
+5 s outage everywhere after 2,022 ms (was 15,364), during a 45 s one after 7,275 ms
+(was 28,639), rosters 8,082 ms (was 28,641). Refused sends during a join 9 / 28 / 41 in
+three join-only runs, as before (12-54): the join loses no connection, the retry
+does not enter into it.
 
 Regression: all Node gates of `tsconfig.bench.json` pass (without
 `bench-persist-log`, which needs `fake-indexeddb`, and the service-bound

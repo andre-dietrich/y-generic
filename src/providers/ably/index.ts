@@ -229,6 +229,17 @@ export interface AblyConfig extends ConnectionConfig {
   doc?: Y.Doc
   /** Debounce delay in ms before writing the snapshot. @default 2000 */
   persistDebounceMs?: number
+  /**
+   * ably-js's first retry after a lost connection; later ones wait up to
+   * twice as long (x 1, 4/3, 5/3, 2). A network that comes back without the
+   * browser saying so (a server, a proxy, a router that was gone) is only
+   * found by that retry. ably-js's own default, 15 s, kept 25 browsers out
+   * for 15.3 s after a 5 s outage and 28.6 s after a 45 s one.
+   * @default 5000 (at most 10 s between two tries, the WebSocket transport's cap)
+   */
+  disconnectedRetryTimeout?: number
+  /** ably-js's retry once a connection has been gone for 2 min. @default 10000 (ably-js: 30000) */
+  suspendedRetryTimeout?: number
 }
 
 const EVENT_NAME = 'yjs-update'
@@ -327,6 +338,10 @@ export class AblyTransport implements Transport {
     const clientOptions: Record<string, any> = {
       clientId: this.clientId,
       echoMessages: this.persistentMode,
+      // A network that comes back silently is found only by ably-js's retry
+      // (see AblyConfig.disconnectedRetryTimeout; repro-ably-lifecycle part 9).
+      disconnectedRetryTimeout: config.disconnectedRetryTimeout ?? 5000,
+      suspendedRetryTimeout: config.suspendedRetryTimeout ?? 10000,
     }
     if (config.apiKey) clientOptions.key = config.apiKey
     if (config.authUrl) clientOptions.authUrl = config.authUrl

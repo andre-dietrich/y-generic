@@ -19,12 +19,35 @@
  * again at its next announce), were the healthy peers left alone, and did 'a'
  * and 'c' get the frame exactly once? Exit code 1 if not.
  *
+ * Part 3 - the page's network changed under it (the WiFi off, mobile data on):
+ * every link runs over an address that is gone. Waiting for ICE to say so cost a
+ * real phone 15 s on Chrome and 25-30 s on Firefox (phone-session.mjs
+ * simple-peer, 2026-09-22; the same wait here). Does the transport leave the
+ * room and join it again at once? And does it stay put for a `change` of the
+ * connection that is no change of the network (Android fires one for every
+ * effectiveType estimate)?
+ *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-trystero-oneway.js
  */
 
 import { TrysteroTransport } from '../../src/providers/trystero/index'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// A page for watchNetworkChange (src/providers/resume.ts).
+class FakeConnection extends EventTarget {
+  type = 'wifi'
+  effectiveType = '4g'
+  switchTo(type: string): void {
+    this.type = type
+    this.dispatchEvent(new Event('change'))
+  }
+}
+const page = new EventTarget()
+const connection = new FakeConnection()
+;(globalThis as any).window = page
+;(globalThis as any).document = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+Object.defineProperty(globalThis.navigator, 'connection', { value: connection, configurable: true, writable: true })
 
 function scriptedRoom() {
   const closed: string[] = []
@@ -74,9 +97,39 @@ async function run(how: 'send' | 'sendTo') {
   return s.closed.includes('b') && s.closed.length === 1 && healthy
 }
 
+/** Part 3: how often did the transport join a room, and did it leave the old one? */
+async function networkChange(): Promise<boolean> {
+  const rooms: { left: boolean }[] = []
+  const joinRoom = () => {
+    const s = scriptedRoom()
+    const entry = { left: false }
+    rooms.push(entry)
+    return { ...s.room, leave: () => (entry.left = true) }
+  }
+  const transport = new TrysteroTransport({ joinRoom: joinRoom as any, appId: 'repro', resumeAfterMs: 0 } as any)
+  await transport.connect({ room: 'repro-room' })
+  connection.type = 'wifi'
+
+  connection.effectiveType = '3g' // no change of the network: nothing must happen
+  connection.dispatchEvent(new Event('change'))
+  await sleep(1200)
+  const afterNoise = rooms.length
+
+  connection.switchTo('cellular')
+  await sleep(1500)
+  const ok = rooms.length === 2 && rooms[0].left && afterNoise === 1
+  console.log(
+    `  rooms joined: ${rooms.length} (want 2), the first one left = ${rooms[0]?.left} (want true), after an effectiveType change only: ${afterNoise} (want 1)`,
+  )
+  transport.disconnect()
+  return ok
+}
+
 async function main() {
   console.log("a peer whose channel's send() throws, in a scripted Trystero room of three:")
   const ok = [await run('send'), await run('sendTo')]
+  console.log('\nthe network changed under the page:')
+  ok.push(await networkChange())
   process.exit(ok.every(Boolean) ? 0 : 1)
 }
 

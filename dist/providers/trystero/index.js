@@ -28,7 +28,7 @@
  * await provider.connect({ room: 'my-room' })
  * ```
  */
-import { watchResume } from '../resume';
+import { watchResume, watchNetworkChange } from '../resume';
 /**
  * Trystero transport implementation.
  * Creates serverless P2P connections using Trystero library.
@@ -87,6 +87,11 @@ export class TrysteroTransport {
                 setTimeout(() => this.rejoin('the page slept'), 5000);
             });
         }
+        // The page's network CHANGED (the WiFi off and mobile data on, or back):
+        // every link runs over an address that is gone, and ICE says so only after
+        // 15 s (Chrome) to 30 s (Firefox). No waiting here - the room is joined
+        // again at once (repro-trystero-oneway, part 3).
+        this._stopNetworkChangeWatch = watchNetworkChange((why) => void this.rejoin(why));
     }
     /** Join the Trystero room and wire it up - at connect() and again at every rejoin(). */
     joinTrysteroRoom() {
@@ -206,6 +211,8 @@ export class TrysteroTransport {
             clearInterval(this._socketWatch);
         this._socketWatch = undefined;
         this._stopResumeWatch?.();
+        this._stopNetworkChangeWatch?.();
+        this._stopNetworkChangeWatch = undefined;
         this._stopResumeWatch = undefined;
         if (this.room) {
             this.room.leave();

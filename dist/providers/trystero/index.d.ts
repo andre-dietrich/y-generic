@@ -194,6 +194,7 @@ export declare class TrysteroTransport implements Transport {
     private _joinedSockets;
     private _socketWatch?;
     private _stopResumeWatch?;
+    private _stopNetworkChangeWatch?;
     private _rejoining;
     constructor(options: TrysteroTransportOptions);
     private log;

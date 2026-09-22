@@ -174,6 +174,10 @@ export class PeerJSTransport implements Transport {
   // session checks it (see later()), so an election retry or a re-dial
   // cannot outlive the session it belongs to.
   private _epoch: number = 0
+  // A re-join after a resume (handleResume) that goes on trying until it
+  // holds; disconnect() - the app's - ends it. Not _epoch: the re-join
+  // disconnects itself before every try.
+  private _rejoinGen: number = 0
   private _reconnectAttempts: number = 0 // signaling reconnect backoff
   private _reconnectTimer?: ReturnType<typeof setTimeout>
   private _stopResumeWatch?: ResumeWatch
@@ -425,6 +429,7 @@ export class PeerJSTransport implements Transport {
     // Ends the session for every pending timer and continuation (later(),
     // connect(), the election) - also when connect() is still in flight.
     this._epoch++
+    this._rejoinGen++
     if (this._reconnectTimer) {
       clearTimeout(this._reconnectTimer)
       this._reconnectTimer = undefined
@@ -637,9 +642,28 @@ export class PeerJSTransport implements Transport {
   private handleResume(sleptMs: number): void {
     if (!this._connected || this._destroying) return
     this.log(`⏰ Page slept ${sleptMs}ms — leaving and re-joining the room`)
-    const room = this._room
+    this.rejoin(this._room, 0)
+  }
+
+  /**
+   * Leave and join again, and again after a failed try: nobody else will. The
+   * page that woke up may find the PeerJS server gone for a moment (its own
+   * network coming back, a server restart): one refused try used to end it -
+   * three pages unfrozen while the server restarted stayed out of the room for
+   * good (room-scenarios.mjs STORM=faults; repro-peerjs-coordinator part 14).
+   * 1 s, doubling, at most 10 s, jittered.
+   */
+  private rejoin(room: string, attempt: number): void {
     this.disconnect()
-    this.connect({ room }).catch((err) => this.log('❌ Re-join after resume failed:', err))
+    const gen = ++this._rejoinGen
+    this.connect({ room }).catch((err) => {
+      if (gen !== this._rejoinGen) return // the app disconnected, or another re-join runs
+      const delay = Math.min(10000, 1000 * 2 ** attempt) * (0.5 + Math.random() * 0.5)
+      this.log(`❌ Re-join after resume failed, again in ${Math.round(delay)} ms:`, err)
+      setTimeout(() => {
+        if (gen === this._rejoinGen) this.rejoin(room, attempt + 1)
+      }, delay)
+    })
   }
 
   /**

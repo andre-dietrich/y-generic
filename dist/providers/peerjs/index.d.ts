@@ -150,6 +150,7 @@ export declare class PeerJSTransport implements Transport {
     private reElectionInProgress;
     private _destroying;
     private _epoch;
+    private _rejoinGen;
     private _reconnectAttempts;
     private _reconnectTimer?;
     private _stopResumeWatch?;
@@ -222,6 +223,15 @@ export declare class PeerJSTransport implements Transport {
      * (onPeerConnect).
      */
     private handleResume;
+    /**
+     * Leave and join again, and again after a failed try: nobody else will. The
+     * page that woke up may find the PeerJS server gone for a moment (its own
+     * network coming back, a server restart): one refused try used to end it -
+     * three pages unfrozen while the server restarted stayed out of the room for
+     * good (room-scenarios.mjs STORM=faults; repro-peerjs-coordinator part 14).
+     * 1 s, doubling, at most 10 s, jittered.
+     */
+    private rejoin;
     /**
      * Register callback for new peer data-channel connections.
      */

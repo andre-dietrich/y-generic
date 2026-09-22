@@ -51,6 +51,13 @@
  *  Part 11 - the page was suspended: Date.now() jumps by 60 s
  *            (resumeAfterMs: 15000). Does the transport leave and re-join
  *            under a new Peer?
+ *  Part 14 - the page slept, and the PeerJS server is not there when it
+ *            re-joins (it refuses the first two Peers). Found by
+ *            room-scenarios.mjs peerjs, STORM=faults (three pages unfrozen
+ *            while the server restarted): "Re-join after resume failed", and
+ *            nothing after it - the three stayed out of the room for good,
+ *            their documents apart. The re-join must be tried again until it
+ *            holds; a disconnect() of the app ends the tries. Exit code 1 if not.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-peerjs-coordinator.js
  */
@@ -109,6 +116,7 @@ class FakePeer extends Emitter {
   static dials: string[] = []
   static serverDown = false
   static reconnects = 0
+  static refuseNew = 0 // the next n Peers get no id from the server
   destroyed = false
   disconnected = false
   registered = false
@@ -122,6 +130,11 @@ class FakePeer extends Emitter {
     this.srv.all.push(this)
     setTimeout(() => {
       if (this.destroyed) return
+      if (this.srv.refuseNew > 0) {
+        this.srv.refuseNew--
+        this.emit('error', { type: 'server-error', message: 'Could not get an ID from the server.' })
+        return
+      }
       if (this.srv.taken.has(id)) {
         this.emit('error', { type: 'unavailable-id', message: `ID "${id}" is taken` })
       } else {
@@ -175,6 +188,7 @@ function reset(): void {
     static dials: string[] = []
     static serverDown = false
     static reconnects = 0
+    static refuseNew = 0
   }
 }
 
@@ -376,7 +390,31 @@ async function main() {
     )
     transport.disconnect()
   }
-  process.exit(0)
+
+  console.log('\nPart 14 - the page slept, and the server refuses the first two Peers of the re-join')
+  let failed = false
+  {
+    const { transport, regular } = await regularPeer(['zzz-b'])
+    Server.refuseNew = 2
+    const realNow = Date.now
+    Date.now = () => realNow() + 60000
+    await sleep(2500)
+    Date.now = realNow
+    await sleep(8000) // retries: ~1 s, ~2 s, ...
+    const open = Server.all.filter((p) => !p.destroyed && p !== regular && p.registered).map((p) => p.id)
+    const tried = Server.all.filter((p) => p !== regular).length
+    const back = open.length > 0
+    console.log(`  Peers tried after the resume: ${tried}, open now: ${open.join(', ') || 'none'} (want one)`)
+    transport.disconnect()
+    Server.refuseNew = 1000
+    const before = Server.all.length
+    await sleep(6000)
+    const after = Server.all.length - before
+    console.log(`  after the app's disconnect(), with the server refusing: ${after} more Peers in 6 s (want 0)`)
+    if (!back || after > 0) failed = true
+    console.log(`  ${back && after === 0 ? 'ok' : 'FAIL'}`)
+  }
+  process.exit(failed ? 1 : 0)
 }
 
 main().catch((e) => {

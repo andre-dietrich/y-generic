@@ -118,11 +118,26 @@ export interface ConferenceTransportOptions {
    * @default 1
    */
   feeds?: number
-  /** One DIGEST goes out per tick, to the lazy links in turn. @default 1000 */
+  /**
+   * One DIGEST goes out per tick, to the lazy links in turn. With
+   * `graftDelayMs` this is how long a peer outside an origin's tree waits
+   * for that origin's frame: a tree covers the peers that were there when
+   * the origin last sent, a peer that joined since has only its default
+   * feeds - the first keystroke after a long silence reaches it this way.
+   * @default 500
+   */
   digestIntervalMs?: number
-  /** How long a frame a DIGEST announced may still arrive by itself before it is GRAFTed. @default 400 */
+  /** Lazy links each state is announced to. @default 2 */
+  digestFanout?: number
+  /** How long a frame a DIGEST announced may still arrive by itself before it is GRAFTed. @default 250 */
   graftDelayMs?: number
-  /** A SUSPECT without an ALIVE for this long: the peer is gone. @default 3000 */
+  /**
+   * A SUSPECT without an ALIVE for this long: the peer is gone. The ALIVE
+   * travels the suspect's tree, which may not reach a peer that joined
+   * since the suspect last sent (see digestIntervalMs): at 3 s one peer in
+   * 100 dropped a living one now and then.
+   * @default 6000
+   */
   suspectTimeoutMs?: number
   /** connect() resolves at the first link, or after this when the room is empty. @default 3000 */
   firstLinkTimeoutMs?: number
@@ -166,21 +181,46 @@ const MAX_HOPS = 32
 const MAX_ABOVE = 1024 // out-of-order seqs remembered per origin before the gap is given up
 const UNICAST_WINDOW = 256
 const EARLY_MS = 3000 // see Origin.first
+// A joiner's first frames carry G_FRESH: sent within FRESH_MS of its
+// connect(). (Its first four only, at first: a reloaded page sent seven
+// within a second - JOIN, presence, its name and colour, acks - and a peer
+// that first saw its seq 6 took the JOIN for history: the reloaded peer was
+// missing from 14 of 99 rosters.) They are not history to anybody
+// - the first is its JOIN beacon, which the core answers with its presence,
+// the second its presence. A settled peer that first saw its seq 2 (sent when
+// more of the joiner's links were open than the JOIN had) took seq 1 for
+// "before my time" and never answered the JOIN: with 100 real browsers a
+// joiner's roster stayed at 45 until the room's presence renewals, 170 s
+// later. A frame with the flag and a seq above 1 says: ask for what is below
+// (the link that has this one, once; the DIGESTs of the others, once each).
+// Without the flag, "seq <= 4" was tried and meant nothing: a settled peer
+// that Trickle keeps quiet is at seq 3 for minutes, its seq 1 long out of
+// every cache, and every DIGEST about it had a joiner ask again. A DIGEST
+// entry carries the flag too, so that a peer that hears of a joiner from a
+// DIGEST first asks for its frames - and of a settled peer does not.
+const FRESH_MS = 3000 // a reloaded page's seven first frames come within a second
+const G_FRESH = 8
 
 interface Link {
   id: string // the inner transport's address of this link
   peer?: string // the wrapper id behind it, from its HELLO
   leaf: boolean
   lazy: boolean // the default, both ways, for an origin without an entry below
-  // Origins for which one direction is the opposite of the default. The
-  // RECEIVER decides: `flipIn` is what we asked the other end for (PRUNE /
-  // GRAFT), `flipOut` what it asked us for.
-  flipIn: Set<string>
-  flipOut: Set<string>
+  // Per origin, ABSOLUTE - a PRUNE-ALL or GRAFT-ALL moves the default, not
+  // these. Relative to the default, a GRAFT-ALL crossing a PRUNE(X) on the
+  // wire left one end thinking "cleared: eager" and the other "pruned:
+  // lazy" - 5-7 such links per 100 peers, and whoever had one as its only
+  // feed got the keystrokes a second late, from a DIGEST. The RECEIVER
+  // decides: `eagerIn` is what we asked the other end for, `eagerOut` what
+  // it asked us for.
+  eagerIn: Map<string, boolean>
+  eagerOut: Map<string, boolean>
   pruned: Map<string, number> // origin -> when we last said PRUNE for it
-  told: Map<string, number> // origin -> high-water mark this link heard from us in a DIGEST
+  told: Map<string, number> // origin -> high-water mark this link heard from us in a DIGEST, or sent us
+  heard: Map<string, number> // origin -> high-water mark this link's own DIGESTs / frames told us it has
   graftTimer?: ReturnType<typeof setTimeout>
   wanted: Map<string, number> // origin -> highest seq this link's DIGESTs announced and we lack
+  asked: Map<string, number> // origin -> highest seq we GRAFTed this link for
 }
 
 interface Origin {
@@ -199,6 +239,8 @@ interface Origin {
   route?: string // link id the first copy came over
   unicastSeen: number[]
   gone: boolean
+  freshUntil: number // a frame with G_FRESH seen within cacheMs: a joiner, its earlier frames are wanted
+  firstSeen?: string // DIAG: how this origin was first heard of
   goneAt?: number
   suspectTimer?: ReturnType<typeof setTimeout>
 }
@@ -234,11 +276,14 @@ export class ConferenceTransport implements Transport {
   /** This peer's address in the room: what the core gets as `from` on the other side. */
   readonly id: string = randomId()
   /** Counters for benchmarks and the playground. */
-  readonly stats = { duplicates: 0, prunes: 0, grafts: 0, digests: 0, suspects: 0, unroutable: 0 }
+  readonly stats = { duplicates: 0, prunes: 0, grafts: 0, digests: 0, suspects: 0, unroutable: 0, connectWaitMs: 0, linksAtConnect: 0 }
 
   private readonly _idBytes = fromHex(this.id)
   private readonly _opts: Required<Omit<ConferenceTransportOptions, 'expectedPeers'>> & { expectedPeers: number }
   private _seq = 0
+  private _connectedAt = Infinity // set when connect() resolves - nothing is sent before
+  private _hadLink = false
+  private _unsent: Uint8Array[] = [] // our frames from before the first link (see _onHello)
   private _agedOwn = 0 // _seq one digest tick ago
   private _useq = 0
   private _refuted: string[] = [] // SUSPECT frames ('origin:seq') an ALIVE has answered
@@ -251,6 +296,8 @@ export class ConferenceTransport implements Transport {
   private _cacheIndex = new Map<string, Cached>()
   private _cacheSize = 0
   private _digestTimer?: ReturnType<typeof setInterval>
+  private _announced = new Map<string, number>() // origin -> hw every lazy link has heard a DIGEST about
+  private _announcedRounds = new Map<string, number>() // 'origin:hw' -> links told so far
   private _digestTurn = 0
   private _firstLink?: () => void
   private _unsubscribe: Array<() => void> = []
@@ -273,9 +320,10 @@ export class ConferenceTransport implements Transport {
       relay: options.relay ?? true,
       mode: options.mode ?? 'tree',
       feeds: options.feeds ?? 1,
-      digestIntervalMs: options.digestIntervalMs ?? 1000,
-      graftDelayMs: options.graftDelayMs ?? 400,
-      suspectTimeoutMs: options.suspectTimeoutMs ?? 3000,
+      digestIntervalMs: options.digestIntervalMs ?? 500,
+      digestFanout: options.digestFanout ?? 2,
+      graftDelayMs: options.graftDelayMs ?? 250,
+      suspectTimeoutMs: options.suspectTimeoutMs ?? 6000,
       firstLinkTimeoutMs: options.firstLinkTimeoutMs ?? 3000,
       expectedRttMs: options.expectedRttMs ?? 250,
       cacheMs: options.cacheMs ?? 30000,
@@ -329,15 +377,24 @@ export class ConferenceTransport implements Transport {
     if (this._opts.mode === 'tree') {
       this._digestTimer = setInterval(() => this._digestTick(), this._opts.digestIntervalMs)
     }
-    if (this._byPeer.size > 0) return
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, this._opts.firstLinkTimeoutMs)
-      this._firstLink = () => {
-        clearTimeout(timer)
-        resolve()
-      }
-    })
-    this._firstLink = undefined
+    const waitFrom = Date.now()
+    if (this._byPeer.size === 0) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, this._opts.firstLinkTimeoutMs)
+        this._firstLink = () => {
+          clearTimeout(timer)
+          resolve()
+        }
+      })
+      this._firstLink = undefined
+    }
+    // The fresh window (G_FRESH) starts when the core starts sending - now,
+    // not before the wait for the first link. With 100 browsers on one
+    // machine that wait ran into its 3 s timeout, and the JOIN went out
+    // with no link to go over: see _onHello for what happens to it then.
+    this._connectedAt = Date.now()
+    this.stats.connectWaitMs = this._connectedAt - waitFrom
+    this.stats.linksAtConnect = this._byPeer.size
   }
 
   disconnect(): void {
@@ -408,7 +465,7 @@ export class ConferenceTransport implements Transport {
     let link = this._links.get(linkId)
     if (link !== undefined) return link
     // A new link starts eager for everything; _onHello decides about its default.
-    link = { id: linkId, leaf: false, lazy: false, flipIn: new Set(), flipOut: new Set(), pruned: new Map(), told: new Map(), wanted: new Map() }
+    link = { id: linkId, leaf: false, lazy: false, eagerIn: new Map(), eagerOut: new Map(), pruned: new Map(), told: new Map(), heard: new Map(), wanted: new Map(), asked: new Map() }
     this._links.set(linkId, link)
     const e = encoding.createEncoder()
     encoding.writeUint8(e, F_HELLO)
@@ -432,15 +489,24 @@ export class ConferenceTransport implements Transport {
   private _eager(link: Link, origin: string, way: 'in' | 'out'): boolean {
     if (this._opts.mode === 'flood') return true
     // A peer's own frames go over its own links, whatever their default.
-    const base = !link.lazy || origin === this.id || origin === link.peer
-    return (way === 'in' ? link.flipIn : link.flipOut).has(origin) ? !base : base
+    const set = (way === 'in' ? link.eagerIn : link.eagerOut).get(origin)
+    if (set !== undefined) return set
+    // A peer's own frames go over its own links, whatever their default.
+    return !link.lazy || origin === this.id || origin === link.peer
   }
 
   private _setEager(link: Link, origin: string, way: 'in' | 'out', eager: boolean): void {
-    const base = !link.lazy || origin === this.id || origin === link.peer
-    const flip = way === 'in' ? link.flipIn : link.flipOut
-    if (eager === base) flip.delete(origin)
-    else flip.add(origin)
+    ;(way === 'in' ? link.eagerIn : link.eagerOut).set(origin, eager)
+  }
+
+  private _hasFeed(origin: string): boolean {
+    for (const l of this._links.values()) if (l.peer !== undefined && this._eager(l, origin, 'in')) return true
+    return false
+  }
+
+  private _anyRelayLink(): Link | undefined {
+    const candidates = Array.from(this._links.values()).filter((l) => l.peer !== undefined && !l.leaf)
+    return candidates[Math.floor(Math.random() * candidates.length)]
   }
 
   /** Links that are eager by default and lead to a peer that passes frames on. */
@@ -452,8 +518,6 @@ export class ConferenceTransport implements Transport {
 
   private _setDefault(link: Link, lazy: boolean): void {
     link.lazy = lazy
-    link.flipIn.clear()
-    link.flipOut.clear()
     if (!lazy) return
     // Not for the origins whose frames reach us over this link: a fresh
     // joiner's links are all eager until its HELLOs are through, it hands
@@ -567,6 +631,18 @@ export class ConferenceTransport implements Transport {
     this._alive(peer, origin)
     this._publishRoomSize()
     if (!first) return
+    // Our first link. What we sent before it (connect() resolved by its
+    // timeout with no link open: the core's JOIN beacon with our presence in
+    // it) went nowhere; it goes over this link now, and the fresh window
+    // (G_FRESH) starts here - that JOIN, seen by a peer only through its
+    // seq 2, was taken for history: 100 browsers, a joiner missing from 3-8
+    // rosters until the presence renewals 170 s later, every second run.
+    if (!this._hadLink) {
+      this._hadLink = true
+      this._connectedAt = Date.now()
+      for (const frame of this._unsent) this._sendLink(link, frame)
+      this._unsent = []
+    }
     // Enough feeds already: this link is a lazy one, unless the other end needs it (_onPrune).
     if (this._opts.mode === 'tree' && this._feeds(link) >= this._opts.feeds) {
       this._sendLink(link, new Uint8Array([F_PRUNE, 0])) // before _setDefault's GRAFT
@@ -581,7 +657,7 @@ export class ConferenceTransport implements Transport {
     if (o === undefined) {
       // What an origin sent before we heard of it is history: the core's join sync covers it.
       const hw = firstSeq === undefined ? -1 : firstSeq - 1
-      o = { hw, above: new Set(), aged: hw, first: hw + 1, top: hw, early: new Set(), earlyUntil: Date.now() + EARLY_MS, unicastSeen: [], gone: false }
+      o = { hw, above: new Set(), aged: hw, first: hw + 1, top: hw, early: new Set(), earlyUntil: Date.now() + EARLY_MS, unicastSeen: [], gone: false, freshUntil: 0 }
       this._origins.set(id, o)
       this._publishRoomSize()
     }
@@ -589,10 +665,17 @@ export class ConferenceTransport implements Transport {
   }
 
   /** true when (origin, seq) is new. */
-  private _markSeen(o: Origin, seq: number): boolean {
+  private _markSeen(o: Origin, seq: number, fresh = false): boolean {
     if (o.hw === -1) {
-      o.hw = o.aged = seq - 1
-      o.first = seq
+      // A joiner's first frames (its JOIN beacon, its presence) are not
+      // history to anybody: a settled peer that first saw its seq 2 - the
+      // presence, sent when more of its links were open than the JOIN had -
+      // took seq 1 for "before my time" and never answered the JOIN; 100
+      // real browsers: a joiner's roster stayed at 45 until the room's
+      // presence renewals, 170 s later. So seq 1 stays wanted, and the
+      // DIGESTs of the links bring it (_onDigest: each link asked once).
+      o.hw = o.aged = fresh ? 0 : seq - 1
+      o.first = fresh ? 1 : seq
       o.earlyUntil = Date.now() + EARLY_MS
     }
     if (seq < o.first) {
@@ -618,11 +701,18 @@ export class ConferenceTransport implements Transport {
     const d = decoding.createDecoder(frame.subarray(3 + ID_BYTES))
     const seq = decoding.readVarUint(d)
     const tree = this._opts.mode === 'tree' && !(flags & G_REPLY)
-    if (originId === this.id) return this._duplicate(link, originId, tree)
+    if (originId === this.id) return this._duplicate(link, originId, tree, seq)
     const origin = this._origin(originId, seq)
-    if (!this._markSeen(origin, seq)) return this._duplicate(link, originId, tree)
+    if (origin.firstSeen === undefined) origin.firstSeen = `gossip seq ${seq} flags ${flags} hops ${hops} over ${link.id.slice(0, 8)}`
+    if (!this._markSeen(origin, seq, (flags & G_FRESH) !== 0)) return this._duplicate(link, originId, tree, seq)
+    // A joiner for as long as its first frames are in the caches: a DIGEST
+    // about it reaches a given link within ~links x the tick, 3 s was too
+    // short at 100 peers (a joiner missing from 8 rosters for 170 s, again).
+    if (flags & G_FRESH) origin.freshUntil = Date.now() + this._opts.cacheMs
 
     const payload = frame.subarray(3 + ID_BYTES + d.pos)
+    // The link has this frame: no DIGEST about it to that link (see _digestTick).
+    this._linkHas(link, originId, seq)
     // Routes must come from frames that ran through the room one after the
     // other - then they are loop-free. A straggler (a seq below one we have
     // seen, over a slower path) is no such frame: with routes taken from
@@ -637,6 +727,10 @@ export class ConferenceTransport implements Transport {
     // its duplicate prunes A - cut off from that origin, for good in an
     // idle room (the gate: one roster in 50 lacked a peer in 2 of 5 runs).
     if (tree && front && !this._eager(link, originId, 'in')) this._graft(link, [originId])
+    else if (flags & G_FRESH && origin.hw < seq - 1 && !link.asked.has(originId)) {
+      link.asked.set(originId, seq)
+      this._graft(link, [originId]) // see G_FRESH
+    }
     if (flags & G_CONTROL) this._onControl(originId, origin, seq, payload)
     else if (flags & G_TUNNEL) this._onTunnel(payload)
     else if (!origin.gone) this._onMessage?.(payload, originId)
@@ -658,12 +752,26 @@ export class ConferenceTransport implements Transport {
     }
   }
 
-  private _duplicate(link: Link, origin: string, tree: boolean): void {
+  /** This link has `origin` up to `seq`: nothing to tell it about that, nothing to ask it beyond. */
+  private _linkHas(link: Link, origin: string, seq: number): void {
+    if (seq > (link.told.get(origin) ?? -1)) link.told.set(origin, seq)
+    if (seq > (link.heard.get(origin) ?? -1)) link.heard.set(origin, seq)
+  }
+
+  private _duplicate(link: Link, origin: string, tree: boolean, seq: number): void {
     this.stats.duplicates++
+    this._linkHas(link, origin, seq)
     if (!tree) return
     // Lazy here and still coming: the other end sees it differently - say it again, not per frame.
     const now = Date.now()
     if (!this._eager(link, origin, 'in') && now - (link.pruned.get(origin) ?? 0) < 1000) return
+    // Never the last: the first copy of a straggler (seq below the front)
+    // over a lazy link makes that link no feed, and its duplicate over the
+    // feed pruned the feed - 1 peer in 100 without a feed for the typist,
+    // its keystrokes a second late from a DIGEST.
+    let feeds = 0
+    for (const l of this._links.values()) if (l !== link && this._eager(l, origin, 'in')) feeds++
+    if (feeds === 0) return
     this._setEager(link, origin, 'in', false)
     link.pruned.set(origin, now)
     this.stats.prunes++
@@ -777,6 +885,7 @@ export class ConferenceTransport implements Transport {
   // ------------------------------------------------------------ broadcast
 
   private _originate(flags: number, payload: Uint8Array): void {
+    if (!this._hadLink || Date.now() - this._connectedAt < FRESH_MS) flags |= G_FRESH
     const e = encoding.createEncoder()
     encoding.writeUint8(e, F_GOSSIP)
     encoding.writeUint8(e, flags)
@@ -786,6 +895,10 @@ export class ConferenceTransport implements Transport {
     encoding.writeUint8Array(e, payload)
     const frame = encoding.toUint8Array(e)
     this._remember(this.id, this._seq, frame)
+    if (!this._hadLink) {
+      this._unsent.push(frame)
+      if (this._unsent.length > 16) this._unsent.shift()
+    }
     for (const link of this._links.values()) if (this._eager(link, this.id, 'out')) this._sendLink(link, frame)
   }
 
@@ -810,6 +923,20 @@ export class ConferenceTransport implements Transport {
    * grow with the number of links, and a peer that lacks something has
    * several lazy neighbours taking turns. It announces the state of one
    * tick AGO - what is still on its way over the tree is not "missing".
+   *
+   * Only what changed since that link last heard from us, and only what
+   * this link has not seen for itself: every frame that came over it moved
+   * `told` too. And each state to `digestFanout` lazy links only, not to
+   * all of them: Plumtree's IHAVE to every lazy link costs one frame per
+   * LINK of the room per message (E, ~10x N-1) unless many messages share
+   * a frame - an idle room's beacons, one every 15 s, do not: 100 idle
+   * browsers sent 68 digests a second, 1 kB/s each, for 5 beacons a
+   * minute. A peer that missed a frame is told by one of its k neighbours
+   * with 1-(1-f/k)^k (k=15, f=2: 87 %), by the origin's next state again,
+   * and the core's own beacons repair the document either way. (A full
+   * DIGEST to every new link was tried: it cost an idle room 5x and bought
+   * nothing - a joiner's roster comes from the answers to its JOIN, and an
+   * origin it has not heard yet is created by that origin's next frame.)
    */
   private _digestTick(): void {
     if (!this._connected) return
@@ -826,19 +953,35 @@ export class ConferenceTransport implements Transport {
           if (o.aged > (link.told.get(id) ?? -1)) entries.push([id, o.aged])
         }
       }
-      if (entries.length === 0) continue
+      // What this link has not seen and did not GRAFT within a tick: it has
+      // it from somewhere else (the tree) - a DIGEST about it to the next
+      // link, and the next, is what kept 100 idle peers at 70 frames a second.
+      const fresh = entries.filter(([id, hw]) => hw > (link.heard.get(id) ?? -1) && hw > (this._announced.get(id) ?? -1))
+      for (const [id, hw] of entries) link.told.set(id, hw)
+      if (fresh.length === 0) continue
+      entries.length = 0
+      entries.push(...fresh)
       const e = encoding.createEncoder()
       encoding.writeUint8(e, F_DIGEST)
       encoding.writeVarUint(e, entries.length)
       for (const [id, hw] of entries) {
         encoding.writeUint8Array(e, fromHex(id))
         encoding.writeVarUint(e, hw)
+        encoding.writeUint8(e, id !== this.id && (this._origins.get(id)?.freshUntil ?? 0) > Date.now() ? 1 : 0)
         link.told.set(id, hw)
       }
       this.stats.digests++
       this._sendLink(link, encoding.toUint8Array(e))
       this._digestTurn = (this._digestTurn + i + 1) % lazy.length
       sent = true
+      // An entry is announced to `digestFanout` links, then done.
+      for (const [id, hw] of entries) {
+        const n = (this._announcedRounds.get(id + ':' + hw) ?? 0) + 1
+        if (n >= Math.min(lazy.length, this._opts.digestFanout)) {
+          this._announced.set(id, hw)
+          this._announcedRounds.delete(id + ':' + hw)
+        } else this._announcedRounds.set(id + ':' + hw, n)
+      }
     }
     this._agedOwn = own
     const forget = Date.now() - 2 * this._opts.cacheMs
@@ -855,19 +998,33 @@ export class ConferenceTransport implements Transport {
     for (let i = 0; i < count; i++) {
       const id = toHex(decoding.readUint8Array(d, ID_BYTES))
       const hw = decoding.readVarUint(d)
+      const fresh = decoding.readUint8(d) === 1
       if (id === this.id) continue
-      const known = this._origins.get(id)
+      this._linkHas(link, id, hw)
+      let known = this._origins.get(id)
       if (known === undefined || known.hw === -1) {
-        // Never heard: its history is the join sync's business, its next frame is ours.
-        const o = this._origin(id)
-        if (o.hw < hw) {
-          o.hw = o.aged = hw
-          o.first = hw + 1
-          o.earlyUntil = Date.now() + EARLY_MS
+        if (fresh) {
+          // A joiner (see G_FRESH): all of it is wanted, from seq 1.
+          known = this._origin(id, 1)
+          known.firstSeen ??= `digest hw ${hw} fresh over ${link.id.slice(0, 8)}`
+          known.freshUntil = Date.now() + this._opts.cacheMs
+        } else {
+          // A settled peer we never heard: its history is the join sync's business, its next frame is ours.
+          const o = this._origin(id)
+          o.firstSeen ??= `digest hw ${hw} over ${link.id.slice(0, 8)}`
+          if (o.hw < hw) {
+            o.hw = o.aged = hw
+            o.first = hw + 1
+            o.earlyUntil = Date.now() + EARLY_MS
+          }
+          continue
         }
-        continue
       }
       if (known.gone || hw <= known.hw) continue
+      // Once per link and state: a link that lacks the same frame as we do
+      // (a joiner's seq 1 that neither got) answers a GRAFT with what it
+      // has - duplicates - and its next DIGEST would have us ask again.
+      if (hw <= (link.asked.get(id) ?? -1)) continue
       if (hw > (link.wanted.get(id) ?? 0)) link.wanted.set(id, hw)
     }
     if (link.wanted.size === 0 || link.graftTimer !== undefined) return
@@ -877,7 +1034,10 @@ export class ConferenceTransport implements Transport {
       const asks: string[] = []
       for (const [id, hw] of link.wanted) {
         const o = this._origins.get(id)
-        if (o !== undefined && !o.gone && o.hw < hw) asks.push(id)
+        if (o !== undefined && !o.gone && o.hw < hw) {
+          asks.push(id)
+          link.asked.set(id, hw)
+        }
       }
       link.wanted.clear()
       if (asks.length > 0) this._graft(link, asks)
@@ -942,6 +1102,15 @@ export class ConferenceTransport implements Transport {
 
   private _suspect(peer: string, origin: Origin): void {
     if (origin.gone || origin.suspectTimer !== undefined) return
+    // Its ALIVE comes down ITS tree, which covers the peers that were there
+    // when it last sent. Outside it, join it now: one GRAFT, and the answer
+    // reaches us over a link that is eager for it - not by the luck of a
+    // DIGEST (fanout 2: 1 peer in 8 outside the tree missed the ALIVE and
+    // dropped a living peer).
+    if (this._opts.mode === 'tree' && !this._hasFeed(peer)) {
+      const link = (origin.route !== undefined ? this._links.get(origin.route) : undefined) ?? this._anyRelayLink()
+      if (link !== undefined) this._graft(link, [peer])
+    }
     origin.suspectTimer = setTimeout(() => {
       origin.suspectTimer = undefined
       if (this._byPeer.has(peer)) return

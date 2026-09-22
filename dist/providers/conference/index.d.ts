@@ -115,11 +115,26 @@ export interface ConferenceTransportOptions {
      * @default 1
      */
     feeds?: number;
-    /** One DIGEST goes out per tick, to the lazy links in turn. @default 1000 */
+    /**
+     * One DIGEST goes out per tick, to the lazy links in turn. With
+     * `graftDelayMs` this is how long a peer outside an origin's tree waits
+     * for that origin's frame: a tree covers the peers that were there when
+     * the origin last sent, a peer that joined since has only its default
+     * feeds - the first keystroke after a long silence reaches it this way.
+     * @default 500
+     */
     digestIntervalMs?: number;
-    /** How long a frame a DIGEST announced may still arrive by itself before it is GRAFTed. @default 400 */
+    /** Lazy links each state is announced to. @default 2 */
+    digestFanout?: number;
+    /** How long a frame a DIGEST announced may still arrive by itself before it is GRAFTed. @default 250 */
     graftDelayMs?: number;
-    /** A SUSPECT without an ALIVE for this long: the peer is gone. @default 3000 */
+    /**
+     * A SUSPECT without an ALIVE for this long: the peer is gone. The ALIVE
+     * travels the suspect's tree, which may not reach a peer that joined
+     * since the suspect last sent (see digestIntervalMs): at 3 s one peer in
+     * 100 dropped a living one now and then.
+     * @default 6000
+     */
     suspectTimeoutMs?: number;
     /** connect() resolves at the first link, or after this when the room is empty. @default 3000 */
     firstLinkTimeoutMs?: number;
@@ -150,10 +165,15 @@ export declare class ConferenceTransport implements Transport {
         digests: number;
         suspects: number;
         unroutable: number;
+        connectWaitMs: number;
+        linksAtConnect: number;
     };
     private readonly _idBytes;
     private readonly _opts;
     private _seq;
+    private _connectedAt;
+    private _hadLink;
+    private _unsent;
     private _agedOwn;
     private _useq;
     private _refuted;
@@ -166,6 +186,8 @@ export declare class ConferenceTransport implements Transport {
     private _cacheIndex;
     private _cacheSize;
     private _digestTimer?;
+    private _announced;
+    private _announcedRounds;
     private _digestTurn;
     private _firstLink?;
     private _unsubscribe;
@@ -208,6 +230,8 @@ export declare class ConferenceTransport implements Transport {
      */
     private _eager;
     private _setEager;
+    private _hasFeed;
+    private _anyRelayLink;
     /** Links that are eager by default and lead to a peer that passes frames on. */
     private _feeds;
     private _setDefault;
@@ -227,6 +251,8 @@ export declare class ConferenceTransport implements Transport {
     /** true when (origin, seq) is new. */
     private _markSeen;
     private _onGossip;
+    /** This link has `origin` up to `seq`: nothing to tell it about that, nothing to ask it beyond. */
+    private _linkHas;
     private _duplicate;
     private _onPrune;
     /**
@@ -255,6 +281,20 @@ export declare class ConferenceTransport implements Transport {
      * grow with the number of links, and a peer that lacks something has
      * several lazy neighbours taking turns. It announces the state of one
      * tick AGO - what is still on its way over the tree is not "missing".
+     *
+     * Only what changed since that link last heard from us, and only what
+     * this link has not seen for itself: every frame that came over it moved
+     * `told` too. And each state to `digestFanout` lazy links only, not to
+     * all of them: Plumtree's IHAVE to every lazy link costs one frame per
+     * LINK of the room per message (E, ~10x N-1) unless many messages share
+     * a frame - an idle room's beacons, one every 15 s, do not: 100 idle
+     * browsers sent 68 digests a second, 1 kB/s each, for 5 beacons a
+     * minute. A peer that missed a frame is told by one of its k neighbours
+     * with 1-(1-f/k)^k (k=15, f=2: 87 %), by the origin's next state again,
+     * and the core's own beacons repair the document either way. (A full
+     * DIGEST to every new link was tried: it cost an idle room 5x and bought
+     * nothing - a joiner's roster comes from the answers to its JOIN, and an
+     * origin it has not heard yet is created by that origin's next frame.)
      */
     private _digestTick;
     private _onDigest;

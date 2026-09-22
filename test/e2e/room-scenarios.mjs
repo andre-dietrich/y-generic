@@ -674,6 +674,8 @@ async function main() {
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
       // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
       if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) presenceViews.push({ p, missing })
+      // A partial mesh: a joiner short of half the room is the case to look at - its first two holes.
+      else if (adapter.partial && missing.length > DIAG_MAX_MISSING) presenceViews.push({ p, missing: missing.slice(0, 2) })
       if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) {
         for (const name of missing) {
           const id = peers.find((q) => `p${q.id}` === name)?.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
@@ -708,6 +710,29 @@ async function main() {
           return { clock: meta?.clock, ageMs: meta ? Date.now() - meta.lastUpdated : undefined, hasState: pr.awareness.getStates().has(id), user: pr.awareness.getStates().get(id)?.user?.name, address: pr._peerAddress.get(id) }
         }, theirs.id)
         console.log(`      ${name} itself: ${JSON.stringify(theirs)} - p${p.id} holds: ${JSON.stringify(held)}`)
+        // Under ConferenceTransport (window.__conference): what the wrapper of each knows of the other's origin.
+        const wrapperView = (page, otherPage) =>
+          otherPage.evaluate(() => window.__conference?.id).then((otherId) =>
+            page.evaluate((otherId) => {
+              const w = window.__conference
+              if (!w || !otherId) return null
+              const o = w._origins.get(otherId)
+              const links = Array.from(w._links.values()).map((l) => `${l.peer?.slice(0, 4) ?? '?'}:${l.lazy ? 'l' : 'e'}${l.eagerIn.has(otherId) ? (l.eagerIn.get(otherId) ? 'I' : 'i') : ''}${l.eagerOut.has(otherId) ? (l.eagerOut.get(otherId) ? 'O' : 'o') : ''}${l.leaf ? '(leaf)' : ''}`)
+              return {
+                origin: o ? { hw: o.hw, top: o.top, first: o.first, gone: o.gone, route: o.route?.slice(0, 8), unicasts: o.unicastSeen.length, firstSeen: o.firstSeen, fresh: o.freshUntil > Date.now() } : 'never heard',
+                direct: w._byPeer.has(otherId),
+                roomSize: w.roomSize,
+                links,
+                stats: w.stats,
+                sent: w._seq,
+                cached: w._cache.length,
+              }
+            }, otherId),
+          )
+        if (await p.page.evaluate(() => !!window.__conference)) {
+          console.log(`      wrapper p${p.id} about ${name}: ${JSON.stringify(await wrapperView(p.page, q.page))}`)
+          console.log(`      wrapper ${name} about p${p.id}: ${JSON.stringify(await wrapperView(q.page, p.page))}`)
+        }
         // What each transport's table holds for the other (simple-peer's internals where there are any).
         const transportId = (x) => x.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
         const entry = (page, remote) =>

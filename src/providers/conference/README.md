@@ -94,7 +94,8 @@ mesh it builds - which helps with nothing but the typist's upload.
 | `expectedPeers` | - | A hint, handed to the inner transport. It has to be known up front: the first peers of a room cannot see how many will follow, and without it a lecture hall first builds a full mesh of its first 64 peers. Too large costs a small room a second hop, too small costs a large room links; neither breaks it. |
 | `relay` | `true` | `false`: a leaf. It never passes on somebody else's frames, never dials a peer that announces itself, and no two leaves are linked. For phones and background tabs: iOS suspends WebRTC when the display locks, and a suspended tree node takes its subtree along until the repair path has healed it. A room needs enough relays to carry its leaves. |
 | `feeds` | `1` | Links kept eager *by default*, for origins not heard yet. 1: the defaults form a tree, a new origin's first frame costs N-1 frames plus one duplicate per extra link of its own. |
-| `digestIntervalMs` | `1000` | One digest per tick - what the repair path costs an idle room: one small frame per peer and second while anybody sends at all. |
+| `digestIntervalMs` | `1000` | One digest per tick, to one lazy link in turn, naming only what that link has not sent or told us. |
+| `digestFanout` | `2` | Lazy links each state is announced to. All of them (Plumtree's IHAVE) is one frame per link of the room per message; an idle room's beacons do not batch, and 100 browsers sent 1 kB/s each for five beacons a minute. A peer that missed a frame is told by one of its k neighbours with 1-(1-2/k)^k (87 % at k=15), by the origin's next state again, and the core's own beacons repair the document either way. |
 | `graftDelayMs` | `400` | How long a frame a digest announced may still arrive by itself. |
 | `suspectTimeoutMs` | `3000` | |
 | `firstLinkTimeoutMs` | `3000` | How long the first peer of a room waits in `connect()`. |
@@ -140,6 +141,14 @@ never each other; a peer whose neighbours are all killed has links again.
   browsers reach each other directly and every link needs TURN - `dial` links per peer of it.
 - **Privacy between hops.** The inner transport encrypts per link; a relaying peer sees what
   it passes on, as every peer of the room does anyway.
-- **Not measured yet:** real browsers beyond the simulation (the full mesh was run with 50),
-  a real phone as a leaf, PeerJS as the inner transport (its coordinator would hold a link to
-  every peer).
+- **Not measured yet:** a real phone as a leaf, Firefox, PeerJS as the inner transport (its
+  coordinator would hold a link to every peer).
+
+Real browsers (`test/e2e/room-scenarios.mjs conference`, headless Chrome): 25 through every
+scenario (rosters complete 0.8 s after the last page, 3-14 links per peer, five frozen pages
+back in 0.8 s, a reload complete in 0.9 s, a killed tab gone after 24 s - Chrome's ICE
+timeout); 100 through five join + reload runs in a row (rosters complete 0.05-1.4 s after the
+last page, a reload in 1-2 s), typing, a killed tab, five frozen pages and bandwidth (5-27
+links per peer; a typist 30 kB/s up, a listener 19 kB/s up while five people type - the
+listeners carry the relay). Details and what each rule was a failure of first:
+`docs/superpowers/specs/2026-09-22-conference-transport.md`.

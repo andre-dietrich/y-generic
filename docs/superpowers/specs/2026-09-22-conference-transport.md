@@ -21,7 +21,8 @@ gone from every roster after 4 s while typing goes on, a cut link between two
 living peers costs nobody a roster entry. The relay needs 1.1-1.2 x (N-1)
 frames per broadcast of the core; a full mesh needs 1.0, flooding 27.
 
-Real browsers: see "Real browsers" below.
+Real browsers: 25 through every scenario of `room-scenarios.mjs`, 100 through
+join / typing / a killed tab / a reload / bandwidth - see "Real browsers".
 
 ## What the literature search added (2026-09-21)
 
@@ -95,6 +96,95 @@ Every rule in the wrapper was a failure of the gate first.
    so (REVIVE) and its core sends its presence again, as for a re-opened link.
    (Flooding SUSPECT/ALIVE over every link also worked and cost 12,000 frames
    per cut link at N=150 instead of 1,200.)
+
+## Real browsers
+
+`test/e2e/room-scenarios.mjs conference` - the simple-peer playground under the
+wrapper (`conference` in the playground's config or `?conference=N` in its URL),
+headless Chrome, y-webrtc's signaling server, `expectedPeers` = N.
+
+**25 browsers, every scenario:** rosters complete 807 ms after the last page
+loaded at 4-15 links per peer (a full mesh: 24); five typists' 60 characters
+everywhere 807 ms after the typing; five frozen pages back with the missed
+text in 824 ms; a reload, a 5 s signaling outage with a peer typing meanwhile,
+a new peer after the restart - all as on the full mesh. A killed tab is gone
+from every roster after 18.6 s (the full mesh: 17 s; Chrome's ICE timeout).
+
+**100 browsers** (join, typing, vanish, reload, bandwidth): 6-27 links per
+peer, five typists everywhere in 8 s, reload complete in 1 s, documents
+identical - and two things the simulator had not shown:
+
+9. **An idle room at 1 kB/s per browser.** Plumtree's IHAVE goes to every
+   lazy link per message; batched into one DIGEST per tick that is one frame
+   per LINK of the room per message (E, ~10x N-1) unless many messages share
+   a frame - an idle room's beacons, one every 15 s, do not: 68 digests a
+   second room-wide, 10 messages a second up and 15 down per browser.
+   → a DIGEST names only what the link has not sent or told us, and each
+   state goes to `digestFanout` (2) lazy links, not all: 72 → 20 frames a
+   second in the simulator (browsers: not re-measured yet).
+10. **A joiner missing from 8-12 rosters for good** (about every second
+    run; with the first fix below: complete only after 170 s, the room's
+    presence renewals). Its JOIN beacon (seq 1) went over its one open link
+    into the forest of default feeds; its presence (seq 2) went out a moment
+    later over more links. Half the room saw seq 2 first and took seq 1 for
+    "before my time" - the rule that keeps a settled peer's history out of
+    a joiner's way. → a joiner's first frames carry a flag (`G_FRESH`: sent
+    within 3 s of its connect() - counted from when connect() resolved, not
+    from before the wait for the first link, which ran into its 3 s timeout
+    with 100 browsers on one machine; and not "its first four", a reloaded
+    page sends seven in a second); a peer that first sees such a frame at
+    seq > 1 asks the link that brought it for what is below, once, and keeps
+    seq 1 wanted for the DIGESTs of its other links (each asked once per
+    state). A DIGEST entry carries the flag as well, for the cache window
+    (30 s - a DIGEST reaches a given link within ~links x the tick), so a
+    peer that hears of a joiner from a DIGEST first asks for its frames, and
+    of a settled peer does not. Three things that did not work first:
+    "seq ≤ 4 means a joiner" without the flag (a settled peer that Trickle
+    keeps quiet is at seq 3 for minutes, its seq 1 out of every cache - a
+    GRAFT storm, 4x the frames); flooding a joiner's first frames over every
+    link (E frames each, 4 per join, plus every idle peer's 4th frame - 6x);
+    a full DIGEST to every new link (5x the idle traffic, and nothing gained:
+    a joiner's roster comes from the JOIN's answers).
+11. **Per-origin link states relative to a default** broke under a
+    GRAFT-ALL crossing a PRUNE(X) on the wire: one end "cleared, so eager",
+    the other "pruned, so lazy" - 5-7 such links per 100 peers, and a peer
+    with one of them as its only feed got its keystrokes a second late.
+    → the per-origin states are absolute; PRUNE-ALL and GRAFT-ALL move only
+    the default for origins without one.
+12. **The last feed pruned.** A straggler (seq below the front) whose first
+    copy came over a lazy link made that link no feed, and its duplicate
+    over the feed pruned the feed: one peer in 100 without a feed for the
+    typist. → never prune the last link that is eager-in for an origin.
+13. **A living peer dropped after a link cut** (1 in 100, now and then).
+    Its ALIVE comes down its tree, which covers the peers that were there
+    when it last sent; a peer that joined since has only default feeds and
+    waited for a DIGEST (fanout 2: one in eight never got one before the
+    3 s timeout). → a peer that suspects X and has no feed for X GRAFTs one
+    at once; `suspectTimeoutMs` 6 s; the DIGEST tick 500 ms and the GRAFT
+    delay 250 ms (the first keystroke after a silence reaches a peer outside
+    the typist's tree this way: ~1 s, then it is in the tree - the gate
+    allows 1.5 s for it).
+
+14. **connect() resolved with no link** (its 3 s wait ran out - 100
+    browsers on one machine take longer than that to open a link), and the
+    core's JOIN, with the presence folded into it, went over nothing. The
+    next frame anybody saw was the first periodic beacon, 5 s later and
+    outside the fresh window: history. → what a peer sends before its first
+    link is kept and goes over that link when it opens, and the fresh
+    window starts there.
+
+After 10-14: the gate passes three seeds at N=100 and all five variants at
+N=150 and N=300. Real browsers, headless Chrome: 25 through every scenario
+(rosters complete 0.8 s after the last page, five frozen pages back in 0.8 s,
+a reload complete in 0.9 s, a new peer after a signaling restart in 1.2 s);
+100 through five join + reload runs in a row (rosters complete 0.05-1.4 s
+after the last page, a reload in 1.0-2.0 s), and typing, a killed tab, five
+frozen pages (back in 1.3 s) and the bandwidth scenario: idle 5.8 kB/s per
+peer on the wire (15 messages a second - the core's beacons at their 5 s
+cadence after typing, each N-1 tree frames plus ~2N digests; STUN 1.1 kB/s),
+a typist 30 kB/s up, a listener 19 kB/s up and 16 down while five people
+type - the listeners carry the relay; a full mesh of 100 would put 80 kB/s
+on each typist.
 
 ## Does the expected number of users help?
 

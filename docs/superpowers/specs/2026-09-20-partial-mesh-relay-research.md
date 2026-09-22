@@ -40,6 +40,8 @@ change.
 **Version 1.8.8**, the same evening: the two Gun findings left open above, one
 cause - the update listener's initial load - and one fix; a joiner in a room whose
 peers are all gone has the document again. No new API, no wire-format change.
+On 2026-09-22 (v1.9.0) `linger` on WebSocket and Nostr, Chrome and Firefox: no
+incomplete roster, nothing to fix ("`linger` on WebSocket and Nostr").
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in
@@ -1022,6 +1024,28 @@ relay killed, back 13 s later with the transport in a 12 s wait, the page visibl
 control with nobody saying anything 8,022 ms. The playground's "links" (relays
 with an open `wire`) said 5 s for the two display-off absences where the
 transport's own "relay back" said 0.2 s: the getter, not the library.
+
+## `linger` on WebSocket and Nostr (2026-09-22)
+
+Gun was the first relay transport through `linger`; WebSocket and Nostr had had
+Firefox and the real phone, not this one. Run on v1.9.0 (`main` @ f017bee),
+`SCENARIOS=join,linger DIAG=1`, 25 peers, local servers (the edrys y-websocket
+relay, the harness' NIP-01 relay), once Chrome only and once with `FIREFOX=10` as
+hidden tabs of one Firefox. 420 s are 14 of the y-websocket server's fixed 30 s
+leases and three and a half of the Nostr playground's 120 s ones.
+
+| | websocket | websocket, 10 Firefox | nostr | nostr, 10 Firefox |
+|---|---|---|---|---|
+| join: rosters complete | 404 ms | 888 ms | 405 ms | 499 ms |
+| text of one peer in every editor | 35 ms | 48 ms | 404 ms | 452 ms |
+| frames during the join: total, peak per second | 125, 25 | 70, 13 | 148, 35 | 110, 29 |
+| frames in 10 idle seconds | 27 | 15 | 1 | 2 |
+| `linger`: moments with an incomplete roster | none | none | none | none |
+| final: editors and Y.Text identical, rosters | yes, 25/25 | yes, 25/25 | yes, 25/25 | yes, 25/25 |
+
+No send refused, nothing to fix. Every relay transport that runs in the harness
+without a hosted service has now been through `linger`; Ably and PubNub (live) have
+not, Supabase and Matrix are not in the harness at all.
 
 ## If it is built — order of work
 

@@ -1154,8 +1154,28 @@ Regression: all Node gates of `tsconfig.bench.json` pass (without
 `bench-relay-return-roster`, `bench-typing-census`, `bench-movers-census`,
 `bench-periodic-awareness` compared with v1.9.0 side by side: awareness deliveries
 identical, the rest within run-to-run noise (relay restart 208 vs 216 deliveries).
-Still open: the real phone on Ably and PubNub (`phone-session.mjs` is ready);
-Supabase and Matrix in the harness.
+Supabase and Matrix are still not in the harness.
+
+### The real phone on PubNub (v1.9.1)
+
+`phone-session.mjs pubnub`, Chrome on Android, eight desktop peers, one types every
+4 s; the phone's address carries room and keys (`?phone&room=...&pub=...&sub=...`,
+the playgrounds fill their form from it - no fetch of the session's config port).
+
+| absence | the link | roster whole after | first missed text after |
+|---|---|---|---|
+| another app in front, 42.7 s | kept | 506 ms | 84 ms |
+| display off, 67.2 s | rebuilt by the SDK (network issues -> reconnected) | 513 ms | 384 ms |
+| display off, 212 s | kept | 515 ms | 411 ms |
+
+Between the second and the third absence the phone's browser fired `offline` and,
+0.6 s later, `online` (the WiFi went, mobile data took over - the service is on the
+internet, so the page kept its network) - the sequence that destroyed the PubNub
+client before `restore: true`. The page heard the room on, and at the end its
+document was the room's, 179 of 179 characters. The room dropped the phone during
+every absence longer than 30 s (no Presence on the playground's keyset: the lease;
+the frozen page renews nothing) and had it back the moment it returned. Nothing
+wrong with the library.
 
 ## If it is built — order of work
 

@@ -186,7 +186,15 @@ async function main() {
     }
     const watcher = peers[0]
     const typist = peers[1]
-    console.log(`\nREADY - ${PEERS} desktop peers in the room. On the phone (same WiFi) open:\n\n    http://${LAN_IP}:${APP_PORT}/?phone${SERVER_PORT === 4470 ? '' : `&sig=${SERVER_PORT}`}\n`)
+    // A hosted service: key(s) and room in the address too - the page then needs no fetch of
+    // /config (a firewall that lets the playground's port through and not the beacon port).
+    const hostedParams =
+      TRANSPORT === 'ably'
+        ? `&room=${ROOM}&ablyKey=${encodeURIComponent(process.env.ABLY_KEY ?? '')}`
+        : TRANSPORT === 'pubnub'
+          ? `&room=${ROOM}&pub=${encodeURIComponent(process.env.PUBNUB_PUBLISH_KEY ?? '')}&sub=${encodeURIComponent(process.env.PUBNUB_SUBSCRIBE_KEY ?? '')}`
+          : ''
+    console.log(`\nREADY - ${PEERS} desktop peers in the room. On the phone (same WiFi) open:\n\n    http://${LAN_IP}:${APP_PORT}/?phone${SERVER_PORT === 4470 ? '' : `&sig=${SERVER_PORT}`}${hostedParams}\n`)
     say('watching')
 
     /** What peer d0 knows of the phone: is it in the awareness, and what does it report of itself? */

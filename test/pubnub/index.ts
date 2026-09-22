@@ -445,8 +445,18 @@ function setupConnectionForm() {
 
 async function start() {
   setupConnectionForm()
+  // `?pub=...&sub=...&room=...` fills the form (and spares a ?phone page the fetch below)
+  const pub = session.get('pub')
+  const sub = session.get('sub')
+  const room = session.get('room')
+  if (pub) (document.getElementById('config-publish-key') as HTMLInputElement).value = pub
+  if (sub) (document.getElementById('config-subscribe-key') as HTMLInputElement).value = sub
+  if (room) (document.getElementById('config-room') as HTMLInputElement).value = room
   if (sessionName === null) return
-  const config = await (await fetch(`http://${location.hostname}:${Number(session.get('sig') ?? 4470) + 1}/config`)).json()
+  const config =
+    pub && sub && room
+      ? { pubnubPublishKey: pub, pubnubSubscribeKey: sub, room }
+      : await (await fetch(`http://${location.hostname}:${Number(session.get('sig') ?? 4470) + 1}/config`)).json()
   ;(document.getElementById('config-publish-key') as HTMLInputElement).value = config.pubnubPublishKey
   ;(document.getElementById('config-subscribe-key') as HTMLInputElement).value = config.pubnubSubscribeKey
   ;(document.getElementById('config-room') as HTMLInputElement).value = config.room

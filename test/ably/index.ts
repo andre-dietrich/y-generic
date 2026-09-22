@@ -439,8 +439,16 @@ function setupConnectionForm() {
 
 async function start() {
   setupConnectionForm()
+  // `?ablyKey=...&room=...` fills the form (and spares a ?phone page the fetch below)
+  const ablyKey = session.get('ablyKey')
+  const room = session.get('room')
+  if (ablyKey) (document.getElementById('config-api-key') as HTMLInputElement).value = ablyKey
+  if (room) (document.getElementById('config-room') as HTMLInputElement).value = room
   if (sessionName === null) return
-  const config = await (await fetch(`http://${location.hostname}:${Number(session.get('sig') ?? 4470) + 1}/config`)).json()
+  const config =
+    ablyKey && room
+      ? { ablyKey, room }
+      : await (await fetch(`http://${location.hostname}:${Number(session.get('sig') ?? 4470) + 1}/config`)).json()
   ;(document.getElementById('config-api-key') as HTMLInputElement).value = config.ablyKey
   ;(document.getElementById('config-room') as HTMLInputElement).value = config.room
   ;(document.getElementById('config-debug') as HTMLInputElement).checked = true

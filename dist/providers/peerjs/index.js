@@ -40,7 +40,7 @@
  * await provider.connect({ room: 'my-room' })
  * ```
  */
-import { watchResume, watchPageBack } from '../resume';
+import { watchResume, watchPageBack, watchNetworkChange } from '../resume';
 /**
  * PeerJS transport implementation.
  * Creates direct peer-to-peer connections using PeerJS library.
@@ -136,6 +136,19 @@ export class PeerJSTransport {
         // moment to sit out a backoff (see reconnectNow). Browser only.
         if (!this._stopPageWatch)
             this._stopPageWatch = watchPageBack(() => this.reconnectNow());
+        // The page's network CHANGED: every link of ours runs over an address that
+        // is gone, and ICE says so only after 15 s (Chrome) to 30 s (Firefox) - the
+        // same repair as after a sleep (repro-peerjs-coordinator part 15,
+        // docs/.../2026-09-20-partial-mesh-relay-research.md "A phone that changes
+        // its network").
+        if (!this._stopNetworkChangeWatch) {
+            this._stopNetworkChangeWatch = watchNetworkChange((why) => {
+                if (!this._connected || this._destroying)
+                    return;
+                this.log(`⏰ ${why} — leaving and re-joining the room`);
+                this.rejoin(this._room, 0);
+            });
+        }
         // Strategy: Try to claim the coordinator ID first
         // If taken, we'll get an error and become a regular peer
         return new Promise((resolve, reject) => {
@@ -305,6 +318,8 @@ export class PeerJSTransport {
         this._reconnectAttempts = 0;
         this._stopResumeWatch?.();
         this._stopResumeWatch = undefined;
+        this._stopNetworkChangeWatch?.();
+        this._stopNetworkChangeWatch = undefined;
         this._stopPageWatch?.();
         this._stopPageWatch = undefined;
         if (!this._connected) {

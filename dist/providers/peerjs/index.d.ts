@@ -154,6 +154,7 @@ export declare class PeerJSTransport implements Transport {
     private _reconnectAttempts;
     private _reconnectTimer?;
     private _stopResumeWatch?;
+    private _stopNetworkChangeWatch?;
     private _stopPageWatch?;
     private _replacingPeer?;
     /**

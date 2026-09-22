@@ -42,7 +42,7 @@
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
-import { watchResume, watchPageBack, type ResumeWatch } from '../resume'
+import { watchResume, watchPageBack, watchNetworkChange, type ResumeWatch } from '../resume'
 
 /**
  * PeerJS constructor type (from peerjs library).
@@ -181,6 +181,7 @@ export class PeerJSTransport implements Transport {
   private _reconnectAttempts: number = 0 // signaling reconnect backoff
   private _reconnectTimer?: ReturnType<typeof setTimeout>
   private _stopResumeWatch?: ResumeWatch
+  private _stopNetworkChangeWatch?: () => void
   private _stopPageWatch?: () => void
   private _replacingPeer?: string // handleIncomingConnection(): this peer's close is not a departure
 
@@ -262,6 +263,19 @@ export class PeerJSTransport implements Transport {
     // Somebody looks at the page again, or the network is back: not the
     // moment to sit out a backoff (see reconnectNow). Browser only.
     if (!this._stopPageWatch) this._stopPageWatch = watchPageBack(() => this.reconnectNow())
+
+    // The page's network CHANGED: every link of ours runs over an address that
+    // is gone, and ICE says so only after 15 s (Chrome) to 30 s (Firefox) - the
+    // same repair as after a sleep (repro-peerjs-coordinator part 15,
+    // docs/.../2026-09-20-partial-mesh-relay-research.md "A phone that changes
+    // its network").
+    if (!this._stopNetworkChangeWatch) {
+      this._stopNetworkChangeWatch = watchNetworkChange((why) => {
+        if (!this._connected || this._destroying) return
+        this.log(`⏰ ${why} — leaving and re-joining the room`)
+        this.rejoin(this._room, 0)
+      })
+    }
 
     // Strategy: Try to claim the coordinator ID first
     // If taken, we'll get an error and become a regular peer
@@ -437,6 +451,8 @@ export class PeerJSTransport implements Transport {
     this._reconnectAttempts = 0
     this._stopResumeWatch?.()
     this._stopResumeWatch = undefined
+    this._stopNetworkChangeWatch?.()
+    this._stopNetworkChangeWatch = undefined
     this._stopPageWatch?.()
     this._stopPageWatch = undefined
     if (!this._connected) {

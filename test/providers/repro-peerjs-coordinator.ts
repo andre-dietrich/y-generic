@@ -51,6 +51,12 @@
  *  Part 11 - the page was suspended: Date.now() jumps by 60 s
  *            (resumeAfterMs: 15000). Does the transport leave and re-join
  *            under a new Peer?
+ *  Part 15 - the page's network changed under it (the WiFi off, mobile data on):
+ *            every link runs over an address that is gone, and waiting for ICE
+ *            to say so cost a real phone 15 s on Chrome and 25-30 s on Firefox
+ *            (phone-session.mjs simple-peer, 2026-09-22; PeerJS waits the same
+ *            way). Does the transport leave and join again at once - and stay
+ *            put for a `change` that is no change of the network?
  *  Part 14 - the page slept, and the PeerJS server is not there when it
  *            re-joins (it refuses the first two Peers). Found by
  *            room-scenarios.mjs peerjs, STORM=faults (three pages unfrozen
@@ -66,8 +72,18 @@ import { PeerJSTransport } from '../../src/providers/peerjs/index'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// The transport checks navigator.onLine before it reconnects.
-Object.defineProperty(globalThis, 'navigator', { value: { onLine: true }, configurable: true })
+// The transport checks navigator.onLine before it reconnects; watchNetworkChange
+// (src/providers/resume.ts) reads the page's network from the same object.
+class FakeConnection extends EventTarget {
+  type = 'wifi'
+  effectiveType = '4g'
+  switchTo(type: string): void {
+    this.type = type
+    this.dispatchEvent(new Event('change'))
+  }
+}
+const connection = new FakeConnection()
+Object.defineProperty(globalThis, 'navigator', { value: { onLine: true, connection }, configurable: true })
 // ... and listens for the tab becoming visible and the browser's `online` (part 13).
 const pageListeners: Record<string, Set<() => void>> = {}
 const eventTarget = {
@@ -231,6 +247,8 @@ async function claimedCoordinator() {
   return { transport, coordinator }
 }
 
+let failed = false
+
 async function main() {
   console.log("Part 1 - coordinator, PeerJS emits the non-fatal 'peer-unavailable'")
   {
@@ -391,8 +409,27 @@ async function main() {
     transport.disconnect()
   }
 
+  console.log('\nPart 15 - the network changed under the page: navigator.connection wifi -> cellular')
+  {
+    const { transport, regular } = await regularPeer(['zzz-b'])
+    connection.type = 'wifi'
+    connection.effectiveType = '3g' // no change of the network
+    connection.dispatchEvent(new Event('change'))
+    await sleep(1200)
+    const afterNoise = Server.all.filter((p) => p !== regular && !p.destroyed).length
+    connection.switchTo('cellular')
+    await sleep(1500)
+    const fresh = Server.all.filter((p) => !p.destroyed && p !== regular).map((p) => p.id)
+    const ok = regular.destroyed && fresh.length > 0 && afterNoise === 0
+    console.log(
+      `  1.5 s after the switch: old Peer destroyed = ${regular.destroyed}, new Peer: ${fresh.join(', ') || 'none'}; after an effectiveType change only: ${afterNoise} new Peers (want 0)`,
+    )
+    if (!ok) failed = true
+    console.log(`  ${ok ? 'ok' : 'FAIL'}`)
+    transport.disconnect()
+  }
+
   console.log('\nPart 14 - the page slept, and the server refuses the first two Peers of the re-join')
-  let failed = false
   {
     const { transport, regular } = await regularPeer(['zzz-b'])
     Server.refuseNew = 2

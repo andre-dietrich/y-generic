@@ -160,6 +160,8 @@ export declare class GunTransport implements Transport {
     private pendingUpdates;
     private updateSlot;
     private readonly BUFFER_SIZE;
+    private writerId;
+    private writeSeq;
     private awarenessListener;
     private lastAwarenessId;
     private ownAwarenessId;
@@ -336,6 +338,13 @@ export declare class GunTransport implements Transport {
      * Uses only BUFFER_SIZE slots to prevent infinite accumulation.
      */
     private generateUpdateId;
+    private slotKey;
+    /**
+     * The writer id: per tab, and the same after a reload (sessionStorage), so
+     * the relay's graph grows by a ring per tab rather than per page load - it
+     * keeps every slot, and a joiner is replayed all of them.
+     */
+    private stableWriterId;
     /**
      * Schedule a debounced snapshot write. Called on every doc update.
      * Always saves the latest full state, never an individual delta.

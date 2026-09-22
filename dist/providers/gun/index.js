@@ -76,10 +76,12 @@ function addCRC32Header(data) {
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
-// The one update slot a page that unloads writes into - warmed at connect, so
-// that write needs no round trip (flush()). Not one of the circular buffer's
-// slots, so it overwrites nothing a peer may still be missing.
-const UNLOAD_SLOT = 'slot-unload';
+// The update slot a page that unloads writes into (`slot-<writer>-unload`) -
+// warmed at connect, so that write needs no round trip (flush()). Not one of
+// the circular buffer's slots, so it overwrites nothing a peer may still be
+// missing; and a writer's own, so two pages that unload at once do not
+// overwrite each other either.
+const UNLOAD_SLOT = 'unload';
 // A presence slot older than this is ignored on receipt: the relay keeps
 // every slot ever written and `.map().on()` replays all of them to a
 // joiner, so without a bound a joiner inherited one phantom presence per
@@ -120,7 +122,16 @@ export class GunTransport {
         this.processedUpdates = new Set();
         this.pendingUpdates = new Map();
         this.updateSlot = 0;
-        this.BUFFER_SIZE = 20; // Circular buffer size
+        // Each writer its own ring of update slots (`slot-<writer>-<n>`). One ring
+        // for the room, every writer counting from slot-0, made concurrent writers
+        // put into the same keys - gun keeps one - and the receivers' dedupe key
+        // (slot, 100 ms window) made two writers in one slot one update: five
+        // writers at 4 Hz, 60 of 200 frames heard live (test/gun/repro-concurrent-
+        // writers.mjs); ten typing peers, the lag typed -> seen 13 s at the median,
+        // 52 s at p95 - the core's resync filled the holes (room-scenarios STORM).
+        this.BUFFER_SIZE = 10; // slots per writer
+        this.writerId = '';
+        this.writeSeq = 0;
         this.awarenessListener = null;
         this.lastAwarenessId = ''; // Track last awareness ID to avoid processing our own
         this.ownAwarenessId = null; // Stable per-client slot key under the awareness node
@@ -245,6 +256,7 @@ export class GunTransport {
             });
         }
         this._connected = true;
+        this.writerId = this.stableWriterId();
         // Warm the slot a page that unloads writes its last words into (see
         // flush()): gun sends a `get` for a node it does not know yet and puts
         // only when the answer is in - a round trip a page that is going away
@@ -252,7 +264,7 @@ export class GunTransport {
         // `data: null` is ignored by every receiver (setupUpdateListener).
         this.roomNode
             .get('updates')
-            .get(UNLOAD_SLOT)
+            .get(this.slotKey(UNLOAD_SLOT))
             .put({ data: null, timestamp: Date.now() });
         // Persistence: load existing snapshot or clear it for a fresh session
         this.snapshotLoaded = false;
@@ -489,7 +501,7 @@ export class GunTransport {
             clearTimeout(this.batchTimeout);
             this.batchTimeout = undefined;
         }
-        this.flushBatch(UNLOAD_SLOT);
+        this.flushBatch(this.slotKey(UNLOAD_SLOT));
         const turn = setTimeout
             .turn;
         if (!turn?.s)
@@ -791,7 +803,10 @@ export class GunTransport {
         // Create update object with circular buffer slot
         const updateId = slotId ?? this.generateUpdateId();
         const timestamp = Date.now();
-        const sequence = Math.floor(timestamp / 100); // Sequence number per 100ms
+        // Unique per write - the receivers dedupe on (slot, sequence). Not the
+        // 100 ms window it used to be (two writes of one slot within 100 ms were
+        // one), and not a counter alone: a reloaded tab keeps its writer id.
+        const sequence = `${timestamp}.${++this.writeSeq}`;
         // Mark as processed so we don't receive our own update
         this.processedUpdates.add(`${updateId}-${sequence}`);
         // Store in Gun using circular buffer slot
@@ -832,9 +847,33 @@ export class GunTransport {
      * Uses only BUFFER_SIZE slots to prevent infinite accumulation.
      */
     generateUpdateId() {
-        const slotId = `slot-${this.updateSlot}`;
+        const slotId = this.slotKey(String(this.updateSlot));
         this.updateSlot = (this.updateSlot + 1) % this.BUFFER_SIZE;
         return slotId;
+    }
+    slotKey(n) {
+        return `slot-${this.writerId}-${n}`;
+    }
+    /**
+     * The writer id: per tab, and the same after a reload (sessionStorage), so
+     * the relay's graph grows by a ring per tab rather than per page load - it
+     * keeps every slot, and a joiner is replayed all of them.
+     */
+    stableWriterId() {
+        const fresh = () => Math.random().toString(36).slice(2, 10);
+        try {
+            const store = globalThis.sessionStorage;
+            if (!store)
+                return fresh();
+            const key = `ygen-gun-writer-${this._room}`;
+            let id = store.getItem(key);
+            if (!id)
+                store.setItem(key, (id = fresh()));
+            return id;
+        }
+        catch {
+            return fresh();
+        }
     }
     // ---------------------------------------------------------------------------
     // Persistence helpers

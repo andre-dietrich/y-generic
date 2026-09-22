@@ -215,13 +215,21 @@ Gun stores Yjs updates in a graph structure:
 gun
   .get('yjs-room-my-room')    // Room node
   .get('updates')              // Updates collection
-  .get(updateId)               // Individual update
+  .get(updateId)               // slot-<writer>-<0..9>: a ring of 10 per writer
   .put({
     data: 'base64String',      // Yjs update (base64 encoded)
     timestamp: 1234567890,     // Creation timestamp
+    sequence: '1234567890.17', // unique per write: what receivers dedupe on
     size: 1024                 // Update size in bytes
   })
 ```
+
+Every writer has its own ring of slots (the writer id lives in the tab's
+`sessionStorage`, so a reload keeps it and the relay's graph grows by a ring
+per tab, not per page load). One ring of 20 for the whole room, every writer
+counting from `slot-0`, made concurrent writers put into the same keys - gun
+keeps one of them - and the receivers' dedupe key (slot and 100 ms window)
+turned two writers into one update.
 
 ## Local vs Remote Sync
 
@@ -350,6 +358,16 @@ Updates are batched to reduce network overhead:
    WebSocket frames while joining and ~50 frames/s when idle (Ably or
    PubNub: 1-3 frames in 10 idle seconds) - acks and relayed gets, not
    this transport's messages.
+
+8. **Concurrent writers overwrote each other's updates** (v1.9.4): the update
+   slots were one ring for the room (see Data Structure). Five writers at
+   4 Hz: 60 of 200 frames heard live (`test/gun/repro-concurrent-writers.mjs`,
+   now 200 of 200, and 400 of 400 with ten); 25 browsers with ten typing
+   (`room-scenarios.mjs gun`, `SCENARIOS=join,storm`): typed -> seen
+   elsewhere 13.3 s at the median and 52.5 s at p95, nothing lost in the end -
+   the core's resync filled every hole. Now 360 / 529 ms. What it costs: gun's
+   own acks and gets for every update that now arrives - ~600 frames/s of the
+   room while ten type (~120 before, when most of the updates never did).
 
 ## Public Gun Relays
 

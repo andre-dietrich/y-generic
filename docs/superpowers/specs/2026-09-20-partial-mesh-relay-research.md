@@ -1297,3 +1297,52 @@ typist was typing at that moment; Yjs ordered the two concurrent inserts by clie
 id and a token lay on both sides of 100 KB: 24-72 "missing" with every document
 identical. The block goes to the very start now: 0 missing everywhere.
 
+## A phone that changes its network: simple-peer (2026-09-22, v1.9.5)
+
+André, on a deployment of his own: with simple-peer on the phone, switching the
+WiFi off (mobile data takes over) or on again costs **over 10 s** until the room is
+back - both directions. `phone-session.mjs simple-peer` with the ICE states in the
+phone's own timeline, 8 desktop peers, WiFi off ~20 s and on again, twice per browser:
+
+| the phone's page | Chrome before | Chrome after | Firefox before | Firefox after |
+|---|---|---|---|---|
+| the browser says the network changed | 0.6 s after the switch | the same | `offline`/`online` 0.3 s apart | the same |
+| ICE says `disconnected` | 5 s | - | 6 s | - |
+| **the links are closed** | **15 s** | **0.1 s** | 25-30 s | 0.5 s |
+| one signaling attempt + its wait | 10 s + up to 15 s | 4 s + up to 4.5 s | the same | the same |
+| out of the room, as the room saw it | 15 s | 6.6 s | 60 s | 13 s |
+
+Two causes, each with a red-first gate in `repro-simple-peer-sleep.ts`:
+
+**The links waited for ICE.** `watchPageBack` dialled the signaling server again and
+left every link alone - and they all ran over an address that was gone. The new
+`watchNetworkChange` (src/providers/resume.ts) says when the page's NETWORK changed,
+not when the page is back: a `navigator.connection` `change` whose `type` differs and
+is not "none" (Android fires a change for every effectiveType estimate - part 15
+keeps those free), or `online` after an `offline` where there is no
+`navigator.connection` (Firefox, Safari). The transport then does what it does after
+a sleep: drop every link, a new peer id, dial at once (parts 13 and 14: links dropped
+`false` -> `true` within 1.5 s).
+
+**Firefox says nothing when the WiFi comes back** - no `navigator.connection`, no
+second `online`. Only the next signaling attempt finds the network, and each one cost
+its full 10 s timeout plus a backoff that had grown to 9.6 s: the phone's second WiFi
+cycle took 60 s to get back into the room. While the room is lost (no socket, no
+link) an attempt costs nothing, so it now times out after 4 s and the backoff is
+capped at 3 s; with links in hand both stay as they were (part 16: the second attempt
+after 12.6 s -> 7.4 s).
+
+**PeerJS and Trystero waited the same way** and got the same watch: PeerJS leaves and
+re-joins (its re-join is the one that keeps trying, part 14), Trystero leaves the room
+and joins it again - `repro-peerjs-coordinator` part 15 and `repro-trystero-oneway`
+part 3, both red before, and both with the control that a `change` of the connection
+which is no change of the network does nothing. The relay transports need none of it:
+a phone's OS closes their sockets when the interface goes, and they see that at once
+(the phone's own timeline: "signaling closed" in the same moment).
+
+25 browsers, every scenario, afterwards: simple-peer (rosters complete 8 ms after the
+join, 24 links per peer), PeerJS (1.9 s, 24 links, the killed coordinator in 23.0 s),
+Trystero (0.4 s, 24 links) and conference (0.4 s, 4-16 links) all as before, only the
+five frozen pages report a sleep. `repro-simple-peer-sparse` and `bench-partial-mesh`
+pass.
+

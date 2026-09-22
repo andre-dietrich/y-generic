@@ -218,6 +218,17 @@ core's: periodic beacons are suppressed less when paths differ in length (N=300:
 
 `src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds
 `Date.now()` far ahead of its last tick), used by both mesh transports to re-join under a new id.
+`watchNetworkChange` says the page's NETWORK CHANGED (a `navigator.connection` `change` of the
+`type`, or `online` after `offline` where there is none - Firefox): every WebRTC link then runs
+over an address that is gone, and waiting for ICE to say so costs 15 s in Chrome and 25-30 s in
+Firefox - the three mesh transports drop their links and re-join at once, as after a sleep
+(`repro-simple-peer-sleep` parts 13-16, `repro-peerjs-coordinator` part 15,
+`repro-trystero-oneway` part 3; each with the control that a `change` which is no change of
+the network does nothing). A relay
+transport needs none: the phone's OS closes its socket with the interface. And while a mesh
+transport has no socket and no link, a signaling attempt times out after 4 s and its backoff is
+capped at 3 s (Firefox reports NOTHING when the WiFi comes back: only the next attempt finds it -
+a phone was 60 s out of the room).
 `watchPageBack` next to it is the shared "the page has its network again" - `visibilitychange`
 to visible, `online`, and `change` on `navigator.connection` (a phone that falls back to mobile
 data says `online` when the WiFi GOES, not when it is back): simple-peer, PeerJS, Nostr,

@@ -172,6 +172,7 @@ export declare class GenericProvider extends Observable<string> {
     private _presenceResponseTimer?;
     private _pendingAwarenessRemoval;
     private _presenceHeardAt;
+    private _presenceHeardClock;
     private _pendingAwarenessRemovalTimeoutId?;
     private _peerConnectDebounceMs;
     private _pendingPeerConnectSyncTimeoutId?;
@@ -1177,7 +1178,8 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _sendBatch;
     /** Is this a presence message (or a batch with one) that carries our own, non-null state? */
-    private _carriesOwnPresence;
+    /** The clock of our own state in this message (or a batch with one), -1 if it carries none. */
+    private _ownPresenceClock;
     /** Is this a message (or a batch with one) whose receivers _touchPeer() its sender? */
     private _provesPresence;
     /** The MESSAGE_BATCH envelope of `_sendBatch`, without sending it. */

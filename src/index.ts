@@ -649,6 +649,9 @@ export class GenericProvider extends Observable<string> {
   // just renewed and the room heard nothing of it for leases
   // (test/dummy/bench-removed-at-old-clock.ts, part 2).
   private _presenceHeardAt = 0
+  // ... and at which clock: a frame that carries our state at a clock the
+  // room already has renews us nowhere (y-protocols ignores an equal clock).
+  private _presenceHeardClock = -1
   private _pendingAwarenessRemovalTimeoutId?: ReturnType<typeof setTimeout>
 
   // onPeerConnect debounce: coalesces a burst of near-simultaneous
@@ -3508,10 +3511,13 @@ export class GenericProvider extends Observable<string> {
     removed: number[]
     present: number[]
     coversUs: boolean
+    /** the clock of our own (non-null) state in it, -1 if it carries none */
+    ownClock: number
   } {
     const removed: number[] = []
     const present: number[] = []
     let coversUs = false
+    let ownClock = -1
     try {
       const d = decoding.createDecoder(payload)
       const len = decoding.readVarUint(d)
@@ -3524,6 +3530,7 @@ export class GenericProvider extends Observable<string> {
         else {
           present.push(clientID)
           if (clientID === this.awareness.clientID && clock >= ourClock) coversUs = true
+          if (clientID === this.awareness.clientID) ownClock = Math.max(ownClock, clock)
         }
       }
     } catch {
@@ -3531,7 +3538,7 @@ export class GenericProvider extends Observable<string> {
       // that deals with it (or throws); suppression is a pure optimization,
       // never worth failing the actual message handling over.
     }
-    return { removed, present, coversUs }
+    return { removed, present, coversUs, ownClock }
   }
 
   /**
@@ -4249,20 +4256,20 @@ export class GenericProvider extends Observable<string> {
   }
 
   /** Is this a presence message (or a batch with one) that carries our own, non-null state? */
-  private _carriesOwnPresence(message: Uint8Array): boolean {
-    const carries = (m: Uint8Array) => {
-      if (m[0] !== MESSAGE_AWARENESS) return false
+  /** The clock of our own state in this message (or a batch with one), -1 if it carries none. */
+  private _ownPresenceClock(message: Uint8Array): number {
+    const clockIn = (m: Uint8Array) => {
+      if (m[0] !== MESSAGE_AWARENESS) return -1
       const decoder = decoding.createDecoder(m)
       decoding.readVarUint(decoder)
-      return this._scanAwarenessPayload(decoding.readVarUint8Array(decoder)).present.includes(this.doc.clientID)
+      return this._scanAwarenessPayload(decoding.readVarUint8Array(decoder)).ownClock
     }
-    if (message[0] !== MESSAGE_BATCH) return carries(message)
+    if (message[0] !== MESSAGE_BATCH) return clockIn(message)
     const decoder = decoding.createDecoder(message)
     decoding.readVarUint(decoder)
-    while (decoding.hasContent(decoder)) {
-      if (carries(decoding.readVarUint8Array(decoder))) return true
-    }
-    return false
+    let clock = -1
+    while (decoding.hasContent(decoder)) clock = Math.max(clock, clockIn(decoding.readVarUint8Array(decoder)))
+    return clock
   }
 
   /** Is this a message (or a batch with one) whose receivers _touchPeer() its sender? */
@@ -4305,9 +4312,22 @@ export class GenericProvider extends Observable<string> {
     // there every 30 s and the removal told to the room - a real phone saw
     // its roster fall to 3-6 of 9 twice a minute. There only our own
     // presence entry counts.
-    if ((this._verifyUpdates && this._provesPresence(data)) || this._carriesOwnPresence(data)) {
+    //
+    // And our presence entry only at a clock the room has not had yet. The
+    // answer to a joiner's JOIN is the room's presence table, ours in it at
+    // the clock everybody else already holds: it tells the joiner about us
+    // and renews us nowhere else (y-protocols ignores an equal clock). On a
+    // relay, where such a table is how a joiner learns the room, a settled
+    // peer that answered joins more often than every half lease never
+    // renewed, and everybody but the joiners expired it
+    // (test/dummy/bench-renewal-under-churn.ts RELAY=1; 25 browsers on
+    // PubNub with a reload every 6 s: a peer missing from a roster 30 s
+    // after it last renewed).
+    const ownClock = this._ownPresenceClock(data)
+    if ((this._verifyUpdates && this._provesPresence(data)) || ownClock > this._presenceHeardClock) {
       this._presenceHeardAt = Date.now()
     }
+    if (ownClock > this._presenceHeardClock) this._presenceHeardClock = ownClock
 
     // Wrap message with CRC32 checksum
     const wrappedData = wrapMessageWithChecksum(data)

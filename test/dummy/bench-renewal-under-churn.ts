@@ -22,8 +22,18 @@
  * number of settled peers any settled peer had in its roster, sampled from
  * one lease in until three. Exit code 1 if it ever was below M.
  *
+ * RELAY=1: the same on a relay hub (no peer events, no unicast - PubNub, Ably,
+ * Nostr, Gun). Found by room-scenarios.mjs pubnub with a reload every 6 s
+ * (SCENARIOS=join,linger LINGER_GAP_MS=5000, 2026-09-22): a peer missing from
+ * rosters 30 s - one lease - after it last renewed. There a joiner learns the
+ * room from the presence table one settled peer answers its JOIN with, and a
+ * frame that carried our state counted as a renewal - at the clock everybody
+ * else already held, which y-protocols ignores. The answering peer renewed
+ * nowhere and never renewed again. Failed 3 of 3 runs before the fix
+ * (_send: our state counts only at a clock the room has not had yet).
+ *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/dummy/bench-renewal-under-churn.js
- *      M=6 LEASE_MS=4000 VISIT_MS=1200 override.
+ *      M=6 LEASE_MS=4000 VISIT_MS=1200 override; RELAY=1 for the relay hub.
  */
 
 import * as Y from 'yjs'
@@ -34,6 +44,7 @@ import { sleep, silenced } from './bench-user-scaling'
 const M = Number(process.env.M ?? 6)
 const LEASE_MS = Number(process.env.LEASE_MS ?? 4000)
 const VISIT_MS = Number(process.env.VISIT_MS ?? 1200)
+const RELAY = !!process.env.RELAY // no peer events, no unicast: PubNub, Ably, Nostr
 
 async function main() {
   let smallest = M
@@ -42,7 +53,7 @@ async function main() {
     const hub = new DummyHub()
     const room = `bench-renewal-${Math.random().toString(36).slice(2)}`
     const join = async (name: string) => {
-      const transport = new DummyTransport({ hub, latency: 5, simulatePeerConnect: true, unicast: true })
+      const transport = new DummyTransport(RELAY ? { hub, latency: 5 } : { hub, latency: 5, simulatePeerConnect: true, unicast: true })
       const provider = new GenericProvider(new Y.Doc(), transport, { disableBc: true, awarenessTimeoutMs: LEASE_MS })
       await provider.connect({ room })
       provider.awareness.setLocalStateField('user', { name })

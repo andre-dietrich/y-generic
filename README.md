@@ -350,6 +350,11 @@ See `examples.ts` for complete implementations of:
 - **PubNubTransport**: Pub/sub messaging
 - **IndexedDBTransport**: Local persistence (acts as a "transport")
 
+The shipped transports live under `genericprovider/providers/<name>` - see
+`src/providers/README.md`. The WebRTC ones (simple-peer, peerjs, trystero) build a
+full mesh and hold up to ~50 browsers; for rooms of 100+ peers wrap simple-peer in
+`genericprovider/providers/conference` (`src/providers/conference/README.md`).
+
 When you combine a persistence provider with a network provider on the
 same `Y.Doc`, connect the persistence provider first and wait for its
 `synced` event before calling `connect()` on the network provider. The

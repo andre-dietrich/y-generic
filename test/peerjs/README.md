@@ -84,7 +84,7 @@ const transport = new PeerJSTransport({
     }
   },
   password: 'optional-encryption',
-  maxConns: 30,
+  maxConns: 64, // the default; every peer of the room must fit - the core needs a full mesh
   debug: true
 })
 ```

@@ -42,6 +42,12 @@ cause - the update listener's initial load - and one fix; a joiner in a room who
 peers are all gone has the document again. No new API, no wire-format change.
 On 2026-09-22 (v1.9.0) `linger` on WebSocket and Nostr, Chrome and Firefox: no
 incomplete roster, nothing to fix ("`linger` on WebSocket and Nostr").
+The same day Ably and PubNub through everything since round 8 ("Ably and PubNub
+through the tests of rounds 9 to 11"): three fixes in the PubNub transport (a page
+whose network came back deaf for good, the provider never told of a link that came
+back, a reloaded page's removal lost to the unload), one in the Ably transport
+(`watchPageBack`), one in the core (on a relay, a peer that answered joins stopped
+renewing). No new API, no wire-format change.
 
 André's question: the WebRTC transports here need a full mesh, y-webrtc holds at
 most 20-30 connections per peer and passes messages on, which scales better in
@@ -1046,6 +1052,110 @@ leases and three and a half of the Nostr playground's 120 s ones.
 No send refused, nothing to fix. Every relay transport that runs in the harness
 without a hosted service has now been through `linger`; Ably and PubNub (live) have
 not, Supabase and Matrix are not in the harness at all.
+
+## Ably and PubNub through the tests of rounds 9 to 11 (2026-09-22)
+
+The two hosted backends had last been in the harness in the third pass of round 8
+(v1.8.0); since then Firefox, `linger`, the real phone and five core changes had
+gone past them. Run on v1.9.0 (`main` @ f4d4c62) against the live services, 25
+peers. New in the harness for it: `offline` (opt-in: one Chrome page loses its
+network through the DevTools protocol for `OFFLINE_MS`, 20 s - the browser fires
+`offline` and `online`, which the proxy cut of `restart` never does), `OUTAGE_MS`
+for a longer `restart` plus "every roster complete again" after it (measured once
+the text is in: right after the cut every roster is still whole),
+`LINGER_GAP_MS` (the check 5 s after each reload instead of 55 s: a ghost of a
+30 s lease is gone by 55 s), an immediate DIAG when a `linger` check fails, the
+core's view of a missing peer for relays too, and one line per kind of refused
+send. The Ably and PubNub playgrounds expose `__provider` (DIAG, the final Y.Text
+check) and understand `?phone` / `?desk` (`phone-session.mjs ably|pubnub`: the
+page fetches key and room from the session script, the phone cannot read `.env`).
+
+What passed as it was: `linger` on both, Chrome and ten Firefox tabs (no incomplete
+roster; Ably 12 / 54 refused sends, all during the join - the free tier's 50/s);
+the standard scenarios on both, Chrome and Firefox; `offline` on Ably (ably-js
+dials at once on `online`). Four findings, each with a red-first gate:
+
+**1. PubNub: a page whose network went and came back never heard the room again.**
+`offline` on PubNub: the returner got no text, its roster fell to 1 of 8, its
+document stayed apart - and it went on sending. Read in pubnub.10.2.7.js: with
+the default `restore: false` the browser's `offline` makes the SDK `destroy()` the
+client, which unsubscribes from every channel; `online` then restarts a subscribe
+loop with an empty channel list, which returns at once. The transport makes its
+client with `restore: true` now.
+
+**2. PubNub: the provider was never told that the link came back.** The only relay
+transport without `onPeerConnect`. After a 45 s outage (longer than the 30 s lease:
+every page expired the room) the rosters healed only through renewals and beacons
+of whoever came first. The transport reports the return now - the browser's
+`online`, or the SDK's own reconnect after a failed subscribe (`PNNetworkIssues` ->
+polling every 3 s -> `PNReconnected`), `isConnected` false in between. Gate for 1
+and 2: `test/providers/repro-pubnub-lifecycle.ts` (a scripted PubNub following the
+SDK's two paths, line numbers of 10.2.7 in its header).
+
+| PubNub, 25 Chrome (8 for `offline`) | before | after |
+|---|---|---|
+| `offline` 20 s: the returner has the text typed meanwhile | never | 403 ms |
+| `offline`: every roster complete | never (returner 1 of 8) | 1,348 ms |
+| outage 45 s: text typed during it everywhere | 9,290 ms | 3,640 ms |
+| outage 45 s: every roster complete | 14,518 ms | 3,641 ms |
+| outage 5 s: text typed during it everywhere | 7,663 ms | 1,616 / 1,214 (Firefox) ms |
+| failed publishes, 45 s outage run | 151 | 0 |
+
+**3. PubNub: a reloaded page was sometimes a ghost for the lease.** `rejoin` 19,947 ms
+in one run ("a live name twice" in every roster). A publish is a `fetch` of the
+SDK's without `keepalive` (there is no option): an unloading page can take it along
+before it left - every reload logs the SDK's "Publish error", most removals arrive
+anyway. `linger` with `LINGER_GAP_MS=5000` (35 reloads in 180 s): 2 ghosts. The
+transport's `flush()` sends what went out in the unloading task once more as a
+`keepalive` POST to the publish endpoint (not with a `cipherKey`); a copy that
+arrives twice changes nothing. Gate: part 6 of the same repro.
+
+**4. Core: on a relay, a settled peer that answered joins stopped renewing.** The same
+35-reload run showed the opposite of a ghost: peers missing from rosters - p8 held
+p14 at p14's own clock 5, last heard 30.3 s before, one lease. p14 believed the
+room had just heard it. On a relay a joiner learns the room from the presence table
+one settled peer answers its JOIN with, and `_send` counted any frame that carried
+our own state as a renewal - at a clock everybody but the joiner already held,
+which y-protocols ignores. A peer that answered joins more often than every half
+lease renewed nowhere and never renewed again. `bench-renewal-under-churn.ts`
+gained `RELAY=1` (no peer events, no unicast): failed 3 of 3 before, passes 5 of 5
+after; the mesh mode passes as before. Fix: our state counts as heard only at a
+clock the room has not had yet (`_presenceHeardClock`). It is the likely cause of
+the one Ably moment seen: in the Firefox `linger` run p14 was missing from two
+rosters at the final check, one 300 s lease after its reload - but an Ably run of
+80 reloads in 420 s on the unfixed code showed nothing (0 of 80 checks incomplete,
+as after the fix): there a peer's own digest beacons, backed off to at most 60 s,
+refresh it well within the 300 s lease most of the time.
+
+| PubNub, 25 Chrome, `SCENARIOS=join,linger LINGER_MS=180000 LINGER_GAP_MS=5000` | checks with an incomplete roster |
+|---|---|
+| with 1 and 2 | 4 of 35 (two ghosts, rosters of 26 and 27) |
+| with 1, 2 and 3 (two runs) | 4 of 35 and 2 of 35 (no ghost; peers missing, up to 9 from one roster) |
+| with 1 to 4 | 0 of 35 |
+| Ably with 4 and 5, `LINGER_MS=420000` | 0 of 80 (v1.9.0: 0 of 80 as well) |
+
+**5. Ably: after an outage, ably-js takes its time.** Not a bug in the library: a 5 s
+outage costs 15.3 s (its retry every 15 s), a 45 s outage 28.6 s (the retry backs
+off) until the text typed during it is everywhere; the rosters follow ~1 s after
+the last peer is back (Ably's presence reports the leave of every peer that is not
+back yet to those that are - measured with the connection ids in the transport's
+log). ably-js dials at once on `online` only; the project's rule for relay
+transports (`watchPageBack`) was missing: a phone whose WiFi comes back while it
+is on mobile data gets no `online`. The transport asks `connection.connect()` when
+the page is back and the connection `disconnected` or `suspended` (part 7 of
+`repro-ably-lifecycle.ts`; in the `offline` scenario the transport dialed on
+`online` and was connected 92 ms later). The silent return of a network that the
+browser does not report (the proxy cut) keeps ably-js's retry; a shorter
+`disconnectedRetryTimeout` would be the lever, not changed here.
+
+Regression: all Node gates of `tsconfig.bench.json` pass (without
+`bench-persist-log`, which needs `fake-indexeddb`, and the service-bound
+`e2e-edrys-ws` / `repro-liveobjects-persist`); `bench-idle-room`,
+`bench-relay-return-roster`, `bench-typing-census`, `bench-movers-census`,
+`bench-periodic-awareness` compared with v1.9.0 side by side: awareness deliveries
+identical, the rest within run-to-run noise (relay restart 208 vs 216 deliveries).
+Still open: the real phone on Ably and PubNub (`phone-session.mjs` is ready);
+Supabase and Matrix in the harness.
 
 ## If it is built — order of work
 

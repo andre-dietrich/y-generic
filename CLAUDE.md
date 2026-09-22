@@ -136,13 +136,21 @@ backend REPLAYS of the document must reach a joiner whose peers are all gone - a
 that skips what arrives before it called back loses exactly that, and the first update of a fresh
 room too), `test/providers/repro-ably-lifecycle.ts` (a
 scripted Ably `Realtime`: its own reconnect, a channel over its message rate),
+`test/providers/repro-pubnub-lifecycle.ts` (a scripted PubNub along the SDK's two paths: the
+browser's `offline` DESTROYS a client made without `restore: true` - deaf for good after `online`;
+a failed subscribe polls back; an unloading page's publish needs a `keepalive` copy, `flush()`),
 `test/dummy/bench-rate-limited-channel.ts` (a backend that REFUSES a publish loses it for every
 receiver at once), `test/dummy/bench-last-joiner-roster.ts` (presence on demand) and
 `test/dummy/bench-renewal-under-churn.ts` (what goes to ONE peer must not count as a presence
-renewal to the room - found at 50 browsers only because that run outlived a 300 s lease). A relay
+renewal to the room - found at 50 browsers only because that run outlived a 300 s lease; `RELAY=1`:
+nor does our state at a clock the room already holds - the presence table a settled peer answers
+a relay joiner with renewed it nowhere, PubNub with a reload every 6 s). A relay
 transport whose link comes BACK by itself tells the provider through `onPeerConnect` (websocket,
-nostr, ably, gun) - never for the first connect. Opt-in scenarios of the harness: `linger`
-(outlives a presence lease under churn - a passing standard run is over before one is),
+nostr, ably, gun, pubnub) - never for the first connect. Opt-in scenarios of the harness: `linger`
+(outlives a presence lease under churn - a passing standard run is over before one is;
+`LINGER_GAP_MS=5000` checks while a short lease's ghost is still there), `offline` (a page's
+network goes and comes back through the DevTools protocol - the browser fires `offline`/`online`,
+the proxy cut of `restart` never does; `OUTAGE_MS=` makes that cut outlast a lease),
 `bandwidth` (bytes per peer from `getStats()`) and `oneway` (a link that receives and cannot send,
 made on purpose - Chrome does that by itself about once per 50-peer join: an `RTCDataChannel`
 object that stays at `connecting` after its own `open`; a transport must rebuild a link whose
@@ -154,7 +162,7 @@ Firefox delays a hidden tab's timers by up to ~20 s in a busy room; `FIREFOX_EAC
 and a visible tab each). That is why a late timer is not a sleep: `watchResume` reports one only
 when ticks AND links were silent for `resumeAfterMs` (30 s), at the first sign of life after the
 silence - never "a message means awake", a waking page handles its queued messages first
-(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|peerjs|nostr|websocket|gun>`: a real
+(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|peerjs|nostr|websocket|gun|ably|pubnub>`: a real
 phone in a room of headless peers, reporting on itself through its presence. What a page
 still owes the room when it unloads (its presence removal, a pending update batch) must not
 wait for a timer - a hidden Firefox tab runs none before it is gone:
@@ -205,8 +213,8 @@ core's: periodic beacons are suppressed less when paths differ in length (N=300:
 `watchPageBack` next to it is the shared "the page has its network again" - `visibilitychange`
 to visible, `online`, and `change` on `navigator.connection` (a phone that falls back to mobile
 data says `online` when the WiFi GOES, not when it is back): simple-peer, PeerJS, Nostr,
-WebSocket and Gun do not sit out a reconnect backoff then (`test/providers/repro-websocket-wake.ts`,
-`test/gun/repro-page-back.mjs`; a
+WebSocket, Gun and Ably do not sit out a reconnect backoff then (`test/providers/repro-websocket-wake.ts`,
+`test/gun/repro-page-back.mjs`, `repro-ably-lifecycle` part 7; PubNub's SDK polls every 3 s; a
 "do it now" must also give up an attempt that is in the air over the network that is gone).
 
 ### Design docs

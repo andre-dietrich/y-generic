@@ -25,7 +25,10 @@
  *  linger      (opt-in) LINGER_MS (420 s: longer than the 300 s presence lease of
  *              a mesh transport) with one peer reloading every 60 s. Rosters are
  *              checked 55 s after each reload. A run of the other scenarios
- *              that passes is over before a lease is.
+ *              that passes is over before a lease is. LINGER_GAP_MS=5000: the
+ *              check 5 s after each reload instead - a reload that leaves a
+ *              ghost (its removal never left the page) on a transport with a
+ *              short lease, while the ghost is still there.
  *  vanish      one tab is killed (no unload handler - a discarded tab, a
  *              phone that never came back). Until every roster dropped it.
  *  sleep       5 peers are frozen through the DevTools protocol for
@@ -35,13 +38,23 @@
  *              Chrome's network thread: links survive it. It exercises the
  *              transports' resume path - five peers rebuilding all their
  *              links at once - not a link's death.)
+ *  offline     (opt-in) one Chrome peer loses its network for OFFLINE_MS (20 s)
+ *              through the DevTools protocol - the browser fires `offline`
+ *              and `online`, as it does when a phone's WiFi goes and comes
+ *              back (the proxy cut of `restart` fires neither: a server that
+ *              went away). Another peer types meanwhile. Until the returner
+ *              has that text, until a text IT types is everywhere, until a
+ *              text typed afterwards reaches it, until every roster is whole.
  *  rejoin      one peer reloads the page. Until it has the room's text and
  *              every roster is complete.
  *  restart     the server (signaling / PeerJS server / Nostr relay /
- *              WebSocket relay) is killed for 5 s and restarted; one peer
- *              types while it is down. Until that text is everywhere, until
- *              a text typed afterwards is; then a NEW peer joins: until it
- *              has the text and every roster shows it.
+ *              WebSocket relay) is killed for OUTAGE_MS (5 s) and restarted;
+ *              one peer types while it is down. Until that text is
+ *              everywhere, until every roster is complete again (an outage
+ *              longer than the presence lease: every page expired the room -
+ *              the relay transport must tell the provider that its link is
+ *              back), until a text typed afterwards is; then a NEW peer
+ *              joins: until it has the text and every roster shows it.
  *  coordinator (peerjs only) the tab of the room's coordinator is killed,
  *              then a new peer joins. Until every roster is complete.
  *
@@ -93,6 +106,8 @@ const puppeteer = require(process.env.PUPPETEER ?? 'puppeteer-core')
 
 const TRANSPORT = process.argv[2]
 const N = Number(process.env.N ?? 25)
+const OUTAGE_MS = Number(process.env.OUTAGE_MS ?? 5000) // restart: how long the server / the network is gone
+const OFFLINE_MS = Number(process.env.OFFLINE_MS ?? 20000) // offline: how long one page has no network
 const FREEZE_MS = Number(process.env.FREEZE_MS ?? 40000) // longer than the transports' resumeAfterMs (30 s), or no resume path runs
 const FIREFOX = Number(process.env.FIREFOX ?? 0)
 const DIAG_MAX_MISSING = Number(process.env.DIAG_MAX_MISSING ?? 2) // DIAG=1: up to how many missing peers a roster's details are printed for
@@ -673,7 +688,7 @@ async function main() {
       if (missing.length > 0 || (adapter.mesh && !adapter.partial && linkCounts[i] < peers.length - 1))
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
       // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
-      if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) presenceViews.push({ p, missing })
+      if (!adapter.partial && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) presenceViews.push({ p, missing }) // relays too: what the core holds is the same question
       // A partial mesh: a joiner short of half the room is the case to look at - its first two holes.
       else if (adapter.partial && missing.length > DIAG_MAX_MISSING) presenceViews.push({ p, missing: missing.slice(0, 2) })
       if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) {
@@ -961,6 +976,31 @@ async function main() {
       await diag('after sleep')
     }
 
+    // ---- offline (opt-in): one page's network goes and comes back - the browser says so
+    if (wanted.includes('offline')) {
+      console.log(`offline (one peer without network for ${OFFLINE_MS / 1000} s)`)
+      const p = peers.filter((q) => !q.firefox && q !== peers[0])[4] // Chrome only: through the DevTools protocol
+      const cdp = await p.page.createCDPSession()
+      await cdp.send('Network.enable')
+      const net = (offline) => cdp.send('Network.emulateNetworkConditions', { offline, latency: 0, downloadThroughput: -1, uploadThroughput: -1 })
+      await net(true)
+      record('offline', `p${p.id}: navigator.onLine while cut off`, await p.page.evaluate(() => navigator.onLine))
+      await sleep(1000)
+      await type(peers[0], 'typed-while-offline ')
+      await sleep(OFFLINE_MS - 1000)
+      await net(false)
+      const t0 = Date.now()
+      record('offline', 'the returner has the text typed while it was offline (since online)', await untilAll([p], async (q) => (await text(q)).includes('typed-while-offline'), 90000))
+      await type(p, 'typed-by-the-returner ')
+      record('offline', 'a text the returner types in every editor', await untilAll(peers, async (q) => (await text(q)).includes('typed-by-the-returner'), 60000))
+      await type(peers[0], 'typed-after-offline ')
+      record('offline', 'a text typed afterwards reaches the returner', await untilAll([p], async (q) => (await text(q)).includes('typed-after-offline'), 60000))
+      const full = await untilAll(peers, async (q) => (await roster(q)) === peers.length, 90000)
+      record('offline', 'every roster complete (since online)', full.ms < 0 ? full : { ...full, ms: Date.now() - t0 })
+      console.log(`    returner: p${p.id}`)
+      await diag('after offline')
+    }
+
     // ---- rejoin
     if (wanted.includes('rejoin')) {
       console.log('rejoin (one peer reloads)')
@@ -976,31 +1016,41 @@ async function main() {
     // ---- linger (opt-in): outlive a presence lease while peers keep coming and going
     if (wanted.includes('linger')) {
       const LINGER_MS = Number(process.env.LINGER_MS ?? 420000)
-      console.log(`linger (${LINGER_MS / 1000} s, one peer reloads every 60 s)`)
+      const GAP_MS = Number(process.env.LINGER_GAP_MS ?? 55000)
+      console.log(`linger (${LINGER_MS / 1000} s, one peer reloads, rosters checked ${GAP_MS / 1000} s later, then the next)`)
       const t0 = Date.now()
       const short = []
-      for (let k = 0; Date.now() - t0 < LINGER_MS; k++) {
+      let checks = 0
+      for (let k = 0; Date.now() - t0 < LINGER_MS; k++, checks++) {
         await reload(peers[(12 + k) % peers.length])
-        await sleep(55000)
-        // Just before the next reload every roster has had 55 s to settle.
+        await sleep(GAP_MS)
+        // Just before the next reload every roster has had GAP_MS to settle.
         const sizes = await Promise.all(peers.map(roster))
         const incomplete = sizes.filter((n) => n !== peers.length).length
-        if (incomplete > 0) short.push(`${Math.round((Date.now() - t0) / 1000)} s: ${incomplete} rosters, smallest ${Math.min(...sizes)}`)
+        if (incomplete > 0) {
+          short.push(`${Math.round((Date.now() - t0) / 1000)} s: ${incomplete} rosters, smallest ${Math.min(...sizes)}, largest ${Math.max(...sizes)}`)
+          await diag(`linger, ${Math.round((Date.now() - t0) / 1000)} s, after reloading p${peers[(12 + k) % peers.length].id}`) // now, not once it healed
+        }
       }
-      record('linger', 'moments with an incomplete roster (55 s after each reload)', short.length === 0 ? 'none' : short)
-      if (short.length > 0) await diag('after linger')
+      record('linger', `moments with an incomplete roster (${GAP_MS / 1000} s after each reload, of ${checks})`, short.length === 0 ? 'none' : short)
     }
 
     // ---- restart
     if (wanted.includes('restart')) {
-      console.log('restart (server down for 5 s)')
+      console.log(`restart (server down for ${OUTAGE_MS / 1000} s)`)
       server.stop()
       await sleep(1000)
       await type(peers[3], 'typed-during-outage ') // unsent: no transport queues for a dead link
-      await sleep(4000)
+      await sleep(OUTAGE_MS - 1000)
       server.start()
       const tBack = Date.now()
       record('restart', 'text typed DURING the outage in every editor (since the restart)', await untilAll(peers, async (p) => (await text(p)).includes('typed-during-outage'), 90000))
+      // Not polled from the restart on: right after it every roster is still whole (nobody
+      // has noticed anything yet); what the return costs comes after - Ably's presence
+      // reports the leave of every dropped connection ~15 s later.
+      const backRosters = await untilAll(peers, async (p) => (await roster(p)) === peers.length, 150000)
+      record('restart', `every roster complete again (${peers.length} users, since the restart)`, backRosters.ms < 0 ? backRosters : { ...backRosters, ms: Date.now() - tBack })
+      if (process.env.DIAG) await diag('after the restart')
       await sleep(Math.max(0, 12000 - (Date.now() - tBack))) // the clients' reconnect backoff
       await type(peers[2], 'typed-after-restart ')
       record('restart', 'text typed after the restart in every editor', await untilAll(peers, async (p) => (await text(p)).includes('typed-after-restart'), 90000))
@@ -1068,6 +1118,14 @@ async function main() {
       }
     }
     record('final', 'sends the backend refused (console, whole run)', peers.reduce((n, p) => n + refused(p), 0))
+    // ... and what they were: one line per kind (timestamps and numbers stripped), with its count.
+    const kinds = new Map()
+    for (const p of peers)
+      for (const l of p.logs.filter((l) => /Protocol\.onNack|\[PubNubTransport\] ❌/.test(l))) {
+        const k = l.slice(10, 170).replace(/\d+/g, '#')
+        kinds.set(k, (kinds.get(k) ?? 0) + 1)
+      }
+    for (const [k, n] of kinds) console.log(`    ${n} x ${k}`)
     record('final', 'rosters', stats(await Promise.all(peers.map(roster))))
     if (adapter.mesh) record('final', 'links per peer', stats(await Promise.all(peers.map(links))))
   } finally {

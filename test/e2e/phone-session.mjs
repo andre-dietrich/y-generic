@@ -33,7 +33,7 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr|websocket|gun]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr|websocket|gun|ably|pubnub]
  *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
  *   websocket needs a y-websocket style server: WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js;
  *   its one "link" is the socket to that server
@@ -41,6 +41,13 @@
  *   peer holds a subscription on (one), and the room drops a silent peer only after the
  *   playground's 120 s presence lease - the phone and the desktop peers need the internet
  *   for the nostr-tools bundle of the playground (a CDN)
+ *   ably and pubnub run against the real service: node --env-file=.env (ABLY_KEY /
+ *   PUBNUB_PUBLISH_KEY + PUBNUB_SUBSCRIBE_KEY). The phone cannot read .env: every page fetches
+ *   the keys and a fresh room name from this script (GET /config on the beacon port, the LAN
+ *   only). The one "link" is the connection to the service; the phone and the desktop peers
+ *   need the internet for the SDK (a CDN) and the service. Ably's playground drops a silent
+ *   peer when Ably's presence reports its leave (~15 s + the 5 min lease as a backstop),
+ *   PubNub's after the 30 s lease (no presence in the playground)
  *   gun needs the gun package for Docker/gun/relay.js: NODE_PATH=/path/to/node_modules (npm
  *   install gun somewhere); the phone needs the internet for the gun bundle of the playground
  *   (a CDN), and the room drops a silent peer only after the playground's 120 s presence lease
@@ -96,6 +103,18 @@ const BACKENDS = {
       spawned('node', [join(process.cwd(), 'Docker/gun/relay.js')], { PORT: String(port) }, mkdtempSync(join(tmpdir(), 'ygen-phone-gun-'))),
   },
 }
+// A hosted service: nothing to start here - the beacon server hands the pages their config.
+const hosted = { server: () => ({ stop() {} }) }
+BACKENDS.ably = { ...hosted, entry: 'test/ably/index.html' }
+BACKENDS.pubnub = { ...hosted, entry: 'test/pubnub/index.html' }
+/** GET /config: what a ?phone / ?desk page of a hosted service needs and cannot read from .env */
+const pageConfig = () => ({
+  room: ROOM,
+  ablyKey: process.env.ABLY_KEY,
+  pubnubPublishKey: process.env.PUBNUB_PUBLISH_KEY,
+  pubnubSubscribeKey: process.env.PUBNUB_SUBSCRIBE_KEY,
+})
+const ROOM = 'phone-' + Math.random().toString(36).slice(2, 10) // a live service: no room of an earlier session
 const backend = BACKENDS[TRANSPORT]
 if (!backend) throw new Error(`usage: phone-session.mjs <${Object.keys(BACKENDS).join('|')}> - playgrounds that understand ?phone`)
 const PEERS = Number(process.env.PEERS ?? 8)
@@ -129,6 +148,10 @@ async function main() {
       let body = ''
       req.on('data', (d) => (body += d))
       req.on('end', () => {
+        if (req.method === 'GET' && req.url === '/config') {
+          res.writeHead(200, { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' }).end(JSON.stringify(pageConfig()))
+          return
+        }
         say(`phone, browser event: ${body.slice(0, 120)}`)
         res.writeHead(204, { 'Access-Control-Allow-Origin': '*' }).end()
       })

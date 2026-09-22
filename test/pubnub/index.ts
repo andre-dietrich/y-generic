@@ -11,6 +11,14 @@ import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
 import { GenericProvider } from '../../src/index'
 import { PubNubTransport } from '../../src/providers/pubnub/index'
+import { installPhoneReport } from '../e2e/phone-report'
+
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless room
+// mates) fetch the keys and the room from the session script (its beacon port, `sig` + 1 - the
+// phone cannot read .env) and connect by themselves, with the transport's debug log on - the
+// phone's timeline is made of its lines.
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
 import {
   registerMediaBlots,
   imageHandler as sharedImageHandler,
@@ -173,6 +181,8 @@ async function initWithConfig(config: {
 
   // Create provider
   const provider = new GenericProvider(doc, transport)
+  ;(window as any).__provider = provider // test/e2e/*.mjs read the room through it
+  ;(window as any).__links = () => (transport.isConnected ? 1 : 0) // phone-session.mjs: the one link
 
   // Listen to status changes
   provider.on('status', (event: any) => {
@@ -190,7 +200,7 @@ async function initWithConfig(config: {
 
   // Listen to sync changes
   provider.on('synced', (event: any) => {
-    const synced = event.synced
+    const synced = typeof event === 'boolean' ? event : !!event?.synced // the provider emits a boolean
     updateSyncStatus(synced)
 
     if (synced) {
@@ -272,14 +282,36 @@ async function initWithConfig(config: {
   const randomColor =
     randomColors[Math.floor(Math.random() * randomColors.length)]
 
-  userNameInput.value = randomName
+  userNameInput.value = sessionName ?? randomName
   userColorInput.value = randomColor
 
   // Set initial awareness state
   provider.awareness.setLocalStateField('user', {
-    name: randomName,
+    name: sessionName ?? randomName,
     color: randomColor,
   })
+
+  // `?phone`: the phone tells on itself through its presence (test/e2e/phone-report.ts).
+  // Its one "link" is the subscription to PubNub; the transport logs the SDK's status
+  // categories.
+  if (sessionName === 'phone') {
+    installPhoneReport({
+      awareness: provider.awareness,
+      yText,
+      links: () => (transport.isConnected ? 1 : 0),
+      logTag: '[PubNubTransport]',
+      timeline: [
+        { match: 'PNNetworkDownCategory', label: () => 'network DOWN' },
+        { match: 'PNNetworkUpCategory', label: () => 'network up' },
+        { match: 'PNNetworkIssuesCategory', label: () => 'network issues' },
+        { match: 'PNReconnectedCategory', label: () => 'reconnected' },
+        { match: 'PNConnectedCategory', label: () => 'connected' },
+        { match: 'PNTimeoutCategory', label: () => 'subscribe timeout' },
+        { match: 'Publish error', label: () => 'publish error', count: true },
+        { match: 'Cannot send', label: () => 'send while not connected', count: true },
+      ],
+    })
+  }
 
   // Update awareness on user input
   userNameInput.addEventListener('input', () => {
@@ -411,9 +443,20 @@ function setupConnectionForm() {
   })
 }
 
+async function start() {
+  setupConnectionForm()
+  if (sessionName === null) return
+  const config = await (await fetch(`http://${location.hostname}:${Number(session.get('sig') ?? 4470) + 1}/config`)).json()
+  ;(document.getElementById('config-publish-key') as HTMLInputElement).value = config.pubnubPublishKey
+  ;(document.getElementById('config-subscribe-key') as HTMLInputElement).value = config.pubnubSubscribeKey
+  ;(document.getElementById('config-room') as HTMLInputElement).value = config.room
+  ;(document.getElementById('config-debug') as HTMLInputElement).checked = true
+  ;(document.getElementById('config-form') as HTMLFormElement).requestSubmit()
+}
+
 // Start when DOM is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', setupConnectionForm)
+  document.addEventListener('DOMContentLoaded', start)
 } else {
-  setupConnectionForm()
+  start()
 }

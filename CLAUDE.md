@@ -9,7 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 logic; a `Transport` (`src/transport.ts`) is a 4-method interface (`connect`, `disconnect`,
 `send`, `onMessage`, plus optional `onPeerConnect`) that callers implement per backend.
 `src/providers/*` are reference transport implementations (dummy, websocket, gun, trystero,
-peerjs, simple-peer, indexeddb, matrix, pubnub, supabase, nostr) shipped as separate
+peerjs, simple-peer, conference, indexeddb, matrix, pubnub, supabase, nostr) shipped as separate
 subpath exports (`genericprovider/providers/<name>`), each independently tree-shakeable and
 mostly gated behind optional peer dependencies.
 
@@ -180,6 +180,25 @@ prints the sizes; and never edit a playground's source while a harness
 run serves it (parcel rebuilds under the run). Why the mesh stays full and what a relay under the
 core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.md`
 (`test/dummy/probe-partial-mesh.ts`).
+
+`src/providers/conference/` (`ConferenceTransport`) is the way past the full mesh: a wrapper
+UNDER the core around a mesh transport that holds a handful of links per peer (`dial`, the rule
+in `src/providers/dial.ts`, wired into simple-peer) and passes frames on - Plumtree with one tree
+PER ORIGIN and a state per DIRECTION of a link, digests + GRAFT as the repair path, unicast along
+the way the origin's broadcasts came, SUSPECT / ALIVE / REVIVE / LEAVE for who is there. Its gate
+is `test/dummy/bench-partial-mesh.ts` (N=100 by default, `N=150`, `N=300`; the real wrapper and the
+real dial rule over simulated data channels and signaling, no oracle; `DIAG=1` names a roster's
+holes and prints the frames around them, `TRACE_FILE=` dumps them all) plus
+`test/providers/repro-simple-peer-sparse.ts` (the real simple-peer on a loopback `wrtc`). Run
+both after touching either directory. Every rule in there was a failure of that gate first, each
+named in the comment next to it: one tree for the room falls apart (two origins prune two links of
+one cycle), one flag for both directions of a link cuts a peer off (its feed prunes over a
+duplicate FROM it), a change of a link's default must keep the origins that arrive over it, a
+route may only come from a frame that advances the front (else unicast goes in a circle), a seq
+below the first one heard is not history for 3 s (a joiner's second frame overtook its JOIN
+beacon), an ALIVE may arrive before its SUSPECT. The one thing it needed from the core: an
+address learned from a single-state awareness frame. What it costs on top of the relay is the
+core's: periodic beacons are suppressed less when paths differ in length (N=300: 91 vs 55).
 
 `src/providers/resume.ts` (`watchResume`) is the shared sleep detector (a timer that finds
 `Date.now()` far ahead of its last tick), used by both mesh transports to re-join under a new id.

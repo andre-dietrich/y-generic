@@ -111,6 +111,24 @@ export interface SimplePeerTransportOptions {
      */
     maxConns?: number;
     /**
+     * A PARTIAL mesh: ask for this many links instead of one to every peer
+     * (see ../dial.ts; the average peer ends up with twice as many, `maxConns`
+     * stays the hard cap). ONLY under ConferenceTransport
+     * (providers/conference), which passes frames on - GenericProvider alone
+     * needs the full mesh. Left undefined, ConferenceTransport's
+     * `expectedPeers` decides: a full mesh up to 16 peers, ln(N) links (at
+     * least 4) beyond.
+     * @default undefined (full mesh)
+     */
+    dial?: number;
+    /**
+     * With `dial`: never dial a peer that announces itself - a leaf that
+     * holds the links it asked for and nobody else's (a phone).
+     * ConferenceTransport sets it from its `relay: false`.
+     * @default false
+     */
+    passive?: boolean;
+    /**
      * Options passed to simple-peer.
      * See https://github.com/feross/simple-peer#api
      * Note: iceServers will be merged into peerOpts.config if not already present
@@ -151,6 +169,12 @@ export interface SimplePeerTransportOptions {
  */
 export declare class SimplePeerTransport implements Transport {
     private options;
+    /** The dial rule of a partial mesh; undefined: full mesh. */
+    private _sparse?;
+    private _announceRetry?;
+    private _passive;
+    /** RTCPeerConnections this transport has created - Chrome allows a renderer 500, closed ones included. */
+    peerConnectionsCreated: number;
     private _connected;
     private _room;
     private _callback?;
@@ -203,6 +227,17 @@ export declare class SimplePeerTransport implements Transport {
      * says the network is back, and when the tab becomes visible again.
      */
     private dialSignalingNow;
+    /**
+     * ConferenceTransport's hooks (providers/conference): a room of
+     * `expectedPeers` that does not fit into a full mesh gets the dial rule,
+     * unless the `dial` option has set one already.
+     */
+    configureSparse(options: {
+        dial?: number;
+        expectedPeers?: number;
+        passive?: boolean;
+    }): void;
+    setRoomSize(peers: number): void;
     /** Publish our peer id to the room on every open signaling connection. */
     private announce;
     /**

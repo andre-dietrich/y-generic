@@ -2359,6 +2359,44 @@ export class GenericProvider extends Observable<string> {
         for (const id of scan.present) {
           if (id !== this.doc.clientID) this._knownPeers.set(id, heardAt)
         }
+        // One state and nothing else: a peer's own presence - its answer to
+        // our JOIN, or its broadcast - and `from` is where it lives. On a
+        // full mesh a link's first frame is a beacon and the address is
+        // known by then; behind a relaying transport (conference) a joiner
+        // gets a settled peer's presence as exactly this frame and, Trickle
+        // keeping settled peers quiet, never a beacon: 23 of 99 peers could
+        // not tell whom the transport's onPeerDisconnect meant, and the
+        // killed peer stayed in their rosters (bench-partial-mesh). Only
+        // while we know nothing better - a sync frame names its sender, a
+        // relayed table with one entry does not.
+        if (
+          from !== undefined &&
+          scan.present.length === 1 &&
+          scan.removed.length === 0 &&
+          scan.present[0] !== this.doc.clientID &&
+          !this._peerAddress.has(scan.present[0])
+        ) {
+          this._peerAddress.set(scan.present[0], from)
+        }
+        // One state and nothing else: a peer's own presence - its answer to
+        // our JOIN, or its broadcast - and `from` is where it lives. On a
+        // full mesh a link's first frame is a beacon and the address is
+        // known by then; behind a relaying transport (conference) a joiner
+        // gets a settled peer's presence as exactly this frame and, Trickle
+        // keeping settled peers quiet, never a beacon: 23 of 99 peers could
+        // not tell whom the transport's onPeerDisconnect meant, and the
+        // killed peer stayed in their rosters (bench-partial-mesh). Only
+        // while we know nothing better - a sync frame names its sender, a
+        // relayed table with one entry does not.
+        if (
+          from !== undefined &&
+          scan.present.length === 1 &&
+          scan.removed.length === 0 &&
+          scan.present[0] !== this.doc.clientID &&
+          !this._peerAddress.has(scan.present[0])
+        ) {
+          this._peerAddress.set(scan.present[0], from)
+        }
 
         // Somebody says WE are gone. y-protocols never lets a remote removal
         // delete the local state - it raises the clock and reports it, and
@@ -3177,8 +3215,16 @@ export class GenericProvider extends Observable<string> {
    * behind by more replaces the reference, the timer keeps running.
    */
   private _scheduleBehindCheck(remoteSv: Uint8Array): void {
-    this._behindSv = remoteSv
+    // The state the grace is FOR: the one that started it. Taking the latest
+    // one instead asks "have I got what somebody had a moment ago" - with a
+    // peer typing, never: on a transport whose paths differ in length
+    // (conference: a beacon from the typist's neighbour takes 2 hops, the
+    // keystroke it already counts takes 4) the check found us "still behind"
+    // by the newest keystroke every time, and 299 listeners sent 185
+    // requests while one peer typed 30 characters (bench-partial-mesh, N=300;
+    // 2 on a full mesh). What a later beacon adds gets its own grace.
     if (this._behindCheckTimer !== undefined) return
+    this._behindSv = remoteSv
     const rtt = this._rttMinMs()
     const delay = Math.max(this._gapGraceMs, rtt === null ? 0 : 2 * rtt)
     this._behindCheckTimer = setTimeout(() => {

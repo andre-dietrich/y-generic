@@ -19,6 +19,10 @@
       "types": "./dist/providers/dummy/index.d.ts",
       "default": "./dist/providers/dummy/index.js"
     },
+    "./providers/conference": {
+      "types": "./dist/providers/conference/index.d.ts",
+      "default": "./dist/providers/conference/index.js"
+    },
     "./providers/simple-peer": {
       "types": "./dist/providers/simple-peer/index.d.ts",
       "default": "./dist/providers/simple-peer/index.js"

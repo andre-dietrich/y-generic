@@ -85,6 +85,28 @@ The transport notices the sleep by its own timers, reconnects signaling, and re-
 new peer id; GenericProvider then resyncs document and presence per link. See
 `docs/superpowers/specs/2026-09-19-webrtc-mobile-resilience-research.md`.
 
+**Rooms of 100+ peers:** `dial` (a partial mesh, see `dial.ts`) and `passive` exist for
+`ConferenceTransport` below - GenericProvider alone needs the full mesh.
+
+### Conference Transport (WebRTC rooms of 100+ peers)
+
+A wrapper around a mesh transport for rooms that do not fit into a full mesh: every peer
+holds a handful of links and passes frames on along a tree per origin (Plumtree), so a
+broadcast still costs N-1 frames. Pure peer-to-peer. All peers of a room must use it.
+
+```typescript
+import Peer from 'simple-peer'
+import { SimplePeerTransport } from 'genericprovider/providers/simple-peer'
+import { ConferenceTransport } from 'genericprovider/providers/conference'
+
+const transport = new ConferenceTransport(
+  new SimplePeerTransport({ peer: Peer, signaling: ['wss://your-signaling-server'] }),
+  { expectedPeers: 300 }, // on a phone: { expectedPeers: 300, relay: false }
+)
+```
+
+How it works, its options and the numbers: `conference/README.md`.
+
 ### PeerJS Transport (Peer-to-Peer)
 
 Direct peer-to-peer connections using WebRTC data channels via PeerJS library.

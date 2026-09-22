@@ -45,7 +45,7 @@
  *  coordinator (peerjs only) the tab of the room's coordinator is killed,
  *              then a new peer joins. Until every roster is complete.
  *
- * Usage: node test/e2e/room-scenarios.mjs <simple-peer|peerjs|trystero|websocket|ably|pubnub|nostr|gun>
+ * Usage: node test/e2e/room-scenarios.mjs <simple-peer|conference|peerjs|trystero|websocket|ably|pubnub|nostr|gun>
  *   N=25 FREEZE_MS=40000 SCENARIOS=join,typing,... OUT=results.json override.
  *   FIREFOX=10: that many of the N peers run in a headless Firefox (FIREFOX_BIN,
  *   default /usr/bin/firefox) - the peers with an odd number, so three of the five
@@ -202,6 +202,28 @@ const ADAPTERS = {
       }, SERVER_PORT)
     },
     async join() {}, // connects on load; room name is fixed in the playground
+  },
+  // The simple-peer playground under ConferenceTransport: a partial mesh, frames passed on.
+  // CONFERENCE_EXPECTED (default: N, floor 17 - below that the transport builds a full mesh).
+  conference: {
+    entry: 'test/simple-peer/index.html',
+    mesh: true,
+    partial: true,
+    vanishTimeoutMs: 90000,
+    server: () => spawned('node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(SERVER_PORT) }),
+    async prepare(page) {
+      await page.evaluateOnNewDocument(
+        (port, expectedPeers) => {
+          localStorage.setItem(
+            'simplepeer-config',
+            JSON.stringify({ signaling: [`ws://localhost:${port}`], iceServers: [], conference: { expectedPeers } }),
+          )
+        },
+        SERVER_PORT,
+        Number(process.env.CONFERENCE_EXPECTED ?? Math.max(17, N)),
+      )
+    },
+    async join() {},
   },
   peerjs: {
     entry: 'test/peerjs/index.html',
@@ -648,7 +670,7 @@ async function main() {
     peers.forEach((p, i) => {
       const missing = peers.map((q) => `p${q.id}`).filter((n) => !rosters[i].includes(n))
       const maxConns = p.logs.map((l) => /maxConns: (\d+)/.exec(l)?.[1]).find(Boolean) ?? '-'
-      if (missing.length > 0 || (adapter.mesh && linkCounts[i] < peers.length - 1))
+      if (missing.length > 0 || (adapter.mesh && !adapter.partial && linkCounts[i] < peers.length - 1))
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
       // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
       if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) presenceViews.push({ p, missing })

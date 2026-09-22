@@ -15,6 +15,7 @@ import {
   SimplePeerTransport,
   type IceServer,
 } from '../../src/providers/simple-peer/index'
+import { ConferenceTransport } from '../../src/providers/conference/index'
 import { math } from 'lib0'
 
 const BlockEmbed = Quill.import('blots/block/embed') as any
@@ -68,6 +69,12 @@ const userId = Math.random().toString(36).substring(7)
 const defaultConfig: {
   signaling: string[]
   iceServers: IceServer[]
+  /**
+   * A room of 100+ peers: the transport goes under ConferenceTransport (a
+   * partial mesh, frames passed on). Every peer of the room needs the same
+   * setting. Also `?conference=<expected peers>` and `&leaf` in the URL.
+   */
+  conference?: { expectedPeers?: number; relay?: boolean }
 } = {
   // Use official y-webrtc signaling server (most reliable)
   signaling: ['wss://y-webrtc-eu.fly.dev'],
@@ -394,8 +401,19 @@ async function init() {
     debug: true, // Enable debug logging in console
   })
 
+  // A room of 100+ peers (see defaultConfig.conference). `transport` stays the
+  // simple-peer one: the peer count below is its WebRTC links.
+  const conference = session.has('conference')
+    ? { expectedPeers: Number(session.get('conference')) || undefined, relay: !session.has('leaf') }
+    : currentConfig.conference
+  const roomTransport = conference ? new ConferenceTransport(transport, conference) : transport
+  if (conference) {
+    log(`🏛️ Conference mode: expecting ${conference.expectedPeers ?? '?'} peers${conference.relay === false ? ', a leaf' : ''}`, 'info')
+    ;(window as any).__conference = roomTransport // test/e2e/room-scenarios.mjs: tree links, room size
+  }
+
   // Create provider
-  const provider = new GenericProvider(doc, transport)
+  const provider = new GenericProvider(doc, roomTransport)
   ;(window as any).__provider = provider // test/e2e/room-scenarios.mjs reads presence clocks through it (DIAG=1)
 
   // Listen to status changes

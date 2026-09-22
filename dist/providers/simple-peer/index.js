@@ -29,6 +29,7 @@
  * ```
  */
 import { watchResume, watchPageBack } from '../resume';
+import { SparseDial } from '../dial';
 /**
  * Maximum chunk size for WebRTC DataChannel messages.
  * Most browsers support up to 256KB, but we use 64KB for safety.
@@ -60,6 +61,8 @@ export class SimplePeerTransport {
      * @param options - Configuration options (must include peer constructor)
      */
     constructor(options) {
+        /** RTCPeerConnections this transport has created - Chrome allows a renderer 500, closed ones included. */
+        this.peerConnectionsCreated = 0;
         this._connected = false;
         this._room = '';
         this.peers = new Map();
@@ -104,6 +107,9 @@ export class SimplePeerTransport {
             resumeAfterMs: options.resumeAfterMs ?? 30000,
             debug: options.debug ?? false,
         };
+        this._passive = options.passive ?? false;
+        if (options.dial !== undefined)
+            this.configureSparse({ dial: options.dial });
         // Generate unique peer ID
         this.peerId = this.generatePeerId();
         this.log(`Initialized — peerId: ${this.peerId}, maxConns: ${this.options.maxConns}`, `\n  signaling: [${this.options.signaling.join(', ')}]`, `\n  iceServers: [${(peerOpts.config?.iceServers ?? []).map((s) => (Array.isArray(s.urls) ? s.urls[0] : s.urls)).join(', ')}]`);
@@ -211,15 +217,47 @@ export class SimplePeerTransport {
                 this.connectSignaling(url).catch(() => { });
         }
     }
+    /**
+     * ConferenceTransport's hooks (providers/conference): a room of
+     * `expectedPeers` that does not fit into a full mesh gets the dial rule,
+     * unless the `dial` option has set one already.
+     */
+    configureSparse(options) {
+        if (options.passive !== undefined)
+            this._passive = options.passive;
+        const dial = options.dial ??
+            (this._sparse === undefined && (options.expectedPeers ?? 0) > 16
+                ? Math.max(4, Math.ceil(Math.log(options.expectedPeers)))
+                : undefined);
+        if (dial !== undefined)
+            this._sparse = new SparseDial({ dial, maxConns: this.options.maxConns, passive: this._passive });
+        else if (this._sparse)
+            this._sparse.passive = this._passive;
+    }
+    setRoomSize(peers) {
+        this._sparse?.setRoomSize(peers);
+    }
     /** Publish our peer id to the room on every open signaling connection. */
     announce() {
-        if (this.peers.size >= this.options.maxConns)
+        // A partial mesh: only while short of links. Every announce goes to every
+        // peer of the room - 300 peers announcing every 5 s are 18,000 signaling
+        // messages a second.
+        if (this._sparse ? !this._sparse.wantsLinks(this.peers.size) : this.peers.size >= this.options.maxConns)
             return;
+        // A partial mesh: an announce is answered by chance - too few answers, and the next try is not 5 s away.
+        if (this._sparse && this._announceRetry === undefined) {
+            this._announceRetry = setTimeout(() => {
+                this._announceRetry = undefined;
+                if (this._connected)
+                    this.announce();
+            }, 1500);
+        }
         for (const ws of this.signalingConns) {
             this.sendSignaling(ws, {
                 type: 'publish',
                 topic: this._room,
                 from: this.peerId,
+                ...(this._sparse && this._passive ? { passive: true } : {}),
             });
         }
     }
@@ -242,6 +280,9 @@ export class SimplePeerTransport {
         // Stop re-announce interval
         if (this.announceInterval) {
             clearInterval(this.announceInterval);
+            if (this._announceRetry !== undefined)
+                clearTimeout(this._announceRetry);
+            this._announceRetry = undefined;
             this.announceInterval = undefined;
         }
         // Close all peer connections
@@ -482,7 +523,18 @@ export class SimplePeerTransport {
                     topics: [this._room],
                 });
                 // Announce presence with topic (room) for y-webrtc protocol
-                if (this.peers.size < this.options.maxConns) {
+                if (this._sparse) {
+                    // A partial mesh: only while short of links, and with what announce() says about us.
+                    if (this._sparse.wantsLinks(this.peers.size)) {
+                        this.sendSignaling(ws, {
+                            type: 'publish',
+                            topic: this._room,
+                            from: this.peerId,
+                            ...(this._passive ? { passive: true } : {}),
+                        });
+                    }
+                }
+                else if (this.peers.size < this.options.maxConns) {
                     // y-webrtc uses 'publish' with from field
                     this.sendSignaling(ws, {
                         type: 'publish',
@@ -576,11 +628,23 @@ export class SimplePeerTransport {
         // Skip messages from ourselves
         if (msg.from && msg.from === this.peerId)
             return;
+        // Every publish goes to the whole topic, signals for others too: what the dial rule knows of the room's size.
+        if (msg.from)
+            this._sparse?.heard(msg.from);
         switch (msg.type) {
             case 'publish':
                 // y-webrtc protocol: messages are published to topics
                 // This is an envelope, the actual message could be an announce or signal
-                if (msg.from) {
+                if (this._sparse) {
+                    // A partial mesh: whoever decides to answer an announce dials, whatever
+                    // the ids say - the announcer cannot know whom to wait for. A publish
+                    // that carries a signal is no announce here.
+                    if (msg.from && !msg.signal && !this.peers.has(msg.from) && this._sparse.answers(msg.from, this.peers.size, msg.passive === true)) {
+                        this.log(`📡 Answering the announce of ${msg.from} (peers: ${this.peers.size + 1})`);
+                        this.createPeerConnection(msg.from, true);
+                    }
+                }
+                else if (msg.from) {
                     // Treat as announce if it's a publish from another peer
                     if (!this.peers.has(msg.from) &&
                         this.peers.size < this.options.maxConns &&
@@ -671,9 +735,11 @@ export class SimplePeerTransport {
             initiator,
             ...this.options.peerOpts,
         });
+        this.peerConnectionsCreated++;
         const peerConn = {
             peer,
             connected: false,
+            initiator,
             peerId: remotePeerId,
             chunkBuffers: new Map(),
         };
@@ -829,6 +895,28 @@ export class SimplePeerTransport {
             this.log(`♻️ Fresh offer from connected peer ${remotePeerId} — replacing the old link`);
             this.removePeer(remotePeerId);
             peerConn = undefined;
+        }
+        // A partial mesh: two peers that are both short of links answer each
+        // other's announce at the same moment, and each holds an initiator for
+        // the other. The larger id's offer stands; the other end drops its own
+        // and answers (an offer fed to an initiator is an error, and both
+        // entries would sit there until connectTimeout).
+        if (this._sparse && peerConn && !peerConn.connected && peerConn.initiator && signal?.type === 'offer') {
+            if (this.peerId > remotePeerId)
+                return;
+            this.log(`🤝 Glare with ${remotePeerId} — its offer stands, dropping ours`);
+            this.peers.delete(remotePeerId);
+            try {
+                peerConn.peer.destroy();
+            }
+            catch (error) {
+                // Ignore errors during cleanup
+            }
+            peerConn = undefined;
+        }
+        if (!peerConn && this._sparse && signal?.type === 'offer' && !this._sparse.accepts(this.peers.size)) {
+            this.log(`⚠️ Peer limit reached (${this.options.maxConns}), ignoring the offer of ${remotePeerId}`);
+            return;
         }
         if (!peerConn) {
             this.log(`📶 Signal from unknown peer ${remotePeerId} (${signal?.type ?? 'candidate'}) — creating non-initiator connection`);

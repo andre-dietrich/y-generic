@@ -398,6 +398,17 @@ export class ConferenceTransport {
             return;
         if (this._opts.mode === 'tree')
             this._regraft(orphans);
+        // Our last link just went: that says something about US (a page back
+        // from a freeze - the mesh transport rebuilds every link under a new
+        // id), nothing about the room. Five frozen pages each suspected 25
+        // peers on waking; whoever's ALIVE their brand-new links did not carry
+        // was dropped, and one peer stayed out of three rosters for good.
+        if (this._byPeer.size === 0) {
+            for (const timer of this._pendingSuspects.values())
+                clearTimeout(timer);
+            this._pendingSuspects.clear();
+            return;
+        }
         if (peer !== undefined && !this._byPeer.has(peer))
             this._scheduleSuspect(peer);
     }
@@ -878,7 +889,7 @@ export class ConferenceTransport {
             }
         }
         this._agedOwn = own;
-        const forget = Date.now() - 2 * this._opts.cacheMs;
+        const forget = Date.now() - 10 * this._opts.cacheMs; // a frozen page is back after minutes, as the same origin
         for (const [id, o] of this._origins) {
             o.aged = o.hw;
             // Kept for a while: a late frame of a departed peer is still a duplicate.
@@ -916,8 +927,11 @@ export class ConferenceTransport {
                     continue;
                 }
             }
-            if (known.gone || hw <= known.hw)
+            if (hw <= known.hw)
                 continue;
+            // Given up, and a neighbour has newer frames of it: it is there.
+            if (known.gone)
+                this._alive(id, known);
             // Once per link and state: a link that lacks the same frame as we do
             // (a joiner's seq 1 that neither got) answers a GRAFT with what it
             // has - duplicates - and its next DIGEST would have us ask again.

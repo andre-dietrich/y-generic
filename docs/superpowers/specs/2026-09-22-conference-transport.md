@@ -173,13 +173,29 @@ identical - and two things the simulator had not shown:
     link is kept and goes over that link when it opens, and the fresh
     window starts there.
 
-After 10-14: the gate passes three seeds at N=100 and all five variants at
+15. **A page back from a freeze suspected everybody.** Its mesh transport
+    rebuilds every link under a new id; the wrapper saw 25 links close and
+    said SUSPECT for each. The ALIVEs come down the suspects' trees, which
+    the waker's brand-new links do not carry yet; whoever's did not arrive
+    in 6 s was dropped, and a fellow sleeper (quiet, its beacons
+    Trickle-suppressed) stayed out of three rosters for good - after 60 s
+    the waker had even forgotten its origin, and a DIGEST naming it created
+    it again as history. → a peer whose LAST link went suspects nobody (the
+    core's rule for `_handlePeerLeave`, one layer down); a DIGEST with newer
+    frames of a peer given up revives it; departed origins are kept for
+    5 min, not 60 s.
+
+After 10-15: the gate passes three seeds at N=100 and all five variants at
 N=150 and N=300. Real browsers, headless Chrome: 25 through every scenario
 (rosters complete 0.8 s after the last page, five frozen pages back in 0.8 s,
 a reload complete in 0.9 s, a new peer after a signaling restart in 1.2 s);
-100 through five join + reload runs in a row (rosters complete 0.05-1.4 s
-after the last page, a reload in 1.0-2.0 s), and typing, a killed tab, five
-frozen pages (back in 1.3 s) and the bandwidth scenario: idle 5.8 kB/s per
+100 through every scenario in one run (rosters complete 99 ms after the last
+page, five typists' text everywhere in 7.6 s, a killed tab gone in 24 s, five
+frozen pages back in 1.7 s, a reload complete in 2.5 s, a 5 s signaling
+outage with text typed meanwhile everywhere 7 ms after, a new peer in 2.5 s,
+documents identical, every roster 100), five join + reload runs before it
+(rosters complete 0.05-1.4 s, a reload in 1.0-2.0 s), and the bandwidth
+scenario: idle 5.8 kB/s per
 peer on the wire (15 messages a second - the core's beacons at their 5 s
 cadence after typing, each N-1 tree frames plus ~2N digests; STUN 1.1 kB/s),
 a typist 30 kB/s up, a listener 19 kB/s up and 16 down while five people

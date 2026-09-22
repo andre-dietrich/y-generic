@@ -33,6 +33,15 @@
  *           until every roster of a 25-peer join was complete. Refused is not
  *           failed: it must be published again (within ~2 s, the rate is per
  *           second).
+ *  Part 7 - the page has its network again (the tab visible again, `online`,
+ *           a different `navigator.connection`) while ably-js waits in its
+ *           retry: connect() must be asked for now. ably-js dials at once on
+ *           `online` only, and retries a lost connection every 15 s with a
+ *           growing backoff: after a 45 s network outage 25 browsers had the
+ *           text typed during it 28.6 s after the network was back
+ *           (room-scenarios.mjs ably, OUTAGE_MS=45000) - and a phone whose
+ *           WiFi comes back while it is on mobile data gets no `online` at
+ *           all (src/providers/resume.ts, watchPageBack). Not while connected.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-ably-lifecycle.js
  * Exit code 1 if a part fails.
@@ -50,8 +59,10 @@ class ScriptedRealtime {
   enters = 0
   entered = false
   private handlers = new Map<string, Cb[]>()
+  connects = 0 // connection.connect() calls
   connection = {
     state: 'connecting',
+    connect: () => void this.connects++,
     on: (event: string, cb: Cb) => void this.handlers.set(event, [...(this.handlers.get(event) ?? []), cb]),
     once: (event: string, cb: Cb) => {
       const wrapped: Cb = (arg) => {
@@ -101,6 +112,12 @@ class ScriptedRealtime {
 
 const frame = new Uint8Array([0, 0, 0, 0, 1, 2, 3]) // 4 bytes CRC header + payload
 
+// A page for watchPageBack (src/providers/resume.ts): the transport watches it from connect() on.
+const page = new EventTarget()
+const doc = Object.assign(new EventTarget(), { visibilityState: 'visible' })
+;(globalThis as any).window = page
+;(globalThis as any).document = doc
+
 async function main(): Promise<void> {
   const transport = new AblyTransport({ Realtime: ScriptedRealtime as any })
   let peerConnects = 0
@@ -124,6 +141,13 @@ async function main(): Promise<void> {
   results.push([`3 suspended -> connected: publishes ${ably.published} (want 3), isConnected ${transport.isConnected}`, ably.published === 3])
 
   results.push([`4 provider told of the two reconnects: onPeerConnect fired ${peerConnects} times (want 2)`, peerConnects === 2])
+
+  ably.emit('disconnected')
+  doc.dispatchEvent(new Event('visibilitychange'))
+  const whileDown = ably.connects
+  ably.emit('connected')
+  page.dispatchEvent(new Event('online'))
+  results.push([`7 page back while ably-js waits: connect() asked ${whileDown} times (want 1); page back while connected: ${ably.connects - whileDown} more (want 0)`, whileDown === 1 && ably.connects === 1])
 
   ably.refusePublishes = 1
   transport.send(frame)

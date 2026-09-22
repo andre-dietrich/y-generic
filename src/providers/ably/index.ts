@@ -44,6 +44,7 @@ import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import * as syncProtocol from 'y-protocols/sync'
 import type { Transport, ConnectionConfig } from '../../transport'
+import { watchPageBack } from '../resume'
 
 // ---------------------------------------------------------------------------
 // CRC32 translation helpers
@@ -142,6 +143,7 @@ function generateUUID(): string {
 
 interface AblyConnectionLike {
   state: string
+  connect?(): void
   once(event: string, cb: (stateChange?: any) => void): void
   on(event: string, cb: (stateChange?: any) => void): void
   off(event?: string, cb?: (...args: any[]) => void): void
@@ -254,6 +256,7 @@ export class AblyTransport implements Transport {
   private _peerDisconnectCallback?: (peerId: string) => void
   private _peerConnectCallback?: (peerId: string) => void
   private _enterTimer?: ReturnType<typeof setTimeout>
+  private _stopPageWatch?: () => void
   private messageBuffer: Array<{ data: Uint8Array; from?: string }> = []
   private chunkBuffer: Map<string, Map<number, string>> = new Map()
   // No preferredCompressMinBytes: this transport strips the CRC32 header
@@ -361,13 +364,28 @@ export class AblyTransport implements Transport {
       this.client!.connection.on('connected', () => {
         clearTimeout(timeout)
         this._isConnected = true
-        this.log('Connected to Ably')
+        this.log('Connected to Ably, connection', (this.client?.connection as { id?: string } | undefined)?.id)
         // Back after an outage: what we produced meanwhile was not sent, and
         // after 15 s Ably reported our leave to the room. The provider
         // announces itself again and pushes what the room has not confirmed.
         if (everConnected) this._peerConnectCallback?.('ably')
         everConnected = true
         resolve()
+      })
+
+      // The page has its network again: not the moment to sit out ably-js's
+      // retry (every 15 s, with a growing backoff; it dials at once on the
+      // browser's `online` only). After a 45 s outage 25 browsers had the text
+      // typed during it 28.6 s after the network was back, and a phone whose
+      // WiFi returns while it is on mobile data gets no `online` at all
+      // (repro-ably-lifecycle part 7, src/providers/resume.ts).
+      this._stopPageWatch?.()
+      this._stopPageWatch = watchPageBack(() => {
+        const connection = this.client?.connection
+        if (connection && (connection.state === 'disconnected' || connection.state === 'suspended')) {
+          this.log('Page is back, dialing Ably now')
+          connection.connect?.()
+        }
       })
 
       this.client!.connection.on('failed', (stateChange: any) => {
@@ -408,7 +426,7 @@ export class AblyTransport implements Transport {
     await this.channel.presence.subscribe('leave', (member) => {
       const id = member?.clientId
       if (typeof id === 'string' && id !== this.clientId) {
-        this.log('Peer left:', id)
+        this.log('Peer left:', id, 'connection', (member as { connectionId?: string } | undefined)?.connectionId)
         this._peerDisconnectCallback?.(id)
       }
     })
@@ -448,6 +466,8 @@ export class AblyTransport implements Transport {
   async disconnect(): Promise<void> {
     this.log('Disconnecting...')
     clearTimeout(this._enterTimer)
+    this._stopPageWatch?.()
+    this._stopPageWatch = undefined
 
     if (this.persistTimer) {
       clearTimeout(this.persistTimer)

@@ -43,6 +43,7 @@ import * as Y from 'yjs';
 import type { Transport, ConnectionConfig } from '../../transport';
 interface AblyConnectionLike {
     state: string;
+    connect?(): void;
     once(event: string, cb: (stateChange?: any) => void): void;
     on(event: string, cb: (stateChange?: any) => void): void;
     off(event?: string, cb?: (...args: any[]) => void): void;
@@ -152,6 +153,7 @@ export declare class AblyTransport implements Transport {
     private _peerDisconnectCallback?;
     private _peerConnectCallback?;
     private _enterTimer?;
+    private _stopPageWatch?;
     private messageBuffer;
     private chunkBuffer;
     private persistentMode;

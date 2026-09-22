@@ -41,6 +41,7 @@
  */
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
+import { watchPageBack } from '../resume';
 // ---------------------------------------------------------------------------
 // CRC32 translation helpers
 //
@@ -235,7 +236,7 @@ export class AblyTransport {
             this.client.connection.on('connected', () => {
                 clearTimeout(timeout);
                 this._isConnected = true;
-                this.log('Connected to Ably');
+                this.log('Connected to Ably, connection', this.client?.connection?.id);
                 // Back after an outage: what we produced meanwhile was not sent, and
                 // after 15 s Ably reported our leave to the room. The provider
                 // announces itself again and pushes what the room has not confirmed.
@@ -243,6 +244,20 @@ export class AblyTransport {
                     this._peerConnectCallback?.('ably');
                 everConnected = true;
                 resolve();
+            });
+            // The page has its network again: not the moment to sit out ably-js's
+            // retry (every 15 s, with a growing backoff; it dials at once on the
+            // browser's `online` only). After a 45 s outage 25 browsers had the text
+            // typed during it 28.6 s after the network was back, and a phone whose
+            // WiFi returns while it is on mobile data gets no `online` at all
+            // (repro-ably-lifecycle part 7, src/providers/resume.ts).
+            this._stopPageWatch?.();
+            this._stopPageWatch = watchPageBack(() => {
+                const connection = this.client?.connection;
+                if (connection && (connection.state === 'disconnected' || connection.state === 'suspended')) {
+                    this.log('Page is back, dialing Ably now');
+                    connection.connect?.();
+                }
             });
             this.client.connection.on('failed', (stateChange) => {
                 clearTimeout(timeout);
@@ -280,7 +295,7 @@ export class AblyTransport {
         await this.channel.presence.subscribe('leave', (member) => {
             const id = member?.clientId;
             if (typeof id === 'string' && id !== this.clientId) {
-                this.log('Peer left:', id);
+                this.log('Peer left:', id, 'connection', member?.connectionId);
                 this._peerDisconnectCallback?.(id);
             }
         });
@@ -320,6 +335,8 @@ export class AblyTransport {
     async disconnect() {
         this.log('Disconnecting...');
         clearTimeout(this._enterTimer);
+        this._stopPageWatch?.();
+        this._stopPageWatch = undefined;
         if (this.persistTimer) {
             clearTimeout(this.persistTimer);
             this.persistTimer = undefined;

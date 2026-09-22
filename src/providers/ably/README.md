@@ -169,7 +169,12 @@ Get list of connected peer client IDs.
    connection state and tells `GenericProvider` when the connection came
    BACK (`onPeerConnect`): the provider announces itself again and pushes
    what it wrote meanwhile. Ably retries a lost connection every 15 s, so
-   that is how long text typed during an outage takes to arrive.
+   that is how long text typed during an outage takes to arrive - unless
+   the browser says `online`: then ably-js dials at once (a page that was
+   20 s without network had the room's text 0.4 s after it was back). After
+   an outage longer than the TTL Ably reports the leave of every peer that
+   is not back yet to the ones that are, and the rosters are whole again
+   about a second after the last one returned.
 7. **Rate limit**: Ably rejects what exceeds a channel's message rate - 50
    messages/s on the free tier - with error 42913 ("nonfatal"). A refused
    publish is sent again after 1-2 s (further each time, five times), a
@@ -211,6 +216,12 @@ npm run dev:ably
 ```
 
 Enter your Ably API key (or token-auth URL) in the configuration panel and start collaborating!
+
+A classroom of 25 browsers against the real service (the key in the gitignored
+`.env`): `node --env-file=.env test/e2e/room-scenarios.mjs ably`, with the
+opt-in scenarios `offline`, `linger` (`LINGER_GAP_MS=5000`: a reload every
+6 s) and `OUTAGE_MS=` for a longer `restart`; `test/e2e/phone-session.mjs ably`
+puts a real phone into such a room.
 
 ## Security Considerations
 

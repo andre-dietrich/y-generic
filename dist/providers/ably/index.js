@@ -122,6 +122,12 @@ function generateUUID() {
         return v.toString(16);
     });
 }
+// ---------------------------------------------------------------------------
+// Structural types for the injected Ably SDK surface (not the real `ably`
+// types, so this file compiles without the package installed)
+// ---------------------------------------------------------------------------
+/** How long after the page's return a lost connection counts as one that died while the page was away. */
+const PAGE_BACK_WINDOW_MS = 5000;
 const EVENT_NAME = 'yjs-update';
 // Ably's default max message size is ~64 KiB; stay well under it. Used both
 // as a base64-string cap for send()'s pub/sub chunking, and as a raw-byte
@@ -145,6 +151,7 @@ export class AblyTransport {
         this.channelName = '';
         this._isConnected = false;
         this.debug = false;
+        this._pageBackAt = 0;
         this.messageBuffer = [];
         this.chunkBuffer = new Map();
         // No preferredCompressMinBytes: this transport strips the CRC32 header
@@ -251,13 +258,16 @@ export class AblyTransport {
             // typed during it 28.6 s after the network was back, and a phone whose
             // WiFi returns while it is on mobile data gets no `online` at all
             // (repro-ably-lifecycle part 7, src/providers/resume.ts).
+            //
+            // At that moment the connection may still say 'connected': ably-js finds
+            // the socket that died in the background a moment later (a real phone,
+            // back from another app after 45 s: 135 ms later) and then waits out its
+            // retry - 19.6 s out of the room. A 'disconnected' that soon after the
+            // page's return is dialed at once as well (repro-ably-lifecycle part 8).
             this._stopPageWatch?.();
             this._stopPageWatch = watchPageBack(() => {
-                const connection = this.client?.connection;
-                if (connection && (connection.state === 'disconnected' || connection.state === 'suspended')) {
-                    this.log('Page is back, dialing Ably now');
-                    connection.connect?.();
-                }
+                this._pageBackAt = Date.now();
+                this._dialIfDown('Page is back');
             });
             this.client.connection.on('failed', (stateChange) => {
                 clearTimeout(timeout);
@@ -266,10 +276,12 @@ export class AblyTransport {
             this.client.connection.on('suspended', () => {
                 this.log('Connection suspended');
                 this._isConnected = false;
+                this._dialSoonAfterPageBack();
             });
             this.client.connection.on('disconnected', () => {
                 this.log('Connection disconnected');
                 this._isConnected = false;
+                this._dialSoonAfterPageBack();
             });
         });
         await this.channel.subscribe((message) => {
@@ -331,6 +343,21 @@ export class AblyTransport {
             this.log('presence.enter refused, again in', Math.round(delay), 'ms:', error);
             this._enterTimer = setTimeout(() => this._enterPresence(attempt + 1), delay);
         }
+    }
+    /** connect() now if ably-js is waiting out a retry. */
+    _dialIfDown(why) {
+        const connection = this.client?.connection;
+        if (connection && (connection.state === 'disconnected' || connection.state === 'suspended')) {
+            this.log(`${why}, dialing Ably now`);
+            connection.connect?.();
+        }
+    }
+    /** A connection lost within PAGE_BACK_WINDOW_MS of the page's return: the socket died while it was away. */
+    _dialSoonAfterPageBack() {
+        if (Date.now() - this._pageBackAt > PAGE_BACK_WINDOW_MS)
+            return;
+        // not from inside ably-js's own state-change event
+        setTimeout(() => this._dialIfDown('Lost right after the page came back'), 0);
     }
     async disconnect() {
         this.log('Disconnecting...');

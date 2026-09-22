@@ -171,7 +171,11 @@ Get list of connected peer client IDs.
    what it wrote meanwhile. Ably retries a lost connection every 15 s, so
    that is how long text typed during an outage takes to arrive - unless
    the browser says `online`: then ably-js dials at once (a page that was
-   20 s without network had the room's text 0.4 s after it was back). After
+   20 s without network had the room's text 0.4 s after it was back) - and
+   when the page is back (visible again, `online`, another network) the
+   transport dials at once, also if ably-js finds the socket dead only a
+   moment after the return (a real phone back from another app: in the room
+   after 0.6 s instead of 19.6 s). After
    an outage longer than the TTL Ably reports the leave of every peer that
    is not back yet to the ones that are, and the rosters are whole again
    about a second after the last one returned.

@@ -154,6 +154,7 @@ export declare class AblyTransport implements Transport {
     private _peerConnectCallback?;
     private _enterTimer?;
     private _stopPageWatch?;
+    private _pageBackAt;
     private messageBuffer;
     private chunkBuffer;
     private persistentMode;
@@ -178,6 +179,10 @@ export declare class AblyTransport implements Transport {
      * throws; tries again until it holds, 1 s doubling up to 30 s, jittered.
      */
     private _enterPresence;
+    /** connect() now if ably-js is waiting out a retry. */
+    private _dialIfDown;
+    /** A connection lost within PAGE_BACK_WINDOW_MS of the page's return: the socket died while it was away. */
+    private _dialSoonAfterPageBack;
     disconnect(): Promise<void>;
     send(data: Uint8Array): void;
     /** Peek the message type byte from CRC32-wrapped data (byte 4, after the 4-byte CRC32 header). */

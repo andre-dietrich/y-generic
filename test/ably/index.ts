@@ -306,6 +306,7 @@ async function initWithConfig(config: {
         { match: 'Connection disconnected', label: () => 'connection disconnected' },
         { match: 'Connection suspended', label: () => 'connection SUSPENDED' },
         { match: 'Connected to Ably', label: () => 'connected' },
+        { match: 'dialing Ably now', label: (l) => (l.includes('Page is back') ? 'page back: dialing now' : 'lost right after the return: dialing now') },
         { match: 'refused', label: (l) => (l.includes('presence') ? 'presence refused' : 'publish refused') },
         { match: 'Cannot send', label: () => 'send while not connected', count: true },
       ],

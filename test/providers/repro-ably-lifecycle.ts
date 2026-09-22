@@ -42,6 +42,13 @@
  *           (room-scenarios.mjs ably, OUTAGE_MS=45000) - and a phone whose
  *           WiFi comes back while it is on mobile data gets no `online` at
  *           all (src/providers/resume.ts, watchPageBack). Not while connected.
+ *  Part 8 - the page is back while the connection still says 'connected' and
+ *           ably-js finds the socket dead a moment later. Found with a real phone
+ *           (phone-session.mjs ably, v1.9.1): back from another app after 45 s,
+ *           'disconnected' came 135 ms after the page was visible - part 7's check
+ *           had seen 'connected' - and ably-js's retry kept the phone out of the
+ *           room for 19.6 s. A 'disconnected' within seconds of the page's return
+ *           must be dialed at once too; one long after it is ably-js's business.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-ably-lifecycle.js
  * Exit code 1 if a part fails.
@@ -148,6 +155,21 @@ async function main(): Promise<void> {
   ably.emit('connected')
   page.dispatchEvent(new Event('online'))
   results.push([`7 page back while ably-js waits: connect() asked ${whileDown} times (want 1); page back while connected: ${ably.connects - whileDown} more (want 0)`, whileDown === 1 && ably.connects === 1])
+  const before8 = ably.connects
+  doc.dispatchEvent(new Event('visibilitychange')) // back, still 'connected' ...
+  await new Promise((r) => setTimeout(r, 135))
+  ably.emit('disconnected') // ... and the dead socket found now
+  await new Promise((r) => setTimeout(r, 10))
+  const soonAfter = ably.connects - before8
+  ably.emit('connected')
+  await new Promise((r) => setTimeout(r, 50))
+  await new Promise((r) => setTimeout(r, 5100)) // past the window after the page's return
+  const before8b = ably.connects
+  ably.emit('disconnected') // a blip nobody's page caused: ably-js's own retry
+  await new Promise((r) => setTimeout(r, 10))
+  const later = ably.connects - before8b
+  ably.emit('connected')
+  results.push([`8 'disconnected' 135 ms after the page came back while connected: connect() asked ${soonAfter} times (want 1); 5 s later, no page event: ${later} (want 0)`, soonAfter === 1 && later === 0])
 
   ably.refusePublishes = 1
   transport.send(frame)

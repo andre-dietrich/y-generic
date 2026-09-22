@@ -1177,6 +1177,21 @@ every absence longer than 30 s (no Presence on the playground's keyset: the leas
 the frozen page renews nothing) and had it back the moment it returned. Nothing
 wrong with the library.
 
+### The real phone on Ably (v1.9.1 -> v1.9.2)
+
+`phone-session.mjs ably`, the same room of eight. Display off 66 s and 123 s: back
+in the room after 376 / 500 ms, the missed text after 415 / 542 ms; WiFi off and on
+with the display on (the browser's `offline`, `online` 0.4 s later): connected 0.5 s
+after `online`; the word typed on the phone reached the room. But back from another
+app after 44.9 s the phone was out of the room for **19.6 s**: at `visibilitychange`
+the connection still said `connected` - the socket had died in the background and
+ably-js found that out 135 ms later - so `watchPageBack`'s check did nothing, and
+ably-js waited out its retry. A `disconnected` or `suspended` within 5 s of the
+page's return is now dialed at once too (`repro-ably-lifecycle` part 8, red before;
+a lost connection with no page return in sight stays ably-js's business). The same
+absence twice on v1.9.2 (86.6 s, 80.4 s): dead socket found after 118 / 69 ms,
+dialed 1 ms later, connected after 575 / 562 ms, the missed text after 619 / 610 ms.
+
 ## If it is built — order of work
 
 1. Turn the probe into a gate: `bench-partial-mesh.ts` that fails on an incomplete

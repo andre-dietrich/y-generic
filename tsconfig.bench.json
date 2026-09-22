@@ -58,6 +58,7 @@
     "test/providers/repro-trystero-oneway.ts",
     "test/providers/repro-peerjs-coordinator.ts",
     "test/providers/repro-ably-lifecycle.ts",
+    "test/providers/repro-pubnub-lifecycle.ts",
     "test/providers/repro-websocket-wake.ts",
     "test/ably/repro-liveobjects-persist.ts"
   ]

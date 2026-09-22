@@ -74,6 +74,7 @@ export declare class PubNubTransport implements Transport {
     private uuid;
     private messageCallback?;
     private _peerDisconnectCallback?;
+    private _peerConnectCallback?;
     private _isConnected;
     private config;
     private debug;
@@ -87,6 +88,12 @@ export declare class PubNubTransport implements Transport {
      */
     connect(config: PubNubConfig): Promise<void>;
     /**
+     * Transport.onPeerConnect: fires when the link to PubNub comes BACK - after
+     * the browser's `online`, or after the SDK's own reconnect found the
+     * network again. Never for the first connect.
+     */
+    onPeerConnect(callback: (peerId: string) => void): () => void;
+    /**
      * Disconnect from PubNub
      */
     disconnect(): void;
@@ -94,6 +101,28 @@ export declare class PubNubTransport implements Transport {
      * Send data to all peers
      */
     send(data: Uint8Array): void;
+    /**
+     * What send() published in the current task - what flush() sends once
+     * more if this task turns out to be the page's last.
+     */
+    private _thisTask;
+    private _thisTaskClear?;
+    private remember;
+    /**
+     * Transport.flush: the page is unloading. A publish is a `fetch` of the
+     * SDK's, and the SDK sets no `keepalive` (there is no option for it): a
+     * page that goes away may take the request with it before it has left.
+     * The one message that matters then is the one sent in this very task,
+     * our presence removal - lost, and a reloaded page stayed a ghost in every
+     * roster for the 30 s lease (2 of 35 reloads, room-scenarios.mjs pubnub,
+     * SCENARIOS=join,linger LINGER_GAP_MS=5000). So what went out in this task
+     * goes once more as a `keepalive` request straight to the publish REST
+     * endpoint, which the browser completes after the page is gone. A copy
+     * that arrives twice changes nothing (an awareness state at an equal
+     * clock, a Yjs update, a duplicate sequence number are all ignored).
+     * Not with a cipher key: the SDK encrypts, this path would not.
+     */
+    flush(): void;
     /**
      * Send large message in chunks
      */

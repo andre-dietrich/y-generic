@@ -131,6 +131,24 @@ Get list of connected peer UUIDs.
    `test/pubnub/live-presence.mjs` is the live check.
 4. **Encryption**: Optional AES encryption is handled by PubNub SDK
 5. **Reliability**: Messages are delivered through PubNub's edge network
+6. **A network that goes and comes back**: the transport makes its PubNub
+   client with `restore: true`. Without it the SDK *destroys* the client
+   when the browser fires `offline` (a phone's WiFi dropping for a second):
+   it unsubscribes from every channel, and `online` restarts a subscribe
+   loop that has none - the page kept sending and never heard the room
+   again. When the link is back (the browser's `online`, or the SDK's own
+   reconnect after a failed subscribe: it polls every 3 s) the transport
+   tells the provider through `onPeerConnect`, which asks the room for its
+   presence and pushes what the room has not confirmed: after a 45 s
+   outage 25 browsers had every roster back after 3.6 s instead of 14.5 s.
+   `test/providers/repro-pubnub-lifecycle.ts` scripts both SDK paths.
+7. **A page that goes away**: a publish is a `fetch` of the SDK's without
+   `keepalive`, and an unloading page can take it along before it has
+   left - the presence removal was lost in about one reload of twenty, a
+   ghost in every roster for the 30 s lease. `flush()` (called by the
+   provider when the page unloads) sends what went out in that task once
+   more as a `keepalive` request to PubNub's publish endpoint. Not with a
+   `cipherKey`: the SDK encrypts, this path does not.
 
 ## Pros & Cons
 
@@ -165,6 +183,13 @@ npm run dev:pubnub
 ```
 
 Enter your PubNub keys in the configuration panel and start collaborating!
+
+A classroom of 25 browsers against the real service (keys in the gitignored
+`.env`): `node --env-file=.env test/e2e/room-scenarios.mjs pubnub` - the
+opt-in scenarios `offline` (a page's network goes and comes back) and
+`linger` with `LINGER_GAP_MS=5000` (a reload every 6 s) are the ones that
+found the three points above; `test/e2e/phone-session.mjs pubnub` puts a
+real phone into such a room.
 
 ## Security Considerations
 

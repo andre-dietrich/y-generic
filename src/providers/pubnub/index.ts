@@ -88,6 +88,7 @@ export class PubNubTransport implements Transport {
   private uuid: string = ''
   private messageCallback?: (data: Uint8Array, from?: string) => void
   private _peerDisconnectCallback?: (peerId: string) => void
+  private _peerConnectCallback?: (peerId: string) => void
   private _isConnected: boolean = false
   private config: PubNubConfig | null = null
   private debug: boolean = false
@@ -141,6 +142,13 @@ export class PubNubTransport implements Transport {
       publishKey: config.publishKey,
       subscribeKey: config.subscribeKey,
       userId: this.uuid,
+      // Without it the SDK DESTROYS the client when the browser says
+      // `offline` (a phone's WiFi going, for a second): it unsubscribes from
+      // every channel, and `online` restarts a subscribe loop that has none -
+      // the page sent on and never heard the room again
+      // (test/providers/repro-pubnub-lifecycle.ts, part 2). With it `offline`
+      // only disconnects, and `online` resumes at the last timetoken.
+      restore: true,
     }
 
     // Add cipher key if provided
@@ -157,22 +165,50 @@ export class PubNubTransport implements Transport {
         reject(new Error('PubNub connection timeout'))
       }, 10000)
 
+      // The link went (the browser said `offline`, or a subscribe request
+      // failed) and has not been reported back yet.
+      let lost = false
+      let everConnected = false
+      const back = () => {
+        this._isConnected = true
+        if (!lost) return
+        lost = false
+        // Back after an outage: what we produced meanwhile was not sent, and
+        // past the lease we expired the room and the room expired us - on a
+        // relay nobody else noticed. The provider asks the room for its
+        // presence and pushes what the room has not confirmed
+        // (repro-pubnub-lifecycle parts 3 and 4).
+        if (everConnected) this._peerConnectCallback?.('pubnub')
+      }
       this.pubnub.addListener({
         status: (statusEvent: any) => {
           this.log(`Status: ${statusEvent.category}`, statusEvent)
 
           if (statusEvent.category === 'PNConnectedCategory') {
-            this._isConnected = true
             clearTimeout(timeout)
             this.log('✅ Connected to PubNub')
-            if (this.presenceEnabled) this.verifyPresence()
+            back()
+            if (!everConnected && this.presenceEnabled) this.verifyPresence()
+            everConnected = true
             resolve()
-          } else if (statusEvent.category === 'PNNetworkDownCategory') {
+          } else if (
+            statusEvent.category === 'PNNetworkDownCategory' ||
+            // a subscribe request failed: the SDK polls every 3 s until the
+            // network answers, then PNReconnectedCategory
+            statusEvent.category === 'PNNetworkIssuesCategory' ||
+            // the same with `enableEventEngine`, which reports the return as
+            // PNConnectedCategory
+            statusEvent.category === 'PNDisconnectedUnexpectedlyCategory'
+          ) {
             this.log('⚠️ Network is down')
             this._isConnected = false
-          } else if (statusEvent.category === 'PNNetworkUpCategory') {
+            lost = true
+          } else if (
+            statusEvent.category === 'PNNetworkUpCategory' ||
+            statusEvent.category === 'PNReconnectedCategory'
+          ) {
             this.log('✅ Network is back up')
-            this._isConnected = true
+            back()
           }
         },
         message: (event: any) => {
@@ -238,6 +274,18 @@ export class PubNubTransport implements Transport {
   }
 
   /**
+   * Transport.onPeerConnect: fires when the link to PubNub comes BACK - after
+   * the browser's `online`, or after the SDK's own reconnect found the
+   * network again. Never for the first connect.
+   */
+  onPeerConnect(callback: (peerId: string) => void): () => void {
+    this._peerConnectCallback = callback
+    return () => {
+      this._peerConnectCallback = undefined
+    }
+  }
+
+  /**
    * Disconnect from PubNub
    */
   disconnect(): void {
@@ -273,6 +321,7 @@ export class PubNubTransport implements Transport {
 
       // Send as single message
       this.log(`📤 Sending ${data.length} bytes`)
+      this.remember(base64Data)
       this.pubnub
         .publish({
           channel: this.channel,
@@ -288,6 +337,55 @@ export class PubNubTransport implements Transport {
     } catch (error) {
       this.log('❌ Send error:', error)
     }
+  }
+
+  /**
+   * What send() published in the current task - what flush() sends once
+   * more if this task turns out to be the page's last.
+   */
+  private _thisTask: string[] = []
+  private _thisTaskClear?: ReturnType<typeof setTimeout>
+  private remember(message: string): void {
+    this._thisTask.push(message)
+    if (this._thisTaskClear === undefined) {
+      this._thisTaskClear = setTimeout(() => {
+        this._thisTask = []
+        this._thisTaskClear = undefined
+      }, 0)
+    }
+  }
+
+  /**
+   * Transport.flush: the page is unloading. A publish is a `fetch` of the
+   * SDK's, and the SDK sets no `keepalive` (there is no option for it): a
+   * page that goes away may take the request with it before it has left.
+   * The one message that matters then is the one sent in this very task,
+   * our presence removal - lost, and a reloaded page stayed a ghost in every
+   * roster for the 30 s lease (2 of 35 reloads, room-scenarios.mjs pubnub,
+   * SCENARIOS=join,linger LINGER_GAP_MS=5000). So what went out in this task
+   * goes once more as a `keepalive` request straight to the publish REST
+   * endpoint, which the browser completes after the page is gone. A copy
+   * that arrives twice changes nothing (an awareness state at an equal
+   * clock, a Yjs update, a duplicate sequence number are all ignored).
+   * Not with a cipher key: the SDK encrypts, this path would not.
+   */
+  flush(): void {
+    const messages = this._thisTask
+    this._thisTask = []
+    if (messages.length === 0 || !this.config || this.config.cipherKey) return
+    if (typeof fetch !== 'function') return
+    const { publishKey, subscribeKey } = this.config
+    const url =
+      `https://ps.pndsn.com/publish/${encodeURIComponent(publishKey)}/${encodeURIComponent(subscribeKey)}/0/` +
+      `${encodeURIComponent(this.channel)}/0?uuid=${encodeURIComponent(this.uuid)}` +
+      `&store=${this.config.storeInHistory ? 1 : 0}`
+    for (const message of messages) {
+      const body = JSON.stringify(message)
+      if (body.length > 60000) continue // keepalive requests share a 64 KiB budget
+      // no headers of our own: a simple request, no CORS preflight to outlive the page
+      fetch(url, { method: 'POST', body, keepalive: true }).catch(() => {})
+    }
+    this.log(`📤 Unloading: ${messages.length} message(s) sent again as keepalive requests`)
   }
 
   /**

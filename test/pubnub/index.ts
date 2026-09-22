@@ -182,6 +182,7 @@ async function initWithConfig(config: {
   // Create provider
   const provider = new GenericProvider(doc, transport)
   ;(window as any).__provider = provider // test/e2e/*.mjs read the room through it
+  ;(window as any).__Y = Y // room-scenarios.mjs `storm`: relative positions in the page's own Yjs
   ;(window as any).__links = () => (transport.isConnected ? 1 : 0) // phone-session.mjs: the one link
 
   // Listen to status changes

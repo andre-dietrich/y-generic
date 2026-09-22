@@ -45,6 +45,17 @@
  *              went away). Another peer types meanwhile. Until the returner
  *              has that text, until a text IT types is everywhere, until a
  *              text typed afterwards reaches it, until every roster is whole.
+ *  storm       (opt-in) sustained load, in phases (STORM=typing,cursor,bulk,faults):
+ *              typing - STORM_TYPISTS (10) Chrome peers type for STORM_S (60 s), a
+ *              character every STORM_KEY_MS (250 ms), each in its own paragraph of
+ *              the editor, in unique tokens; every page notes when it first saw
+ *              each token: the lag typed -> seen elsewhere, what is missing, when
+ *              everything is everywhere. cursor - every peer changes its presence
+ *              STORM_CURSOR_HZ (5) times a second for half of STORM_S: the lag
+ *              and how many changes arrive. bulk - three STORM_BULK_KB (100 KB)
+ *              inserts while the typists type. faults - 90 s of typing with a
+ *              reload, three pages frozen for 40 s, one typist offline for 20 s
+ *              and the server down for 5 s: every token everywhere afterwards.
  *  rejoin      one peer reloads the page. Until it has the room's text and
  *              every roster is complete.
  *  restart     the server (signaling / PeerJS server / Nostr relay /
@@ -1035,6 +1046,233 @@ async function main() {
       record('linger', `moments with an incomplete roster (${GAP_MS / 1000} s after each reload, of ${checks})`, short.length === 0 ? 'none' : short)
     }
 
+    // ---- storm (opt-in): sustained load - many typists, a presence storm, bulk inserts, faults under load
+    if (wanted.includes('storm')) {
+      const PHASES = (process.env.STORM ?? 'typing,cursor,bulk,faults').split(',')
+      const TYPISTS = Number(process.env.STORM_TYPISTS ?? 10)
+      const KEY_MS = Number(process.env.STORM_KEY_MS ?? 250)
+      const STORM_MS = Number(process.env.STORM_S ?? 60) * 1000
+      const CURSOR_HZ = Number(process.env.STORM_CURSOR_HZ ?? 5)
+      const BULK_KB = Number(process.env.STORM_BULK_KB ?? 100)
+      const q = (xs, f) => (xs.length === 0 ? null : [...xs].sort((a, b) => a - b)[Math.min(xs.length - 1, Math.floor(xs.length * f))])
+      const pct = (xs) => ({ samples: xs.length, p50: q(xs, 0.5), p95: q(xs, 0.95), max: q(xs, 1) })
+      // Typists: Chrome peers (a hidden Firefox tab clamps its timers), never peers[0], never the
+      // ones the fault phase freezes or reloads.
+      const chrome = peers.filter((p) => !p.firefox && p !== peers[0])
+      const typists = chrome.slice(0, TYPISTS)
+      const listeners = peers.filter((p) => !typists.includes(p))
+
+      // In every page: which token it saw first when (tokens ⟦typist.n⟧ in the editor's Y.Text,
+      // scanned at most every 100 ms), and the awareness states of the presence storm.
+      const install = (p) =>
+        p.page.evaluate(() => {
+          if (window.__storm) return
+          const pr = window.__provider
+          const yt = pr.doc.getText('quill')
+          const st = (window.__storm = { seen: {}, aw: [], awSeq: {} })
+          let pending = false
+          const scan = () => {
+            pending = false
+            const now = Date.now()
+            for (const m of yt.toString().matchAll(/⟦([\w.]+)⟧/g)) if (st.seen[m[1]] === undefined) st.seen[m[1]] = now
+          }
+          yt.observe(() => {
+            if (!pending) (pending = true), setTimeout(scan, 100)
+          })
+          scan()
+          pr.awareness.on('change', ({ added, updated }) => {
+            const now = Date.now()
+            for (const id of [...added, ...updated]) {
+              if (id === pr.doc.clientID) continue
+              const s = pr.awareness.getStates().get(id)?.storm
+              if (!s || st.awSeq[id] === s.seq) continue
+              st.awSeq[id] = s.seq
+              st.aw.push(now - s.t)
+            }
+          })
+        })
+      // One typist: its own paragraph, one character every keyMs, a token = ⟦id.n⟧ (a relative
+      // position keeps it contiguous while nine others type elsewhere). Resolves with when each
+      // token was complete.
+      const typeFor = (p, ms, prefix) =>
+        p.page.evaluate(
+          (id, keyMs, ms) =>
+            new Promise((done) => {
+              const pr = window.__provider
+              const Y = window.__Y
+              const yt = pr.doc.getText('quill')
+              yt.insert(yt.length, '\n')
+              let rel = Y.createRelativePositionFromTypeIndex(yt, yt.length, -1)
+              const typed = {}
+              let n = 0
+              let i = 0
+              const end = Date.now() + ms
+              const timer = setInterval(() => {
+                if (i === 0 && Date.now() >= end) return clearInterval(timer), done(typed)
+                const token = `⟦${id}.${n}⟧`
+                const at = Y.createAbsolutePositionFromRelativePosition(rel, pr.doc)?.index ?? yt.length
+                yt.insert(at, token[i])
+                rel = Y.createRelativePositionFromTypeIndex(yt, at + 1, -1)
+                if (++i === token.length) (typed[`${id}.${n}`] = Date.now()), n++, (i = 0)
+              }, keyMs)
+            }),
+          `${prefix}${p.id}`, // tokens unique across phases: t3.17, b3.17, f3.17
+          KEY_MS,
+          ms,
+        )
+      /** every token typed reached every page? lag = first seen - typed, over (token, other page) */
+      const collect = async (typedBy, among) => {
+        const seen = await Promise.all(among.map((p) => p.page.evaluate(() => window.__storm?.seen ?? {}).catch(() => ({}))))
+        const lags = []
+        let missing = 0
+        let pairs = 0
+        typedBy.forEach(({ p, typed }) =>
+          among.forEach((o, j) => {
+            if (o === p) return
+            for (const [k, t] of Object.entries(typed)) {
+              pairs++
+              if (seen[j][k] === undefined) missing++
+              else lags.push(Math.max(0, seen[j][k] - t))
+            }
+          }),
+        )
+        return { lags, missing, pairs }
+      }
+      const allHave = (typedBy) => {
+        const keys = typedBy.flatMap(({ typed }) => Object.keys(typed))
+        return untilAll(peers, (p) => p.page.evaluate((keys) => keys.every((k) => window.__storm?.seen[k] !== undefined), keys), 120000)
+      }
+      const typing = async (label, ms, prefix, during = async () => {}) => {
+        await Promise.all(peers.map(install))
+        const t0 = Date.now()
+        const [typed] = await Promise.all([Promise.all(typists.map((p) => typeFor(p, ms, prefix).then((typed) => ({ p, typed })))), during(t0)])
+        const tEnd = Date.now()
+        const total = typed.reduce((n, { typed }) => n + Object.keys(typed).length, 0)
+        record(label, `tokens typed (${typists.length} typists, a character every ${KEY_MS} ms, ${ms / 1000} s)`, total)
+        record(label, 'frames sent by the whole room while typing', wire(t0, tEnd))
+        const done = await allHave(typed)
+        record(label, 'every token in every editor (since the typing ended)', done.ms < 0 ? done : { ...done, ms: Date.now() - tEnd })
+        const { lags, missing, pairs } = await collect(typed, peers)
+        record(label, 'lag typed -> seen elsewhere, ms (100 ms resolution)', pct(lags))
+        record(label, 'tokens missing somewhere at the end (of token x page pairs)', `${missing} of ${pairs}`)
+        const ids = await Promise.all(peers.map((p) => p.page.evaluate(() => window.__provider.doc.getText('quill').toString())))
+        record(label, 'documents identical (Y.Text)', new Set(ids).size === 1)
+        return { typed, tEnd }
+      }
+
+      if (PHASES.includes('typing')) {
+        console.log(`storm: typing (${typists.length} typists for ${STORM_MS / 1000} s)`)
+        await typing('storm typing', STORM_MS, 't')
+      }
+
+      if (PHASES.includes('cursor')) {
+        console.log(`storm: cursor (every peer changes its presence ${CURSOR_HZ} times a second for ${STORM_MS / 2000} s)`)
+        await Promise.all(peers.map(install))
+        await Promise.all(peers.map((p) => p.page.evaluate(() => (window.__storm.aw = []))))
+        const t0 = Date.now()
+        await Promise.all(
+          peers.map((p) =>
+            p.page.evaluate(
+              (hz, ms) =>
+                new Promise((done) => {
+                  const aw = window.__provider.awareness
+                  let seq = 0
+                  const end = Date.now() + ms
+                  const timer = setInterval(() => {
+                    if (Date.now() >= end) return clearInterval(timer), done()
+                    aw.setLocalStateField('storm', { seq: ++seq, t: Date.now() })
+                  }, 1000 / hz)
+                }),
+              CURSOR_HZ,
+              STORM_MS / 2,
+            ),
+          ),
+        )
+        const tEnd = Date.now()
+        await sleep(3000)
+        const got = await Promise.all(peers.map((p) => p.page.evaluate(() => window.__storm.aw)))
+        const lags = got.flat()
+        const sent = peers.length * CURSOR_HZ * (STORM_MS / 2000)
+        record('storm cursor', 'frames sent by the whole room', wire(t0, tEnd))
+        record('storm cursor', 'presence changes made (all peers)', Math.round(sent))
+        record('storm cursor', 'presence changes seen per peer and second (of other peers)', Math.round((lags.length / peers.length / (STORM_MS / 2000)) * 10) / 10)
+        record('storm cursor', 'lag changed -> seen elsewhere, ms', pct(lags))
+        const full = await untilAll(peers, async (p) => (await roster(p)) === peers.length, 30000)
+        record('storm cursor', 'every roster complete afterwards', full)
+      }
+
+      if (PHASES.includes('bulk')) {
+        const blocks = 3
+        console.log(`storm: bulk (${blocks} inserts of ${BULK_KB} KB while ${typists.length} peers type for ${STORM_MS / 2000} s)`)
+        const inserter = peers[0]
+        const marks = []
+        await typing('storm bulk', STORM_MS / 2, 'b', async (t0) => {
+          for (let b = 0; b < blocks; b++) {
+            await sleep(STORM_MS / 2 / (blocks + 1))
+            const at = await inserter.page.evaluate(
+              (kb, b) => {
+                const yt = window.__provider.doc.getText('quill')
+                const line = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit. '
+                // At the very start, far from every typist: appended at the end (after the last
+                // character the inserter knew of) a block could land inside a token the last
+                // typist was typing there at the same moment - Yjs orders the two concurrent
+                // inserts by client id; right for a CRDT, invisible to the token scan.
+                yt.insert(0, line.repeat(Math.ceil((kb * 1024) / line.length)) + `⟦bulk.${b}⟧\n`)
+                return Date.now()
+              },
+              BULK_KB,
+              b,
+            )
+            marks.push({ b, at })
+          }
+        })
+        const seen = await Promise.all(peers.map((p) => p.page.evaluate(() => window.__storm.seen)))
+        const arrive = marks.map(({ b, at }) => {
+          const ms = seen.filter((s, j) => peers[j] !== inserter).map((s) => (s[`bulk.${b}`] === undefined ? Infinity : s[`bulk.${b}`] - at))
+          return Math.max(...ms)
+        })
+        record('storm bulk', `each ${BULK_KB} KB insert in every editor after, ms (100 ms resolution)`, arrive.map((ms) => (ms === Infinity ? 'NEVER' : ms)))
+      }
+
+      if (PHASES.includes('faults')) {
+        const FAULT_MS = Math.max(STORM_MS, 90000)
+        console.log(`storm: faults (${typists.length} peers type for ${FAULT_MS / 1000} s; meanwhile a reload, three frozen pages, one typist offline, the server restarted)`)
+        const spare = listeners.filter((p) => !p.firefox && p !== peers[0])
+        const reloaded = spare[0]
+        const frozen = spare.slice(1, 4)
+        const offline = typists[typists.length - 1]
+        await typing('storm faults', FAULT_MS, 'f', async (t0) => {
+          const at = (s) => sleep(Math.max(0, t0 + s * 1000 - Date.now()))
+          await at(10)
+          console.log(`    ${Math.round((Date.now() - t0) / 1000)} s: p${reloaded?.id} reloads`)
+          if (reloaded) await reload(reloaded).then(() => install(reloaded))
+          await at(20)
+          console.log(`    ${Math.round((Date.now() - t0) / 1000)} s: ${frozen.map((p) => 'p' + p.id).join(' ')} frozen for 40 s`)
+          const sessions = await Promise.all(frozen.map((p) => p.page.createCDPSession()))
+          await Promise.all(sessions.map((s) => s.send('Page.setWebLifecycleState', { state: 'frozen' })))
+          await at(30)
+          console.log(`    ${Math.round((Date.now() - t0) / 1000)} s: p${offline.id} (a typist) offline for 20 s`)
+          const cdp = await offline.page.createCDPSession()
+          await cdp.send('Network.enable')
+          const net = (o) => cdp.send('Network.emulateNetworkConditions', { offline: o, latency: 0, downloadThroughput: -1, uploadThroughput: -1 })
+          await net(true)
+          await at(50)
+          await net(false)
+          console.log(`    ${Math.round((Date.now() - t0) / 1000)} s: p${offline.id} online again`)
+          await at(60)
+          await Promise.all(sessions.map((s) => s.send('Page.setWebLifecycleState', { state: 'active' })))
+          console.log(`    ${Math.round((Date.now() - t0) / 1000)} s: unfrozen; the server is down for 5 s`)
+          server.stop()
+          await at(65)
+          server.start()
+          console.log(`    ${Math.round((Date.now() - t0) / 1000)} s: the server is back`)
+        })
+        const full = await untilAll(peers, async (p) => (await roster(p)) === peers.length, 150000)
+        record('storm faults', 'every roster complete afterwards', full)
+        if (full.ms < 0) await diag('after storm faults')
+      }
+    }
+
     // ---- restart
     if (wanted.includes('restart')) {
       console.log(`restart (server down for ${OUTAGE_MS / 1000} s)`)
@@ -1096,7 +1334,9 @@ async function main() {
     for (const name of (process.env.DUMP_LOGS ?? '').split(',').filter(Boolean)) {
       const p = peers.find((q) => `p${q.id}` === name)
       console.log(`  [logs ${name}]`)
-      for (const l of (p?.logs ?? []).filter((l) => process.env.DUMP_ALL || !/Sync|awareness|Awareness|📥|📤/.test(l)).slice(-Number(process.env.DUMP_N ?? 25))) console.log('    ' + l.slice(0, 220))
+      // DUMP_GREP=regex: only the lines that match (a flood of one warning hides the rest)
+      const only = process.env.DUMP_GREP ? new RegExp(process.env.DUMP_GREP) : null
+      for (const l of (p?.logs ?? []).filter((l) => (only ? only.test(l) : process.env.DUMP_ALL || !/Sync|awareness|Awareness|📥|📤/.test(l))).slice(-Number(process.env.DUMP_N ?? 25))) console.log('    ' + l.slice(0, 220))
     }
     await diag('final')
     const texts = await Promise.all(peers.map(text))

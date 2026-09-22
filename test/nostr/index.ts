@@ -179,6 +179,8 @@ async function connect() {
     })
 
     ;(window as any).__provider = provider // test/e2e/phone-session.mjs reads the room through it
+
+    ;(window as any).__Y = Y // room-scenarios.mjs `storm`: relative positions in the page's own Yjs
     // What a mesh transport calls its links: the relays that hold our subscription (no
     // public getter for it - a playground may look)
     const links = (): number => (transport as any)._hearing.size

@@ -195,6 +195,8 @@ async function initWithConfig(config: {
 
   ;(window as any).__provider = provider // test/e2e/room-scenarios.mjs compares the documents through it
 
+  ;(window as any).__Y = Y // room-scenarios.mjs `storm`: relative positions in the page's own Yjs
+
   // Listen to status changes
   provider.on('status', (event: any) => {
     const status = event.state

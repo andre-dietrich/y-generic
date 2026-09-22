@@ -128,6 +128,8 @@ async function initWithConfig(config: {
   })
 
   ;(window as any).__provider = provider // test/e2e/phone-session.mjs reads the room through it
+
+  ;(window as any).__Y = Y // room-scenarios.mjs `storm`: relative positions in the page's own Yjs
   // What this transport calls its links: the relays whose socket is open (no public getter
   // for it - a playground may look).
   const links = (): number =>

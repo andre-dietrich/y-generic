@@ -415,6 +415,7 @@ async function init() {
   // Create provider
   const provider = new GenericProvider(doc, roomTransport)
   ;(window as any).__provider = provider // test/e2e/room-scenarios.mjs reads presence clocks through it (DIAG=1)
+  ;(window as any).__Y = Y // room-scenarios.mjs `storm`: relative positions in the page's own Yjs
 
   // Listen to status changes
   provider.on('status', (event: any) => {

@@ -34,9 +34,19 @@ class FakeConnection {
   once(event: string, cb: (sc?: any) => void) {
     if (event === 'connected') setTimeout(cb, 0)
   }
+  // The transport waits for its FIRST 'connected' on `on`, not `once` (ably-js
+  // reconnects by itself and the transport has to hear that too - the round-8
+  // lifecycle fix, repro-ably-lifecycle.ts). A fake that only files the handler
+  // away never connects: `Ably connection timeout`, 10 s in. ably-js emits to
+  // `on` handlers registered before the connection opens, so this one does too.
   on(event: string, cb: (sc?: any) => void) {
     if (!this.handlers.has(event)) this.handlers.set(event, [])
     this.handlers.get(event)!.push(cb)
+    if (event === 'connected')
+      setTimeout(() => {
+        this.state = 'connected'
+        cb()
+      }, 0)
   }
   off() {}
 }
@@ -59,6 +69,11 @@ class FakeChannel {
     async get() {
       return []
     },
+    // The transport drops a peer the moment Ably reports its leave. Nobody
+    // leaves in this fake, so nothing is ever emitted - but the method has to
+    // exist, or connect() throws before the persistence path is reached.
+    async subscribe(_event: string, _cb: (member: any) => void) {},
+    unsubscribe() {},
   }
   object: { get(): Promise<FakeLiveMapRoot> }
   constructor(private store: Map<string, any>) {

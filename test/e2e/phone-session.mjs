@@ -33,7 +33,10 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|peerjs|nostr|websocket|gun|ably|pubnub]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|conference|peerjs|nostr|websocket|gun|ably|pubnub]
+ *   conference runs the simple-peer playground under ConferenceTransport (the same y-webrtc
+ *   signaling server): CONFERENCE_EXPECTED=<N> overrides the expected room size, LEAF=1 puts the
+ *   PHONE at the edge of the partial mesh (the desktop peers stay relays)
  *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
  *   websocket needs a y-websocket style server: WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js;
  *   its one "link" is the socket to that server
@@ -94,6 +97,13 @@ const BACKENDS = {
       relay.start()
       return relay
     },
+  },
+  // The simple-peer playground under ConferenceTransport (?conference=<N>, &leaf): a partial
+  // mesh. LEAF=1 puts the PHONE at the edge of it - the desktop peers stay relays.
+  conference: {
+    entry: 'test/simple-peer/index.html',
+    server: (port) => spawned('node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(port) }),
+    params: (isPhone) => `&conference=${process.env.CONFERENCE_EXPECTED ?? PEERS + 1}${isPhone && process.env.LEAF ? '&leaf' : ''}`,
   },
   gun: {
     entry: 'test/gun/index.html',
@@ -179,7 +189,7 @@ async function main() {
     const peers = []
     for (let i = 0; i < PEERS; i++) {
       const page = await (await browser.createBrowserContext()).newPage()
-      await page.goto(`http://${LAN_IP}:${APP_PORT}/?desk=d${i}&sig=${SERVER_PORT}`, { waitUntil: 'load' })
+      await page.goto(`http://${LAN_IP}:${APP_PORT}/?desk=d${i}&sig=${SERVER_PORT}${backend.params?.(false) ?? ''}`, { waitUntil: 'load' })
       await page.waitForSelector('.ql-editor', { timeout: 60000 })
       peers.push(page)
       await sleep(i === 0 ? 3000 : 200) // the first peer opens the room (PeerJS: claims the coordinator id)
@@ -194,7 +204,9 @@ async function main() {
         : TRANSPORT === 'pubnub'
           ? `&room=${ROOM}&pub=${encodeURIComponent(process.env.PUBNUB_PUBLISH_KEY ?? '')}&sub=${encodeURIComponent(process.env.PUBNUB_SUBSCRIBE_KEY ?? '')}`
           : ''
-    console.log(`\nREADY - ${PEERS} desktop peers in the room. On the phone (same WiFi) open:\n\n    http://${LAN_IP}:${APP_PORT}/?phone${SERVER_PORT === 4470 ? '' : `&sig=${SERVER_PORT}`}${hostedParams}\n`)
+    console.log(
+      `\nREADY - ${PEERS} desktop peers in the room. On the phone (same WiFi) open:\n\n    http://${LAN_IP}:${APP_PORT}/?phone${SERVER_PORT === 4470 ? '' : `&sig=${SERVER_PORT}`}${hostedParams}${backend.params?.(true) ?? ''}\n`,
+    )
     say('watching')
 
     /** What peer d0 knows of the phone: is it in the awareness, and what does it report of itself? */
@@ -202,7 +214,17 @@ async function main() {
       watcher.evaluate(() => {
         const pr = window.__provider
         const entry = Array.from(pr.awareness.getStates().entries()).find(([, s]) => s.user?.name === 'phone')
-        return { present: !!entry, report: entry?.[1].report ?? null, roomLen: pr.doc.getText('quill').length, links: pr.transport.connectedPeers ?? window.__links?.() }
+        // Under ConferenceTransport `transport` is the wrapper: its links are the inner
+        // transport's, and `roomSize` is what the wrapper itself believes the room is - a
+        // divergence from the roster is the failure a conference phone session exists to find.
+        const t = pr.transport
+        return {
+          present: !!entry,
+          report: entry?.[1].report ?? null,
+          roomLen: pr.doc.getText('quill').length,
+          links: t.connectedPeers ?? t.inner?.connectedPeers ?? window.__links?.(),
+          ...(t.roomSize === undefined ? {} : { roomSize: t.roomSize }),
+        }
       })
     const everywhere = async () => (await Promise.all(peers.map((p) => p.evaluate(() => Array.from(window.__provider.awareness.getStates().values()).some((s) => s.user?.name === 'phone'))))).every(Boolean)
 

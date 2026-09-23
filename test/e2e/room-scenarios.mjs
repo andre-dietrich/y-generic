@@ -122,6 +122,7 @@ const OFFLINE_MS = Number(process.env.OFFLINE_MS ?? 20000) // offline: how long 
 const FREEZE_MS = Number(process.env.FREEZE_MS ?? 40000) // longer than the transports' resumeAfterMs (30 s), or no resume path runs
 const FIREFOX = Number(process.env.FIREFOX ?? 0)
 const DIAG_MAX_MISSING = Number(process.env.DIAG_MAX_MISSING ?? 2) // DIAG=1: up to how many missing peers a roster's details are printed for
+const DIAG_MAX_VIEWS = Number(process.env.DIAG_MAX_VIEWS ?? 3) // ... and for how many peers with a hole the presence/wrapper details are dumped
 const JOIN_GAP_MS = Number(process.env.JOIN_GAP_MS ?? 200) // between two joins; smaller = more pairs that join in the same second
 const CHROME = process.env.CHROME ?? '/usr/bin/google-chrome'
 const APP_PORT = Number(process.env.APP_PORT ?? 3450)
@@ -692,6 +693,72 @@ async function main() {
     const rosters = await Promise.all(peers.map(names))
     const linkCounts = await Promise.all(peers.map(links))
     const presenceViews = []
+    // A partial mesh: who each peer is (the wrapper's own address, the inner transport's peer id)
+    // and how many DIRECT links it holds - the topology every other number here is read against.
+    // A roster LONGER than the room: a ghost - a page that reloaded and whose removal never
+    // reached this peer (or was never believed). `missing` below says nothing about those, so
+    // name them here: who is listed that is nobody's live name, what this peer's core holds for
+    // it, and - under a partial mesh - what its wrapper thinks of that origin.
+    // A reloaded page comes back under its OWN name (p14 is p14 again), so a ghost is not a
+    // name nobody carries - it is the same name TWICE: the old clientID beside the new one.
+    const live = new Set(peers.map((p) => `p${p.id}`))
+    const ghostViews = peers
+      .map((p, i) => ({
+        p,
+        ghosts: [...new Set(rosters[i].filter((n, j) => !live.has(n) || rosters[i].indexOf(n) !== j))],
+      }))
+      .filter((x) => x.ghosts.length > 0)
+    if (ghostViews.length > 0) {
+      const suspectTotal = await Promise.all(peers.map((p) => p.page.evaluate(() => window.__conference?.stats.suspects ?? null).catch(() => null)))
+      console.log(
+        `  [diag ${label}] rosters longer than the room: ${ghostViews.map((x) => `p${x.p.id}(+${x.ghosts.length})`).join(' ')}` +
+          (suspectTotal.some((x) => x !== null) ? ` - SUSPECTs sent by the room so far: ${suspectTotal.reduce((a, b) => a + (b ?? 0), 0)}` : ''),
+      )
+      for (const { p, ghosts } of ghostViews.slice(0, DIAG_MAX_VIEWS)) {
+        const held = await p.page
+          .evaluate((names) => {
+            const pr = window.__provider
+            const w = window.__conference
+            const out = []
+            for (const [id, s] of pr.awareness.getStates().entries()) {
+              if (!names.includes(s.user?.name)) continue
+              const meta = pr.awareness.meta.get(id)
+              const address = pr._peerAddress?.get(id)
+              const o = address && w ? w._origins.get(address) : undefined
+              out.push({
+                name: s.user?.name,
+                clientID: id,
+                clock: meta?.clock,
+                ageMs: meta ? Date.now() - meta.lastUpdated : undefined,
+                address: address ?? null,
+                origin: o ? { gone: o.gone, goneAt: o.goneAt, hw: o.hw, route: o.route?.slice(0, 8), direct: w._byPeer.has(address) } : address ? 'no origin' : null,
+                // Did anybody suspect it? This page's own count, and whether it ever had a
+                // SUSPECT pending for that address: nobody sent one vs. the one that was
+                // sent never got here are different bugs.
+                suspects: w ? w.stats.suspects : null,
+                pending: w && address ? w._pendingSuspects.has(address) : null,
+              })
+            }
+            return out
+          }, ghosts)
+          .catch((e) => String(e).slice(0, 120))
+        console.log(`    p${p.id} holds: ${JSON.stringify(held)}`)
+      }
+    }
+    if (adapter.partial && (ghostViews.length > 0 || rosters.some((r) => r.length < peers.length))) {
+      const who = await Promise.all(
+        peers.slice(0, DIAG_MAX_VIEWS).map((p) =>
+          p.page
+            .evaluate(() => {
+              const t = window.__provider?.transport
+              const w = window.__conference
+              return { wrapper: w?.id ?? null, inner: t?.peerId ?? t?.inner?.peerId ?? null, direct: w ? w._byPeer.size : null }
+            })
+            .catch((e) => ({ error: String(e).slice(0, 80) })),
+        ),
+      )
+      console.log(`  [diag ${label}] partial mesh, first ${who.length}: ${who.map((x, i) => `p${peers[i].id} ${JSON.stringify(x)}`).join('  ')}`)
+    }
     console.log(`  [diag ${label}] peer: links / roster size / maxConns / missing`)
     peers.forEach((p, i) => {
       const missing = peers.map((q) => `p${q.id}`).filter((n) => !rosters[i].includes(n))
@@ -700,29 +767,41 @@ async function main() {
         console.log(`    p${p.id}: ${linkCounts[i]} / ${rosters[i].length} / ${maxConns} / ${missing.join(' ') || '-'}`)
       // One or two missing on a mesh: what this peer's transport logged about THEM (by transport id).
       if (!adapter.partial && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) presenceViews.push({ p, missing }) // relays too: what the core holds is the same question
-      // A partial mesh: a joiner short of half the room is the case to look at - its first two holes.
-      else if (adapter.partial && missing.length > DIAG_MAX_MISSING) presenceViews.push({ p, missing: missing.slice(0, 2) })
+      // A partial mesh: EVERY hole, its first two peers. One or two missing is the shape of a
+      // linger / storm failure there (a ghost, a lost removal) - the old rule, "more than
+      // DIAG_MAX_MISSING", printed nothing for exactly the case those runs produce.
+      else if (adapter.partial && missing.length > 0) presenceViews.push({ p, missing: missing.slice(0, 2) })
       if (adapter.mesh && missing.length > 0 && missing.length <= DIAG_MAX_MISSING) {
+        // Every id a page ever logged, not the first: a peer that slept or whose network changed
+        // re-joined under a new one, and its old id says nothing about what happened afterwards.
+        const loggedIds = (x) => [...new Set(x.logs.flatMap((l) => { const m = /peerId: ([\w-]+)/.exec(l); return m ? [m[1]] : [] }))]
         for (const name of missing) {
-          const id = peers.find((q) => `p${q.id}` === name)?.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
+          const theirIds = loggedIds(peers.find((q) => `p${q.id}` === name) ?? { logs: [] })
+          const id = theirIds[theirIds.length - 1]
           if (!id) continue
-          console.log(`      p${p.id}'s log about ${name} (${id}):`)
+          console.log(`      p${p.id}'s log about ${name} (${theirIds.join(', ')}):`)
           // Lines with the other's full id, and the signaling lines between the two
           // (those carry the first 8 characters of both ids, and of nobody else's).
-          const mine = p.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
+          const myIds = loggedIds(p)
           const q = peers.find((x) => `p${x.id}` === name)
-          if (!mine || !q) continue
-          const about = (other, self) => (l) => !/signal=candidate/.test(l) && (l.includes(other) || (l.includes(other.slice(0, 8)) && l.includes(self.slice(0, 8))))
-          for (const l of p.logs.filter(about(id, mine)).slice(0, 60)) console.log('        ' + l.slice(0, 200))
+          if (myIds.length === 0 || !q) continue
+          const about = (others, selves) => (l) =>
+            !/signal=candidate/.test(l) &&
+            others.some((o) => l.includes(o) || (l.includes(o.slice(0, 8)) && selves.some((s) => l.includes(s.slice(0, 8)))))
+          for (const l of p.logs.filter(about(theirIds, myIds)).slice(0, 60)) console.log('        ' + l.slice(0, 200))
           // ... and the other side: did THEIR link to this peer get replaced, open twice, fail to send?
-          console.log(`      ${name}'s log about p${p.id} (${mine}):`)
-          for (const l of q.logs.filter(about(mine, id)).slice(0, 60)) console.log('        ' + l.slice(0, 200))
+          console.log(`      ${name}'s log about p${p.id} (${myIds.join(', ')}):`)
+          for (const l of q.logs.filter(about(myIds, theirIds)).slice(0, 60)) console.log('        ' + l.slice(0, 200))
         }
       }
     })
     // ... and what its core holds for them, next to their own clock (playgrounds that expose __provider):
     // no meta = their presence never arrived; a clock >= theirs without a state = it arrived and lost.
-    for (const { p, missing } of presenceViews) {
+    // A whole room short of the same peer would print the same story 25 times (and every entry
+    // costs several evaluates in two pages): the first DIAG_MAX_VIEWS of them say it.
+    if (presenceViews.length > DIAG_MAX_VIEWS)
+      console.log(`    (${presenceViews.length} peers with a hole; details for the first ${DIAG_MAX_VIEWS})`)
+    for (const { p, missing } of presenceViews.slice(0, DIAG_MAX_VIEWS)) {
       for (const name of missing) {
         const q = peers.find((x) => `p${x.id}` === name)
         const theirs = await q?.page.evaluate(() => {
@@ -760,10 +839,20 @@ async function main() {
           console.log(`      wrapper ${name} about p${p.id}: ${JSON.stringify(await wrapperView(q.page, p.page))}`)
         }
         // What each transport's table holds for the other (simple-peer's internals where there are any).
-        const transportId = (x) => x.logs.map((l) => /peerId: ([\w-]+)/.exec(l)?.[1]).find(Boolean)
+        // The LIVE id, from the page: `peerId:` is logged once, in the constructor, and a peer that
+        // slept / changed its network re-joined under a new one - the logged id would look up nothing.
+        // Under ConferenceTransport `transport` is the wrapper; its table is the inner transport's.
+        const transportId = (x) =>
+          x.page
+            .evaluate(() => {
+              const t = window.__provider?.transport
+              return t?.peerId ?? t?.inner?.peerId ?? null
+            })
+            .catch(() => null)
         const entry = (page, remote) =>
           page.evaluate((remote) => {
-            const t = window.__provider?.transport
+            const t0 = window.__provider?.transport
+            const t = t0?.peers ? t0 : t0?.inner
             const e = t?.peers?.get?.(remote)
             if (!e) return { entry: false, tableSize: t?.peers?.size }
             const sp = e.peer
@@ -774,9 +863,10 @@ async function main() {
               sp: sp && { initiator: sp.initiator, destroyed: sp.destroyed, destroying: sp.destroying, _connected: sp._connected, _connecting: sp._connecting, _pcReady: sp._pcReady, _channelReady: sp._channelReady },
             }
           }, remote)
-        if (transportId(p) && transportId(q)) {
-          console.log(`      table entry p${p.id} -> ${name}: ${JSON.stringify(await entry(p.page, transportId(q)))}`)
-          console.log(`      table entry ${name} -> p${p.id}: ${JSON.stringify(await entry(q.page, transportId(p)))}`)
+        const [pTransportId, qTransportId] = await Promise.all([transportId(p), transportId(q)])
+        if (pTransportId && qTransportId) {
+          console.log(`      table entry p${p.id} (${pTransportId}) -> ${name} (${qTransportId}): ${JSON.stringify(await entry(p.page, qTransportId))}`)
+          console.log(`      table entry ${name} -> p${p.id}: ${JSON.stringify(await entry(q.page, pTransportId))}`)
         }
         // The WebRTC connections between the two, paired by ICE ufrag: one or more? what was sent, what arrived?
         const [mine, theirPcs] = await Promise.all([pcView(p), pcView(q)])
@@ -890,7 +980,52 @@ async function main() {
     // ---- oneway (opt-in, WebRTC transports): a link that cannot send, made on purpose
     if (wanted.includes('oneway') && adapter.mesh) {
       console.log('oneway (one peer cannot send to one other, then renames itself)')
-      const [a, b] = [peers[2], peers[3]]
+      // How this page's DIRECT neighbours address it: under conference the wrapper's own id
+      // (what a HELLO carries, and what `_byPeer` is keyed by - NOT the inner transport's peer
+      // id, which is the key of `_links`), the transport's peer id otherwise.
+      const addr = (p) =>
+        p.page
+          .evaluate(() => {
+            const t = window.__provider?.transport
+            return window.__conference?.id ?? t?.peerId ?? t?.inner?.peerId ?? null
+          })
+          .catch(() => null)
+      // Does this page hold a direct link to that transport id? The wrapper's own table under
+      // conference, the transport's peer table otherwise. null/false: not observable here.
+      const holdsLink = (p, remoteId) =>
+        p.page
+          .evaluate((id) => {
+            const w = window.__conference
+            if (w) return w._byPeer.has(id)
+            const t0 = window.__provider?.transport
+            const t = t0?.peers ? t0 : t0?.inner
+            const e = t?.peers?.get?.(id)
+            return e ? e.connected !== false : false
+          }, remoteId)
+          .catch(() => null)
+      // A partial mesh: the fixed pair p2/p3 usually has NO direct link at all - nothing would be
+      // patched below, the rename would travel over the tree, and this scenario would record a
+      // pass having tested nothing. Take a pair that is actually linked.
+      let [a, b] = [peers[2], peers[3]]
+      if (adapter.partial) {
+        const addresses = await Promise.all(peers.map(addr))
+        const byAddr = new Map(addresses.flatMap((id, i) => (id ? [[id, peers[i]]] : [])))
+        let found = false
+        for (const cand of peers.slice(2)) {
+          const linked = await cand.page.evaluate(() => (window.__conference ? Array.from(window.__conference._byPeer.keys()) : [])).catch(() => [])
+          const other = linked.map((id) => byAddr.get(id)).find((x) => x && x !== cand)
+          if (other) {
+            ;[a, b] = [other, cand]
+            found = true
+            break
+          }
+        }
+        record('oneway', `a pair with a direct link: p${b.id} -> p${a.id}`, found ? 'chosen' : 'NONE FOUND - the fixed pair, which may have no direct link')
+      }
+      const observer = peers.find((p) => p !== a && p !== b) ?? peers[4]
+      const aAddr = await addr(a)
+      // Only worth polling for its return if we can see it at all right now.
+      const linkObservable = aAddr ? (await holdsLink(b, aAddr)) === true : false
       const [aPcs, bPcs] = await Promise.all([pcView(a), pcView(b)])
       const mine = bPcs.filter((x) => x.remote && x.conn === 'connected' && aPcs.some((y) => y.local === x.remote))
       record('oneway', `connections between p${a.id} and p${b.id}`, mine.length)
@@ -908,9 +1043,23 @@ async function main() {
       await fill(b.page, '#user-name', renamed)
       const sees = (p) =>
         p.page.evaluate((name) => Array.from(document.querySelectorAll('#user-list .user-badge span, #users-list li span')).some((el) => el.textContent.includes(name)), renamed)
-      record('oneway', 'a third peer sees the new name', await untilAll([peers[4]], sees, 30000))
+      record('oneway', 'a third peer sees the new name', await untilAll([observer], sees, 30000))
       const seen = await untilAll([a], sees, 60000)
       record('oneway', `p${a.id} - the one it cannot send to - sees the new name`, seen.ms < 0 ? seen : { ...seen, ms: Date.now() - t0 })
+      // The rule is "a transport must rebuild a link whose send() throws, never just log it" -
+      // and on a FULL mesh the rename above proves it, because there is no other way round.
+      // On a partial mesh there is: the name arrives over a tree path within half a second
+      // whether or not anybody noticed the dead direction. So ask the sharp question directly.
+      const dropped = b.logs.some((l) => /cannot send — dropping it|sendTo failed|Send failed|Error when sending|Error sending/.test(l))
+      record('oneway', `p${b.id} noticed the dead direction and dropped the link (console)`, dropped)
+      if (!dropped) for (const l of b.logs.slice(-15)) console.log('        ' + l.slice(0, 200))
+      // Whether the two then dial EACH OTHER again is not required of a partial mesh: the dial
+      // rule replaces a link only while the peer is under its target (p2 held 11 links after the
+      // drop and wanted none). A number, not a verdict - on a full mesh it must come back.
+      if (linkObservable) {
+        const back = await untilAll([b], (p) => holdsLink(p, aAddr), adapter.partial ? 15000 : 60000)
+        record('oneway', `p${b.id} holds a direct link to p${a.id} again${adapter.partial ? ' (a partial mesh need not)' : ''}`, back.ms < 0 ? back : { ...back, ms: Date.now() - t0 })
+      }
       record('oneway', 'links per peer afterwards', stats(await Promise.all(peers.map(links))))
       record('oneway', 'peers whose transport said the page had slept, so far', resumed().join(' ') || 'nobody')
       await fill(b.page, '#user-name', `p${b.id}`) // the roster diagnosis goes by name
@@ -1366,6 +1515,19 @@ async function main() {
         kinds.set(k, (kinds.get(k) ?? 0) + 1)
       }
     for (const [k, n] of kinds) console.log(`    ${n} x ${k}`)
+    if (adapter.partial) {
+      // Did the wrapper's departure machinery run at all? A link that died, a SUSPECT planned,
+      // a SUSPECT sent - three numbers that say which step is missing when a ghost survives.
+      const st = await Promise.all(peers.map((p) => p.page.evaluate(() => window.__conference?.stats ?? null).catch(() => null)))
+      const sum = (k) => st.reduce((a, s) => a + (s?.[k] ?? 0), 0)
+      record('final', 'wrapper: links died / SUSPECTs planned / SUSPECTs sent (whole room)', `${sum('linkDowns')} / ${sum('suspectsScheduled')} / ${sum('suspects')}`)
+      // ... and where the ones that never became a broadcast went (see ConferenceTransport.stats)
+      record(
+        'final',
+        'wrapper: a dead link that did NOT end in a SUSPECT, by reason',
+        `noPeer ${sum('skipNoPeer')}, relinked ${sum('skipRelinked')}, lastLink ${sum('skipLastLink')}, alreadyGone ${sum('skipGone')}, NEVER-KNEW-IT ${sum('skipNoOrigin')}, pending ${sum('skipPending')}, othersFirst ${sum('skipOthersFirst')} - departures learned from a C_LEAVE: ${sum('goneByLeave')}`,
+      )
+    }
     record('final', 'rosters', stats(await Promise.all(peers.map(roster))))
     if (adapter.mesh) record('final', 'links per peer', stats(await Promise.all(peers.map(links))))
   } finally {

@@ -392,7 +392,22 @@ room:
 | with the relay | **533** |
 
 Five checks still show a single ghost: the relay is a broadcast too and can miss somebody -
-only far less often, because its sender is alive and its tree works. Regression: 35 of 35
+only far less often, because its sender is alive and its tree works.
+
+The other two `linger` variants, run after the fix, complete the picture:
+
+| conference `linger`, 420 s, 25 peers | checks that were not 25 | SUSPECTs sent |
+|---|---|---|
+| Chrome, a reload every 5 s | 5 of 81 | 17 |
+| Chrome, a reload every 55 s | **none of 8** | 8 |
+| **ten hidden Firefox tabs, every 5 s** | 5 of 80 | 16 |
+
+Firefox matters here because the scatter a relayed goodbye waits out runs on exactly the
+timers Firefox stretches by up to 20 s in a hidden tab - and it behaves like Chrome, with
+the suppression still doing its work (16 broadcasts for 67 dead links). Four of its five
+are the same single ghost; the fifth is the opposite and harmless - a roster of 23, the
+page that had just reloaded still building up 5 s in (Chrome shows that as "smallest 1").
+Both runs end at 25/25/25 with identical documents. Regression: 35 of 35
 `bench-*` gates and `repro-simple-peer-sparse` pass.
 
 **Gate**: the "deaf to goodbye" phase - a peer disconnects properly while one observer, one

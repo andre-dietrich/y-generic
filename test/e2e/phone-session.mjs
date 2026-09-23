@@ -33,7 +33,7 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|conference|peerjs|nostr|websocket|gun|ably|pubnub]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|conference|peerjs|trystero|nostr|websocket|gun|ably|pubnub]
  *   conference runs the simple-peer playground under ConferenceTransport (the same y-webrtc
  *   signaling server): CONFERENCE_EXPECTED=<N> overrides the expected room size, LEAF=1 puts the
  *   PHONE at the edge of the partial mesh (the desktop peers stay relays)
@@ -54,6 +54,12 @@
  *   gun needs the gun package for Docker/gun/relay.js: NODE_PATH=/path/to/node_modules (npm
  *   install gun somewhere); the phone needs the internet for the gun bundle of the playground
  *   (a CDN), and the room drops a silent peer only after the playground's 120 s presence lease
+ *   trystero is served over https (parcel's self-signed certificate: the phone has to accept
+ *   it once) because Trystero's room keys need `crypto.subtle`, which a browser withholds
+ *   from a plain-http LAN address. The page's own `sendBeacon` lifecycle reports stay http
+ *   and are then blocked as mixed content - the "phone, browser event:" lines are missing
+ *   from such a run; what the phone measures about itself comes through its presence and is
+ *   unaffected.
  *   PEERS=8 MINUTES=12 TYPE_MS=4000 LAN_IP=192.168.x.y APP_PORT=3450 SERVER_PORT=4470 OUT=timeline.json
  */
 
@@ -104,6 +110,23 @@ const BACKENDS = {
     entry: 'test/simple-peer/index.html',
     server: (port) => spawned('node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(port) }),
     params: (isPhone) => `&conference=${process.env.CONFERENCE_EXPECTED ?? PEERS + 1}${isPhone && process.env.LEAF ? '&leaf' : ''}`,
+  },
+  trystero: {
+    entry: 'test/trystero/index.html',
+    // Trystero derives its room keys with `crypto.subtle`, which a browser only hands to a
+    // SECURE CONTEXT - https or localhost. A phone session is served over the LAN address,
+    // so plain http leaves `crypto.subtle` undefined: every page throws on `importKey` and
+    // `digest`, finds nobody, and sends "to 0 peers" for ever. Hence https here (parcel's
+    // self-signed certificate; the phone has to accept it once).
+    https: true,
+    // The nostr strategy against the relay of this process: the phone and the desk peers
+    // find each other over the LAN, and the data channels are Trystero's own.
+    server: (port) => {
+      const relay = nostrRelay(port)
+      relay.start()
+      return relay
+    },
+    params: () => `&room=${ROOM}`,
   },
   gun: {
     entry: 'test/gun/index.html',
@@ -169,7 +192,19 @@ async function main() {
     .listen(SERVER_PORT + 1, '0.0.0.0')
   const parcel = spawn(
     'node',
-    ['node_modules/.bin/parcel', 'serve', backend.entry, '--dist-dir', mkdtempSync(join(tmpdir(), 'ygen-phone-')), '--port', String(APP_PORT), '--host', '0.0.0.0', '--no-hmr'],
+    [
+      'node_modules/.bin/parcel',
+      'serve',
+      backend.entry,
+      '--dist-dir',
+      mkdtempSync(join(tmpdir(), 'ygen-phone-')),
+      '--port',
+      String(APP_PORT),
+      '--host',
+      '0.0.0.0',
+      '--no-hmr',
+      ...(backend.https ? ['--https'] : []),
+    ],
     { stdio: ['ignore', 'pipe', 'ignore'] },
   )
   await new Promise((resolve, reject) => {
@@ -180,7 +215,18 @@ async function main() {
     executablePath: CHROME,
     headless: true,
     protocolTimeout: 240000,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-background-timer-throttling', '--disable-renderer-backgrounding', '--disable-backgrounding-occluded-windows'],
+    // The self-signed certificate of a `https` backend. `ignoreHTTPSErrors` is the old name,
+    // `acceptInsecureCerts` the current one, and the flag is what actually does it in Chrome.
+    ignoreHTTPSErrors: true,
+    acceptInsecureCerts: true,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-background-timer-throttling',
+      '--disable-renderer-backgrounding',
+      '--disable-backgrounding-occluded-windows',
+      ...(backend.https ? ['--ignore-certificate-errors'] : []),
+    ],
   })
 
   try {
@@ -189,7 +235,7 @@ async function main() {
     const peers = []
     for (let i = 0; i < PEERS; i++) {
       const page = await (await browser.createBrowserContext()).newPage()
-      await page.goto(`http://${LAN_IP}:${APP_PORT}/?desk=d${i}&sig=${SERVER_PORT}${backend.params?.(false) ?? ''}`, { waitUntil: 'load' })
+      await page.goto(`${backend.https ? 'https' : 'http'}://${LAN_IP}:${APP_PORT}/?desk=d${i}&sig=${SERVER_PORT}${backend.params?.(false) ?? ''}`, { waitUntil: 'load' })
       await page.waitForSelector('.ql-editor', { timeout: 60000 })
       peers.push(page)
       await sleep(i === 0 ? 3000 : 200) // the first peer opens the room (PeerJS: claims the coordinator id)
@@ -205,7 +251,7 @@ async function main() {
           ? `&room=${ROOM}&pub=${encodeURIComponent(process.env.PUBNUB_PUBLISH_KEY ?? '')}&sub=${encodeURIComponent(process.env.PUBNUB_SUBSCRIBE_KEY ?? '')}`
           : ''
     console.log(
-      `\nREADY - ${PEERS} desktop peers in the room. On the phone (same WiFi) open:\n\n    http://${LAN_IP}:${APP_PORT}/?phone${SERVER_PORT === 4470 ? '' : `&sig=${SERVER_PORT}`}${hostedParams}${backend.params?.(true) ?? ''}\n`,
+      `\nREADY - ${PEERS} desktop peers in the room. On the phone (same WiFi) open:\n\n    ${backend.https ? 'https' : 'http'}://${LAN_IP}:${APP_PORT}/?phone${SERVER_PORT === 4470 ? '' : `&sig=${SERVER_PORT}`}${hostedParams}${backend.params?.(true) ?? ''}\n`,
     )
     say('watching')
 

@@ -18,6 +18,13 @@ import {
   videoHandler as sharedVideoHandler,
 } from '../shared/quill-media.js'
 import { log, updateStatus, updateSyncStatus } from '../shared/ui-helpers.js'
+import { installPhoneReport } from '../e2e/phone-report'
+
+// test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless
+// room mates) take the signaling relay from the page's own host - one room over the LAN,
+// nothing to set up on the phone - and no TURN: everybody is on that WiFi.
+const session = new URLSearchParams(location.search)
+const sessionName = session.has('phone') ? 'phone' : session.get('desk')
 
 // Import all Trystero strategy modules
 // @ts-ignore - importing from local minified files
@@ -369,14 +376,33 @@ async function initWithConfig(config: {
   const randomColor =
     randomColors[Math.floor(Math.random() * randomColors.length)]
 
-  userNameInput.value = randomName
+  userNameInput.value = sessionName ?? randomName
   userColorInput.value = randomColor
 
   // Set initial awareness state
   provider.awareness.setLocalStateField('user', {
-    name: randomName,
+    name: sessionName ?? randomName,
     color: randomColor,
   })
+
+  // `?phone`: the phone tells on itself through its presence (test/e2e/phone-report.ts).
+  // Its "links" are the data channels Trystero holds to the other peers.
+  if (sessionName === 'phone') {
+    installPhoneReport({
+      awareness: provider.awareness,
+      yText,
+      links: () => (transport as any).peers.size, // TrysteroTransport has no public link count
+      logTag: '[TrysteroTransport]',
+      timeline: [
+        { match: 'Page slept', label: (l) => `slept ${/slept (\d+)ms/.exec(l)?.[1] ?? '?'} ms` },
+        { match: 'network changed', label: () => 'network changed - leaving and joining again' },
+        { match: 'Peer joined', label: () => 'peer joined', count: true },
+        { match: 'Peer left', label: () => 'peer left', count: true },
+        { match: 'Joined room', label: () => 'joined the room' },
+        { match: 'Left room', label: () => 'left the room' },
+      ],
+    })
+  }
 
   // Update awareness on user input
   userNameInput.addEventListener('input', () => {
@@ -565,9 +591,27 @@ function setupConnectionForm() {
   })
 }
 
+/**
+ * A `?phone` / `?desk` page fills the form itself and connects: the nostr strategy
+ * against the relay this machine runs (phone-session.mjs), no TURN, one fixed room.
+ */
+function start() {
+  setupConnectionForm()
+  if (sessionName === null) return
+  const port = session.get('sig') ?? '4470'
+  ;(document.getElementById('config-strategy') as HTMLSelectElement).value = 'nostr'
+  ;(document.getElementById('config-strategy') as HTMLSelectElement).dispatchEvent(new Event('change'))
+  ;(document.getElementById('config-app-id') as HTMLInputElement).value = 'y-generic-phone'
+  ;(document.getElementById('config-room') as HTMLInputElement).value = session.get('room') ?? 'phone-room'
+  ;(document.getElementById('config-relays') as HTMLTextAreaElement).value = `ws://${location.hostname}:${port}`
+  ;(document.getElementById('config-turn-servers') as HTMLTextAreaElement).value = ''
+  ;(document.getElementById('config-debug') as HTMLInputElement).checked = true
+  ;(document.getElementById('connect-btn') as HTMLButtonElement).click()
+}
+
 // Start when DOM is ready
 if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', setupConnectionForm)
+  document.addEventListener('DOMContentLoaded', start)
 } else {
-  setupConnectionForm()
+  start()
 }

@@ -206,7 +206,32 @@ is `test/dummy/bench-partial-mesh.ts` (N=100 by default, `N=150`, `N=300`; the r
 real dial rule over simulated data channels and signaling, no oracle; `DIAG=1` names a roster's
 holes and prints the frames around them, `TRACE_FILE=` dumps them all) plus
 `test/providers/repro-simple-peer-sparse.ts` (the real simple-peer on a loopback `wrtc`). Run
-both after touching either directory. Every rule in there was a failure of that gate first, each
+both after touching either directory. Its last two phases - a page that UNLOADS (the core's
+`beforeunload` in order, then the channels close) and RELOADS pages coming back under new
+addresses (`RELOADS`, `RELOAD_GAP_MS`; 250 ms is the storm) - are measurements, not verdicts,
+until round 13's departure findings are fixed: `GATE_DEPARTURE=1` turns them into one. They
+run last on purpose, because they change who is in the room. What they say today: the removal
+of an unloading page empties a full mesh in 25 ms and a LEAF-heavy partial mesh in 1.4 s, and
+sometimes not at all - `docs/superpowers/specs/2026-09-22-conference-transport.md`, round 13,
+which also has the round's fix and the two repairs that failed on the way to it. A page that
+reloads says goodbye (`provider.disconnect()` -> C_LEAVE), but that frame is the LEAVER's
+and travels the leaver's paths, so it reaches ~3.6 of 24 peers; those mark the origin `gone`
+SILENTLY, and the dead link a moment later is then skipped ("already gone", 69 of 69 in a
+420 s run) - so nobody tells the room, and whoever missed the goodbye also missed the
+presence removal that took the same dying path and held the entry for the core's whole 300 s
+lease (48 of 81 checks carried a ghost, `stats.suspects` was 0). **`_relayLeave`**: whoever
+hears a C_LEAVE says it again in ITS OWN voice, scattered and suppressed like a suspicion,
+and without a `_byPeer` check (a goodbye is the peer's word, not a guess). 48 of 81 -> 5, 17
+broadcasts for 300 goodbyes heard, and an idle room of 300 stays at 533 frames/s against 524
+untouched. Gate: the "deaf to goodbye" phase. What does NOT work, both measured before it:
+`idleSuspectMs` (suspect what went quiet - correct, gated, and **ships off (0)** because an
+idle room of 300 went to 19,611 frames/s: peers are legitimately silent for minutes and a
+false departure costs a resync; turn it on below ~50 peers) and a C_LEAVE from the unloading
+page via `Transport.leave` (reverted - it dies on the same path the presence removal dies
+on, 50 ms without it vs 76 ms with). Also open: a killed tab takes 23-33 s instead of 6 s to
+leave every roster. In the browser harness `conference` also runs
+`linger`, `offline`, `storm` and `oneway` now, and `phone-session.mjs conference`
+(`CONFERENCE_EXPECTED=`, `LEAF=1` puts the phone at the edge) is wired. Every rule in there was a failure of that gate first, each
 named in the comment next to it: one tree for the room falls apart (two origins prune two links of
 one cycle), one flag for both directions of a link cuts a peer off (its feed prunes over a
 duplicate FROM it), a change of a link's default must keep the origins that arrive over it, a

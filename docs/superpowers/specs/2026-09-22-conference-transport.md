@@ -271,3 +271,226 @@ DIAG=1 TRACE_FILE=/tmp/trace.tsv PHASES=join ...                 a roster's hole
 node bench-dist/test/providers/repro-simple-peer-sparse.js       the real simple-peer, loopback wrtc
 N=25 node test/e2e/room-scenarios.mjs conference                 real browsers
 ```
+
+## Round 13: the scenarios the transport had never been through (2026-09-22)
+
+Round 11 shipped the wrapper on the standard scenarios (25 and 100 browsers). It had
+never been through `linger`, `offline`, `storm`, a meaningful `oneway`, or Firefox.
+All of them below on v1.9.5, 25 peers, local signaling, `DIAG=1`.
+
+Three of them found nothing, and one of those is a measurement worth keeping:
+
+| scenario | result |
+|---|---|
+| `offline` (one page loses its network for 20 s) | the returner has the text typed meanwhile after **24 ms**, its own text is everywhere after 474 ms, every roster whole 1,560 ms after `online`. The inner simple-peer's `watchNetworkChange` tears every link down and re-joins under a new inner id; the wrapper's own id survives, and the "our last link went, do not suspect the whole room" branch holds. The `G_FRESH` worry (a woken peer meets an origin at a high seq and takes it for history) did not materialise. |
+| `storm` (10 typists 60 s, a presence storm, 3 x 100 KB, then `faults`) | **0 of 12,576 token x page pairs missing**, documents identical, rosters whole 3 ms after the fault phase. Typing lag p50/p95 **107 / 119 ms** - the same as the full mesh (simple-peer 108/120, peerjs 111/121), so the multi-hop tree costs the typist nothing. And it is the quietest transport measured: **2 frames/s** for the whole room while ten type, against 7 (simple-peer), 44 (websocket), 598 (gun). Cursor: all 119.2 presence changes per peer and second arrive, p50 34 ms. Bulk: 319-472 ms per 100 KB (simple-peer 241-248). |
+| `oneway` | the scenario as written **tested nothing here**: it patched the data channels of a fixed pair (p2/p3) which on a partial mesh usually has no direct link at all, and the rename then travelled over the tree in 400 ms either way. The harness now picks a pair that actually holds a direct link (`window.__conference._byPeer`) and asks the sharp question - did the SENDING side notice the dead direction? It does: `❌ sendTo failed` -> `♻️ Link ... dropping it so the pair dials again`, as the rule demands. Whether the two then dial EACH OTHER again is not required of a partial mesh (the peer held 11 links after the drop and wanted no replacement), so that is recorded as a number, not a verdict. |
+
+### Found: a reloaded page can stay in a roster for the whole lease
+
+`SCENARIOS=join,linger LINGER_MS=420000 LINGER_GAP_MS=5000` (one page reloads every
+5 s, rosters checked 5 s later): **48 of 81 checks held a roster that was too LONG** -
+never one that was short. Up to three ghosts at once, and one of them was still there
+420 s later. A 180 s run of the same thing is clean: it takes enough churn for routes
+to die while somebody is leaving.
+
+The ghost is the same name twice, the old clientID beside the new one:
+
+```
+p0 holds: [{"name":"p16","clientID":2887087969,"clock":7,"ageMs":87443,
+            "address":"ef68771e7547",
+            "origin":{"gone":false,"hw":-1,"route":"mud3e7bz","direct":false}}, ...]
+```
+
+Three things in that line, and they are the whole mechanism:
+
+- **`hw: -1`** - p0's wrapper never saw a single frame from that origin. It knows it by
+  hearsay, from a DIGEST (`_origin(id)` without a first seq, line 1023).
+- **`direct: false`** - p0 never had a link to p16, so when p16 reloaded no link of p0's
+  died, and `_scheduleSuspect` is reached **only** from `_linkDown` (line 559).
+- **`gone: false`**, 87 s on. Everybody else's route to the departure ran through the one
+  broadcast `C_SUSPECT`: whoever already has a `suspectTimer` stays silent by design, so
+  exactly one peer sends it. p0 did not get it.
+
+And the presence removal an unloading page sends is its **last** message: whoever knew
+it only over a route that was dying at that moment misses it, and nobody ever repeats it.
+The core then holds the entry for the full 300 s lease.
+
+**The room sent 0 SUSPECTs in the whole 420 s run** (`stats.suspects`, summed over all 25
+pages, new counters `linkDowns` / `suspectsScheduled` / `suspects`). A control run with a
+killed tab shows the path does work - 21 links died, 6 suspects planned, 2 sent (the other
+4 stayed silent because somebody else's arrived first, which is the design).
+
+Not fixed in this round, on André's call: **measure first**. What has been measured:
+
+| | ghosts |
+|---|---|
+| `bench-partial-mesh` N=100, 25 reloads 1 s apart, 6 s to settle | 0 |
+| ... 250 ms apart, 6 s to settle | 6, with the browser's exact signature (`hw -1 gone false direct false`) |
+| ... 250 ms apart, 20 s to settle | 0 |
+| ... N=20, **60 reloads so every peer reloads three times**, 1 s apart | 0 |
+
+So Node reproduces the **signature** but not the **permanence**: there the SUSPECT does
+arrive, only late. The hypothesis that repeated reloads of the same page are what makes it
+permanent is refuted. Whatever keeps it alive in a browser is not in the model yet.
+
+#### The cause, measured to the end
+
+Counters in the wrapper (`linkDowns`, `suspectsScheduled`, `suspects`, and one per reason a
+planned suspicion was dropped) over the same 420 s browser run:
+
+```
+links died / SUSPECTs planned / SUSPECTs sent:  69 / 0 / 0
+by reason: noPeer 0, relinked 0, lastLink 0, alreadyGone 69, NEVER-KNEW-IT 0,
+           pending 0, othersFirst 0  -  departures learned from a C_LEAVE: 290
+```
+
+Read from the bottom up, that is the whole mechanism:
+
+1. A page that reloads **says goodbye**: the playground's own `beforeunload` calls
+   `provider.disconnect()` (`test/simple-peer/index.ts:606`), which broadcasts `C_LEAVE`.
+2. That frame is a gossip frame **of the leaver**, so it travels the leaver's paths and
+   reaches only whoever was listening on one that still worked - 290 departures learned over
+   ~80 reloads, about **3.6 of 24 peers** each time.
+3. Those few mark the origin `gone` and report it to their own core - **silently**.
+4. A moment later the link dies. The suspicion that would have told the room is planned and
+   dropped, because the peer already counts as gone: **69 of 69** (`alreadyGone`, and
+   `NEVER-KNEW-IT 0` rules out the alternative, that the neighbour no longer knew it).
+5. So nobody ever says it out loud. The peers that missed the goodbye also missed the
+   leaver's presence removal - it took the same dying path - and nothing follows for them.
+
+This refutes what the first measurement suggested. "Nobody declares a departure" was wrong:
+**every neighbour does, 290 times over. It is simply never spoken aloud.**
+
+#### Fixed: a goodbye that is heard is passed on in one's own voice
+
+`_relayLeave`, called from the `C_LEAVE` handler before `_gone`: schedule a `C_SUSPECT` for
+that origin with the same scatter and the same suppression a real suspicion uses, so one
+neighbour speaks and not all of them. Our paths are not the leaver's, which is the entire
+point. Two details:
+
+- **No `_byPeer` check** before sending, unlike a suspicion. A goodbye is the peer's own
+  word, not a guess - our link to it is about to close because it said so.
+- The `C_SUSPECT` handler cancels our own pending relay when somebody else's arrives
+  (`skipOthersFirst`), which is what keeps the cost at one broadcast per departure.
+
+25 browsers, `linger` 420 s, a reload every 5 s, checked 5 s after each:
+
+| | before | after |
+|---|---|---|
+| checks with a roster that was not 25 (of 81) | **48** | **5** |
+| ... ghosts at once | up to 3, one for the whole run | one at a time |
+| SUSPECTs sent by the room | **0** | 17 (of 300 goodbyes heard, 283 suppressed) |
+| final: documents identical, rosters | yes, max 26 | yes, **25/25/25** |
+
+And it is free where it matters - the relay answers an event that does not happen in a quiet
+room:
+
+| N=300, idle 300 s | frames/s of the whole room |
+|---|---|
+| untouched | 524 |
+| with the relay | **533** |
+
+Five checks still show a single ghost: the relay is a broadcast too and can miss somebody -
+only far less often, because its sender is alive and its tree works. Regression: 35 of 35
+`bench-*` gates and `repro-simple-peer-sparse` pass.
+
+**Gate**: the "deaf to goodbye" phase - a peer disconnects properly while one observer, one
+that holds no direct link to it, drops every C_LEAVE. 6.5 s before, 2.1 s after, with 6
+relays for 35 goodbyes heard. (An attempt to sharpen it further by keeping the leaver's
+links open, so that no dead link could trigger a suspicion, was dropped: with its links up
+the leaver still counts as directly connected everywhere, which changes how frames spread.
+The browser run is the measurement that decides here.)
+
+#### Also tried: `idleSuspectMs` - suspecting what has gone quiet. Shipped off.
+
+Before the cause was known, the same symptom was treated with a periodic sweep: suspect an
+origin not heard from in `idleSuspectMs` that this peer holds no link to. It works - the
+gate below proves an observer that misses every SUSPECT still lets a vanished peer go - and
+it cost far too much, which is why it ships at **0**:
+
+| idle room, 300 s, frames/s | N=40 | N=300 |
+|---|---|---|
+| off | 15 | **524** |
+| 200 s | 32 | **19,611** |
+| 90 s | 39 | - |
+
+A living peer is far quieter than it looks - the core suppresses a periodic beacon whenever
+it overhears an equal one, so 40 peers sent 47 broadcasts between them in 300 s - and a
+false departure is not one frame: `_gone` reaches the core, the entry goes, the REVIVE
+brings it back, the core resyncs. At N=300 the core's own sends went from 336 broadcasts /
+234 unicasts to 3,347 / 43,025. Narrowing it to origins whose route had died does not work
+either: the observer carrying the ghost reaches it over a link to a peer that is still
+there.
+
+It stays in the code with its gate ("deaf observer": a peer vanishes without a word and one
+observer drops every C_SUSPECT - `NEVER` before, `<= 2.9 s` after), useful in a small room
+that values a quick roster over frames, off above ~50 peers.
+
+#### And one that cannot work: `C_LEAVE` from the unloading page
+
+`Transport.leave` in `src/transport.ts`, a call in the core's `beforeunload`, a `leave()` on
+the wrapper - built, gated, reverted. A control run says why: a deaf observer heard an
+unloading peer's departure in 50 ms without it and 76 ms with it. `C_LEAVE` is a gossip
+frame of the leaver and travels the path its presence removal travels; whoever misses one
+misses both. Nothing the leaver says can reach them - which is exactly why the repair had to
+be somebody else's voice.
+
+### Found: a vanished peer takes 23-33 s to leave every roster
+
+`suspectTimeoutMs` is 6 s, so a killed tab should be gone from everybody in ~6-7 s. It is
+not: **23.0 s** with 25 Chrome peers, **32.7 s** with ten of them hidden Firefox tabs.
+With Firefox in the room the counters read `108 links died / 92 suspects planned / 7 sent`.
+
+### Firefox (`FIREFOX=10`, hidden tabs of one Firefox)
+
+Nothing fails: rosters 25/25 throughout, documents identical, the five frozen Chrome pages
+have the missed text 1,248 ms after the unfreeze and every roster is whole 1,254 ms after
+it, and text typed during a 5 s signaling outage is everywhere 4 ms after it comes back.
+The wrapper's own timers (digest 500 ms, graft 250 ms) survive Firefox's hidden-tab
+clamping, which was 4-7 s here (round 9 saw up to 24 s in a busier room) - the peers
+*behind* a hidden Firefox relay were the worry and they are fine.
+
+What is slower than Chrome-only: a reload is in every roster after 4.9 s (0.97 s), a new
+peer after a server restart after 6.2 s, the killed tab above. `editors identical: false`
+with `documents identical (Y.Text): true` is the known Firefox `innerText` artefact of
+round 9, not a finding.
+
+### Harness and gate changes this round
+
+- `room-scenarios.mjs`: DIAG dumps a partial mesh's holes at **any** size (it printed
+  nothing for a roster short by one or two - the shape `linger` and `storm` produce);
+  names **ghosts** (a roster longer than the room: the same name twice, with both
+  clientIDs, clocks, ages, addresses, the wrapper's origin state and the room's SUSPECT
+  count); reads a transport's id **live from the page** instead of the one `peerId:` line
+  its constructor logged (a peer that slept or changed its network re-joined under a new
+  one, so every table lookup after such a scenario was silently looking up nothing), and
+  reaches through the wrapper to the inner transport's table; picks the `oneway` pair by
+  an actual direct link.
+- `bench-partial-mesh.ts`: two new departure phases, both at the very end of a variant (they
+  change who is in the room, so nothing else may run after them - put before the kill phase
+  they made it red, which is a property of the test order, not of the transport):
+  - **unload** - the core's `beforeunload` in order (flush the pending update, remove the
+    awareness state, `transport.flush()`), then the channels close.
+  - **reload** - RELOADS pages go and come back under a new address, RELOAD_GAP_MS apart.
+    Quiet at the default 1 s; `RELOAD_GAP_MS=250` is the storm.
+
+  Both are **measurements, not verdicts** (`GATE_DEPARTURE=1` makes them fail the run): the
+  numbers below are what the transport does today, and gating them would make this file red
+  on every run and hide the regressions it does gate. Flip the switch when a fix lands.
+
+  | N=100, 25 reloads | full | conference | leaves | dial | dialleaves |
+  |---|---|---|---|---|---|
+  | the removal has emptied every roster | 25 ms | ghost in 2/98 | 1,425 ms | 1,269 ms | ghost in 9/98 |
+  | rosters too long after the reloads | - | 0/99 | 0/99 | 0/99 | 0/99 |
+
+  The ghost under Node carries the browser's signature (`wrapper there hw -1, direct false`).
+  What the spread says: the removal of an unloading page reaches a **leaf-heavy** room far
+  too slowly - `leaves` and `dialleaves` are the rooms with phones in them.
+
+  And a correction to the test bed itself: `MeshNet.deliver` tested the SENDER's connection
+  at ARRIVAL, so every frame of a page that closed in the same task was silently dropped -
+  which no browser does, and which made the first unload gate red for the wrong reason.
+
+Regression after all of it: 35 of 35 `bench-*` gates pass (plus `bench-persist-log`, which
+needs `fake-indexeddb`), and `repro-simple-peer-sparse` passes.

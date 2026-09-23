@@ -1346,3 +1346,96 @@ Trystero (0.4 s, 24 links) and conference (0.4 s, 4-16 links) all as before, onl
 five frozen pages report a sleep. `repro-simple-peer-sparse` and `bench-partial-mesh`
 pass.
 
+
+## Round 13: the last gaps in the coverage table (2026-09-22)
+
+After round 12 four things had never been measured. Three are closed here; what the
+conference transport's own runs found is in `2026-09-22-conference-transport.md`
+(a ghost that outlives a reload, and a vanished peer that takes 23-33 s to leave
+every roster).
+
+### Trystero, bandwidth - the last mesh transport without a figure
+
+`SCENARIOS=join,bandwidth`, 25 Chrome peers, local signaling, full mesh (24 links).
+
+| kB/s per peer, up / down | trystero | simple-peer | peerjs |
+|---|---|---|---|
+| idle - wire | 1.97 / 1.97 | 2.0 / 2.0 | 2.1 / 2.1 |
+| ... of which STUN keep-alive | 1.96 | 2.0 | - |
+| typist (5 of 25, 4.9 char/s) - payload | 7.6 / 1.67 | 5.7 / 1.2 | - |
+| typist - wire | 20.5 / 13.0 | 18.2 / 11.5 | 18.3 / 11.3 |
+| listener - wire | 5.2 / 7.0 | 4.7 / 6.4 | 4.3 / 6.1 |
+
+Trystero costs what the others cost; it is the same WebRTC underneath. Worth noting
+because it was the open question: its **pool of 20 pre-made offers** does not show up in
+the idle column at all - `getStats()` counts the links that exist, and an idle peer's
+1.97 kB/s is 1.96 kB/s of STUN keep-alive. What that pool costs is CPU and memory on the
+page, not bytes on the wire.
+
+### Ably and PubNub under load - the chunked burst nobody had tried
+
+Round 12 left `storm` out of the two hosted services on purpose (the free tier's rate
+limit would dominate a 25-peer, 10-typist run). The part that is worth the quota is
+`bulk`: a 100 KB insert is chunked by the transports (Ably 55 KB, PubNub 30 KB) into a
+**burst** of 2-5 publishes, which is exactly the shape a per-channel rate limiter refuses -
+and a refused chunk loses the message for every receiver at once. `bench-rate-limited-channel`
+gates the consequence; a real chunked burst through a real free-tier channel had never run.
+
+`N=12 SCENARIOS=join,storm STORM=typing,bulk STORM_TYPISTS=4 STORM_KEY_MS=1000 STORM_S=60`
+(~4 msg/s, well under the 50/s cap):
+
+| | ably (live) | pubnub (live) |
+|---|---|---|
+| typing: lag p50 / p95, ms | 131 / 135 | 146 / 168 |
+| typing: tokens missing | 0 of 440 | 0 of 440 |
+| bulk: tokens missing | 0 of 220 | 0 of 220 |
+| bulk: each 100 KB everywhere, ms | 421 / 461 / 438 | 201 / 152 / 202 |
+| sends the backend refused, whole run | **10** (`channel.maxRate`, nonfatal) | 0 |
+| final: documents identical, rosters | yes, 12/12 | yes, 12/12 |
+
+Ably's limiter did refuse ten publishes of the chunked bursts - and nothing was lost:
+the round-8 rule ("refused is not failed": published again after 1-2 s, five times) holds
+against the real service with real chunks. PubNub's smaller chunks went through untouched
+and land faster despite being more of them.
+
+`cursor` and `faults` stay out by decision: a 5 Hz presence storm measures the rate
+limiter rather than the provider (`bench-renewal-under-churn RELAY=1` gates that
+behaviour), and `faults`' server outage is the proxy cut that `restart` already ran for
+both services in round 12.
+
+### Gun against the public relays - the round-8 verdict no longer holds
+
+Round 8 recorded: `LIVE=1` on Gun, "nothing arrived (rosters 0 of 25 complete, text in 1
+of 25 editors)", and it was the relays themselves, not y-generic. Re-measured on v1.9.5
+(`LIVE=1 SCENARIOS=join,typing`, 25 Chrome peers, the public relays named in `.env`):
+
+| Gun, 25 browsers | round 8, public | round 13, public | round 12, local relay |
+|---|---|---|---|
+| rosters complete | never (0 of 25) | **778 ms** | 408 ms |
+| text of one peer everywhere | 1 of 25 editors | **710 ms** | - |
+| 60 characters of 5 typists everywhere | - | 1,465 ms | 2,184 ms |
+| frames during the join: total, peak/s | - | 9,939, 3,661 | 7,493, 2,769 |
+| frames in 10 idle seconds | - | 391 | 533 |
+| final: documents identical, rosters | no | **yes, 25/25** | yes, 25/25 |
+
+Either the relays recovered or round 10's Gun work carries it (v1.8.8 fixed exactly the
+two replay holes a public relay exposes: an initial load that skipped what arrived before
+its callback, and the first update of a fresh room). Both, most likely. The README's
+warning about public relays still stands for a classroom - 9,939 frames for one join is
+somebody else's bandwidth - but "nothing arrives" is no longer true.
+
+### A gate that had been broken since v1.8.0
+
+`test/ably/repro-liveobjects-persist.ts` (LiveObjects snapshot chunking: save, restore,
+a corrupted chunk) had never run in a regression pass. It fails at once: `Ably connection
+timeout`, 10 s in. Not the transport - its **fake SDK**. The transport waits for its first
+`connected` on `connection.on`, not `once`, since the round-8 lifecycle fix (ably-js
+reconnects by itself and the transport has to hear that too); the fake only ever fired
+`once` handlers, so the connection never opened. Behind that, a second staleness: the
+transport subscribes to `presence` leaves, and the fake had no `presence.subscribe`. Both
+fixed in the fake; all three scenarios pass. Nothing was wrong with the persistence path -
+but the gate that would have said so had been mute for four releases.
+
+`bench-persist-log` (the other never-in-a-regression gate, needs `fake-indexeddb`) passes
+unchanged: 3 rows for 1,000 keystrokes, 10 B per keystroke, content equal across a reload
+and a compaction.

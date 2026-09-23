@@ -1109,8 +1109,22 @@ async function main() {
     if (wanted.includes('vanish')) {
       console.log('vanish')
       const gone = peers[peers.length - 1]
+      // How long the ROOM takes to drop it splits into two very different halves: how long
+      // the browser needs to admit that a link of a killed tab is dead (ICE: ~15 s in
+      // Chrome, 25-30 s in Firefox, round 12), and what the transport does once it knows.
+      // Measure the first half, so the second is not blamed for it.
+      const linkDowns = () =>
+        Promise.all(peers.map((p) => p.page.evaluate(() => window.__conference?.stats.linkDowns ?? null).catch(() => null))).then((xs) =>
+          xs.some((x) => x !== null) ? xs.reduce((a, b) => a + (b ?? 0), 0) : null,
+        )
+      const downsBefore = await linkDowns()
+      const killedAt = Date.now()
       await gone.page.close()
       peers = others(gone)
+      if (downsBefore !== null) {
+        const noticed = await untilAll([peers[0]], async () => (await linkDowns()) > downsBefore, adapter.vanishTimeoutMs)
+        record('vanish', 'the first neighbour saw a link die (the browser admitting it, not the transport)', noticed.ms < 0 ? noticed : { ...noticed, ms: Date.now() - killedAt })
+      }
       record('vanish', `every roster dropped the killed tab (${peers.length} users)`, await untilAll(peers, async (p) => (await roster(p)) === peers.length, adapter.vanishTimeoutMs, rosterNote))
     }
 

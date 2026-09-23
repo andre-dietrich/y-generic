@@ -436,11 +436,29 @@ frame of the leaver and travels the path its presence removal travels; whoever m
 misses both. Nothing the leaver says can reach them - which is exactly why the repair had to
 be somebody else's voice.
 
-### Found: a vanished peer takes 23-33 s to leave every roster
+### Explained: a vanished peer takes 23-33 s to leave every roster - and 3/4 of it is the browser
 
 `suspectTimeoutMs` is 6 s, so a killed tab should be gone from everybody in ~6-7 s. It is
 not: **23.0 s** with 25 Chrome peers, **32.7 s** with ten of them hidden Firefox tabs.
-With Firefox in the room the counters read `108 links died / 92 suspects planned / 7 sent`.
+
+The `vanish` scenario now measures the two halves separately, and they settle the question:
+
+| 25 Chrome peers, conference | |
+|---|---|
+| until the first neighbour LEARNS the link died (the browser admitting it) | **16,564 ms** |
+| until every one of the 24 rosters has dropped it, from there (the transport) | **6,460 ms** |
+
+Three quarters of it is Chrome refusing to call a WebRTC link dead for ~15 s (25-30 s in
+Firefox, round 12) - a killed tab says nothing, so ICE is the only witness. The remaining
+quarter is exactly the `suspectTimeoutMs` this transport is configured with. A real phone
+agrees: a tab closed by hand was out of the room ~18 s later
+(`phone-session.mjs trystero`, 2026-09-23).
+
+**Nothing to fix in the transport.** The only way to shorten the first half is an
+application-level keep-alive per link, and that repeats the mistake `idleSuspectMs` made:
+frames in every quiet room, for ever, to speed up a rare case by seconds. The digest tick
+is no substitute - it sends only when it has something new to tell, and to one link per
+tick, so a quiet room carries no traffic to read a link's health from.
 
 ### Firefox (`FIREFOX=10`, hidden tabs of one Firefox)
 

@@ -1501,3 +1501,19 @@ transport stayed where it was"), green after. 25 browsers through every scenario
 afterwards: the five frozen pages have the missed text 74 ms after the unfreeze and every
 roster is whole 110 ms after it, rosters 25/25, 24 links per peer, and a new peer after a
 relay restart is everywhere after 1.2 s.
+
+#### The fix, confirmed on the phone (2026-09-23)
+
+The same five steps again, with both watches running:
+
+| trystero, André's phone | before | after |
+|---|---|---|
+| another app in front, ~40 s | 20,502 ms | 14,501 ms |
+| display off, ~65 s | 506 ms | 501 ms |
+| **display off, ~3 min** | **never came back (>8 min)** | **11,014 ms**, roster 9/9, missed text after 183 ms |
+
+The case the fix exists for works. Trystero stays the slowest transport in the set (11-14 s
+against conference's 0.5 s for the same absences): its own announce cycle plus the 5 s the
+transport deliberately waits after it detects a sleep. A phone tab closed by hand was out
+of the room ~18 s later, which is ICE, not the transport - see the conference spec's
+"a vanished peer takes 23-33 s".

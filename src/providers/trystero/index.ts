@@ -284,7 +284,18 @@ export class TrysteroTransport implements Transport {
 
     if (this.options.getRelaySockets) {
       this._socketWatch = setInterval(() => this.checkRelaySockets(), 2000)
-    } else if ((this.options.resumeAfterMs ?? 30000) > 0) {
+    }
+    // BOTH, not one or the other. A dead relay socket and a page that slept are different
+    // things, and a playground passes `getRelaySockets` for every strategy - so this used
+    // to be an `else if`, and every real page ran with no sleep detection at all, waiting
+    // for a socket to die that a phone's sleep leaves looking perfectly healthy.
+    //
+    // A real phone (phone-session.mjs trystero, 2026-09-23, 8 desktop peers): away for
+    // ~40 s it needed 20.5 s to be in the room again, and away for ~3 minutes it never
+    // came back - the room had not seen it 8 minutes later, while the phone itself
+    // counted 7-8 links and noticed nothing. The same absences on conference: 0.5 s each.
+    // Gate: repro-trystero-oneway.ts part 4.
+    if ((this.options.resumeAfterMs ?? 30000) > 0) {
       this._stopResumeWatch = watchResume(this.options.resumeAfterMs ?? 30000, () => {
         setTimeout(() => this.rejoin('the page slept'), 5000)
       })

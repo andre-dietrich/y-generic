@@ -125,11 +125,68 @@ async function networkChange(): Promise<boolean> {
   return ok
 }
 
+/**
+ * Part 4: the page SLEPT, and the transport was built the way a playground builds it -
+ * with `getRelaySockets`.
+ *
+ * A real phone, 2026-09-23 (`phone-session.mjs trystero`, 8 desktop peers): away for
+ * ~40 s it took **20.5 s** to be in the room again, and away for ~3 minutes it NEVER
+ * came back - 8 minutes later the room still did not have it, while the phone itself
+ * counted 7-8 links and noticed nothing. conference did the same three absences in
+ * 0.5 s each.
+ *
+ * The cause is one `else`: `watchResume` was installed only when `getRelaySockets` was
+ * NOT given, so every playground - which passes it for each strategy - ran without any
+ * sleep detection at all and relied on a relay socket dying. After a phone's sleep the
+ * sockets look intact, so nothing ever fired.
+ *
+ * Here: a room with `getRelaySockets` whose sockets stay open, a clock that jumps, and
+ * the question whether the transport joins the room again.
+ */
+async function sleptWithRelaySockets(): Promise<boolean> {
+  const rooms: { left: boolean }[] = []
+  const joinRoom = () => {
+    const s = scriptedRoom()
+    const entry = { left: false }
+    rooms.push(entry)
+    return { ...s.room, leave: () => (entry.left = true) }
+  }
+  // What a playground hands in: the strategy's relay sockets, all of them healthy.
+  const socket = { readyState: 1 } as any
+  const transport = new TrysteroTransport({
+    joinRoom: joinRoom as any,
+    appId: 'repro',
+    resumeAfterMs: 300,
+    getRelaySockets: () => ({ 'wss://relay.example': socket }),
+  } as any)
+  await transport.connect({ room: 'repro-room' })
+  const joinedBefore = rooms.length
+
+  // The page slept: its timers did not run while the clock moved on. watchResume ticks
+  // every second and compares - so a clock that is 10 s ahead is a 10 s sleep to it.
+  const realNow = Date.now
+  const jump = 10000
+  Date.now = () => realNow.call(Date) + jump
+  // rejoin('the page slept') is delayed by 5 s in the transport, so wait past that.
+  await sleep(7000)
+  Date.now = realNow
+
+  const ok = rooms.length === joinedBefore + 1 && rooms[0].left
+  console.log(
+    `  rooms joined: ${rooms.length} (want ${joinedBefore + 1}), the first one left = ${rooms[0]?.left} (want true)` +
+      (ok ? '' : ' - the page slept and the transport stayed where it was'),
+  )
+  transport.disconnect()
+  return ok
+}
+
 async function main() {
   console.log("a peer whose channel's send() throws, in a scripted Trystero room of three:")
   const ok = [await run('send'), await run('sendTo')]
   console.log('\nthe network changed under the page:')
   ok.push(await networkChange())
+  console.log('\nthe page slept, with getRelaySockets given (as every playground does):')
+  ok.push(await sleptWithRelaySockets())
   process.exit(ok.every(Boolean) ? 0 : 1)
 }
 

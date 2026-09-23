@@ -407,7 +407,14 @@ timers Firefox stretches by up to 20 s in a hidden tab - and it behaves like Chr
 the suppression still doing its work (16 broadcasts for 67 dead links). Four of its five
 are the same single ghost; the fifth is the opposite and harmless - a roster of 23, the
 page that had just reloaded still building up 5 s in (Chrome shows that as "smallest 1").
-Both runs end at 25/25/25 with identical documents. Regression: 35 of 35
+Both runs end at 25/25/25 with identical documents.
+
+**100 browsers, after the fix** (the round-11 run predates it; four times the room means
+four times as many neighbours hearing the same goodbye at once, so the suppression had to
+be checked at that size): rosters 99/99, documents identical, a reload everywhere after
+1.7 s, 6 frames/s idle - and `98 goodbyes heard, 87 suppressed, 23 broadcasts`. No storm.
+The killed tab reads as it does at 25: 14.0 s until the browser admits the link is dead,
+the transport after that. Regression: 35 of 35
 `bench-*` gates and `repro-simple-peer-sparse` pass.
 
 **Gate**: the "deaf to goodbye" phase - a peer disconnects properly while one observer, one

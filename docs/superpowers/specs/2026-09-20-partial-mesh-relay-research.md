@@ -1517,3 +1517,20 @@ against conference's 0.5 s for the same absences): its own announce cycle plus t
 transport deliberately waits after it detects a sleep. A phone tab closed by hand was out
 of the room ~18 s later, which is ICE, not the transport - see the conference spec's
 "a vanished peer takes 23-33 s".
+
+#### And the Firefox run the fix made necessary
+
+Activating `watchResume` for Trystero re-opened a round-9 question: a HIDDEN Firefox tab,
+whose timers Firefox stretches by up to 24 s, was taken for a sleeping page back then - nine
+of ten Firefox peers left and re-joined the room about once a minute. So: 15 Chrome peers
+and 10 hidden Firefox tabs, every scenario.
+
+**Zero re-joins in the whole run** (`Re-joining the room`, the transport's own line - the
+harness' "said the page had slept" counter greps for `Page slept` and would have missed
+Trystero's wording either way). Links 24/24/24, rosters 25/25 at the end, documents
+identical. The round-9 rule holds: a sleep needs the timers AND the links to have been
+silent, and the harness' freeze leaves the links delivering. Which is also why no browser
+run could ever have found what the phone found.
+
+The join still takes 60 s with hidden Firefox tabs, exactly as in round 9 - Trystero's own
+announce cycle, unchanged by any of this.

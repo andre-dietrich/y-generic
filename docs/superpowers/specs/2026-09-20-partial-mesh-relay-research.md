@@ -1439,3 +1439,65 @@ but the gate that would have said so had been mute for four releases.
 `bench-persist-log` (the other never-in-a-regression gate, needs `fake-indexeddb`) passes
 unchanged: 3 rows for 1,000 keystrokes, 10 B per keystroke, content equal across a reload
 and a compaction.
+
+### Three phone sessions, and what only a phone could find (2026-09-23)
+
+`phone-session.mjs` gained two backends this round: `conference` (the simple-peer
+playground under the wrapper, `&conference=<N>`, `LEAF=1` for a phone at the edge) and
+`trystero` (its playground had no `?phone` wiring at all).
+
+| André's Android phone, 8 desktop peers | conference, 9 peers | conference, `&leaf` | conference, **21 peers** | trystero |
+|---|---|---|---|---|
+| another app in front, ~40 s | 509 ms | 502 ms | 527 ms | **20,502 ms**, roster fell to 1 |
+| display off, ~70 s | 502 ms | 501 ms | 503 ms | 506 ms, then out again briefly |
+| display off, ~3 min | 519 ms | 506 ms | 522 ms | **never came back (>8 min)** |
+| links the phone held | 8 of 8 | 8 of 8 | **5-8 of 20** | 8 of 8 |
+
+Two things to read carefully here:
+
+**The first two conference runs tested the wrapper over a FULL mesh.** Below 17 peers the
+dial rule builds one on purpose, so with 9 in the room the phone held a link to everybody
+and nothing was ever relayed - the difference between a relay and a leaf could not show.
+The third run (20 desktop peers, `conference=21`) is the real one: 5 to 8 links out of 20,
+the rest of the room reachable only through neighbours. It is as clean as the others,
+including the 3-minute absence, where the phone is a relay node vanishing from the middle
+of a tree: the room dropped it at 374.9 s and had it back in EVERY roster 48 s later, and
+the phone itself held all 21 peers before and after each absence.
+
+**Trystero cannot be served over plain http on a LAN address at all.** `crypto.subtle`,
+which it uses to derive room keys, is withheld from an insecure context - so every page
+threw `importKey`/`digest`, found nobody, and sent "to 0 peers" for ever. That is why
+`room-scenarios.mjs trystero` (localhost) works and a phone session (the LAN address) does
+not. `phone-session.mjs` now serves that backend over https with parcel's self-signed
+certificate; the phone accepts it once, puppeteer ignores it. Worth knowing outside the
+test bed too: a classroom on Trystero needs https.
+
+#### Found, by the phone alone: Trystero had no sleep detection in any real page
+
+Away for ~40 s the phone took 20.5 s to be in the room again; away for 3 minutes it never
+returned, while counting 7-8 links and noticing nothing. One `else` is the whole story
+(`src/providers/trystero/index.ts`):
+
+```ts
+if (this.options.getRelaySockets) {
+  this._socketWatch = setInterval(() => this.checkRelaySockets(), 2000)
+} else if ((this.options.resumeAfterMs ?? 30000) > 0) {
+  this._stopResumeWatch = watchResume(...)     // never reached in practice
+}
+```
+
+Every playground passes `getRelaySockets` (one per strategy), so `watchResume` was never
+installed and the transport relied entirely on a relay socket dying. A phone's sleep leaves
+the sockets looking healthy, so nothing ever fired. Both watches now run: they answer
+different questions.
+
+Four browser rounds never caught this, because the harness freezes pages through the
+DevTools protocol - which kills the relay sockets, so the other path covered for it. It
+took a device that sleeps its WiFi and comes back with sockets that look intact.
+
+Gate: `repro-trystero-oneway.ts` part 4 - a transport built with `getRelaySockets` whose
+sockets stay open, and a clock that jumps 10 s. Red before ("the page slept and the
+transport stayed where it was"), green after. 25 browsers through every scenario
+afterwards: the five frozen pages have the missed text 74 ms after the unfreeze and every
+roster is whole 110 ms after it, rosters 25/25, 24 links per peer, and a new peer after a
+relay restart is everywhere after 1.2 s.

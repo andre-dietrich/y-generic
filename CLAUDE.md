@@ -170,8 +170,17 @@ Firefox delays a hidden tab's timers by up to ~20 s in a busy room; `FIREFOX_EAC
 and a visible tab each). That is why a late timer is not a sleep: `watchResume` reports one only
 when ticks AND links were silent for `resumeAfterMs` (30 s), at the first sign of life after the
 silence - never "a message means awake", a waking page handles its queued messages first
-(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|peerjs|nostr|websocket|gun|ably|pubnub>`: a real
-phone in a room of headless peers, reporting on itself through its presence. What a page
+(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|conference|peerjs|trystero|nostr|websocket|gun|ably|pubnub>`:
+a real phone in a room of headless peers, reporting on itself through its presence
+(`conference`: `CONFERENCE_EXPECTED=`, `LEAF=1` puts the phone at the edge - and use more
+than 16 desktop peers or the dial rule builds a FULL mesh and the wrapper relays nothing;
+`trystero` is served over **https**, because `crypto.subtle`, which its room keys need, is
+withheld from a plain-http LAN address - every page then finds nobody and sends "to 0
+peers" for ever, which also means a classroom on Trystero needs https). What only the phone
+found, round 13: Trystero installed `watchResume` in an `else` branch of
+`getRelaySockets`, so no real page had sleep detection - away 40 s it took 20.5 s to
+re-join, away 3 minutes it never did, while counting 7-8 links (conference: 0.5 s for the
+same absences). Both watches run now; gate `repro-trystero-oneway` part 4. What a page
 still owes the room when it unloads (its presence removal, a pending update batch) must not
 wait for a timer - a hidden Firefox tab runs none before it is gone:
 `test/dummy/bench-unload-removal.ts` - and a transport that defers its writes (Gun: its own

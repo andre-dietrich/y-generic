@@ -136,6 +136,49 @@ export interface ConferenceTransportOptions {
      * @default 6000
      */
     suspectTimeoutMs?: number;
+    /**
+     * How long an origin may stay silent before this peer suspects it on its
+     * own, without any link of its own having died.
+     *
+     * `_scheduleSuspect` is reached only from `_linkDown`, so only a DIRECT
+     * neighbour ever starts a departure - everybody else depends on the one
+     * `C_SUSPECT` that neighbour broadcasts (whoever already holds a
+     * `suspectTimer` stays silent). Miss that single frame and the origin
+     * stays `gone: false` for ever, while the core, which was promised a
+     * departure report and therefore grants a 300 s lease, holds the entry
+     * for all of it: 25 browsers reloading every 5 s had 48 of 81 checks
+     * carry a ghost, one of them for the whole 420 s run, and the room sent
+     * no SUSPECT at all (round 13).
+     *
+     * **Off by default, because it does not pay at the size this transport
+     * exists for.** It works - the gate proves an observer that misses every
+     * SUSPECT still lets a vanished peer go - but a living peer is far
+     * quieter than it looks: the core suppresses a periodic beacon whenever
+     * it overhears an equal one, so peers in a settled room say nothing for
+     * minutes, and every one of them is then suspected. Worse, a wrong
+     * suspicion is not one frame: `_gone` reaches the core, the entry is
+     * dropped, the REVIVE brings it back, and the core resyncs.
+     *
+     * Idle rooms, 300 s, frames per second of the whole room:
+     *
+     * | | N=40 | N=300 |
+     * |---|---|---|
+     * | off | 15 | 524 |
+     * | 200 s | 32 | **19,611** |
+     * | 90 s | 39 | - |
+     *
+     * At N=300 the core's own sends go from 336 broadcasts / 234 unicasts to
+     * 3,347 / 43,025: an avalanche, not an overhead. Narrowing it to origins
+     * whose route had died was tried and does not work either - the observer
+     * that carries the ghost reaches it over a link to a peer that is still
+     * very much there.
+     *
+     * Set it in a small room that values a quick roster over frames; leave it
+     * off above ~50 peers. A peer suspected wrongly answers C_ALIVE at once,
+     * which also GRAFTs the path that lost it, so it is safe either way.
+     * @default 0 (off)
+     */
+    idleSuspectMs?: number;
     /** connect() resolves at the first link, or after this when the room is empty. @default 3000 */
     firstLinkTimeoutMs?: number;
     /**
@@ -167,6 +210,26 @@ export declare class ConferenceTransport implements Transport {
         unroutable: number;
         connectWaitMs: number;
         linksAtConnect: number;
+        linkDowns: number;
+        suspectsScheduled: number;
+        /**
+         * Why a dead link did NOT end in a "that peer is gone" broadcast. A
+         * departure reaches everybody but the direct neighbours through exactly
+         * one such broadcast, so these six counters are the diagnosis when a
+         * ghost survives: noPeer = the link never carried a HELLO, relinked =
+         * that peer already has a newer link here, lastLink = it was OUR last
+         * link (we are the ones who just woke up, see _linkDown), gone/pending
+         * = already handled, othersFirst = somebody else's SUSPECT arrived while
+         * ours was waiting, which is the design.
+         */
+        skipNoPeer: number;
+        skipRelinked: number;
+        skipLastLink: number;
+        skipGone: number;
+        skipNoOrigin: number;
+        goneByLeave: number;
+        skipPending: number;
+        skipOthersFirst: number;
     };
     private readonly _idBytes;
     private readonly _opts;
@@ -186,6 +249,7 @@ export declare class ConferenceTransport implements Transport {
     private _cacheIndex;
     private _cacheSize;
     private _digestTimer?;
+    private _idleTimer?;
     private _announced;
     private _announcedRounds;
     private _digestTurn;
@@ -301,6 +365,46 @@ export declare class ConferenceTransport implements Transport {
     private _onGraft;
     /** SUSPECT names its target; ALIVE names the SUSPECT it answers (that frame's origin and seq). */
     private _broadcastControl;
+    /**
+     * An origin we have not heard from in `idleSuspectMs`, and hold no link
+     * to, is suspected here as well - not only by the neighbours whose link
+     * to it died.
+     *
+     * Without this, a departure reaches everybody but its direct neighbours
+     * through exactly ONE broadcast C_SUSPECT, and a peer that misses it
+     * keeps the entry until the core's 300 s lease runs out - a lease the
+     * core only grants because this transport promised to report departures.
+     * 25 browsers reloading every 5 s: 48 of 81 checks carried a ghost, one
+     * for the whole 420 s, and `stats.suspects` over the whole room was 0
+     * (round 13). The same peers that miss the frame are the ones that knew
+     * the leaver only from a DIGEST (`hw: -1`), so they also never got its
+     * last message, the presence removal.
+     *
+     * Suspecting a peer that is merely quiet costs one broadcast and is
+     * answered with C_ALIVE, which also GRAFTs the path that lost us; the
+     * core's periodic beacons back off to at most 60 s, so a living peer is
+     * never silent for the default 90 s.
+     */
+    private _sweepIdleOrigins;
+    /**
+     * Somebody said goodbye. Say it again in OUR voice.
+     *
+     * A C_LEAVE is a gossip frame of the LEAVER, so it travels the leaver's
+     * paths and reaches only the peers whose path still worked - measured in
+     * 25 browsers over 420 s of reloads: about 3.6 of 24. Those few then mark
+     * the origin `gone` silently, and the dead link that follows a moment
+     * later is skipped for exactly that reason ("already gone", 69 of 69), so
+     * nobody ever tells the room. The peers that missed the goodbye also
+     * missed the leaver's presence removal, which took the same dying path,
+     * and nothing follows either: they held the entry for the core's whole
+     * 300 s lease (48 of 81 checks carried a ghost, one for the full run).
+     *
+     * Our paths are not the leaver's, so passing it on in our own name is
+     * what closes that hole. Scattered and suppressed exactly like a
+     * SUSPECT, so one neighbour speaks and not all of them - and it costs
+     * what a departure without a goodbye costs anyway: one broadcast.
+     */
+    private _relayLeave;
     /**
      * Our link to `peer` closed. Every neighbour of a dead peer notices that
      * at about the same time: wait a random moment, and say nothing if

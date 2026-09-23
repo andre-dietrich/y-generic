@@ -139,6 +139,49 @@ export interface ConferenceTransportOptions {
    * @default 6000
    */
   suspectTimeoutMs?: number
+  /**
+   * How long an origin may stay silent before this peer suspects it on its
+   * own, without any link of its own having died.
+   *
+   * `_scheduleSuspect` is reached only from `_linkDown`, so only a DIRECT
+   * neighbour ever starts a departure - everybody else depends on the one
+   * `C_SUSPECT` that neighbour broadcasts (whoever already holds a
+   * `suspectTimer` stays silent). Miss that single frame and the origin
+   * stays `gone: false` for ever, while the core, which was promised a
+   * departure report and therefore grants a 300 s lease, holds the entry
+   * for all of it: 25 browsers reloading every 5 s had 48 of 81 checks
+   * carry a ghost, one of them for the whole 420 s run, and the room sent
+   * no SUSPECT at all (round 13).
+   *
+   * **Off by default, because it does not pay at the size this transport
+   * exists for.** It works - the gate proves an observer that misses every
+   * SUSPECT still lets a vanished peer go - but a living peer is far
+   * quieter than it looks: the core suppresses a periodic beacon whenever
+   * it overhears an equal one, so peers in a settled room say nothing for
+   * minutes, and every one of them is then suspected. Worse, a wrong
+   * suspicion is not one frame: `_gone` reaches the core, the entry is
+   * dropped, the REVIVE brings it back, and the core resyncs.
+   *
+   * Idle rooms, 300 s, frames per second of the whole room:
+   *
+   * | | N=40 | N=300 |
+   * |---|---|---|
+   * | off | 15 | 524 |
+   * | 200 s | 32 | **19,611** |
+   * | 90 s | 39 | - |
+   *
+   * At N=300 the core's own sends go from 336 broadcasts / 234 unicasts to
+   * 3,347 / 43,025: an avalanche, not an overhead. Narrowing it to origins
+   * whose route had died was tried and does not work either - the observer
+   * that carries the ghost reaches it over a link to a peer that is still
+   * very much there.
+   *
+   * Set it in a small room that values a quick roster over frames; leave it
+   * off above ~50 peers. A peer suspected wrongly answers C_ALIVE at once,
+   * which also GRAFTs the path that lost it, so it is safe either way.
+   * @default 0 (off)
+   */
+  idleSuspectMs?: number
   /** connect() resolves at the first link, or after this when the room is empty. @default 3000 */
   firstLinkTimeoutMs?: number
   /**
@@ -239,6 +282,8 @@ interface Origin {
   route?: string // link id the first copy came over
   unicastSeen: number[]
   gone: boolean
+  /** When a frame of this origin's own was last accepted - what `idleSuspectMs` measures. */
+  lastHeard: number
   freshUntil: number // a frame with G_FRESH seen within cacheMs: a joiner, its earlier frames are wanted
   firstSeen?: string // DIAG: how this origin was first heard of
   goneAt?: number
@@ -276,7 +321,36 @@ export class ConferenceTransport implements Transport {
   /** This peer's address in the room: what the core gets as `from` on the other side. */
   readonly id: string = randomId()
   /** Counters for benchmarks and the playground. */
-  readonly stats = { duplicates: 0, prunes: 0, grafts: 0, digests: 0, suspects: 0, unroutable: 0, connectWaitMs: 0, linksAtConnect: 0 }
+  readonly stats = {
+    duplicates: 0,
+    prunes: 0,
+    grafts: 0,
+    digests: 0,
+    suspects: 0,
+    unroutable: 0,
+    connectWaitMs: 0,
+    linksAtConnect: 0,
+    linkDowns: 0,
+    suspectsScheduled: 0,
+    /**
+     * Why a dead link did NOT end in a "that peer is gone" broadcast. A
+     * departure reaches everybody but the direct neighbours through exactly
+     * one such broadcast, so these six counters are the diagnosis when a
+     * ghost survives: noPeer = the link never carried a HELLO, relinked =
+     * that peer already has a newer link here, lastLink = it was OUR last
+     * link (we are the ones who just woke up, see _linkDown), gone/pending
+     * = already handled, othersFirst = somebody else's SUSPECT arrived while
+     * ours was waiting, which is the design.
+     */
+    skipNoPeer: 0,
+    skipRelinked: 0,
+    skipLastLink: 0,
+    skipGone: 0,
+    skipNoOrigin: 0,
+    goneByLeave: 0,
+    skipPending: 0,
+    skipOthersFirst: 0,
+  }
 
   private readonly _idBytes = fromHex(this.id)
   private readonly _opts: Required<Omit<ConferenceTransportOptions, 'expectedPeers'>> & { expectedPeers: number }
@@ -296,6 +370,7 @@ export class ConferenceTransport implements Transport {
   private _cacheIndex = new Map<string, Cached>()
   private _cacheSize = 0
   private _digestTimer?: ReturnType<typeof setInterval>
+  private _idleTimer?: ReturnType<typeof setInterval>
   private _announced = new Map<string, number>() // origin -> hw every lazy link has heard a DIGEST about
   private _announcedRounds = new Map<string, number>() // 'origin:hw' -> links told so far
   private _digestTurn = 0
@@ -324,6 +399,7 @@ export class ConferenceTransport implements Transport {
       digestFanout: options.digestFanout ?? 2,
       graftDelayMs: options.graftDelayMs ?? 250,
       suspectTimeoutMs: options.suspectTimeoutMs ?? 6000,
+      idleSuspectMs: options.idleSuspectMs ?? 0,
       firstLinkTimeoutMs: options.firstLinkTimeoutMs ?? 3000,
       expectedRttMs: options.expectedRttMs ?? 250,
       cacheMs: options.cacheMs ?? 30000,
@@ -377,6 +453,9 @@ export class ConferenceTransport implements Transport {
     if (this._opts.mode === 'tree') {
       this._digestTimer = setInterval(() => this._digestTick(), this._opts.digestIntervalMs)
     }
+    if (this._opts.idleSuspectMs > 0) {
+      this._idleTimer = setInterval(() => this._sweepIdleOrigins(), Math.max(1000, Math.floor(this._opts.idleSuspectMs / 6)))
+    }
     const waitFrom = Date.now()
     if (this._byPeer.size === 0) {
       await new Promise<void>((resolve) => {
@@ -402,6 +481,8 @@ export class ConferenceTransport implements Transport {
     this._connected = false
     if (this._digestTimer !== undefined) clearInterval(this._digestTimer)
     this._digestTimer = undefined
+    if (this._idleTimer !== undefined) clearInterval(this._idleTimer)
+    this._idleTimer = undefined
     for (const timer of this._pendingSuspects.values()) clearTimeout(timer)
     this._pendingSuspects.clear()
     for (const o of this._origins.values()) if (o.suspectTimer !== undefined) clearTimeout(o.suspectTimer)
@@ -532,6 +613,7 @@ export class ConferenceTransport implements Transport {
   private _linkDown(linkId: string): void {
     const link = this._links.get(linkId)
     if (link === undefined) return
+    this.stats.linkDowns++
     this._links.delete(linkId)
     if (link.graftTimer !== undefined) clearTimeout(link.graftTimer)
     const orphans: string[] = []
@@ -552,11 +634,14 @@ export class ConferenceTransport implements Transport {
     // peers on waking; whoever's ALIVE their brand-new links did not carry
     // was dropped, and one peer stayed out of three rosters for good.
     if (this._byPeer.size === 0) {
+      this.stats.skipLastLink++
       for (const timer of this._pendingSuspects.values()) clearTimeout(timer)
       this._pendingSuspects.clear()
       return
     }
-    if (peer !== undefined && !this._byPeer.has(peer)) this._scheduleSuspect(peer)
+    if (peer === undefined) this.stats.skipNoPeer++
+    else if (this._byPeer.has(peer)) this.stats.skipRelinked++
+    else this._scheduleSuspect(peer)
   }
 
   /**
@@ -667,7 +752,7 @@ export class ConferenceTransport implements Transport {
     if (o === undefined) {
       // What an origin sent before we heard of it is history: the core's join sync covers it.
       const hw = firstSeq === undefined ? -1 : firstSeq - 1
-      o = { hw, above: new Set(), aged: hw, first: hw + 1, top: hw, early: new Set(), earlyUntil: Date.now() + EARLY_MS, unicastSeen: [], gone: false, freshUntil: 0 }
+      o = { hw, above: new Set(), aged: hw, first: hw + 1, top: hw, early: new Set(), earlyUntil: Date.now() + EARLY_MS, unicastSeen: [], gone: false, lastHeard: Date.now(), freshUntil: 0 }
       this._origins.set(id, o)
       this._publishRoomSize()
     }
@@ -691,9 +776,11 @@ export class ConferenceTransport implements Transport {
     if (seq < o.first) {
       if (o.early.has(seq) || Date.now() > o.earlyUntil) return false
       o.early.add(seq)
+      o.lastHeard = Date.now()
       return true
     }
     if (seq <= o.hw || o.above.has(seq)) return false
+    o.lastHeard = Date.now()
     o.above.add(seq)
     while (o.above.delete(o.hw + 1)) o.hw++
     if (o.above.size > MAX_ABOVE) {
@@ -1088,21 +1175,114 @@ export class ConferenceTransport implements Transport {
   }
 
   /**
+   * An origin we have not heard from in `idleSuspectMs`, and hold no link
+   * to, is suspected here as well - not only by the neighbours whose link
+   * to it died.
+   *
+   * Without this, a departure reaches everybody but its direct neighbours
+   * through exactly ONE broadcast C_SUSPECT, and a peer that misses it
+   * keeps the entry until the core's 300 s lease runs out - a lease the
+   * core only grants because this transport promised to report departures.
+   * 25 browsers reloading every 5 s: 48 of 81 checks carried a ghost, one
+   * for the whole 420 s, and `stats.suspects` over the whole room was 0
+   * (round 13). The same peers that miss the frame are the ones that knew
+   * the leaver only from a DIGEST (`hw: -1`), so they also never got its
+   * last message, the presence removal.
+   *
+   * Suspecting a peer that is merely quiet costs one broadcast and is
+   * answered with C_ALIVE, which also GRAFTs the path that lost us; the
+   * core's periodic beacons back off to at most 60 s, so a living peer is
+   * never silent for the default 90 s.
+   */
+  private _sweepIdleOrigins(): void {
+    if (!this._connected) return
+    const deadline = Date.now() - this._opts.idleSuspectMs
+    for (const [id, o] of this._origins) {
+      if (o.gone || o.suspectTimer !== undefined || o.lastHeard > deadline) continue
+      if (this._byPeer.has(id)) continue // a link of our own is the better witness
+      this._scheduleSuspect(id)
+    }
+  }
+
+  /**
+   * Somebody said goodbye. Say it again in OUR voice.
+   *
+   * A C_LEAVE is a gossip frame of the LEAVER, so it travels the leaver's
+   * paths and reaches only the peers whose path still worked - measured in
+   * 25 browsers over 420 s of reloads: about 3.6 of 24. Those few then mark
+   * the origin `gone` silently, and the dead link that follows a moment
+   * later is skipped for exactly that reason ("already gone", 69 of 69), so
+   * nobody ever tells the room. The peers that missed the goodbye also
+   * missed the leaver's presence removal, which took the same dying path,
+   * and nothing follows either: they held the entry for the core's whole
+   * 300 s lease (48 of 81 checks carried a ghost, one for the full run).
+   *
+   * Our paths are not the leaver's, so passing it on in our own name is
+   * what closes that hole. Scattered and suppressed exactly like a
+   * SUSPECT, so one neighbour speaks and not all of them - and it costs
+   * what a departure without a goodbye costs anyway: one broadcast.
+   */
+  private _relayLeave(peer: string): void {
+    if (this._pendingSuspects.has(peer)) return
+    this._pendingSuspects.set(
+      peer,
+      setTimeout(
+        () => {
+          this._pendingSuspects.delete(peer)
+          // No `_byPeer` check here, unlike a suspicion: a goodbye is a peer's own word,
+          // not a guess. Our link to it is about to close anyway - it said so.
+          if (!this._connected) return
+          this.stats.suspects++
+          this._broadcastControl(C_SUSPECT, peer)
+        },
+        Math.random() * this._opts.suspectTimeoutMs * 0.1,
+      ),
+    )
+  }
+
+  /**
    * Our link to `peer` closed. Every neighbour of a dead peer notices that
    * at about the same time: wait a random moment, and say nothing if
    * somebody else's SUSPECT came by meanwhile.
    */
   private _scheduleSuspect(peer: string): void {
     const origin = this._origins.get(peer)
-    if (origin === undefined || origin.gone || this._pendingSuspects.has(peer)) return
+    if (origin === undefined) {
+      this.stats.skipNoOrigin++
+      return
+    }
+    if (origin.gone) {
+      this.stats.skipGone++
+      return
+    }
+    if (this._pendingSuspects.has(peer)) {
+      this.stats.skipPending++
+      return
+    }
+    this.stats.suspectsScheduled++
     this._pendingSuspects.set(
       peer,
       setTimeout(
         () => {
           this._pendingSuspects.delete(peer)
-          if (!this._connected || this._byPeer.has(peer)) return
+          if (!this._connected) return
+          if (this._byPeer.has(peer)) {
+            this.stats.skipRelinked++
+            return
+          }
           const o = this._origins.get(peer)
-          if (o === undefined || o.gone || o.suspectTimer !== undefined) return
+          if (o === undefined) {
+            this.stats.skipNoOrigin++
+            return
+          }
+          if (o.gone) {
+            this.stats.skipGone++
+            return
+          }
+          if (o.suspectTimer !== undefined) {
+            this.stats.skipOthersFirst++
+            return
+          }
           this.stats.suspects++
           this._suspect(peer, o)
           this._broadcastControl(C_SUSPECT, peer)
@@ -1165,6 +1345,13 @@ export class ConferenceTransport implements Transport {
       case C_SUSPECT: {
         const target = toHex(payload.subarray(1, 1 + ID_BYTES))
         if (target === this.id) return this._broadcastControl(C_ALIVE, originId, seq)
+        // Somebody is already telling the room: whatever we had waiting can go.
+        const ours = this._pendingSuspects.get(target)
+        if (ours !== undefined) {
+          clearTimeout(ours)
+          this._pendingSuspects.delete(target)
+          this.stats.skipOthersFirst++
+        }
         if (this._byPeer.has(target)) return // our own link to it is the better witness
         // The answer may be here already: SUSPECT and ALIVE run down two
         // different trees. An ALIVE that arrived 25 ms before its SUSPECT
@@ -1181,6 +1368,8 @@ export class ConferenceTransport implements Transport {
         return this._alive(originId, origin)
       }
       case C_LEAVE:
+        this.stats.goneByLeave++
+        this._relayLeave(originId)
         return this._gone(originId, origin)
     }
   }

@@ -230,6 +230,13 @@ export interface AblyConfig extends ConnectionConfig {
   /** Debounce delay in ms before writing the snapshot. @default 2000 */
   persistDebounceMs?: number
   /**
+   * The longest a change waits for its snapshot while the debounce keeps
+   * being restarted - by somebody who types: without it nothing was written
+   * for as long as that went on (test/ably/repro-liveobjects-persist.ts, 7).
+   * @default 10000
+   */
+  persistMaxWaitMs?: number
+  /**
    * ably-js's first retry after a lost connection; later ones wait up to
    * twice as long (x 1, 4/3, 5/3, 2). A network that comes back without the
    * browser saying so (a server, a proxy, a router that was gone) is only
@@ -249,8 +256,6 @@ const EVENT_NAME = 'yjs-update'
 // raw ArrayBuffer/Buffer, no base64 inflation, so the same conservative
 // number is a safe threshold for both).
 const MAX_MESSAGE_SIZE = 55000
-// Message type identifiers (must match GenericProvider's wire format).
-const MESSAGE_AWARENESS = 1
 
 /**
  * Ably transport for y-generic.
@@ -282,6 +287,21 @@ export class AblyTransport implements Transport {
   private persistentMode: boolean = false
   private persistDoc: Y.Doc | null = null
   private persistDebounceMs: number = 2000
+  private persistMaxWaitMs: number = 10000
+  /** When the oldest change the pending snapshot is for was made; 0 = none pending */
+  private persistPendingSince: number = 0
+  /** ConnectionConfig.sealFrame - the encryption of a wrapper above us */
+  private sealFrame?: (frame: Uint8Array) => Uint8Array
+  /**
+   * A snapshot is written for a change made HERE, not for one applied from
+   * the room (Y.applyUpdate makes a transaction that is not local) - its
+   * author writes that one. Told from the wire frame before, by its type
+   * byte: behind an encrypting wrapper that byte is ciphertext, and every
+   * presence change wrote a snapshot (test/ably/repro-liveobjects-persist.ts, 5).
+   */
+  private _onDocUpdate = (_u: Uint8Array, _o: unknown, _d: Y.Doc, tr: Y.Transaction): void => {
+    if (tr.local) this.queuePersist()
+  }
   private persistTimer?: ReturnType<typeof setTimeout>
   private isWritingSnapshot: boolean = false
   private savePending: boolean = false
@@ -311,6 +331,8 @@ export class AblyTransport implements Transport {
     this.persistentMode = config.persistent ?? false
     this.persistDoc = config.doc ?? null
     this.persistDebounceMs = config.persistDebounceMs ?? 2000
+    this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000
+    this.sealFrame = config.sealFrame
 
     if (this.persistentMode && !this.persistDoc) {
       throw new Error(
@@ -463,6 +485,11 @@ export class AblyTransport implements Transport {
     if (this.persistentMode) {
       this.liveRoot = await this.channel.object!.get()
       this.loadSnapshot()
+      this.persistDoc!.on('update', this._onDocUpdate)
+      // What this peer brings along (edits made offline, a local copy)
+      // reaches the snapshot once the stored one is merged - saveSnapshot
+      // waits for that.
+      this.queuePersist()
     }
   }
 
@@ -513,6 +540,7 @@ export class AblyTransport implements Transport {
       clearTimeout(this.persistTimer)
       this.persistTimer = undefined
     }
+    this.persistDoc?.off('update', this._onDocUpdate)
     if (this.persistentMode && this.persistDoc) {
       try {
         await this.saveSnapshot()
@@ -542,6 +570,8 @@ export class AblyTransport implements Transport {
     this.chunkBuffer.clear()
     this.persistentMode = false
     this.persistDoc = null
+    this.persistPendingSince = 0
+    this.sealFrame = undefined
     this.snapshotLoaded = false
     this.liveRoot = null
   }
@@ -560,18 +590,6 @@ export class AblyTransport implements Transport {
     } else {
       this._publish(base64Data)
     }
-
-    // Only real doc updates trigger a snapshot save, not every awareness
-    // heartbeat (peekMessageType() reads the type byte right after the
-    // 4-byte CRC header GenericProvider prepends to every message).
-    if (this.persistentMode && this.peekMessageType(data) !== MESSAGE_AWARENESS) {
-      this.queuePersist()
-    }
-  }
-
-  /** Peek the message type byte from CRC32-wrapped data (byte 4, after the 4-byte CRC32 header). */
-  private peekMessageType(data: Uint8Array): number {
-    return data.length < 5 ? -1 : data[4]
   }
 
   onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
@@ -609,13 +627,31 @@ export class AblyTransport implements Transport {
   // Persistence helpers (LiveObjects)
   // ---------------------------------------------------------------------------
 
-  /** Schedule a debounced snapshot write. Called on every non-awareness send(). */
+  /** Schedule a debounced snapshot write - never beyond persistMaxWaitMs after the oldest change. */
   private queuePersist(): void {
+    const now = Date.now()
+    if (!this.persistPendingSince) this.persistPendingSince = now
     if (this.persistTimer) clearTimeout(this.persistTimer)
     this.persistTimer = setTimeout(
-      () => this.saveSnapshot(),
-      this.persistDebounceMs,
+      () => {
+        this.persistTimer = undefined
+        this.saveSnapshot()
+      },
+      Math.max(0, Math.min(this.persistDebounceMs, this.persistPendingSince + this.persistMaxWaitMs - now)),
     )
+  }
+
+  /**
+   * Transport.flush: the page is unloading. A snapshot still in its
+   * debounce is written now - a page that goes runs no further timer, and
+   * the last edit before a reload or a closed tab was missing from the room
+   * (test/ably/repro-liveobjects-persist.ts, 6).
+   */
+  flush(): void {
+    if (!this.persistTimer) return
+    clearTimeout(this.persistTimer)
+    this.persistTimer = undefined
+    void this.saveSnapshot()
   }
 
   /**
@@ -642,12 +678,23 @@ export class AblyTransport implements Transport {
 
     this.isWritingSnapshot = true
     this.savePending = false
+    this.persistPendingSince = 0
 
     try {
       const enc = encoding.createEncoder()
       encoding.writeVarUint(enc, 0) // MESSAGE_SYNC
       syncProtocol.writeSyncStep2(enc, this.persistDoc)
-      const snapshotBytes = encoding.toUint8Array(enc)
+      let snapshotBytes = encoding.toUint8Array(enc)
+      // Behind an encrypting wrapper (ConnectionConfig.sealFrame) the
+      // snapshot is stored the way a sent frame travels - sealed, then
+      // without the CRC32 header, as send() strips it - so loadSnapshot's
+      // addCRC32Header hands the wrapper what it opens. Built under the
+      // wrapper it was stored in the clear and dropped by the wrapper on
+      // delivery (test/ably/repro-liveobjects-persist.ts, 4). Without one the
+      // stored bytes are what they always were.
+      if (this.sealFrame) {
+        snapshotBytes = new Uint8Array(stripCRC32Header(this.sealFrame(addCRC32Header(snapshotBytes))))
+      }
 
       const chunks: ArrayBuffer[] = []
       for (let i = 0; i < snapshotBytes.length; i += MAX_MESSAGE_SIZE) {

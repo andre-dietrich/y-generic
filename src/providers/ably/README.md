@@ -136,6 +136,27 @@ snapshots are chunked, since each write is capped at Ably's 64 KiB message
 size). On connect, any existing snapshot is read back and delivered before
 normal sync traffic begins.
 
+**When it is written**: for a change made on this peer (a local Yjs
+transaction; a change applied from the room is written by its author), and
+once after connect for what the peer brings along, debounced by
+`persistDebounceMs` (2000 ms) but never more than `persistMaxWaitMs`
+(10,000 ms) after the oldest change - a debounce every edit restarts wrote
+nothing while somebody typed. A snapshot still waiting is written at once
+when the page unloads (`flush()`, called by the provider's `beforeunload`)
+and on `disconnect()`. The change used to be told from the wire frame's
+type byte, which an encrypting wrapper turns into ciphertext: every presence
+change wrote a snapshot (`test/ably/repro-liveobjects-persist.ts`, 5-7).
+
+**Behind an encrypting wrapper** (LiaScript's `wrapTransport` with a
+password) the snapshot is built under the wrapper: it was stored in the
+clear and delivered as a frame the wrapper could not open, so a password
+room was never restored. The wrapper passes its encryption as `sealFrame`
+in the config it hands to `connect()`, and the snapshot is stored the way a
+sent frame travels - sealed, then without the CRC32 header as `send()`
+strips it - so the load path's re-added header gives the wrapper exactly
+what it opens (part 4; live against LiveObjects as well). Without
+`sealFrame` the stored bytes are unchanged.
+
 **Retention**: LiveObjects state is durably stored for 24h–90 days
 (configurable per app, Ably default 90 days) — good enough to resume after
 everyone's been offline for a while, not a replacement for a real backend if

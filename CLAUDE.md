@@ -134,7 +134,8 @@ What the harness finds gets a fast gate under plain Node before the fix:
 the library's path is an env var, see their headers), `test/nostr/repro-persistent.mjs` (Nostr's
 `persistent` snapshot: what is still in its debounce when the page unloads or disconnects, and
 behind an encrypting wrapper - LiaScript's password - the snapshot is built UNDER the wrapper, so
-the wrapper hands its encryption down as `ConnectionConfig.sealFrame`), `test/gun/repro-lone-joiner.mjs` (what a
+the wrapper hands its encryption down as `ConnectionConfig.sealFrame`; Ably's twin:
+`test/ably/repro-liveobjects-persist.ts`, scenarios 4-7), `test/gun/repro-lone-joiner.mjs` (what a
 backend REPLAYS of the document must reach a joiner whose peers are all gone - an initial load
 that skips what arrives before it called back loses exactly that, and the first update of a fresh
 room too), `test/providers/repro-ably-lifecycle.ts` (a

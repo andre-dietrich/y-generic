@@ -135,6 +135,13 @@ export interface AblyConfig extends ConnectionConfig {
     /** Debounce delay in ms before writing the snapshot. @default 2000 */
     persistDebounceMs?: number;
     /**
+     * The longest a change waits for its snapshot while the debounce keeps
+     * being restarted - by somebody who types: without it nothing was written
+     * for as long as that went on (test/ably/repro-liveobjects-persist.ts, 7).
+     * @default 10000
+     */
+    persistMaxWaitMs?: number;
+    /**
      * ably-js's first retry after a lost connection; later ones wait up to
      * twice as long (x 1, 4/3, 5/3, 2). A network that comes back without the
      * browser saying so (a server, a proxy, a router that was gone) is only
@@ -171,6 +178,19 @@ export declare class AblyTransport implements Transport {
     private persistentMode;
     private persistDoc;
     private persistDebounceMs;
+    private persistMaxWaitMs;
+    /** When the oldest change the pending snapshot is for was made; 0 = none pending */
+    private persistPendingSince;
+    /** ConnectionConfig.sealFrame - the encryption of a wrapper above us */
+    private sealFrame?;
+    /**
+     * A snapshot is written for a change made HERE, not for one applied from
+     * the room (Y.applyUpdate makes a transaction that is not local) - its
+     * author writes that one. Told from the wire frame before, by its type
+     * byte: behind an encrypting wrapper that byte is ciphertext, and every
+     * presence change wrote a snapshot (test/ably/repro-liveobjects-persist.ts, 5).
+     */
+    private _onDocUpdate;
     private persistTimer?;
     private isWritingSnapshot;
     private savePending;
@@ -196,13 +216,18 @@ export declare class AblyTransport implements Transport {
     private _dialSoonAfterPageBack;
     disconnect(): Promise<void>;
     send(data: Uint8Array): void;
-    /** Peek the message type byte from CRC32-wrapped data (byte 4, after the 4-byte CRC32 header). */
-    private peekMessageType;
     onMessage(callback: (data: Uint8Array, from?: string) => void): () => void;
     /** Get the clientIds of other peers currently present on the channel. */
     getPresence(): Promise<string[]>;
-    /** Schedule a debounced snapshot write. Called on every non-awareness send(). */
+    /** Schedule a debounced snapshot write - never beyond persistMaxWaitMs after the oldest change. */
     private queuePersist;
+    /**
+     * Transport.flush: the page is unloading. A snapshot still in its
+     * debounce is written now - a page that goes runs no further timer, and
+     * the last edit before a reload or a closed tab was missing from the room
+     * (test/ably/repro-liveobjects-persist.ts, 6).
+     */
+    flush(): void;
     /**
      * Encode the full Y.Doc state as a SYNC_STEP_2 message and write it across
      * one or more LiveMap keys (each `set()` is capped at Ably's 64 KiB message

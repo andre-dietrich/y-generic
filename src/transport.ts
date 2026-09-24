@@ -165,6 +165,17 @@ export interface ConnectionConfig {
    */
   waitFor?: Promise<unknown>
 
+  /**
+   * Set by a wrapper that encrypts what goes through send() and decrypts
+   * what comes out of onMessage(): its encryption, applied to one frame. A
+   * transport that stores frames it builds itself for later delivery (a
+   * persistent snapshot, see Nostr's `persistent`) stores and delivers them
+   * sealed - built under the wrapper they were otherwise stored in the
+   * clear and dropped by it on delivery. Transports that store nothing
+   * ignore it.
+   */
+  sealFrame?: (frame: Uint8Array) => Uint8Array
+
   /** Any other backend-specific configuration */
   [key: string]: any
 }

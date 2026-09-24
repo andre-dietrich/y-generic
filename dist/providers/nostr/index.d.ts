@@ -181,6 +181,26 @@ export interface NostrConfig extends ConnectionConfig {
     persistentKind?: number;
     /** Debounce between a document change and the next snapshot publish. */
     persistDebounceMs?: number;
+    /**
+     * The longest a document change waits for its snapshot while the
+     * debounce keeps being restarted - by somebody who types, or by a room
+     * where somebody always does: without it no snapshot was published for
+     * as long as that went on (test/nostr/repro-persistent.mjs, part 5).
+     * @default 10000
+     */
+    persistMaxWaitMs?: number;
+    /**
+     * For a wrapper that encrypts what goes through send() and decrypts what
+     * comes out of onMessage() (LiaScript's wrapTransport with a password):
+     * its encryption, applied to a frame. The snapshot is built down here,
+     * under the wrapper - so it went to the relay in the clear, and came
+     * back as a frame the wrapper could not open and dropped: a password
+     * room was never restored (test/nostr/repro-persistent.mjs, part 4).
+     * With it the snapshot is stored as the sealed frame and delivered as
+     * such, and the wrapper opens it like any other. A wrapper sets it in
+     * the config it passes on to connect().
+     */
+    sealFrame?: (frame: Uint8Array) => Uint8Array;
     /** Enable debug logging (overrides constructor option). */
     debug?: boolean;
 }
@@ -225,6 +245,10 @@ export declare class NostrTransport implements Transport {
     private doc;
     private persistentKind;
     private persistDebounceMs;
+    private persistMaxWaitMs;
+    private persistPendingSince;
+    private sealFrame?;
+    private lastSnapshotAt;
     private persistTimer?;
     private isPublishingSnapshot;
     private publishPending;
@@ -266,6 +290,9 @@ export declare class NostrTransport implements Transport {
     private _resubscribeNow;
     send(data: Uint8Array): Promise<void>;
     private _queueSnapshotPublish;
+    /** A change the relays have no snapshot of yet: in the debounce, or behind a publish in flight. */
+    private _snapshotPending;
+    private _publishSnapshot;
     /**
      * Publish the whole doc as one snapshot, always through the chunk
      * envelope (even a single part) - see README.md's "Persistent mode" for
@@ -273,8 +300,22 @@ export declare class NostrTransport implements Transport {
      * regardless of how many parts a given snapshot needs, so an older
      * differently-sized snapshot's slots are always overwritten rather than
      * left stale alongside a newer one under a different address.
+     *
+     * Every event is signed and handed to the pool in the calling task (the
+     * sockets' sends follow in its microtasks) - what flush() and disconnect()
+     * need - and resolves once the relays answered. `created_at` only ever
+     * grows: a relay keeps, of two events of one address in the same second,
+     * the one with the LOWER id (NIP-01), which is a coin toss between an
+     * older and a newer snapshot, and per chunk a torn mix of two.
      */
-    private _publishSnapshot;
+    private _publishSnapshotNow;
+    /**
+     * Transport.flush: the page is unloading. A snapshot still in its
+     * debounce goes now - a page that goes runs no further timer, and the
+     * last edit before a reload or a closed tab was missing from the room
+     * (test/nostr/repro-persistent.mjs, part 2).
+     */
+    flush(): void;
     /**
      * Transport.onPeerConnect: fires when a relay holds our subscription again
      * after NONE did (relay restart, frozen page, no relay reachable at

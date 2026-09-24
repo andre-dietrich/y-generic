@@ -42,7 +42,9 @@ base64 chars, from a fresh key (no NIP-05, no web of trust):
 | wss://relay.nostr.band, wss://relay.nostr.bg, wss://nostr.fmt.wiz.biz | timeout | timeout | |
 
 None of them returned a stored event for the room afterwards: kind 27370
-is in NIP-01's ephemeral range (20000-29999), relays do not store it. So
+is in NIP-01's ephemeral range (20000-29999), relays do not store it
+(re-probed 2026-09-24: nos.lol and nostr.mom DID return one 3 s after it
+was published - do not count on either). So
 `historyWindowSecs` fetches nothing with the default kind - a late joiner
 gets the document from a live peer's reply instead (measured: ~1 s
 below), unless persistent mode is on (see below). A regular `eventKind`
@@ -101,7 +103,27 @@ Publishing is debounced (`persistDebounceMs`, default 2000 ms) off
 `doc`'s own `update` event, not the outgoing wire frame - `send()`'s frame
 can't be peeked reliably here since this transport hints
 `preferredCompressMinBytes`, which shifts the message-type byte to an
-unpredictable offset once compression is on.
+unpredictable offset once compression is on. A change never waits longer
+than `persistMaxWaitMs` (default 10,000 ms) for its snapshot, however often
+the debounce is restarted - by somebody typing, or a room where somebody
+always is. A snapshot still waiting goes out at once when the page unloads
+(`flush()`, called by the provider's `beforeunload`) and on `disconnect()`,
+which closes the relays only once they have answered it (at most 3 s).
+Before that, the last edit within 2 s of a reload or a closed tab was
+missing from the room, and nothing was stored while somebody kept typing
+(`test/nostr/repro-persistent.mjs`, parts 2, 3 and 5). `created_at` only
+grows per peer: of two events of one address in the same second a relay
+keeps the lower id - an older snapshot, or per chunk a torn mix of two.
+
+**Behind an encrypting wrapper** (LiaScript's `wrapTransport` with a
+password) the snapshot is built under the wrapper: it was stored in the
+clear and delivered as a frame the wrapper could not open, so a password
+room was never restored (part 4). The wrapper passes its encryption as
+`sealFrame` in the config it hands to `connect()`; the snapshot is then
+stored as the sealed frame (`sealed: true` in the chunk envelope) and
+delivered unchanged, and the wrapper opens it like any other. The wrapper
+must forward `preferredCompressMinBytes` as well - the sealed frame carries
+the compression flag byte, see below.
 
 Always published through the chunk envelope, even a single-part snapshot,
 so the addressing scheme never changes shape: if a later, larger snapshot
@@ -153,4 +175,5 @@ nostr-tools), `secretKey` (persist it for a stable identity, else
 ephemeral), `eventKind` (27370), `debug`. Connect: `room`, `relays`,
 `password` (hashes into the room tag - discoverability, not encryption),
 `historyWindowSecs` (see above), `persistent`, `doc`, `persistentKind`
-(30078), `persistDebounceMs` (2000 ms) - see "Persistent mode" above.
+(30078), `persistDebounceMs` (2000 ms), `persistMaxWaitMs` (10,000 ms),
+`sealFrame` - see "Persistent mode" above.

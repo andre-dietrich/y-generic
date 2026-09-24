@@ -169,6 +169,8 @@ const DEFAULT_PERSISTENT_KIND = 30078;
 // path (a two-phase fetch that learns the real total instead of guessing
 // a fixed candidate range).
 const MAX_SNAPSHOT_CHUNKS = 20;
+// disconnect() closes the pool once a pending snapshot is answered, or after this.
+const SNAPSHOT_CLOSE_WAIT_MS = 3000;
 // ---------------------------------------------------------------------------
 // NostrTransport
 // ---------------------------------------------------------------------------
@@ -213,6 +215,11 @@ export class NostrTransport {
         this.doc = null;
         this.persistentKind = DEFAULT_PERSISTENT_KIND;
         this.persistDebounceMs = 2000;
+        this.persistMaxWaitMs = 10000;
+        // When the oldest change the pending snapshot is for was made; 0 = none pending
+        this.persistPendingSince = 0;
+        // created_at of the last snapshot published, see _publishSnapshotNow
+        this.lastSnapshotAt = 0;
         this.isPublishingSnapshot = false;
         this.publishPending = false;
         this.snapshotSub = null;
@@ -281,6 +288,8 @@ export class NostrTransport {
             this.doc = config.doc;
             this.persistentKind = config.persistentKind ?? DEFAULT_PERSISTENT_KIND;
             this.persistDebounceMs = config.persistDebounceMs ?? 2000;
+            this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000;
+            this.sealFrame = config.sealFrame;
             const snapshotDTags = Array.from({ length: MAX_SNAPSHOT_CHUNKS }, (_, i) => `${this.roomTag}#${i}`);
             this.snapshotSub = this.pool.subscribeMany(this.relays, { kinds: [this.persistentKind], '#d': snapshotDTags }, {
                 onevent: (event) => {
@@ -291,13 +300,19 @@ export class NostrTransport {
                         const whole = this.snapshotChunks.push(parsed);
                         if (whole === null)
                             return;
-                        const update = base64ToUint8Array(whole);
-                        const enc = encoding.createEncoder();
-                        encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH);
-                        encoding.writeVarUint8Array(enc, update);
-                        this._deliver(wrapFrame(encoding.toUint8Array(enc)));
+                        const bytes = base64ToUint8Array(whole);
+                        if (parsed.sealed) {
+                            // A frame sealed by the wrapper above us (see sealFrame): it opens it.
+                            this._deliver(bytes);
+                        }
+                        else {
+                            const enc = encoding.createEncoder();
+                            encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH);
+                            encoding.writeVarUint8Array(enc, bytes);
+                            this._deliver(wrapFrame(encoding.toUint8Array(enc)));
+                        }
                         if (debug)
-                            console.log('[NostrTransport] Applied persisted snapshot,', update.length, 'bytes');
+                            console.log('[NostrTransport] Applied persisted snapshot,', bytes.length, 'bytes');
                     }
                     catch (err) {
                         console.warn('[NostrTransport] Failed to decode snapshot event:', err);
@@ -328,6 +343,11 @@ export class NostrTransport {
             this.snapshotSub.close();
             this.snapshotSub = null;
         }
+        // A snapshot still in its debounce is published before the sockets
+        // close, not dropped: provider.destroy() 300 ms after an edit left the
+        // room without it (test/nostr/repro-persistent.mjs, part 3).
+        const pool = this.pool;
+        const published = this._snapshotPending() ? this._publishSnapshotNow() : null;
         if (this.doc) {
             this.doc.off('update', this._onDocUpdate);
             this.doc = null;
@@ -338,9 +358,19 @@ export class NostrTransport {
         }
         this.persistentMode = false;
         this.publishPending = false;
+        this.persistPendingSince = 0;
+        this.sealFrame = undefined;
         this.snapshotChunks.clear();
-        if (this.pool) {
-            this.pool.close(this.relays);
+        if (pool) {
+            const relays = this.relays;
+            if (published) {
+                // Until the relays have answered, or gave no answer in time.
+                const timeout = new Promise((resolve) => setTimeout(resolve, SNAPSHOT_CLOSE_WAIT_MS));
+                Promise.race([published, timeout]).then(() => pool.close(relays));
+            }
+            else {
+                pool.close(relays);
+            }
             this.pool = null;
         }
         this._connected = false;
@@ -491,19 +521,21 @@ export class NostrTransport {
     // Persistent mode: publish the doc as one or more addressable events
     // ---------------------------------------------------------------------------
     _queueSnapshotPublish() {
+        const now = Date.now();
+        if (!this.persistPendingSince)
+            this.persistPendingSince = now;
         if (this.persistTimer)
             clearTimeout(this.persistTimer);
-        this.persistTimer = setTimeout(() => this._publishSnapshot(), this.persistDebounceMs);
+        // Debounced, but never beyond persistMaxWaitMs after the oldest change.
+        const delay = Math.max(0, Math.min(this.persistDebounceMs, this.persistPendingSince + this.persistMaxWaitMs - now));
+        this.persistTimer = setTimeout(() => this._publishSnapshot(), delay);
     }
-    /**
-     * Publish the whole doc as one snapshot, always through the chunk
-     * envelope (even a single part) - see README.md's "Persistent mode" for
-     * why: it keeps exactly one addressing scheme (`${roomTag}#${index}`)
-     * regardless of how many parts a given snapshot needs, so an older
-     * differently-sized snapshot's slots are always overwritten rather than
-     * left stale alongside a newer one under a different address.
-     */
+    /** A change the relays have no snapshot of yet: in the debounce, or behind a publish in flight. */
+    _snapshotPending() {
+        return this.persistentMode && !!this.doc && (this.persistTimer !== undefined || this.publishPending);
+    }
     async _publishSnapshot() {
+        this.persistTimer = undefined;
         if (!this.pool || !this.doc)
             return;
         if (this.isPublishingSnapshot) {
@@ -513,32 +545,83 @@ export class NostrTransport {
         this.isPublishingSnapshot = true;
         this.publishPending = false;
         try {
-            const base64 = uint8ArrayToBase64(Y.encodeStateAsUpdate(this.doc));
-            const parts = splitChunks(base64, MAX_CONTENT_CHARS);
-            if (parts.length > MAX_SNAPSHOT_CHUNKS) {
-                console.warn(`[NostrTransport] Snapshot needs ${parts.length} chunks, more than MAX_SNAPSHOT_CHUNKS ` +
-                    `(${MAX_SNAPSHOT_CHUNKS}); skipping this publish. The live update channel still keeps ` +
-                    'connected peers in sync; the next smaller snapshot will catch late joiners up again.');
-                return;
-            }
-            for (const part of parts) {
-                const event = this.opts.finalizeEvent({
-                    kind: this.persistentKind,
-                    created_at: Math.floor(Date.now() / 1000),
-                    tags: [['d', `${this.roomTag}#${part.index}`]],
-                    content: JSON.stringify(part),
-                }, this.secretKey);
-                await Promise.allSettled(this.pool.publish(this.relays, event));
-            }
-        }
-        catch (err) {
-            console.warn('[NostrTransport] Failed to publish snapshot:', err);
+            await this._publishSnapshotNow();
         }
         finally {
             this.isPublishingSnapshot = false;
             if (this.publishPending)
                 this._queueSnapshotPublish();
         }
+    }
+    /**
+     * Publish the whole doc as one snapshot, always through the chunk
+     * envelope (even a single part) - see README.md's "Persistent mode" for
+     * why: it keeps exactly one addressing scheme (`${roomTag}#${index}`)
+     * regardless of how many parts a given snapshot needs, so an older
+     * differently-sized snapshot's slots are always overwritten rather than
+     * left stale alongside a newer one under a different address.
+     *
+     * Every event is signed and handed to the pool in the calling task (the
+     * sockets' sends follow in its microtasks) - what flush() and disconnect()
+     * need - and resolves once the relays answered. `created_at` only ever
+     * grows: a relay keeps, of two events of one address in the same second,
+     * the one with the LOWER id (NIP-01), which is a coin toss between an
+     * older and a newer snapshot, and per chunk a torn mix of two.
+     */
+    _publishSnapshotNow() {
+        this.persistPendingSince = 0;
+        if (!this.pool || !this.doc)
+            return Promise.resolve();
+        try {
+            let bytes = Y.encodeStateAsUpdate(this.doc);
+            const sealed = !!this.sealFrame;
+            if (this.sealFrame) {
+                // The frame as it is delivered (see connect()), sealed as the wrapper seals a sent one.
+                const enc = encoding.createEncoder();
+                encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH);
+                encoding.writeVarUint8Array(enc, bytes);
+                bytes = this.sealFrame(wrapFrame(encoding.toUint8Array(enc)));
+            }
+            const parts = splitChunks(uint8ArrayToBase64(bytes), MAX_CONTENT_CHARS);
+            if (parts.length > MAX_SNAPSHOT_CHUNKS) {
+                console.warn(`[NostrTransport] Snapshot needs ${parts.length} chunks, more than MAX_SNAPSHOT_CHUNKS ` +
+                    `(${MAX_SNAPSHOT_CHUNKS}); skipping this publish. The live update channel still keeps ` +
+                    'connected peers in sync; the next smaller snapshot will catch late joiners up again.');
+                return Promise.resolve();
+            }
+            this.lastSnapshotAt = Math.max(Math.floor(Date.now() / 1000), this.lastSnapshotAt + 1);
+            const published = [];
+            for (const part of parts) {
+                const event = this.opts.finalizeEvent({
+                    kind: this.persistentKind,
+                    created_at: this.lastSnapshotAt,
+                    tags: [['d', `${this.roomTag}#${part.index}`]],
+                    content: JSON.stringify(sealed ? { ...part, sealed } : part),
+                }, this.secretKey);
+                published.push(...this.pool.publish(this.relays, event));
+            }
+            return Promise.allSettled(published);
+        }
+        catch (err) {
+            console.warn('[NostrTransport] Failed to publish snapshot:', err);
+            return Promise.resolve();
+        }
+    }
+    /**
+     * Transport.flush: the page is unloading. A snapshot still in its
+     * debounce goes now - a page that goes runs no further timer, and the
+     * last edit before a reload or a closed tab was missing from the room
+     * (test/nostr/repro-persistent.mjs, part 2).
+     */
+    flush() {
+        if (!this._snapshotPending())
+            return;
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = undefined;
+        }
+        this.publishPending = false;
+        void this._publishSnapshotNow();
     }
     /**
      * Transport.onPeerConnect: fires when a relay holds our subscription again

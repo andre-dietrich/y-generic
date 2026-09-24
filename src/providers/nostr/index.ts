@@ -54,7 +54,7 @@
 import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import type { Transport, ConnectionConfig } from '../../transport'
-import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
+import { splitChunks, isChunk, ChunkAssembler, type Chunk } from '../chunking'
 import { watchPageBack } from '../resume'
 
 // Common relays (strfry default) cap an event at 64 KiB; content is the
@@ -186,6 +186,14 @@ const DEFAULT_PERSISTENT_KIND = 30078
 // path (a two-phase fetch that learns the real total instead of guessing
 // a fixed candidate range).
 const MAX_SNAPSHOT_CHUNKS = 20
+
+// disconnect() closes the pool once a pending snapshot is answered, or after this.
+const SNAPSHOT_CLOSE_WAIT_MS = 3000
+
+/** The chunk envelope of a snapshot; `sealed`: the data is a frame sealed by sealFrame. */
+interface SnapshotChunk extends Chunk {
+  sealed?: boolean
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -341,6 +349,28 @@ export interface NostrConfig extends ConnectionConfig {
   /** Debounce between a document change and the next snapshot publish. */
   persistDebounceMs?: number
 
+  /**
+   * The longest a document change waits for its snapshot while the
+   * debounce keeps being restarted - by somebody who types, or by a room
+   * where somebody always does: without it no snapshot was published for
+   * as long as that went on (test/nostr/repro-persistent.mjs, part 5).
+   * @default 10000
+   */
+  persistMaxWaitMs?: number
+
+  /**
+   * For a wrapper that encrypts what goes through send() and decrypts what
+   * comes out of onMessage() (LiaScript's wrapTransport with a password):
+   * its encryption, applied to a frame. The snapshot is built down here,
+   * under the wrapper - so it went to the relay in the clear, and came
+   * back as a frame the wrapper could not open and dropped: a password
+   * room was never restored (test/nostr/repro-persistent.mjs, part 4).
+   * With it the snapshot is stored as the sealed frame and delivered as
+   * such, and the wrapper opens it like any other. A wrapper sets it in
+   * the config it passes on to connect().
+   */
+  sealFrame?: (frame: Uint8Array) => Uint8Array
+
   /** Enable debug logging (overrides constructor option). */
   debug?: boolean
 }
@@ -398,6 +428,12 @@ export class NostrTransport implements Transport {
   private doc: Y.Doc | null = null
   private persistentKind = DEFAULT_PERSISTENT_KIND
   private persistDebounceMs = 2000
+  private persistMaxWaitMs = 10000
+  // When the oldest change the pending snapshot is for was made; 0 = none pending
+  private persistPendingSince = 0
+  private sealFrame?: (frame: Uint8Array) => Uint8Array
+  // created_at of the last snapshot published, see _publishSnapshotNow
+  private lastSnapshotAt = 0
   private persistTimer?: ReturnType<typeof setTimeout>
   private isPublishingSnapshot = false
   private publishPending = false
@@ -491,6 +527,8 @@ export class NostrTransport implements Transport {
       this.doc = config.doc
       this.persistentKind = config.persistentKind ?? DEFAULT_PERSISTENT_KIND
       this.persistDebounceMs = config.persistDebounceMs ?? 2000
+      this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000
+      this.sealFrame = config.sealFrame
 
       const snapshotDTags = Array.from(
         { length: MAX_SNAPSHOT_CHUNKS },
@@ -506,12 +544,17 @@ export class NostrTransport implements Transport {
               if (!isChunk(parsed)) return
               const whole = this.snapshotChunks.push(parsed)
               if (whole === null) return
-              const update = base64ToUint8Array(whole)
-              const enc = encoding.createEncoder()
-              encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
-              encoding.writeVarUint8Array(enc, update)
-              this._deliver(wrapFrame(encoding.toUint8Array(enc)))
-              if (debug) console.log('[NostrTransport] Applied persisted snapshot,', update.length, 'bytes')
+              const bytes = base64ToUint8Array(whole)
+              if ((parsed as SnapshotChunk).sealed) {
+                // A frame sealed by the wrapper above us (see sealFrame): it opens it.
+                this._deliver(bytes)
+              } else {
+                const enc = encoding.createEncoder()
+                encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
+                encoding.writeVarUint8Array(enc, bytes)
+                this._deliver(wrapFrame(encoding.toUint8Array(enc)))
+              }
+              if (debug) console.log('[NostrTransport] Applied persisted snapshot,', bytes.length, 'bytes')
             } catch (err) {
               console.warn('[NostrTransport] Failed to decode snapshot event:', err)
             }
@@ -544,6 +587,11 @@ export class NostrTransport implements Transport {
       this.snapshotSub.close()
       this.snapshotSub = null
     }
+    // A snapshot still in its debounce is published before the sockets
+    // close, not dropped: provider.destroy() 300 ms after an edit left the
+    // room without it (test/nostr/repro-persistent.mjs, part 3).
+    const pool = this.pool
+    const published = this._snapshotPending() ? this._publishSnapshotNow() : null
     if (this.doc) {
       this.doc.off('update', this._onDocUpdate)
       this.doc = null
@@ -554,10 +602,19 @@ export class NostrTransport implements Transport {
     }
     this.persistentMode = false
     this.publishPending = false
+    this.persistPendingSince = 0
+    this.sealFrame = undefined
     this.snapshotChunks.clear()
 
-    if (this.pool) {
-      this.pool.close(this.relays)
+    if (pool) {
+      const relays = this.relays
+      if (published) {
+        // Until the relays have answered, or gave no answer in time.
+        const timeout = new Promise((resolve) => setTimeout(resolve, SNAPSHOT_CLOSE_WAIT_MS))
+        Promise.race([published, timeout]).then(() => pool.close(relays))
+      } else {
+        pool.close(relays)
+      }
       this.pool = null
     }
 
@@ -721,8 +778,37 @@ export class NostrTransport implements Transport {
   // ---------------------------------------------------------------------------
 
   private _queueSnapshotPublish(): void {
+    const now = Date.now()
+    if (!this.persistPendingSince) this.persistPendingSince = now
     if (this.persistTimer) clearTimeout(this.persistTimer)
-    this.persistTimer = setTimeout(() => this._publishSnapshot(), this.persistDebounceMs)
+    // Debounced, but never beyond persistMaxWaitMs after the oldest change.
+    const delay = Math.max(
+      0,
+      Math.min(this.persistDebounceMs, this.persistPendingSince + this.persistMaxWaitMs - now),
+    )
+    this.persistTimer = setTimeout(() => this._publishSnapshot(), delay)
+  }
+
+  /** A change the relays have no snapshot of yet: in the debounce, or behind a publish in flight. */
+  private _snapshotPending(): boolean {
+    return this.persistentMode && !!this.doc && (this.persistTimer !== undefined || this.publishPending)
+  }
+
+  private async _publishSnapshot(): Promise<void> {
+    this.persistTimer = undefined
+    if (!this.pool || !this.doc) return
+    if (this.isPublishingSnapshot) {
+      this.publishPending = true
+      return
+    }
+    this.isPublishingSnapshot = true
+    this.publishPending = false
+    try {
+      await this._publishSnapshotNow()
+    } finally {
+      this.isPublishingSnapshot = false
+      if (this.publishPending) this._queueSnapshotPublish()
+    }
   }
 
   /**
@@ -732,44 +818,71 @@ export class NostrTransport implements Transport {
    * regardless of how many parts a given snapshot needs, so an older
    * differently-sized snapshot's slots are always overwritten rather than
    * left stale alongside a newer one under a different address.
+   *
+   * Every event is signed and handed to the pool in the calling task (the
+   * sockets' sends follow in its microtasks) - what flush() and disconnect()
+   * need - and resolves once the relays answered. `created_at` only ever
+   * grows: a relay keeps, of two events of one address in the same second,
+   * the one with the LOWER id (NIP-01), which is a coin toss between an
+   * older and a newer snapshot, and per chunk a torn mix of two.
    */
-  private async _publishSnapshot(): Promise<void> {
-    if (!this.pool || !this.doc) return
-    if (this.isPublishingSnapshot) {
-      this.publishPending = true
-      return
-    }
-    this.isPublishingSnapshot = true
-    this.publishPending = false
+  private _publishSnapshotNow(): Promise<unknown> {
+    this.persistPendingSince = 0
+    if (!this.pool || !this.doc) return Promise.resolve()
     try {
-      const base64 = uint8ArrayToBase64(Y.encodeStateAsUpdate(this.doc))
-      const parts = splitChunks(base64, MAX_CONTENT_CHARS)
+      let bytes = Y.encodeStateAsUpdate(this.doc)
+      const sealed = !!this.sealFrame
+      if (this.sealFrame) {
+        // The frame as it is delivered (see connect()), sealed as the wrapper seals a sent one.
+        const enc = encoding.createEncoder()
+        encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
+        encoding.writeVarUint8Array(enc, bytes)
+        bytes = this.sealFrame(wrapFrame(encoding.toUint8Array(enc)))
+      }
+      const parts = splitChunks(uint8ArrayToBase64(bytes), MAX_CONTENT_CHARS)
       if (parts.length > MAX_SNAPSHOT_CHUNKS) {
         console.warn(
           `[NostrTransport] Snapshot needs ${parts.length} chunks, more than MAX_SNAPSHOT_CHUNKS ` +
             `(${MAX_SNAPSHOT_CHUNKS}); skipping this publish. The live update channel still keeps ` +
             'connected peers in sync; the next smaller snapshot will catch late joiners up again.',
         )
-        return
+        return Promise.resolve()
       }
+      this.lastSnapshotAt = Math.max(Math.floor(Date.now() / 1000), this.lastSnapshotAt + 1)
+      const published: Promise<unknown>[] = []
       for (const part of parts) {
         const event = this.opts.finalizeEvent(
           {
             kind: this.persistentKind,
-            created_at: Math.floor(Date.now() / 1000),
+            created_at: this.lastSnapshotAt,
             tags: [['d', `${this.roomTag}#${part.index}`]],
-            content: JSON.stringify(part),
+            content: JSON.stringify(sealed ? { ...part, sealed } : part),
           },
           this.secretKey,
         )
-        await Promise.allSettled(this.pool.publish(this.relays, event))
+        published.push(...this.pool.publish(this.relays, event))
       }
+      return Promise.allSettled(published)
     } catch (err) {
       console.warn('[NostrTransport] Failed to publish snapshot:', err)
-    } finally {
-      this.isPublishingSnapshot = false
-      if (this.publishPending) this._queueSnapshotPublish()
+      return Promise.resolve()
     }
+  }
+
+  /**
+   * Transport.flush: the page is unloading. A snapshot still in its
+   * debounce goes now - a page that goes runs no further timer, and the
+   * last edit before a reload or a closed tab was missing from the room
+   * (test/nostr/repro-persistent.mjs, part 2).
+   */
+  flush(): void {
+    if (!this._snapshotPending()) return
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = undefined
+    }
+    this.publishPending = false
+    void this._publishSnapshotNow()
   }
 
   /**

@@ -942,14 +942,16 @@ export class SimplePeerTransport implements Transport {
     // Handle connection
     peer.on('connect', () => onChannelOpen('connect'))
 
-    // Handle ICE connection state for debugging
+    // Handle ICE connection state for debugging. addEventListener, not the
+    // on* properties: simple-peer's own handlers there destroy the peer on
+    // failure, which is what fires 'close' for a peer that vanished.
     if (peer._pc) {
-      peer._pc.oniceconnectionstatechange = () => {
+      peer._pc.addEventListener('iceconnectionstatechange', () => {
         this.log(`🧊 ICE ${remotePeerId}: ${peer._pc.iceConnectionState}`)
-      }
-      peer._pc.onconnectionstatechange = () => {
+      })
+      peer._pc.addEventListener('connectionstatechange', () => {
         this.log(`🔗 Connection ${remotePeerId}: ${peer._pc.connectionState}`)
-      }
+      })
     }
 
     // Handle incoming data

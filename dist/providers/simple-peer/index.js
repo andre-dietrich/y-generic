@@ -40,6 +40,12 @@ const CHUNK_SIZE = 64 * 1024;
  */
 const MAX_BUFFERED_AMOUNT = 16 * 1024;
 /**
+ * How long a peer connection may take to open its channel. If an offer/answer
+ * is lost in signaling, neither side ever reaches 'failed', so without this the
+ * half-built connection blocks re-discovery of that peer forever.
+ */
+const CONNECT_TIMEOUT = 15000;
+/**
  * Message type markers for chunking protocol.
  * - 0x00: Complete message (no chunking, raw data)
  * - 0x01: Chunked message with header
@@ -184,6 +190,7 @@ export class SimplePeerTransport {
         this._reconnectAttempts.clear();
         // Close all peer connections
         for (const peerConn of this.peers.values()) {
+            clearTimeout(peerConn.connectTimer);
             peerConn.peer.destroy();
         }
         this.peers.clear();
@@ -645,6 +652,13 @@ export class SimplePeerTransport {
             chunkBuffers: new Map(),
         };
         this.peers.set(remotePeerId, peerConn);
+        // Removing it lets the next announce rebuild the connection from scratch.
+        peerConn.connectTimer = setTimeout(() => {
+            if (this.peers.get(remotePeerId) !== peerConn || peerConn.connected)
+                return;
+            this.log(`⏱️ Peer ${remotePeerId} did not connect within ${CONNECT_TIMEOUT}ms — dropping`);
+            this.removePeer(remotePeerId);
+        }, CONNECT_TIMEOUT);
         // Handle signaling data (ICE candidates and SDP)
         peer.on('signal', (signal) => {
             this.log(`📤 Signal to ${remotePeerId}: ${signal.type ?? 'candidate'}`);
@@ -666,6 +680,7 @@ export class SimplePeerTransport {
             if (peerConn.connected)
                 return; // already fired
             peerConn.connected = true;
+            clearTimeout(peerConn.connectTimer);
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`);
             for (const cb of this._peerConnectCallbacks)
@@ -770,12 +785,17 @@ export class SimplePeerTransport {
             }
         });
         // Handle errors
+        // close/error fire asynchronously after destroy(); by then a fresh
+        // connection to the same peer may exist, which they must not remove.
         peer.on('error', (error) => {
             this.log(`❌ Peer error [${remotePeerId}]: ${error.message ?? error}`);
-            this.removePeer(remotePeerId);
+            if (this.peers.get(remotePeerId) === peerConn)
+                this.removePeer(remotePeerId);
         });
         // Handle close
         peer.on('close', () => {
+            if (this.peers.get(remotePeerId) !== peerConn)
+                return;
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected && p.peerId !== remotePeerId).length;
             this.log(`🔴 Peer channel closed: ${remotePeerId} — ${connectedCount}/${this.peers.size - 1} remaining`);
             this.removePeer(remotePeerId);
@@ -817,6 +837,7 @@ export class SimplePeerTransport {
         const peerConn = this.peers.get(peerId);
         if (peerConn) {
             const wasConnected = peerConn.connected;
+            clearTimeout(peerConn.connectTimer);
             try {
                 peerConn.peer.destroy();
             }

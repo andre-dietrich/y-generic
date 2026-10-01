@@ -129,6 +129,8 @@ interface PeerConnection {
   peer: any // SimplePeer instance
   connected: boolean
   peerId: string
+  /** Drops the connection if it never opens (see CONNECT_TIMEOUT) */
+  connectTimer?: ReturnType<typeof setTimeout>
   /** Buffer for reassembling chunked messages */
   chunkBuffers: Map<
     number,
@@ -148,6 +150,13 @@ const CHUNK_SIZE = 64 * 1024
  * If we send too much too fast, the buffer overflows.
  */
 const MAX_BUFFERED_AMOUNT = 16 * 1024
+
+/**
+ * How long a peer connection may take to open its channel. If an offer/answer
+ * is lost in signaling, neither side ever reaches 'failed', so without this the
+ * half-built connection blocks re-discovery of that peer forever.
+ */
+const CONNECT_TIMEOUT = 15000
 
 /**
  * Message type markers for chunking protocol.
@@ -356,6 +365,7 @@ export class SimplePeerTransport implements Transport {
 
     // Close all peer connections
     for (const peerConn of this.peers.values()) {
+      clearTimeout(peerConn.connectTimer)
       peerConn.peer.destroy()
     }
     this.peers.clear()
@@ -909,6 +919,13 @@ export class SimplePeerTransport implements Transport {
 
     this.peers.set(remotePeerId, peerConn)
 
+    // Removing it lets the next announce rebuild the connection from scratch.
+    peerConn.connectTimer = setTimeout(() => {
+      if (this.peers.get(remotePeerId) !== peerConn || peerConn.connected) return
+      this.log(`⏱️ Peer ${remotePeerId} did not connect within ${CONNECT_TIMEOUT}ms — dropping`)
+      this.removePeer(remotePeerId)
+    }, CONNECT_TIMEOUT)
+
     // Handle signaling data (ICE candidates and SDP)
     peer.on('signal', (signal: any) => {
       this.log(`📤 Signal to ${remotePeerId}: ${signal.type ?? 'candidate'}`)
@@ -930,6 +947,7 @@ export class SimplePeerTransport implements Transport {
     const onChannelOpen = (via: string) => {
       if (peerConn.connected) return // already fired
       peerConn.connected = true
+      clearTimeout(peerConn.connectTimer)
       const connectedCount = Array.from(this.peers.values()).filter(
         (p) => p.connected,
       ).length
@@ -1047,13 +1065,16 @@ export class SimplePeerTransport implements Transport {
     })
 
     // Handle errors
+    // close/error fire asynchronously after destroy(); by then a fresh
+    // connection to the same peer may exist, which they must not remove.
     peer.on('error', (error: Error) => {
       this.log(`❌ Peer error [${remotePeerId}]: ${error.message ?? error}`)
-      this.removePeer(remotePeerId)
+      if (this.peers.get(remotePeerId) === peerConn) this.removePeer(remotePeerId)
     })
 
     // Handle close
     peer.on('close', () => {
+      if (this.peers.get(remotePeerId) !== peerConn) return
       const connectedCount = Array.from(this.peers.values()).filter(
         (p) => p.connected && p.peerId !== remotePeerId,
       ).length
@@ -1108,6 +1129,7 @@ export class SimplePeerTransport implements Transport {
     const peerConn = this.peers.get(peerId)
     if (peerConn) {
       const wasConnected = peerConn.connected
+      clearTimeout(peerConn.connectTimer)
       try {
         peerConn.peer.destroy()
       } catch (error) {

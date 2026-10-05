@@ -327,6 +327,15 @@ export class SimplePeerTransport implements Transport {
       `✅ Connected to room "${this._room}" — ${this.signalingConns.length}/${this.options.signaling.length} signaling server(s)`,
     )
 
+    // A first attempt that failed asked for a reconnect while _connected was
+    // still false, which reads as a deliberate disconnect and is ignored.
+    // Retry those servers now, or one unreachable at startup stays unused.
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        this.scheduleSignalingReconnect(this.options.signaling[index])
+      }
+    })
+
     // Start periodic re-subscribe + re-announce to help late joiners discover us.
     // Deliberately NOT gated on `peers.size < maxConns`: a full mesh must keep
     // advertising, or peers that later drop out can never rediscover us.
@@ -852,6 +861,14 @@ export class SimplePeerTransport implements Transport {
         if (!resolved) {
           resolved = true
           this.log(`⏱️ Signaling connection timeout: ${url}`)
+          // Abandon the attempt so it can't open late next to its retry.
+          ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null
+          try {
+            ws.close()
+          } catch {
+            // already closing
+          }
+          this.scheduleSignalingReconnect(url)
           reject(new Error('Signaling connection timeout'))
         }
       }, 10000)

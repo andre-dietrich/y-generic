@@ -59,6 +59,14 @@ export interface WebSocketConfig extends ConnectionConfig {
   protocols?: string | string[]
   /** Enable debug logging */
   debug?: boolean
+  /**
+   * Drop and reconnect when nothing has been received for this long (ms).
+   * Catches half-open sockets that still report OPEN but deliver nothing.
+   * Same rule as y-websocket's client; relies on regular server traffic
+   * (GenericProvider's periodic sync and awareness renewals). 0 disables.
+   * (default: 30000)
+   */
+  messageTimeout?: number
 }
 
 /**
@@ -100,6 +108,8 @@ export class WebSocketTransport implements Transport {
   private intentionalDisconnect: boolean = false
   private messageQueue: Uint8Array[] = [] // Queue messages until connected
   private receivedBuffer: Uint8Array[] = [] // Buffer messages received before callback registered
+  private lastMessageAt: number = 0
+  private livenessTimer?: ReturnType<typeof setInterval>
 
   get isConnected(): boolean {
     return this._isConnected
@@ -150,6 +160,7 @@ export class WebSocketTransport implements Transport {
           this._isConnected = true
           this.reconnectAttempts = 0
           this.log(`✅ WebSocket connected to room: ${config.room}`)
+          this.startLivenessCheck()
 
           // Flush queued messages
           this.flushMessageQueue()
@@ -158,6 +169,7 @@ export class WebSocketTransport implements Transport {
         }
 
         this.ws.onmessage = (event) => {
+          this.lastMessageAt = Date.now()
           this.handleMessage(event.data)
         }
 
@@ -172,6 +184,7 @@ export class WebSocketTransport implements Transport {
 
         this.ws.onclose = (event) => {
           clearTimeout(timeout)
+          this.stopLivenessCheck()
           this._isConnected = false
           this.log(
             `WebSocket closed: code=${event.code}, reason=${event.reason || 'none'}`,
@@ -193,6 +206,7 @@ export class WebSocketTransport implements Transport {
    */
   disconnect(): void {
     this.intentionalDisconnect = true
+    this.stopLivenessCheck()
 
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
@@ -290,6 +304,44 @@ export class WebSocketTransport implements Transport {
     }
 
     this.messageQueue = []
+  }
+
+  /**
+   * Watch for a socket that stays OPEN but receives nothing (half-open: dead
+   * TCP path, NAT or proxy idle timeout). The browser may not fire onclose for
+   * many minutes; meanwhile sends vanish and nothing arrives.
+   */
+  private startLivenessCheck(): void {
+    this.stopLivenessCheck()
+    const timeout = this.config?.messageTimeout ?? 30000
+    if (timeout <= 0) return
+    this.lastMessageAt = Date.now()
+    this.livenessTimer = setInterval(() => {
+      const silentFor = Date.now() - this.lastMessageAt
+      if (!this.ws || silentFor <= timeout) return
+      this.log(`💀 No message for ${silentFor}ms, reconnecting`)
+      // Don't wait for onclose: on a dead path the close handshake can hang.
+      const ws = this.ws
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null
+      try {
+        ws.close()
+      } catch {
+        // already closing
+      }
+      this.ws = null
+      this._isConnected = false
+      this.stopLivenessCheck()
+      if (!this.intentionalDisconnect && (this.config?.autoReconnect ?? true)) {
+        this.attemptReconnect()
+      }
+    }, Math.max(100, timeout / 10))
+  }
+
+  private stopLivenessCheck(): void {
+    if (this.livenessTimer) {
+      clearInterval(this.livenessTimer)
+      this.livenessTimer = undefined
+    }
   }
 
   /**

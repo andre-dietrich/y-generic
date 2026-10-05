@@ -114,6 +114,13 @@ export interface SimplePeerTransportOptions {
      * @default false
      */
     debug?: boolean;
+    /**
+     * Drop and reconnect a signaling socket that has received nothing for this
+     * long (ms). A ping is sent at half this interval. Catches half-open sockets
+     * that still report OPEN but deliver nothing. 0 disables.
+     * @default 30000
+     */
+    signalingTimeout?: number;
 }
 /**
  * SimplePeer transport implementation using simple-peer library.
@@ -134,6 +141,8 @@ export declare class SimplePeerTransport implements Transport {
     private announceInterval?;
     private _reconnectAttempts;
     private _reconnectTimers;
+    private _signalingLiveness;
+    private _livenessInterval?;
     /**
      * Create a new SimplePeer transport.
      *
@@ -230,6 +239,21 @@ export declare class SimplePeerTransport implements Transport {
      * disconnect(), and never stacks duplicate timers for the same URL.
      */
     private scheduleSignalingReconnect;
+    /**
+     * Forget a signaling socket and schedule its reconnect. Without the
+     * reconnect, a single socket drop is terminal: the re-announce loop is gated
+     * on `signalingConns.length > 0`, so peer discovery stops forever while
+     * `isConnected` still reports true.
+     */
+    private dropSignaling;
+    /**
+     * Ping signaling sockets that went quiet, and drop the ones that stayed
+     * silent past `signalingTimeout`. A half-open socket (dead TCP path, NAT or
+     * proxy idle timeout) keeps reporting OPEN and may not fire onclose for many
+     * minutes, during which we are invisible to new peers. Healthy sockets see
+     * traffic every 5s anyway (our own re-announce is echoed by the server).
+     */
+    private checkSignalingLiveness;
     /**
      * Connect to a signaling server.
      */

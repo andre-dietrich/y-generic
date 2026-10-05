@@ -75,6 +75,7 @@ export class WebSocketTransport {
         this.intentionalDisconnect = false;
         this.messageQueue = []; // Queue messages until connected
         this.receivedBuffer = []; // Buffer messages received before callback registered
+        this.lastMessageAt = 0;
     }
     get isConnected() {
         return this._isConnected;
@@ -117,11 +118,13 @@ export class WebSocketTransport {
                     this._isConnected = true;
                     this.reconnectAttempts = 0;
                     this.log(`✅ WebSocket connected to room: ${config.room}`);
+                    this.startLivenessCheck();
                     // Flush queued messages
                     this.flushMessageQueue();
                     resolve();
                 };
                 this.ws.onmessage = (event) => {
+                    this.lastMessageAt = Date.now();
                     this.handleMessage(event.data);
                 };
                 this.ws.onerror = (error) => {
@@ -133,6 +136,7 @@ export class WebSocketTransport {
                 };
                 this.ws.onclose = (event) => {
                     clearTimeout(timeout);
+                    this.stopLivenessCheck();
                     this._isConnected = false;
                     this.log(`WebSocket closed: code=${event.code}, reason=${event.reason || 'none'}`);
                     // Attempt reconnection if not intentional
@@ -151,6 +155,7 @@ export class WebSocketTransport {
      */
     disconnect() {
         this.intentionalDisconnect = true;
+        this.stopLivenessCheck();
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = undefined;
@@ -235,6 +240,45 @@ export class WebSocketTransport {
             this.send(data);
         }
         this.messageQueue = [];
+    }
+    /**
+     * Watch for a socket that stays OPEN but receives nothing (half-open: dead
+     * TCP path, NAT or proxy idle timeout). The browser may not fire onclose for
+     * many minutes; meanwhile sends vanish and nothing arrives.
+     */
+    startLivenessCheck() {
+        this.stopLivenessCheck();
+        const timeout = this.config?.messageTimeout ?? 30000;
+        if (timeout <= 0)
+            return;
+        this.lastMessageAt = Date.now();
+        this.livenessTimer = setInterval(() => {
+            const silentFor = Date.now() - this.lastMessageAt;
+            if (!this.ws || silentFor <= timeout)
+                return;
+            this.log(`💀 No message for ${silentFor}ms, reconnecting`);
+            // Don't wait for onclose: on a dead path the close handshake can hang.
+            const ws = this.ws;
+            ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+            try {
+                ws.close();
+            }
+            catch {
+                // already closing
+            }
+            this.ws = null;
+            this._isConnected = false;
+            this.stopLivenessCheck();
+            if (!this.intentionalDisconnect && (this.config?.autoReconnect ?? true)) {
+                this.attemptReconnect();
+            }
+        }, Math.max(100, timeout / 10));
+    }
+    stopLivenessCheck() {
+        if (this.livenessTimer) {
+            clearInterval(this.livenessTimer);
+            this.livenessTimer = undefined;
+        }
     }
     /**
      * Attempt to reconnect

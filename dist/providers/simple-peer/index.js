@@ -80,6 +80,9 @@ export class SimplePeerTransport {
         // the pending retry timer (so disconnect() can cancel it).
         this._reconnectAttempts = new Map();
         this._reconnectTimers = new Map();
+        // Liveness per open signaling socket: when it last received anything and
+        // whether a ping is outstanding. Mirrors lib0's WebsocketClient (y-webrtc).
+        this._signalingLiveness = new Map();
         if (!options.peer) {
             throw new Error('SimplePeerTransport requires the "peer" option. ' +
                 'Please provide the simple-peer constructor: ' +
@@ -106,6 +109,7 @@ export class SimplePeerTransport {
             maxConns: options.maxConns ?? 20 + Math.floor(Math.random() * 15),
             peerOpts,
             debug: options.debug ?? false,
+            signalingTimeout: options.signalingTimeout ?? 30000,
         };
         // Generate unique peer ID
         this.peerId = this.generatePeerId();
@@ -165,6 +169,9 @@ export class SimplePeerTransport {
                 });
             }
         }, 5000); // Re-announce every 5 seconds for better peer discovery
+        if (this.options.signalingTimeout > 0) {
+            this._livenessInterval = setInterval(() => this.checkSignalingLiveness(), Math.max(100, this.options.signalingTimeout / 10));
+        }
     }
     /**
      * Disconnect from all peers and signaling servers.
@@ -182,6 +189,11 @@ export class SimplePeerTransport {
             clearInterval(this.announceInterval);
             this.announceInterval = undefined;
         }
+        if (this._livenessInterval) {
+            clearInterval(this._livenessInterval);
+            this._livenessInterval = undefined;
+        }
+        this._signalingLiveness.clear();
         // Cancel any pending signaling reconnects
         for (const timer of this._reconnectTimers.values()) {
             clearTimeout(timer);
@@ -454,6 +466,50 @@ export class SimplePeerTransport {
         }, delay));
     }
     /**
+     * Forget a signaling socket and schedule its reconnect. Without the
+     * reconnect, a single socket drop is terminal: the re-announce loop is gated
+     * on `signalingConns.length > 0`, so peer discovery stops forever while
+     * `isConnected` still reports true.
+     */
+    dropSignaling(ws, url) {
+        const index = this.signalingConns.indexOf(ws);
+        if (index > -1) {
+            this.signalingConns.splice(index, 1);
+        }
+        this._signalingLiveness.delete(ws);
+        this.scheduleSignalingReconnect(url);
+    }
+    /**
+     * Ping signaling sockets that went quiet, and drop the ones that stayed
+     * silent past `signalingTimeout`. A half-open socket (dead TCP path, NAT or
+     * proxy idle timeout) keeps reporting OPEN and may not fire onclose for many
+     * minutes, during which we are invisible to new peers. Healthy sockets see
+     * traffic every 5s anyway (our own re-announce is echoed by the server).
+     */
+    checkSignalingLiveness() {
+        const now = Date.now();
+        const timeout = this.options.signalingTimeout;
+        for (const [ws, liveness] of [...this._signalingLiveness]) {
+            const silentFor = now - liveness.lastMessage;
+            if (silentFor > timeout) {
+                this.log(`💀 Signaling silent for ${silentFor}ms, reconnecting: ${liveness.url}`);
+                // Don't wait for onclose: on a dead path the close handshake can hang.
+                ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+                try {
+                    ws.close();
+                }
+                catch {
+                    // already closing
+                }
+                this.dropSignaling(ws, liveness.url);
+            }
+            else if (silentFor > timeout / 2 && !liveness.pinged) {
+                liveness.pinged = true;
+                this.sendSignaling(ws, { type: 'ping' });
+            }
+        }
+    }
+    /**
      * Connect to a signaling server.
      */
     async connectSignaling(url) {
@@ -485,12 +541,22 @@ export class SimplePeerTransport {
                     });
                 }
                 this.signalingConns.push(ws);
+                this._signalingLiveness.set(ws, {
+                    url,
+                    lastMessage: Date.now(),
+                    pinged: false,
+                });
                 if (!resolved) {
                     resolved = true;
                     resolve();
                 }
             };
             ws.onmessage = (event) => {
+                const liveness = this._signalingLiveness.get(ws);
+                if (liveness) {
+                    liveness.lastMessage = Date.now();
+                    liveness.pinged = false;
+                }
                 try {
                     const msg = JSON.parse(event.data);
                     // Only log signal-bearing messages to avoid flooding with pure topology pings
@@ -512,14 +578,7 @@ export class SimplePeerTransport {
             };
             ws.onclose = () => {
                 this.log(`🔴 Signaling disconnected: ${url}`);
-                const index = this.signalingConns.indexOf(ws);
-                if (index > -1) {
-                    this.signalingConns.splice(index, 1);
-                }
-                // Without this, a single socket drop is terminal: the re-announce loop
-                // is gated on `signalingConns.length > 0`, so peer discovery stops
-                // forever while `isConnected` still reports true.
-                this.scheduleSignalingReconnect(url);
+                this.dropSignaling(ws, url);
                 if (!resolved) {
                     // Closed before ever opening — settle connect()'s promise so
                     // Promise.allSettled() in connect() isn't left hanging.
@@ -611,6 +670,9 @@ export class SimplePeerTransport {
                     // Signal without explicit target — handle anyway (some servers strip `to`)
                     this.handlePeerSignal(msg.from, msg.signal);
                 }
+                break;
+            case 'pong':
+                // Liveness reply; receiving it already refreshed the socket's timer.
                 break;
             default:
                 this.log(`❓ Unknown signaling message type: ${msg.type}`);

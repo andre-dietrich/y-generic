@@ -15,6 +15,14 @@ export interface WebSocketConfig extends ConnectionConfig {
     protocols?: string | string[];
     /** Enable debug logging */
     debug?: boolean;
+    /**
+     * Drop and reconnect when nothing has been received for this long (ms).
+     * Catches half-open sockets that still report OPEN but deliver nothing.
+     * Same rule as y-websocket's client; relies on regular server traffic
+     * (GenericProvider's periodic sync and awareness renewals). 0 disables.
+     * (default: 30000)
+     */
+    messageTimeout?: number;
 }
 /**
  * WebSocket Transport for Yjs
@@ -55,6 +63,8 @@ export declare class WebSocketTransport implements Transport {
     private intentionalDisconnect;
     private messageQueue;
     private receivedBuffer;
+    private lastMessageAt;
+    private livenessTimer?;
     get isConnected(): boolean;
     /**
      * Connect to WebSocket server
@@ -80,6 +90,13 @@ export declare class WebSocketTransport implements Transport {
      * Flush queued messages
      */
     private flushMessageQueue;
+    /**
+     * Watch for a socket that stays OPEN but receives nothing (half-open: dead
+     * TCP path, NAT or proxy idle timeout). The browser may not fire onclose for
+     * many minutes; meanwhile sends vanish and nothing arrives.
+     */
+    private startLivenessCheck;
+    private stopLivenessCheck;
     /**
      * Attempt to reconnect
      */

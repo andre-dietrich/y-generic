@@ -20,7 +20,12 @@
  *   1. the student → teacher link stalls once / twice in a row;
  *   2. the same with two signaling servers (every signal arrives twice);
  *   3. a candidate of the stalled attempt arrives after the retry started
- *      (with simple-peer, adding it fails and destroys the connection).
+ *      (with simple-peer, adding it fails and destroys the connection);
+ *   4. every direct attempt stalls, as for peers behind one NAT whose mDNS
+ *      host candidates don't resolve (in the e2e runs a stalled pair stalled
+ *      again on every retry): with a TURN server the retry goes relay-only
+ *      and connects; without one the link stays down and no relay-only
+ *      attempt is made.
  * Each prints how long until every pair has an open channel, and checks a
  * targeted message gets through.
  *
@@ -100,8 +105,11 @@ class FakeWebSocket {
 
 const fakePeers = new Map<string, FakePeer>()
 let uidCounter = 0
-/** Decides whether the attempt between two transports (by owner name) stalls. */
-let stallPolicy: (initiatorOwner: string, otherOwner: string) => boolean = () => false
+/**
+ * Decides whether the attempt between two transports (by owner name) stalls;
+ * `relay` is true when either side is relay-only (iceTransportPolicy 'relay').
+ */
+let stallPolicy: (initiatorOwner: string, otherOwner: string, relay: boolean) => boolean = () => false
 /** Owner name per transport peerId, filled in by the scenario. */
 const ownerOf = new Map<string, string>()
 let currentOwner = ''
@@ -114,11 +122,14 @@ class FakePeer extends EventEmitter {
   connected = false
   destroyed = false
   stalled = false
+  relay: boolean
   private pending: string[] = []
 
-  constructor(opts: { initiator: boolean }) {
+  constructor(opts: { initiator: boolean; config?: any }) {
     super()
     this.initiator = opts.initiator
+    this.relay = opts.config?.iceTransportPolicy === 'relay'
+    if (this.relay) stats.relayPeers++
     fakePeers.set(this.uid, this)
     if (this.initiator) {
       setTimeout(() => {
@@ -155,7 +166,7 @@ class FakePeer extends EventEmitter {
       } else {
         // initiator got the answer: ICE runs
         const other = this.remote!
-        const stall = stallPolicy(this.owner, other.owner)
+        const stall = stallPolicy(this.owner, other.owner, this.relay || other.relay)
         this.stalled = other.stalled = stall
         if (!stall) {
           setTimeout(() => {
@@ -199,7 +210,7 @@ class FakePeer extends EventEmitter {
   }
 }
 
-const stats = { errors: [] as string[] }
+const stats = { errors: [] as string[], relayPeers: 0 }
 
 // ---------------------------------------------------------------------------
 
@@ -212,20 +223,32 @@ interface Node {
 
 async function scenario(
   title: string,
-  opts: { signaling: number; stalls: number; staleCandidate?: boolean },
+  opts: {
+    signaling: number
+    /** how many attempts of the T↔S2 link stall, or every direct (non-relay) one */
+    stalls: number | 'direct'
+    staleCandidate?: boolean
+    /** configure a TURN server (enables the relay fallback) */
+    turn?: boolean
+    /** the T↔S2 link must stay closed (no usable path), checked for this long */
+    expectNeverMs?: number
+  },
 ) {
   servers.clear()
   fakePeers.clear()
   ownerOf.clear()
   stats.errors = []
+  stats.relayPeers = 0
   const urls = Array.from({ length: opts.signaling }, (_, i) => `fake://sig${i}`)
   for (const u of urls) servers.set(u, new FakeSignalingServer())
 
   // The newest joiner initiates (higher peerId); stall its link to the teacher.
-  let stallsLeft = opts.stalls
-  stallPolicy = (a, b) => {
+  let stallsLeft = opts.stalls === 'direct' ? Infinity : opts.stalls
+  stallPolicy = (a, b, relay) => {
     const pair = [a, b].sort().join('-')
-    if (pair === 'S2-T' && stallsLeft > 0) {
+    if (pair !== 'S2-T') return false
+    if (opts.stalls === 'direct') return !relay
+    if (stallsLeft > 0) {
       stallsLeft--
       return true
     }
@@ -239,6 +262,9 @@ async function scenario(
       peer: FakePeer,
       signaling: urls,
       signalingTimeout: 0,
+      iceServers: opts.turn
+        ? [{ urls: 'stun:stun.example:3478' }, { urls: 'turn:turn.example:3478', username: 'u', credential: 'p' }]
+        : undefined,
     })
     const node: Node = { name, t, openAt: new Map(), received: [] }
     const peerId = (t as any).peerId as string
@@ -285,7 +311,7 @@ async function scenario(
   }
 
   // Wait until all six channel ends are open (or give up).
-  const deadline = Date.now() + 70000
+  const deadline = Date.now() + (opts.expectNeverMs ?? 70000)
   while (Date.now() < deadline && nodes.some((n) => n.openAt.size < 2)) await sleep(50)
   await sleep(200)
 
@@ -305,10 +331,15 @@ async function scenario(
     `${title.padEnd(48)} T↔S2 open after ${fmt(tToS2)} / ${fmt(s2ToT)} (from S2 joining);`,
     `ping ${nodes[2].received.includes('ping') ? 'arrived' : 'LOST'};`,
     `S1 links ${nodes[1].openAt.size === 2 ? 'ok' : 'MISSING'};`,
+    `relay-only peers: ${stats.relayPeers};`,
     `errors: ${errors || 'none'}`,
   )
   for (const n of nodes) n.t.disconnect()
   await sleep(50)
+  if (opts.expectNeverMs !== undefined) {
+    // No usable path: the link stays down, and no relay attempt without TURN.
+    return tToS2 === undefined && (opts.turn || stats.relayPeers === 0)
+  }
   return tToS2 !== undefined && s2ToT !== undefined && nodes[2].received.includes('ping')
 }
 
@@ -319,6 +350,9 @@ async function main() {
     await scenario('T↔S2 stalls twice', { signaling: 1, stalls: 2 }),
     await scenario('stalls once, 2 signaling servers', { signaling: 2, stalls: 1 }),
     await scenario('stalls once, stale candidate after retry', { signaling: 1, stalls: 1, staleCandidate: true }),
+    await scenario('every direct attempt stalls, TURN configured', { signaling: 1, stalls: 'direct', turn: true }),
+    await scenario('stalls twice (2nd is relay), TURN configured', { signaling: 1, stalls: 2, turn: true }),
+    await scenario('every direct attempt stalls, no TURN (stays down)', { signaling: 1, stalls: 'direct', expectNeverMs: 20000 }),
   ]
   const ok = results.every(Boolean)
   console.log(ok ? 'OK' : 'FAILED')

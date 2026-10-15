@@ -129,6 +129,16 @@ export interface SimplePeerTransportOptions {
      * @default 5000
      */
     connectTimeout?: number;
+    /**
+     * After this many consecutive timed-out attempts to a peer, the initiator
+     * retries with `iceTransportPolicy: 'relay'`, so the connection runs via
+     * TURN. A stall that repeats for a pair (e.g. peers behind one NAT whose
+     * mDNS host candidates don't resolve) never clears on a direct retry; a
+     * relay-only connection has no direct pair to get stuck on. Only used when
+     * a `turn:`/`turns:` server is configured. `false` disables it.
+     * @default 1
+     */
+    relayFallbackAfter?: number | false;
 }
 /**
  * SimplePeer transport implementation using simple-peer library.
@@ -153,6 +163,7 @@ export declare class SimplePeerTransport implements Transport {
     private _livenessInterval?;
     private _peerLastSeen;
     private _connectFailures;
+    private _hasTurnServer;
     /**
      * Create a new SimplePeer transport.
      *

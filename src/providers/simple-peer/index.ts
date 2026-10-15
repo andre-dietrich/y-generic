@@ -140,6 +140,17 @@ export interface SimplePeerTransportOptions {
    * @default 5000
    */
   connectTimeout?: number
+
+  /**
+   * After this many consecutive timed-out attempts to a peer, the initiator
+   * retries with `iceTransportPolicy: 'relay'`, so the connection runs via
+   * TURN. A stall that repeats for a pair (e.g. peers behind one NAT whose
+   * mDNS host candidates don't resolve) never clears on a direct retry; a
+   * relay-only connection has no direct pair to get stuck on. Only used when
+   * a `turn:`/`turns:` server is configured. `false` disables it.
+   * @default 1
+   */
+  relayFallbackAfter?: number | false
 }
 
 interface PeerConnection {
@@ -236,6 +247,7 @@ export class SimplePeerTransport implements Transport {
     debug: boolean
     signalingTimeout: number
     connectTimeout: number
+    relayFallbackAfter: number | false
   }
   private _connected: boolean = false
   private _room: string = ''
@@ -267,6 +279,8 @@ export class SimplePeerTransport implements Transport {
   // out in a row (for the connect timeout backoff).
   private _peerLastSeen: Map<string, number> = new Map()
   private _connectFailures: Map<string, number> = new Map()
+  // Whether the ICE servers include a TURN server (relay fallback needs one).
+  private _hasTurnServer: boolean = false
 
   /**
    * Create a new SimplePeer transport.
@@ -308,7 +322,15 @@ export class SimplePeerTransport implements Transport {
       debug: options.debug ?? false,
       signalingTimeout: options.signalingTimeout ?? 30000,
       connectTimeout: options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT,
+      relayFallbackAfter: options.relayFallbackAfter ?? 1,
     }
+    this._hasTurnServer = (
+      (peerOpts.config?.iceServers as IceServer[] | undefined) ?? []
+    ).some((s) =>
+      (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) =>
+        /^turns?:/.test(u),
+      ),
+    )
 
     // Generate unique peer ID
     this.peerId = this.generatePeerId()
@@ -1045,13 +1067,30 @@ export class SimplePeerTransport implements Transport {
       return
     }
 
+    const failures = this._connectFailures.get(remotePeerId) ?? 0
+    // See relayFallbackAfter. Only the initiator switches: relay-only on one
+    // side already leaves no direct pair, and the other side needs no change.
+    const relayAfter = this.options.relayFallbackAfter
+    const relay =
+      initiator &&
+      relayAfter !== false &&
+      failures >= relayAfter &&
+      this._hasTurnServer
+    const peerOpts = relay
+      ? {
+          ...this.options.peerOpts,
+          config: { ...this.options.peerOpts.config, iceTransportPolicy: 'relay' },
+        }
+      : this.options.peerOpts
+
     this.log(
       `🤝 Creating ${initiator ? 'outbound (initiator)' : 'inbound (non-initiator)'} connection to ${remotePeerId}`,
+      relay ? `— relay only (after ${failures} stalled attempt(s))` : '',
     )
 
     const peer = new this.options.peer({
       initiator,
-      ...this.options.peerOpts,
+      ...peerOpts,
     })
 
     const peerConn: PeerConnection = {
@@ -1066,7 +1105,6 @@ export class SimplePeerTransport implements Transport {
 
     // See DEFAULT_CONNECT_TIMEOUT: the initiator times out early and offers
     // again; the non-initiator waits for that new offer.
-    const failures = this._connectFailures.get(remotePeerId) ?? 0
     const timeout = initiator
       ? Math.min(this.options.connectTimeout * 2 ** failures, CONNECT_TIMEOUT_MAX)
       : CONNECT_TIMEOUT_MAX

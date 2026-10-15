@@ -104,6 +104,8 @@ export class SimplePeerTransport {
         // out in a row (for the connect timeout backoff).
         this._peerLastSeen = new Map();
         this._connectFailures = new Map();
+        // Whether the ICE servers include a TURN server (relay fallback needs one).
+        this._hasTurnServer = false;
         if (!options.peer) {
             throw new Error('SimplePeerTransport requires the "peer" option. ' +
                 'Please provide the simple-peer constructor: ' +
@@ -132,7 +134,9 @@ export class SimplePeerTransport {
             debug: options.debug ?? false,
             signalingTimeout: options.signalingTimeout ?? 30000,
             connectTimeout: options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT,
+            relayFallbackAfter: options.relayFallbackAfter ?? 1,
         };
+        this._hasTurnServer = (peerOpts.config?.iceServers ?? []).some((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => /^turns?:/.test(u)));
         // Generate unique peer ID
         this.peerId = this.generatePeerId();
         this.log(`Initialized — peerId: ${this.peerId}, maxConns: ${this.options.maxConns}`, `\n  signaling: [${this.options.signaling.join(', ')}]`, `\n  iceServers: [${(peerOpts.config?.iceServers ?? []).map((s) => (Array.isArray(s.urls) ? s.urls[0] : s.urls)).join(', ')}]`);
@@ -746,10 +750,24 @@ export class SimplePeerTransport {
             this.log(`⏭️ Peer connection already exists: ${remotePeerId}`);
             return;
         }
-        this.log(`🤝 Creating ${initiator ? 'outbound (initiator)' : 'inbound (non-initiator)'} connection to ${remotePeerId}`);
+        const failures = this._connectFailures.get(remotePeerId) ?? 0;
+        // See relayFallbackAfter. Only the initiator switches: relay-only on one
+        // side already leaves no direct pair, and the other side needs no change.
+        const relayAfter = this.options.relayFallbackAfter;
+        const relay = initiator &&
+            relayAfter !== false &&
+            failures >= relayAfter &&
+            this._hasTurnServer;
+        const peerOpts = relay
+            ? {
+                ...this.options.peerOpts,
+                config: { ...this.options.peerOpts.config, iceTransportPolicy: 'relay' },
+            }
+            : this.options.peerOpts;
+        this.log(`🤝 Creating ${initiator ? 'outbound (initiator)' : 'inbound (non-initiator)'} connection to ${remotePeerId}`, relay ? `— relay only (after ${failures} stalled attempt(s))` : '');
         const peer = new this.options.peer({
             initiator,
-            ...this.options.peerOpts,
+            ...peerOpts,
         });
         const peerConn = {
             peer,
@@ -761,7 +779,6 @@ export class SimplePeerTransport {
         this.peers.set(remotePeerId, peerConn);
         // See DEFAULT_CONNECT_TIMEOUT: the initiator times out early and offers
         // again; the non-initiator waits for that new offer.
-        const failures = this._connectFailures.get(remotePeerId) ?? 0;
         const timeout = initiator
             ? Math.min(this.options.connectTimeout * 2 ** failures, CONNECT_TIMEOUT_MAX)
             : CONNECT_TIMEOUT_MAX;

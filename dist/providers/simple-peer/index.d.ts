@@ -121,6 +121,14 @@ export interface SimplePeerTransportOptions {
      * @default 30000
      */
     signalingTimeout?: number;
+    /**
+     * How long (ms) the initiator gives a peer connection to open its channel
+     * before tearing it down and offering again. Doubles after each consecutive
+     * failure with the same peer, up to 30s, so a slow (e.g. TURN-only) network
+     * is not torn down forever. See CONNECT_TIMEOUT_MAX.
+     * @default 5000
+     */
+    connectTimeout?: number;
 }
 /**
  * SimplePeer transport implementation using simple-peer library.
@@ -143,6 +151,8 @@ export declare class SimplePeerTransport implements Transport {
     private _reconnectTimers;
     private _signalingLiveness;
     private _livenessInterval?;
+    private _peerLastSeen;
+    private _connectFailures;
     /**
      * Create a new SimplePeer transport.
      *
@@ -279,6 +289,7 @@ export declare class SimplePeerTransport implements Transport {
      */
     private handlePeerSignal;
     private pruneStalePeer;
+    private forgetGonePeers;
     /**
      * Remove and cleanup a peer connection.
      */

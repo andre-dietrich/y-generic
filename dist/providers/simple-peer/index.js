@@ -40,11 +40,27 @@ const CHUNK_SIZE = 64 * 1024;
  */
 const MAX_BUFFERED_AMOUNT = 16 * 1024;
 /**
- * How long a peer connection may take to open its channel. If an offer/answer
- * is lost in signaling, neither side ever reaches 'failed', so without this the
- * half-built connection blocks re-discovery of that peer forever.
+ * How long a peer connection may take to open its channel. Neither side ever
+ * reaches 'failed' when an offer/answer is lost in signaling, or when ICE gets
+ * stuck one-sided: the controlling side sees a successful check, nominates the
+ * pair and stops checking, while the controlled side never gets a check
+ * answered and stays 'checking' (seen between peers behind the same NAT, where
+ * the only usable pair needed a hairpin that worked in one direction only).
+ *
+ * The initiator owns recovery: after `connectTimeout` (doubling per failure up
+ * to CONNECT_TIMEOUT_MAX) it tears its side down and sends a fresh offer, which
+ * the other side recognises by its new attempt id and accepts in place of the
+ * stuck connection. The non-initiator only waits CONNECT_TIMEOUT_MAX, to
+ * clean up when the initiator is gone.
  */
-const CONNECT_TIMEOUT = 15000;
+const DEFAULT_CONNECT_TIMEOUT = 5000;
+const CONNECT_TIMEOUT_MAX = 30000;
+/**
+ * A peer whose signaling messages we saw this recently is still in the room,
+ * so a timed-out connection to it is retried right away. Two announce periods
+ * plus slack.
+ */
+const PEER_SEEN_WINDOW = 12000;
 /**
  * Message type markers for chunking protocol.
  * - 0x00: Complete message (no chunking, raw data)
@@ -83,6 +99,11 @@ export class SimplePeerTransport {
         // Liveness per open signaling socket: when it last received anything and
         // whether a ping is outstanding. Mirrors lib0's WebsocketClient (y-webrtc).
         this._signalingLiveness = new Map();
+        // Per remote peerId, outliving its PeerConnection: when we last saw any
+        // signaling message from it, and how many connection attempts to it timed
+        // out in a row (for the connect timeout backoff).
+        this._peerLastSeen = new Map();
+        this._connectFailures = new Map();
         if (!options.peer) {
             throw new Error('SimplePeerTransport requires the "peer" option. ' +
                 'Please provide the simple-peer constructor: ' +
@@ -110,6 +131,7 @@ export class SimplePeerTransport {
             peerOpts,
             debug: options.debug ?? false,
             signalingTimeout: options.signalingTimeout ?? 30000,
+            connectTimeout: options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT,
         };
         // Generate unique peer ID
         this.peerId = this.generatePeerId();
@@ -161,6 +183,7 @@ export class SimplePeerTransport {
             if (this.signalingConns.length === 0)
                 return;
             this.log('Re-announcing presence...');
+            this.forgetGonePeers();
             for (const ws of this.signalingConns) {
                 // Re-subscribe every tick: a signaling server can silently drop a
                 // subscription while the socket stays open (ping/pong alive), which
@@ -220,6 +243,8 @@ export class SimplePeerTransport {
         }
         this.signalingConns = [];
         this.announcedPeers.clear();
+        this._peerLastSeen.clear();
+        this._connectFailures.clear();
     }
     /**
      * Send data to all connected peers.
@@ -620,6 +645,8 @@ export class SimplePeerTransport {
         // Skip messages from ourselves
         if (msg.from && msg.from === this.peerId)
             return;
+        if (msg.from)
+            this._peerLastSeen.set(msg.from, Date.now());
         switch (msg.type) {
             case 'publish':
                 // y-webrtc protocol: messages are published to topics
@@ -651,7 +678,7 @@ export class SimplePeerTransport {
                 // Handle embedded signal if present
                 if (msg.signal && msg.from) {
                     if (!msg.to || msg.to === this.peerId) {
-                        this.handlePeerSignal(msg.from, msg.signal);
+                        this.handlePeerSignal(msg.from, msg.signal, msg.attempt);
                     }
                 }
                 break;
@@ -681,11 +708,11 @@ export class SimplePeerTransport {
                 }
                 // Received WebRTC signal from peer
                 if (msg.to === this.peerId && msg.signal) {
-                    this.handlePeerSignal(msg.from, msg.signal);
+                    this.handlePeerSignal(msg.from, msg.signal, msg.attempt);
                 }
                 else if (!msg.to && msg.signal) {
                     // Signal without explicit target — handle anyway (some servers strip `to`)
-                    this.handlePeerSignal(msg.from, msg.signal);
+                    this.handlePeerSignal(msg.from, msg.signal, msg.attempt);
                 }
                 break;
             case 'pong':
@@ -728,16 +755,28 @@ export class SimplePeerTransport {
             peer,
             connected: false,
             peerId: remotePeerId,
+            attemptId: Math.random().toString(36).slice(2, 10),
             chunkBuffers: new Map(),
         };
         this.peers.set(remotePeerId, peerConn);
-        // Removing it lets the next announce rebuild the connection from scratch.
+        // See DEFAULT_CONNECT_TIMEOUT: the initiator times out early and offers
+        // again; the non-initiator waits for that new offer.
+        const failures = this._connectFailures.get(remotePeerId) ?? 0;
+        const timeout = initiator
+            ? Math.min(this.options.connectTimeout * 2 ** failures, CONNECT_TIMEOUT_MAX)
+            : CONNECT_TIMEOUT_MAX;
         peerConn.connectTimer = setTimeout(() => {
             if (this.peers.get(remotePeerId) !== peerConn || peerConn.connected)
                 return;
-            this.log(`⏱️ Peer ${remotePeerId} did not connect within ${CONNECT_TIMEOUT}ms — dropping`);
+            this._connectFailures.set(remotePeerId, failures + 1);
             this.removePeer(remotePeerId);
-        }, CONNECT_TIMEOUT);
+            const seenAt = this._peerLastSeen.get(remotePeerId) ?? 0;
+            const present = Date.now() - seenAt < PEER_SEEN_WINDOW;
+            this.log(`⏱️ Peer ${remotePeerId} did not connect within ${timeout}ms (attempt ${failures + 1}) — dropping`, initiator && present ? 'and offering again' : '');
+            if (initiator && present && this.peers.size < this.options.maxConns) {
+                this.createPeerConnection(remotePeerId, true);
+            }
+        }, timeout);
         // Handle signaling data (ICE candidates and SDP)
         peer.on('signal', (signal) => {
             this.log(`📤 Signal to ${remotePeerId}: ${signal.type ?? 'candidate'}`);
@@ -750,6 +789,7 @@ export class SimplePeerTransport {
                 to: remotePeerId,
                 signal,
                 topic: this._room,
+                attempt: peerConn.attemptId,
             });
         });
         // Mark channel open and notify provider — called by either 'connect' or the first
@@ -760,6 +800,7 @@ export class SimplePeerTransport {
                 return; // already fired
             peerConn.connected = true;
             clearTimeout(peerConn.connectTimer);
+            this._connectFailures.delete(remotePeerId);
             const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
             this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`);
             for (const cb of this._peerConnectCallbacks)
@@ -883,14 +924,55 @@ export class SimplePeerTransport {
     /**
      * Handle WebRTC signal from peer.
      */
-    handlePeerSignal(remotePeerId, signal) {
+    handlePeerSignal(remotePeerId, signal, attempt) {
         let peerConn = this.peers.get(remotePeerId);
+        if (peerConn && signal?.sdp && signal.sdp === peerConn.remoteSdp) {
+            // The same offer/answer again (one copy per signaling server); applying
+            // it twice makes simple-peer destroy the connection.
+            return;
+        }
+        if (peerConn && signal?.type === 'offer') {
+            // An offer from a new attempt means the remote gave up on the old
+            // connection (e.g. its connect timeout fired): start over with a fresh
+            // one instead of renegotiating the stuck one. A renegotiation offer
+            // carries the same attempt id; peers without attempt ids (older
+            // versions) are recognised by a second offer on a connection that
+            // never opened.
+            const restarted = attempt !== undefined
+                ? peerConn.remoteAttemptId !== undefined &&
+                    attempt !== peerConn.remoteAttemptId
+                : !peerConn.connected && peerConn.remoteSdp !== undefined;
+            if (restarted) {
+                this.log(`🔁 New offer from ${remotePeerId} — replacing its connection`);
+                this.removePeer(remotePeerId);
+                peerConn = undefined;
+            }
+        }
+        if (peerConn && signal?.candidate && attempt !== undefined) {
+            // A candidate from an attempt other than the one we negotiate with is
+            // stale; simple-peer destroys the connection when adding it fails.
+            if (attempt !== peerConn.remoteAttemptId) {
+                this.log(`🗑️ Ignoring candidate from an old attempt of ${remotePeerId}`);
+                return;
+            }
+        }
+        if (!peerConn && signal?.candidate && attempt !== undefined) {
+            // A tagged candidate always follows its offer on the same socket, so
+            // one for a peer we have no connection to belongs to a closed attempt.
+            this.log(`🗑️ Ignoring candidate for unknown peer ${remotePeerId}`);
+            return;
+        }
         if (!peerConn) {
             this.log(`📶 Signal from unknown peer ${remotePeerId} (${signal?.type ?? 'candidate'}) — creating non-initiator connection`);
             this.createPeerConnection(remotePeerId, false);
             peerConn = this.peers.get(remotePeerId);
         }
         if (peerConn) {
+            if (signal?.sdp) {
+                if (attempt !== undefined)
+                    peerConn.remoteAttemptId = attempt;
+                peerConn.remoteSdp = signal.sdp;
+            }
             try {
                 peerConn.peer.signal(signal);
             }
@@ -907,6 +989,17 @@ export class SimplePeerTransport {
     pruneStalePeer(peerId) {
         if (this.announcedPeers.has(peerId) && !this.peers.has(peerId)) {
             this.announcedPeers.delete(peerId);
+        }
+    }
+    // Drop the per-peer bookkeeping of peers we hold no connection to and have
+    // not heard from for a while, so it does not grow with every visitor.
+    forgetGonePeers() {
+        const cutoff = Date.now() - 5 * PEER_SEEN_WINDOW;
+        for (const [peerId, seenAt] of this._peerLastSeen) {
+            if (seenAt < cutoff && !this.peers.has(peerId)) {
+                this._peerLastSeen.delete(peerId);
+                this._connectFailures.delete(peerId);
+            }
         }
     }
     /**

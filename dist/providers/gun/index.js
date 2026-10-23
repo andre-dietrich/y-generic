@@ -44,35 +44,7 @@
 import { watchPageBack } from '../resume';
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
-// ---------------------------------------------------------------------------
-// CRC32 helpers — needed to wrap snapshot payloads for GenericProvider
-// ---------------------------------------------------------------------------
-const _CRC32_TABLE = (() => {
-    const table = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-        let c = i;
-        for (let j = 0; j < 8; j++)
-            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-        table[i] = c;
-    }
-    return table;
-})();
-function _crc32(data) {
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i++)
-        crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff];
-    return (crc ^ 0xffffffff) >>> 0;
-}
-function addCRC32Header(data) {
-    const crc = _crc32(data);
-    const wrapped = new Uint8Array(4 + data.length);
-    wrapped[0] = (crc >>> 24) & 0xff;
-    wrapped[1] = (crc >>> 16) & 0xff;
-    wrapped[2] = (crc >>> 8) & 0xff;
-    wrapped[3] = crc & 0xff;
-    wrapped.set(data, 4);
-    return wrapped;
-}
+import { addCRC32Header, toBase64, fromBase64 } from '../codec';
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -380,7 +352,7 @@ export class GunTransport {
                 // framing back into the individual envelopes flushBatch() combined
                 // (see frameUpdates()/unframeUpdates()) — a flush may contain
                 // several independently CRC32-wrapped GenericProvider messages.
-                const decoded = this.base64ToUint8Array(payload);
+                const decoded = fromBase64(payload);
                 const frames = this.unframeUpdates(decoded);
                 if (this._callback) {
                     for (const frame of frames) {
@@ -660,7 +632,7 @@ export class GunTransport {
      * so peers never overwrite each other's presence data.
      */
     async sendAwareness(data) {
-        let payload = this.uint8ArrayToBase64(data);
+        let payload = toBase64(data);
         // Encrypt if password is set
         if (this.encryptionEnabled) {
             payload = await this.encrypt(payload);
@@ -746,7 +718,7 @@ export class GunTransport {
                         return;
                     }
                 }
-                const decoded = this.base64ToUint8Array(payload);
+                const decoded = fromBase64(payload);
                 if (this._callback) {
                     this._callback(decoded);
                 }
@@ -817,7 +789,7 @@ export class GunTransport {
         // Clear batch
         this.updateBatch = [];
         // Convert to base64 for Gun storage
-        let payload = this.uint8ArrayToBase64(merged);
+        let payload = toBase64(merged);
         // Encrypt if password is set
         if (this.encryptionEnabled) {
             payload = await this.encrypt(payload);
@@ -943,7 +915,7 @@ export class GunTransport {
             encoding.writeVarUint(enc, 0); // MESSAGE_SYNC
             syncProtocol.writeSyncStep2(enc, this.persistDoc);
             const snapshotBytes = encoding.toUint8Array(enc);
-            let payload = this.uint8ArrayToBase64(snapshotBytes);
+            let payload = toBase64(snapshotBytes);
             if (this.encryptionEnabled) {
                 payload = await this.encrypt(payload);
             }
@@ -990,7 +962,7 @@ export class GunTransport {
                     }
                     payload = decrypted;
                 }
-                const snapshotBytes = this.base64ToUint8Array(payload);
+                const snapshotBytes = fromBase64(payload);
                 if (snapshotBytes.length > 0) {
                     // Wrap with CRC32 so GenericProvider accepts it
                     const wrapped = addCRC32Header(snapshotBytes);
@@ -1014,27 +986,6 @@ export class GunTransport {
                 this.snapshotLoaded = true;
             }
         });
-    }
-    /**
-     * Convert Uint8Array to base64 string.
-     */
-    uint8ArrayToBase64(bytes) {
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-            binary += String.fromCharCode(bytes[i]);
-        }
-        return btoa(binary);
-    }
-    /**
-     * Convert base64 string to Uint8Array.
-     */
-    base64ToUint8Array(base64) {
-        const binary = atob(base64);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
-            bytes[i] = binary.charCodeAt(i);
-        }
-        return bytes;
     }
     /**
      * Encrypt data using SEA with the configured password.

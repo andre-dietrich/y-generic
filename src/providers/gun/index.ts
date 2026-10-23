@@ -47,38 +47,7 @@ import { watchPageBack } from '../resume'
 import * as encoding from 'lib0/encoding'
 import * as syncProtocol from 'y-protocols/sync'
 import type { Transport, ConnectionConfig } from '../../transport'
-
-// ---------------------------------------------------------------------------
-// CRC32 helpers — needed to wrap snapshot payloads for GenericProvider
-// ---------------------------------------------------------------------------
-
-const _CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let c = i
-    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[i] = c
-  }
-  return table
-})()
-
-function _crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++)
-    crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-function addCRC32Header(data: Uint8Array): Uint8Array {
-  const crc = _crc32(data)
-  const wrapped = new Uint8Array(4 + data.length)
-  wrapped[0] = (crc >>> 24) & 0xff
-  wrapped[1] = (crc >>> 16) & 0xff
-  wrapped[2] = (crc >>> 8) & 0xff
-  wrapped[3] = crc & 0xff
-  wrapped.set(data, 4)
-  return wrapped
-}
+import { addCRC32Header, toBase64, fromBase64 } from '../codec'
 
 // Message type identifiers (must match GenericProvider)
 const MESSAGE_SYNC = 0
@@ -547,7 +516,7 @@ export class GunTransport implements Transport {
         // framing back into the individual envelopes flushBatch() combined
         // (see frameUpdates()/unframeUpdates()) — a flush may contain
         // several independently CRC32-wrapped GenericProvider messages.
-        const decoded = this.base64ToUint8Array(payload)
+        const decoded = fromBase64(payload)
         const frames = this.unframeUpdates(decoded)
 
         if (this._callback) {
@@ -843,7 +812,7 @@ export class GunTransport implements Transport {
    * so peers never overwrite each other's presence data.
    */
   private async sendAwareness(data: Uint8Array): Promise<void> {
-    let payload = this.uint8ArrayToBase64(data)
+    let payload = toBase64(data)
 
     // Encrypt if password is set
     if (this.encryptionEnabled) {
@@ -949,7 +918,7 @@ export class GunTransport implements Transport {
             }
           }
 
-          const decoded = this.base64ToUint8Array(payload)
+          const decoded = fromBase64(payload)
           if (this._callback) {
             this._callback(decoded)
           }
@@ -1034,7 +1003,7 @@ export class GunTransport implements Transport {
     this.updateBatch = []
 
     // Convert to base64 for Gun storage
-    let payload = this.uint8ArrayToBase64(merged)
+    let payload = toBase64(merged)
 
     // Encrypt if password is set
     if (this.encryptionEnabled) {
@@ -1182,7 +1151,7 @@ export class GunTransport implements Transport {
       syncProtocol.writeSyncStep2(enc, this.persistDoc)
       const snapshotBytes = encoding.toUint8Array(enc)
 
-      let payload = this.uint8ArrayToBase64(snapshotBytes)
+      let payload = toBase64(snapshotBytes)
       if (this.encryptionEnabled) {
         payload = await this.encrypt(payload)
       }
@@ -1235,7 +1204,7 @@ export class GunTransport implements Transport {
           payload = decrypted
         }
 
-        const snapshotBytes = this.base64ToUint8Array(payload)
+        const snapshotBytes = fromBase64(payload)
         if (snapshotBytes.length > 0) {
           // Wrap with CRC32 so GenericProvider accepts it
           const wrapped = addCRC32Header(snapshotBytes)
@@ -1256,29 +1225,6 @@ export class GunTransport implements Transport {
         this.snapshotLoaded = true
       }
     })
-  }
-
-  /**
-   * Convert Uint8Array to base64 string.
-   */
-  private uint8ArrayToBase64(bytes: Uint8Array): string {
-    let binary = ''
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i])
-    }
-    return btoa(binary)
-  }
-
-  /**
-   * Convert base64 string to Uint8Array.
-   */
-  private base64ToUint8Array(base64: string): Uint8Array {
-    const binary = atob(base64)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i)
-    }
-    return bytes
   }
 
   /**

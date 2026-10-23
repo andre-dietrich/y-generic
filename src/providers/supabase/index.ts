@@ -1,6 +1,7 @@
 import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import type { Transport, ConnectionConfig } from '../../transport'
+import { addCRC32Header, stripCRC32Header, toBase64, fromBase64, hashPassword } from '../codec'
 import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 
 // GenericProvider's full-state push frame (see src/index.ts).
@@ -35,59 +36,6 @@ const MAX_CHUNK_CHARS = 200000
 export interface SupabaseTransportOptions {
   /** The `createClient` function from the Supabase JS library. */
   createClient: (url: string, key: string) => any
-}
-
-// ---------------------------------------------------------------------------
-// CRC32 helpers (GenericProvider wraps messages with CRC32 header)
-// ---------------------------------------------------------------------------
-
-const _CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let c = i
-    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[i] = c
-  }
-  return table
-})()
-
-function _crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++)
-    crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-/** Add a valid CRC32 header so GenericProvider accepts the message. */
-function addCRC32Header(data: Uint8Array): Uint8Array {
-  const crc = _crc32(data)
-  const wrapped = new Uint8Array(4 + data.length)
-  wrapped[0] = (crc >>> 24) & 0xff
-  wrapped[1] = (crc >>> 16) & 0xff
-  wrapped[2] = (crc >>> 8) & 0xff
-  wrapped[3] = crc & 0xff
-  wrapped.set(data, 4)
-  return wrapped
-}
-
-/** Strip the 4-byte CRC32 header that GenericProvider prepends. */
-function stripCRC32Header(data: Uint8Array): Uint8Array {
-  return data.length >= 4 ? data.subarray(4) : data
-}
-
-// ---------------------------------------------------------------------------
-// Password hashing helper (simple hash for channel name obfuscation)
-// ---------------------------------------------------------------------------
-
-async function hashPassword(password: string): Promise<string> {
-  const encoder = new TextEncoder()
-  const data = encoder.encode(password)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data)
-  const hashArray = Array.from(new Uint8Array(hashBuffer))
-  return hashArray
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-    .substring(0, 16)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +302,7 @@ export class SupabaseTransport implements Transport {
     }
 
     // Too large for one broadcast: base64 chunks through the JSON path
-    const base64 = this.uint8ArrayToBase64(payload)
+    const base64 = toBase64(payload)
     for (const chunk of splitChunks(base64, MAX_CHUNK_CHARS)) {
       this.channel.send({ type: 'broadcast', event: 'm:' + this.peerId, payload: chunk })
     }
@@ -407,7 +355,7 @@ export class SupabaseTransport implements Transport {
         this.log('No stored document for this room yet')
         return
       }
-      const update = this.base64ToUint8Array(data.content)
+      const update = fromBase64(data.content)
       const enc = encoding.createEncoder()
       encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
       encoding.writeVarUint8Array(enc, update)
@@ -461,7 +409,7 @@ export class SupabaseTransport implements Transport {
       const state = Y.encodeStateAsUpdate(this.doc)
       const { error } = await this.supabase.from(this.tableName).upsert({
         id: this.roomId,
-        content: this.uint8ArrayToBase64(state),
+        content: toBase64(state),
         updated_at: new Date().toISOString(),
       })
       if (error) throw error
@@ -490,11 +438,11 @@ export class SupabaseTransport implements Transport {
       } else if (ArrayBuffer.isView(payload)) {
         data = new Uint8Array(payload.buffer, payload.byteOffset, payload.byteLength)
       } else if (typeof payload === 'string') {
-        data = this.base64ToUint8Array(payload) // an older sender
+        data = fromBase64(payload) // an older sender
       } else if (isChunk(payload)) {
         const whole = this.chunks.push(payload)
         if (whole === null) return
-        data = this.base64ToUint8Array(whole)
+        data = fromBase64(whole)
       } else {
         return
       }
@@ -509,22 +457,6 @@ export class SupabaseTransport implements Transport {
   }
 
   // Utility methods for base64 conversion
-  private uint8ArrayToBase64(data: Uint8Array): string {
-    let binary = ''
-    for (let i = 0; i < data.length; i++) {
-      binary += String.fromCharCode(data[i])
-    }
-    return btoa(binary)
-  }
-
-  private base64ToUint8Array(base64: string): Uint8Array {
-    const binary = atob(base64)
-    const bytes = new Uint8Array(binary.length)
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i)
-    }
-    return bytes
-  }
 
   private log(...args: any[]): void {
     if (this.debug) {

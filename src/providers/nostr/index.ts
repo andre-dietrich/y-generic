@@ -54,6 +54,7 @@
 import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import type { Transport, ConnectionConfig } from '../../transport'
+import { crc32, toBase64, fromBase64, hashPassword } from '../codec'
 import { splitChunks, isChunk, ChunkAssembler, type Chunk } from '../chunking'
 import { watchPageBack } from '../resume'
 
@@ -64,27 +65,6 @@ const MAX_CONTENT_CHARS = 60000
 // GenericProvider's frame type for a full-state push (see src/index.ts) -
 // not exported from core, mirrored here the same way supabase/index.ts does.
 const MESSAGE_SYNC_PUSH = 6
-
-// ---------------------------------------------------------------------------
-// CRC32 helper (GenericProvider wraps every frame with a CRC32 header;
-// see supabase/index.ts's identical helper)
-// ---------------------------------------------------------------------------
-
-const _CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let c = i
-    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[i] = c
-  }
-  return table
-})()
-
-function _crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++) crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  return (crc ^ 0xffffffff) >>> 0
-}
 
 /**
  * Wrap a message the way GenericProvider expects to receive one from this
@@ -102,7 +82,7 @@ function _crc32(data: Uint8Array): number {
  * be hit here since this transport always hints compression.
  */
 function wrapFrame(data: Uint8Array): Uint8Array {
-  const crc = _crc32(data)
+  const crc = crc32(data)
   const wrapped = new Uint8Array(5 + data.length)
   wrapped[1] = (crc >>> 24) & 0xff
   wrapped[2] = (crc >>> 16) & 0xff
@@ -118,40 +98,6 @@ function snapshotFrame(update: Uint8Array): Uint8Array {
   encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH)
   encoding.writeVarUint8Array(enc, update)
   return wrapFrame(encoding.toUint8Array(enc))
-}
-
-// ---------------------------------------------------------------------------
-// Base64 helpers (no Buffer/Node dependency)
-// ---------------------------------------------------------------------------
-
-function uint8ArrayToBase64(data: Uint8Array): string {
-  let binary = ''
-  for (let i = 0; i < data.length; i++) {
-    binary += String.fromCharCode(data[i])
-  }
-  return btoa(binary)
-}
-
-function base64ToUint8Array(base64: string): Uint8Array {
-  const binary = atob(base64)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i)
-  }
-  return bytes
-}
-
-// ---------------------------------------------------------------------------
-// Password hashing (obfuscates room tag — not encryption)
-// ---------------------------------------------------------------------------
-
-async function hashPassword(password: string): Promise<string> {
-  const encoded = new TextEncoder().encode(password)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded)
-  return Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-    .substring(0, 16)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +495,7 @@ export class NostrTransport implements Transport {
               if (!isChunk(parsed)) return
               const whole = this.snapshotChunks.push(parsed)
               if (whole === null) return
-              const bytes = base64ToUint8Array(whole)
+              const bytes = fromBase64(whole)
               // A sealed frame is opened by the wrapper above us (see sealFrame).
               this._deliver((parsed as SnapshotChunk).sealed ? bytes : snapshotFrame(bytes))
               if (debug) console.log('[NostrTransport] Applied persisted snapshot,', bytes.length, 'bytes')
@@ -677,7 +623,7 @@ export class NostrTransport implements Transport {
           // compression flag when compressionThresholdBytes is on): a
           // transport that strips and re-adds the header cannot carry a
           // compressed frame.
-          this._deliver(base64ToUint8Array(content))
+          this._deliver(fromBase64(content))
         } catch (err) {
           console.warn('[NostrTransport] Failed to decode event content:', err)
         }
@@ -753,7 +699,7 @@ export class NostrTransport implements Transport {
       return
     }
 
-    const base64 = uint8ArrayToBase64(data)
+    const base64 = toBase64(data)
     // Above the relays' event size cap: one event per chunk.
     const contents =
       base64.length > MAX_CONTENT_CHARS
@@ -838,7 +784,7 @@ export class NostrTransport implements Transport {
       const sealed = !!this.sealFrame
       // Sealed: the frame as it is delivered (see connect()), sealed as the wrapper seals a sent one.
       const bytes = this.sealFrame ? this.sealFrame(snapshotFrame(update)) : update
-      const parts = splitChunks(uint8ArrayToBase64(bytes), MAX_CONTENT_CHARS)
+      const parts = splitChunks(toBase64(bytes), MAX_CONTENT_CHARS)
       if (parts.length > MAX_SNAPSHOT_CHUNKS) {
         console.warn(
           `[NostrTransport] Snapshot needs ${parts.length} chunks, more than MAX_SNAPSHOT_CHUNKS ` +

@@ -380,14 +380,6 @@ export declare class GunTransport implements Transport {
      */
     private loadSnapshot;
     /**
-     * Convert Uint8Array to base64 string.
-     */
-    private uint8ArrayToBase64;
-    /**
-     * Convert base64 string to Uint8Array.
-     */
-    private base64ToUint8Array;
-    /**
      * Encrypt data using SEA with the configured password.
      */
     private encrypt;

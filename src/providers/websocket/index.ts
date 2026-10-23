@@ -1,4 +1,5 @@
 import type { Transport, ConnectionConfig } from '../../transport'
+import { addCRC32Header, stripCRC32Header } from '../codec'
 import { watchPageBack } from '../resume'
 
 // ---------------------------------------------------------------------------
@@ -9,40 +10,6 @@ import { watchPageBack } from '../resume'
 // The y-websocket server however speaks plain Yjs wire format (no header).
 // These helpers translate between the two worlds at the transport boundary.
 // ---------------------------------------------------------------------------
-
-const _CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let c = i
-    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[i] = c
-  }
-  return table
-})()
-
-function _crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++)
-    crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-/** Strip the 4-byte CRC32 header that GenericProvider prepends. */
-function stripCRC32Header(data: Uint8Array): Uint8Array {
-  return data.length >= 4 ? data.subarray(4) : data
-}
-
-/** Add a valid CRC32 header so GenericProvider accepts the message. */
-function addCRC32Header(data: Uint8Array): Uint8Array {
-  const crc = _crc32(data)
-  const wrapped = new Uint8Array(4 + data.length)
-  wrapped[0] = (crc >>> 24) & 0xff
-  wrapped[1] = (crc >>> 16) & 0xff
-  wrapped[2] = (crc >>> 8) & 0xff
-  wrapped[3] = crc & 0xff
-  wrapped.set(data, 4)
-  return wrapped
-}
 
 /**
  * WebSocket transport configuration

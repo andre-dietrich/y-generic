@@ -44,6 +44,7 @@ import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import * as syncProtocol from 'y-protocols/sync'
 import type { Transport, ConnectionConfig } from '../../transport'
+import { addCRC32Header, stripCRC32Header, toBase64, fromBase64, hashPassword } from '../codec'
 import { watchPageBack } from '../resume'
 import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 
@@ -55,76 +56,6 @@ import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 // base64-encoding and re-add it after decoding so GenericProvider accepts
 // the incoming message.
 // ---------------------------------------------------------------------------
-
-const _CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let c = i
-    for (let j = 0; j < 8; j++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-    table[i] = c
-  }
-  return table
-})()
-
-function _crc32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++)
-    crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-/** Strip the 4-byte CRC32 header that GenericProvider prepends. */
-function stripCRC32Header(data: Uint8Array): Uint8Array {
-  return data.length >= 4 ? data.subarray(4) : data
-}
-
-/** Add a valid CRC32 header so GenericProvider accepts the message. */
-function addCRC32Header(data: Uint8Array): Uint8Array {
-  const crc = _crc32(data)
-  const wrapped = new Uint8Array(4 + data.length)
-  wrapped[0] = (crc >>> 24) & 0xff
-  wrapped[1] = (crc >>> 16) & 0xff
-  wrapped[2] = (crc >>> 8) & 0xff
-  wrapped[3] = crc & 0xff
-  wrapped.set(data, 4)
-  return wrapped
-}
-
-// ---------------------------------------------------------------------------
-// Base64 helpers (no Buffer/Node dependency)
-// ---------------------------------------------------------------------------
-
-function uint8ToBase64(data: Uint8Array): string {
-  const chunkSize = 8192 // Process 8KB at a time to avoid arg-count overflow
-  let binary = ''
-  for (let i = 0; i < data.length; i += chunkSize) {
-    const chunk = data.subarray(i, Math.min(i + chunkSize, data.length))
-    binary += String.fromCharCode(...chunk)
-  }
-  return btoa(binary)
-}
-
-function base64ToUint8(str: string): Uint8Array {
-  const binary = atob(str)
-  const bytes = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i)
-  }
-  return bytes
-}
-
-// ---------------------------------------------------------------------------
-// Password hashing (obfuscates channel name — not encryption)
-// ---------------------------------------------------------------------------
-
-async function hashPassword(password: string): Promise<string> {
-  const encoded = new TextEncoder().encode(password)
-  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded)
-  return Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-    .substring(0, 16)
-}
 
 function generateUUID(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -585,7 +516,7 @@ export class AblyTransport implements Transport {
     }
 
     const payload = stripCRC32Header(data)
-    const base64Data = uint8ToBase64(payload)
+    const base64Data = toBase64(payload)
 
     // Above Ably's message size: one message per chunk.
     if (base64Data.length > MAX_MESSAGE_SIZE) {
@@ -815,7 +746,7 @@ export class AblyTransport implements Transport {
         if (data === null) return // more to come
       }
       if (typeof data !== 'string') return
-      this.deliver(addCRC32Header(base64ToUint8(data)), from)
+      this.deliver(addCRC32Header(fromBase64(data)), from)
     } catch (error) {
       this.log('Error handling message:', error)
     }

@@ -141,17 +141,6 @@ export declare class PubNubTransport implements Transport {
      */
     getPresence(): Promise<string[]>;
     /**
-     * Convert Uint8Array to base64 string
-     *
-     * Handles large arrays by processing in chunks to avoid
-     * "too many function arguments" error with String.fromCharCode
-     */
-    private uint8ToBase64;
-    /**
-     * Convert base64 string to Uint8Array
-     */
-    private base64ToUint8;
-    /**
      * Generate a unique UUID
      */
     private generateUUID;

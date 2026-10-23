@@ -137,8 +137,6 @@ export declare class SupabaseTransport implements Transport {
     /** Upsert the full current state; a write that overlaps a change re-runs once. */
     private saveToDatabase;
     private handleMessage;
-    private uint8ArrayToBase64;
-    private base64ToUint8Array;
     private log;
 }
 //# sourceMappingURL=index.d.ts.map

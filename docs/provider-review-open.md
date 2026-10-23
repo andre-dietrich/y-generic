@@ -7,10 +7,10 @@ matters, what a fix would take.
 
 ## Cross-provider
 
-- **Duplicated helpers.** CRC32 in websocket, gun, ably, supabase, nostr (and the
-  core); base64 in six providers; `hashPassword` in nostr, ably, supabase. One
-  `src/providers/codec.ts` next to `chunking.ts` would hold them. Planned for the
-  end of the review, once every provider is read.
+- **Duplicated helpers: done, except Matrix.** CRC32, base64 and
+  `hashPassword` live in `src/providers/codec.ts` now (websocket, gun, ably,
+  supabase, nostr, pubnub). Matrix keeps its own base64 (skipped in this
+  review); the core keeps its own CRC32 (not touched).
 - **Password rooms need a secure context.** `hashPassword` uses `crypto.subtle`,
   which a plain-http LAN address does not have: `connect()` throws in a password
   room (nostr, ably, likely supabase). Same root cause as Trystero needing https

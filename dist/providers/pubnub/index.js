@@ -1,3 +1,4 @@
+import { toBase64, fromBase64 } from '../codec';
 import { splitChunks, isChunk, ChunkAssembler } from '../chunking';
 export class PubNubTransport {
     constructor(options = {}) {
@@ -56,7 +57,7 @@ export class PubNubTransport {
         // threw for '数学'); other names go as UTF-8, a Latin-1 one keeps its channel.
         this.channel = /^[\x00-\xff]*$/.test(config.room)
             ? btoa(config.room)
-            : this.uint8ToBase64(new TextEncoder().encode(config.room));
+            : toBase64(new TextEncoder().encode(config.room));
         this.log(`Connecting as ${this.uuid} to channel ${this.channel}`);
         // Create PubNub instance
         const pubnubConfig = {
@@ -139,7 +140,7 @@ export class PubNubTransport {
                             if (message === null)
                                 return; // more to come
                         }
-                        const data = typeof message === 'string' ? this.base64ToUint8(message) : new Uint8Array(message);
+                        const data = typeof message === 'string' ? fromBase64(message) : new Uint8Array(message);
                         this.log(`📨 Received ${data.length} bytes from ${event.publisher}`);
                         // the publisher uuid is the peer id onPeerDisconnect reports
                         if (this.messageCallback)
@@ -201,7 +202,7 @@ export class PubNubTransport {
             return;
         }
         try {
-            const base64Data = this.uint8ToBase64(data);
+            const base64Data = toBase64(data);
             // Above PubNub's message size: one message per chunk, not stored.
             if (base64Data.length > this.MAX_MESSAGE_SIZE) {
                 for (const chunk of splitChunks(base64Data, this.MAX_MESSAGE_SIZE))
@@ -328,29 +329,6 @@ export class PubNubTransport {
             this.log('Error getting presence:', error);
             return [];
         }
-    }
-    /**
-     * Convert Uint8Array to base64 string
-     *
-     * Handles large arrays by processing in chunks to avoid
-     * "too many function arguments" error with String.fromCharCode
-     */
-    uint8ToBase64(data) {
-        const chunkSize = 8192; // Process 8KB at a time
-        let binary = '';
-        for (let i = 0; i < data.length; i += chunkSize) {
-            const chunk = data.subarray(i, Math.min(i + chunkSize, data.length));
-            binary += String.fromCharCode(...chunk);
-        }
-        return btoa(binary);
-    }
-    /**
-     * Convert base64 string to Uint8Array
-     */
-    base64ToUint8(str) {
-        return new Uint8Array(atob(str)
-            .split('')
-            .map((c) => c.charCodeAt(0)));
     }
     /**
      * Generate a unique UUID

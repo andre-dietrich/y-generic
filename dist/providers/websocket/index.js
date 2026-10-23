@@ -186,12 +186,31 @@ export class WebSocketTransport {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = undefined;
         }
-        if (this.ws) {
-            this.log('Disconnecting from WebSocket...');
-            this.ws.close(1000, 'Client disconnect');
-            this.ws = null;
-        }
+        this.log('Disconnecting from WebSocket...');
+        this.dropSocket();
+        // A new session starts fresh: its first open is no RE-connect, and what
+        // the old one queued is not sent into it (repro-websocket-wake, part 4).
+        this._everOpened = false;
+        this.messageQueue = [];
         this._isConnected = false;
+    }
+    /**
+     * Close the socket with its handlers detached first: a browser fires
+     * `close` in a later task, and a late one dialed a second socket into a
+     * session that connect() had already started (repro-websocket-wake, part 4).
+     */
+    dropSocket() {
+        const ws = this.ws;
+        if (!ws)
+            return;
+        ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+        try {
+            ws.close(1000, 'Client disconnect');
+        }
+        catch {
+            // a socket that never opened
+        }
+        this.ws = null;
     }
     /**
      * Send data to server
@@ -212,9 +231,6 @@ export class WebSocketTransport {
             this.log('❌ Send error:', error);
         }
     }
-    /**
-     * Register message callback
-     */
     /**
      * Transport.onPeerConnect: fires when the socket to the server re-opens
      * after a drop (never for the first connect - connect()'s own syncNow()
@@ -302,17 +318,7 @@ export class WebSocketTransport {
             clearTimeout(this.reconnectTimer);
             this.reconnectTimer = undefined;
         }
-        const stale = this.ws;
-        if (stale) {
-            stale.onopen = stale.onmessage = stale.onerror = stale.onclose = null;
-            try {
-                stale.close();
-            }
-            catch {
-                // a socket that never opened
-            }
-            this.ws = null;
-        }
+        this.dropSocket();
         this.reconnectAttempts = 0;
         this.log('🔄 The page has its network again - connecting now');
         this.connect(this.config).catch(() => { }); // a failure ends in onclose and its backoff, as ever

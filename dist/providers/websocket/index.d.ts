@@ -76,12 +76,15 @@ export declare class WebSocketTransport implements Transport {
      */
     disconnect(): void;
     /**
+     * Close the socket with its handlers detached first: a browser fires
+     * `close` in a later task, and a late one dialed a second socket into a
+     * session that connect() had already started (repro-websocket-wake, part 4).
+     */
+    private dropSocket;
+    /**
      * Send data to server
      */
     send(data: Uint8Array): void;
-    /**
-     * Register message callback
-     */
     /**
      * Transport.onPeerConnect: fires when the socket to the server re-opens
      * after a drop (never for the first connect - connect()'s own syncNow()

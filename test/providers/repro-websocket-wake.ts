@@ -23,7 +23,12 @@
  *              waited for.
  *  3 quiet     while connected, and after disconnect(), the same events dial
  *              nothing.
- * 1 and 2 want less than 500 ms, 3 no new socket. Exit code 1 otherwise.
+ *  4 again     disconnect() and connect() at once, as a room switch does: a
+ *              browser fires the old socket's `close` LATER, when the new
+ *              session is under way - it must not dial a second socket, and
+ *              the new session's first open is no RE-connect (onPeerConnect).
+ *              What was queued for the old session is not sent in the new one.
+ * 1 and 2 want less than 500 ms, 3 and 4 no extra socket. Exit code 1 otherwise.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-websocket-wake.js
  */
@@ -46,6 +51,7 @@ Object.defineProperty(globalThis, 'navigator', { value: { onLine: true, connecti
 // ---- the network
 let network: 'up' | 'refuse' | 'hang' = 'up'
 let sockets = 0
+let sent = 0
 let live: FakeWebSocket | null = null
 class FakeWebSocket {
   static CONNECTING = 0
@@ -74,11 +80,17 @@ class FakeWebSocket {
       }
     }, 5)
   }
-  send(_data: unknown): void {}
+  send(_data: unknown): void {
+    sent++
+  }
+  /** as a browser does it: CLOSING now, the `close` event in a later task */
   close(code = 1000, reason = ''): void {
-    if (this.readyState === FakeWebSocket.CLOSED) return
-    this.readyState = FakeWebSocket.CLOSED
-    this.onclose?.({ code, reason })
+    if (this.readyState >= FakeWebSocket.CLOSING) return
+    this.readyState = FakeWebSocket.CLOSING
+    setTimeout(() => {
+      this.readyState = FakeWebSocket.CLOSED
+      this.onclose?.({ code, reason })
+    }, 5)
   }
   /** what a server that went away does to an open socket */
   drop(): void {
@@ -136,7 +148,29 @@ async function main() {
   const afterDisconnect = sockets - quiet
   console.log(`3 quiet: new sockets while connected ${whileConnected} (want 0), after disconnect() ${afterDisconnect} (want 0)`)
 
-  const ok = backoff >= 0 && backoff < 500 && inTheAir >= 0 && inTheAir < 500 && whileConnected === 0 && afterDisconnect === 0
+  // 4: a new session right after disconnect(), with a message queued in the old one
+  const t4 = new WebSocketTransport()
+  const config = { serverUrl: 'ws://stub', room: 'r', reconnectDelay: 50, maxReconnectDelay: 100 } as any
+  await t4.connect(config)
+  let told = 0
+  t4.onPeerConnect(() => told++)
+  network = 'hang'
+  live!.drop() // the server went away: a message waits in the queue
+  t4.send(new Uint8Array([0, 0, 0, 0, 9]))
+  await sleep(200) // a reconnect attempt is in the air when the session ends
+  t4.disconnect()
+  network = 'up'
+  const s4 = sockets
+  sent = 0
+  await t4.connect(config)
+  await sleep(500) // the old socket's late `close`, and a backoff after it, are long past
+  const extra = sockets - s4 - 1
+  const stale = sent - 1 // the handshake's SyncStep1 is the one expected
+  console.log(`4 again: extra sockets ${extra} (want 0), onPeerConnect ${told} (want 0), old session's messages sent ${stale} (want 0)`)
+
+  const ok =
+    backoff >= 0 && backoff < 500 && inTheAir >= 0 && inTheAir < 500 && whileConnected === 0 && afterDisconnect === 0 &&
+    extra === 0 && told === 0 && stale === 0
   process.exit(ok ? 0 : 1)
 }
 

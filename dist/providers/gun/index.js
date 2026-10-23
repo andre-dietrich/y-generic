@@ -140,6 +140,19 @@ export class GunTransport {
         this.persistentMode = false;
         this.persistDoc = null;
         this.persistDebounceMs = 2000;
+        this.persistMaxWaitMs = 10000;
+        // When the oldest change the pending snapshot is for was made; 0 = none pending
+        this.persistPendingSince = 0;
+        /**
+         * A snapshot is for a change made HERE (a local transaction); one applied
+         * from the room is its author's to write. Told from send()'s frames before:
+         * every digest beacon wrote the whole document, in a room nobody edits, from
+         * every peer (test/gun/repro-writes.mjs, part 2).
+         */
+        this._onDocUpdate = (_u, _o, _d, tr) => {
+            if (tr.local)
+                this.queuePersist();
+        };
         this._redialTimers = new Map();
         this._redialNow = new Map(); // url -> dial it now (a backoff to skip)
         this.isWritingToGun = false;
@@ -183,6 +196,7 @@ export class GunTransport {
         this.persistentMode = config.persistent ?? false;
         this.persistDoc = config.doc ?? null;
         this.persistDebounceMs = config.persistDebounceMs ?? 2000;
+        this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000;
         if (this.persistentMode && !this.persistDoc) {
             throw new Error('GunTransport: a Y.Doc must be provided via config.doc when persistent is true');
         }
@@ -269,7 +283,12 @@ export class GunTransport {
         // Persistence: load existing snapshot or clear it for a fresh session
         this.snapshotLoaded = false;
         if (this.persistentMode) {
+            // Warm the snapshot node as UNLOAD_SLOT is warmed: flush()'s put must
+            // leave in the unloading task (test/gun/repro-writes.mjs, part 4). A
+            // field of its own - gun merges a put field by field, `data` stays.
+            this.roomNode.get('snapshot').put({ warmedAt: Date.now() });
             this.loadSnapshot();
+            this.persistDoc.on('update', this._onDocUpdate);
         }
         else {
             // Overwrite any previously saved snapshot so reconnecting peers start fresh
@@ -497,6 +516,13 @@ export class GunTransport {
      * `await` runs in a page that is already gone.
      */
     flush() {
+        // A snapshot still in its debounce: put now (no await before the put
+        // without a password), so the turn queue below drains it too (part 4).
+        if (this.persistTimer) {
+            clearTimeout(this.persistTimer);
+            this.persistTimer = undefined;
+            this.saveSnapshot();
+        }
         if (this.batchTimeout) {
             clearTimeout(this.batchTimeout);
             this.batchTimeout = undefined;
@@ -540,6 +566,7 @@ export class GunTransport {
             clearTimeout(this.persistTimer);
             this.persistTimer = undefined;
         }
+        this.persistDoc?.off('update', this._onDocUpdate);
         if (this.persistentMode && this.persistDoc) {
             this.saveSnapshot();
         }
@@ -582,6 +609,7 @@ export class GunTransport {
         this.pendingUpdates.clear();
         this.persistentMode = false;
         this.persistDoc = null;
+        this.persistPendingSince = 0;
         this.pendingLoad = null;
         this.snapshotLoaded = false;
         this.log('✅ Disconnected');
@@ -589,7 +617,7 @@ export class GunTransport {
     /**
      * Send data to all peers via Gun.
      * Routes awareness to a separate volatile node, doc sync to circular buffer.
-     * Uses debouncing for doc sync - each new update resets the timer.
+     * Doc sync is batched: a batch leaves batchInterval ms after its first update.
      */
     send(data) {
         if (!this._connected || !this.roomNode) {
@@ -603,19 +631,13 @@ export class GunTransport {
             this.sendAwareness(data);
             return;
         }
-        // Doc sync goes through batched circular buffer
+        // Doc sync goes through batched circular buffer, batchInterval after the batch's first update
         this.updateBatch.push(data);
-        // Clear existing timeout (debouncing - resets timer on each update)
-        if (this.batchTimeout) {
-            clearTimeout(this.batchTimeout);
-        }
-        // Set new timeout to flush batch after period of inactivity
-        this.batchTimeout = setTimeout(() => {
-            this.flushBatch();
-        }, this.options.batchInterval);
-        // Schedule a snapshot save for persistent mode
-        if (this.persistentMode) {
-            this.queuePersist();
+        if (!this.batchTimeout) {
+            this.batchTimeout = setTimeout(() => {
+                this.batchTimeout = undefined;
+                this.flushBatch();
+            }, this.options.batchInterval);
         }
     }
     /**
@@ -779,7 +801,7 @@ export class GunTransport {
     }
     /**
      * Flush batched updates to Gun.
-     * Called after debounce period (no new updates for batchInterval ms).
+     * Called batchInterval ms after the batch's first update.
      */
     async flushBatch(slotId) {
         if (this.updateBatch.length === 0)
@@ -879,13 +901,19 @@ export class GunTransport {
     // Persistence helpers
     // ---------------------------------------------------------------------------
     /**
-     * Schedule a debounced snapshot write. Called on every doc update.
-     * Always saves the latest full state, never an individual delta.
+     * Schedule a debounced snapshot write of the latest full state - never
+     * beyond persistMaxWaitMs after the oldest change.
      */
     queuePersist() {
+        const now = Date.now();
+        if (!this.persistPendingSince)
+            this.persistPendingSince = now;
         if (this.persistTimer)
             clearTimeout(this.persistTimer);
-        this.persistTimer = setTimeout(() => this.saveSnapshot(), this.persistDebounceMs);
+        this.persistTimer = setTimeout(() => {
+            this.persistTimer = undefined;
+            this.saveSnapshot();
+        }, Math.max(0, Math.min(this.persistDebounceMs, this.persistPendingSince + this.persistMaxWaitMs - now)));
     }
     /**
      * Encode the full Y.Doc state as a proper y-protocols SYNC_STEP_2 message
@@ -908,6 +936,7 @@ export class GunTransport {
         }
         this.isWritingToGun = true;
         this.savePending = false;
+        this.persistPendingSince = 0;
         try {
             // Encode as a proper y-generic SYNC_STEP_2 message
             const enc = encoding.createEncoder();
@@ -918,10 +947,14 @@ export class GunTransport {
             if (this.encryptionEnabled) {
                 payload = await this.encrypt(payload);
             }
+            // `cleared: false`: gun merges field by field, and a non-persistent
+            // peer's `cleared: true` outlived every later snapshot - loadSnapshot()
+            // skipped them all (test/gun/repro-writes.mjs, part 5).
             this.roomNode.get('snapshot').put({
                 data: payload,
                 timestamp: Date.now(),
                 encrypted: this.encryptionEnabled,
+                cleared: false,
             });
             this.log('💾 Snapshot saved', snapshotBytes.length, 'bytes');
         }

@@ -93,3 +93,27 @@ matters, what a fix would take.
   have the same open question.
 - **Not run live.** The new gate (test/supabase/repro-persistent.ts) uses a
   scripted supabase-js; test/supabase/live-presence.mjs was not rerun.
+
+## Gun
+
+- **A lone joiner gets nothing once a writer's ring has wrapped.** Without
+  `persistent` there is no snapshot; the relay holds a writer's last 10 update
+  batches only, and Yjs keeps updates whose predecessors are missing pending -
+  a joiner whose peers are all gone sees 0 characters of a long session, not
+  just its end (repro-writes part 3 showed 0 chars before the persistence
+  fix). By design of the ring; persistent mode is the answer.
+- **A non-persistent connect clears the room's snapshot.** Intended ("new
+  sessions start from a blank state"), but in a room where some peers are
+  persistent and some are not, every non-persistent visitor resets the stored
+  copy until the next persistent write. Part 5's fix makes that write count
+  again; the clearing itself is unchanged.
+- **Receive throttle of 300 ms.** setupUpdateListener() processes slots at
+  most every 300 ms: part 1's lag of ~400 ms is mostly that. Not a starvation
+  (leading edge + one trailing timer), so left alone.
+- **Snapshot write with a password is async.** saveSnapshot() awaits SEA's
+  encrypt before its put, so flush() cannot get it out of an unloading page
+  (the same holds for the update batch, documented at flush()).
+- **No sealFrame.** Gun encrypts with its own `password`/SEA option; a
+  wrapper's sealFrame is not used. Behind an encrypting wrapper the snapshot
+  would have Nostr's and Ably's old bug; not checked whether LiaScript wraps
+  Gun that way.

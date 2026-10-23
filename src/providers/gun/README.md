@@ -164,12 +164,12 @@ interface GunTransportOptions {
   gun: GunConstructor           // Gun constructor (required)
   peers?: string[]              // Relay server URLs (default: [])
   gunOptions?: {                // Gun configuration
-    localStorage?: boolean      // Enable localStorage (default: true)
-    radisk?: boolean            // Enable Radisk persistence (default: true)
+    localStorage?: boolean      // Enable localStorage (default: false)
+    radisk?: boolean            // Enable Radisk persistence (default: false)
     [key: string]: any
   }
   debug?: boolean               // Enable debug logging (default: false)
-  batchInterval?: number        // Update batch interval in ms (default: 50)
+  batchInterval?: number        // A batch leaves at most this many ms after its first update (default: 100)
 }
 ```
 
@@ -255,13 +255,13 @@ const transport = new GunTransport({
 
 ### Update Batching
 Updates are batched to reduce network overhead:
-- Multiple updates within 50ms are merged
-- Reduces number of Gun writes
+- Updates within `batchInterval` (100 ms) of a batch's first one are merged
+- Reduces number of Gun writes; a steady stream still leaves every 100 ms
 - Configurable via `batchInterval` option
 
 ### Deduplication
 - Each update has a unique ID
-- Processed updates are tracked (last 1000)
+- Processed updates are tracked (last 200)
 - Prevents infinite loops and duplicate processing
 
 ### Data Encoding

@@ -84,9 +84,10 @@ export interface GunTransportOptions {
      */
     debug?: boolean;
     /**
-     * Update batch interval in milliseconds.
-     * Uses debouncing - timer resets on each update.
-     * Only sends after this period of inactivity.
+     * Update batch interval in milliseconds: a batch leaves at most this long
+     * after its first update. Not a debounce - one every update restarted sent
+     * nothing while updates kept coming faster than this (test/gun/repro-writes.mjs,
+     * part 1; the core's batchUpdates had the same, c793f81).
      * @default 100
      */
     batchInterval?: number;
@@ -133,6 +134,14 @@ export interface GunConnectionConfig extends ConnectionConfig {
      * @default 2000
      */
     persistDebounceMs?: number;
+    /**
+     * The longest a change waits for its snapshot while the debounce keeps
+     * being restarted - by somebody who types: no snapshot was written for as
+     * long as that went on, and once the writer's ring of update slots had
+     * wrapped, a joiner got nothing (test/gun/repro-writes.mjs, part 3).
+     * @default 10000
+     */
+    persistMaxWaitMs?: number;
 }
 /**
  * GunDB transport implementation.
@@ -169,7 +178,16 @@ export declare class GunTransport implements Transport {
     private persistentMode;
     private persistDoc;
     private persistDebounceMs;
+    private persistMaxWaitMs;
+    private persistPendingSince;
     private persistTimer?;
+    /**
+     * A snapshot is for a change made HERE (a local transaction); one applied
+     * from the room is its author's to write. Told from send()'s frames before:
+     * every digest beacon wrote the whole document, in a room nobody edits, from
+     * every peer (test/gun/repro-writes.mjs, part 2).
+     */
+    private _onDocUpdate;
     private _redialTimers;
     private _redialNow;
     private _stopPageWatch?;
@@ -267,7 +285,7 @@ export declare class GunTransport implements Transport {
     /**
      * Send data to all peers via Gun.
      * Routes awareness to a separate volatile node, doc sync to circular buffer.
-     * Uses debouncing for doc sync - each new update resets the timer.
+     * Doc sync is batched: a batch leaves batchInterval ms after its first update.
      */
     send(data: Uint8Array): void;
     /**
@@ -322,7 +340,7 @@ export declare class GunTransport implements Transport {
     private unframeUpdates;
     /**
      * Flush batched updates to Gun.
-     * Called after debounce period (no new updates for batchInterval ms).
+     * Called batchInterval ms after the batch's first update.
      */
     private flushBatch;
     /**
@@ -346,8 +364,8 @@ export declare class GunTransport implements Transport {
      */
     private stableWriterId;
     /**
-     * Schedule a debounced snapshot write. Called on every doc update.
-     * Always saves the latest full state, never an individual delta.
+     * Schedule a debounced snapshot write of the latest full state - never
+     * beyond persistMaxWaitMs after the oldest change.
      */
     private queuePersist;
     /**

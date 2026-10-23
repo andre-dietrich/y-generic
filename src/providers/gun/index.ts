@@ -152,9 +152,10 @@ export interface GunTransportOptions {
   debug?: boolean
 
   /**
-   * Update batch interval in milliseconds.
-   * Uses debouncing - timer resets on each update.
-   * Only sends after this period of inactivity.
+   * Update batch interval in milliseconds: a batch leaves at most this long
+   * after its first update. Not a debounce - one every update restarted sent
+   * nothing while updates kept coming faster than this (test/gun/repro-writes.mjs,
+   * part 1; the core's batchUpdates had the same, c793f81).
    * @default 100
    */
   batchInterval?: number
@@ -206,6 +207,15 @@ export interface GunConnectionConfig extends ConnectionConfig {
    * @default 2000
    */
   persistDebounceMs?: number
+
+  /**
+   * The longest a change waits for its snapshot while the debounce keeps
+   * being restarted - by somebody who types: no snapshot was written for as
+   * long as that went on, and once the writer's ring of update slots had
+   * wrapped, a joiner got nothing (test/gun/repro-writes.mjs, part 3).
+   * @default 10000
+   */
+  persistMaxWaitMs?: number
 }
 
 /**
@@ -256,7 +266,19 @@ export class GunTransport implements Transport {
   private persistentMode: boolean = false
   private persistDoc: Y.Doc | null = null
   private persistDebounceMs: number = 2000
+  private persistMaxWaitMs: number = 10000
+  // When the oldest change the pending snapshot is for was made; 0 = none pending
+  private persistPendingSince = 0
   private persistTimer?: ReturnType<typeof setTimeout>
+  /**
+   * A snapshot is for a change made HERE (a local transaction); one applied
+   * from the room is its author's to write. Told from send()'s frames before:
+   * every digest beacon wrote the whole document, in a room nobody edits, from
+   * every peer (test/gun/repro-writes.mjs, part 2).
+   */
+  private _onDocUpdate = (_u: Uint8Array, _o: unknown, _d: Y.Doc, tr: Y.Transaction): void => {
+    if (tr.local) this.queuePersist()
+  }
   private _redialTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private _redialNow = new Map<string, () => void>() // url -> dial it now (a backoff to skip)
   private _stopPageWatch?: () => void
@@ -319,6 +341,7 @@ export class GunTransport implements Transport {
     this.persistentMode = config.persistent ?? false
     this.persistDoc = config.doc ?? null
     this.persistDebounceMs = config.persistDebounceMs ?? 2000
+    this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000
 
     if (this.persistentMode && !this.persistDoc) {
       throw new Error(
@@ -416,7 +439,12 @@ export class GunTransport implements Transport {
     // Persistence: load existing snapshot or clear it for a fresh session
     this.snapshotLoaded = false
     if (this.persistentMode) {
+      // Warm the snapshot node as UNLOAD_SLOT is warmed: flush()'s put must
+      // leave in the unloading task (test/gun/repro-writes.mjs, part 4). A
+      // field of its own - gun merges a put field by field, `data` stays.
+      this.roomNode.get('snapshot').put({ warmedAt: Date.now() })
       this.loadSnapshot()
+      this.persistDoc!.on('update', this._onDocUpdate)
     } else {
       // Overwrite any previously saved snapshot so reconnecting peers start fresh
       this.roomNode
@@ -659,6 +687,13 @@ export class GunTransport implements Transport {
    * `await` runs in a page that is already gone.
    */
   flush(): void {
+    // A snapshot still in its debounce: put now (no await before the put
+    // without a password), so the turn queue below drains it too (part 4).
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer)
+      this.persistTimer = undefined
+      this.saveSnapshot()
+    }
     if (this.batchTimeout) {
       clearTimeout(this.batchTimeout)
       this.batchTimeout = undefined
@@ -702,6 +737,7 @@ export class GunTransport implements Transport {
       clearTimeout(this.persistTimer)
       this.persistTimer = undefined
     }
+    this.persistDoc?.off('update', this._onDocUpdate)
     if (this.persistentMode && this.persistDoc) {
       this.saveSnapshot()
     }
@@ -750,6 +786,7 @@ export class GunTransport implements Transport {
     this.pendingUpdates.clear()
     this.persistentMode = false
     this.persistDoc = null
+    this.persistPendingSince = 0
     this.pendingLoad = null
     this.snapshotLoaded = false
 
@@ -759,7 +796,7 @@ export class GunTransport implements Transport {
   /**
    * Send data to all peers via Gun.
    * Routes awareness to a separate volatile node, doc sync to circular buffer.
-   * Uses debouncing for doc sync - each new update resets the timer.
+   * Doc sync is batched: a batch leaves batchInterval ms after its first update.
    */
   send(data: Uint8Array): void {
     if (!this._connected || !this.roomNode) {
@@ -776,22 +813,13 @@ export class GunTransport implements Transport {
       return
     }
 
-    // Doc sync goes through batched circular buffer
+    // Doc sync goes through batched circular buffer, batchInterval after the batch's first update
     this.updateBatch.push(data)
-
-    // Clear existing timeout (debouncing - resets timer on each update)
-    if (this.batchTimeout) {
-      clearTimeout(this.batchTimeout)
-    }
-
-    // Set new timeout to flush batch after period of inactivity
-    this.batchTimeout = setTimeout(() => {
-      this.flushBatch()
-    }, this.options.batchInterval)
-
-    // Schedule a snapshot save for persistent mode
-    if (this.persistentMode) {
-      this.queuePersist()
+    if (!this.batchTimeout) {
+      this.batchTimeout = setTimeout(() => {
+        this.batchTimeout = undefined
+        this.flushBatch()
+      }, this.options.batchInterval)
     }
   }
 
@@ -988,7 +1016,7 @@ export class GunTransport implements Transport {
 
   /**
    * Flush batched updates to Gun.
-   * Called after debounce period (no new updates for batchInterval ms).
+   * Called batchInterval ms after the batch's first update.
    */
   private async flushBatch(slotId?: string): Promise<void> {
     if (this.updateBatch.length === 0) return
@@ -1106,14 +1134,19 @@ export class GunTransport implements Transport {
   // ---------------------------------------------------------------------------
 
   /**
-   * Schedule a debounced snapshot write. Called on every doc update.
-   * Always saves the latest full state, never an individual delta.
+   * Schedule a debounced snapshot write of the latest full state - never
+   * beyond persistMaxWaitMs after the oldest change.
    */
   private queuePersist(): void {
+    const now = Date.now()
+    if (!this.persistPendingSince) this.persistPendingSince = now
     if (this.persistTimer) clearTimeout(this.persistTimer)
     this.persistTimer = setTimeout(
-      () => this.saveSnapshot(),
-      this.persistDebounceMs,
+      () => {
+        this.persistTimer = undefined
+        this.saveSnapshot()
+      },
+      Math.max(0, Math.min(this.persistDebounceMs, this.persistPendingSince + this.persistMaxWaitMs - now)),
     )
   }
 
@@ -1140,6 +1173,7 @@ export class GunTransport implements Transport {
 
     this.isWritingToGun = true
     this.savePending = false
+    this.persistPendingSince = 0
 
     try {
       // Encode as a proper y-generic SYNC_STEP_2 message
@@ -1153,10 +1187,14 @@ export class GunTransport implements Transport {
         payload = await this.encrypt(payload)
       }
 
+      // `cleared: false`: gun merges field by field, and a non-persistent
+      // peer's `cleared: true` outlived every later snapshot - loadSnapshot()
+      // skipped them all (test/gun/repro-writes.mjs, part 5).
       this.roomNode.get('snapshot').put({
         data: payload,
         timestamp: Date.now(),
         encrypted: this.encryptionEnabled,
+        cleared: false,
       })
 
       this.log('💾 Snapshot saved', snapshotBytes.length, 'bytes')

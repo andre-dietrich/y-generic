@@ -68,6 +68,9 @@ export class DummyHub {
     transport: DummyTransport,
     callback: (data: Uint8Array, from?: string) => void,
   ): void {
+    // One entry per transport: a second onMessage() while connected added
+    // another, and every message arrived twice (test/providers/check-dummy.ts).
+    this.leave(room, transport)
     if (!this.rooms.has(room)) {
       this.rooms.set(room, new Set())
     }
@@ -193,45 +196,36 @@ export class DummyHub {
     const clients = this.rooms.get(room)
     if (!clients) return
 
-    const latency = options?.latency ?? 0
-    const dropRate = options?.dropRate ?? 0
-    const jitter = options?.jitter ?? 0
-
     for (const client of clients) {
       // Don't send back to sender
-      if (client.transport === sender) continue
+      if (client.transport !== sender) this._deliver(client.callback, data, sender, options)
+    }
+  }
 
-      // Simulate packet loss
-      if (dropRate > 0 && Math.random() < dropRate) {
-        continue
-      }
-
-      // Calculate actual delay with jitter
-      let actualDelay = latency
-      if (latency > 0 && jitter > 0) {
-        // Random delay between latency*(1-jitter) and latency*(1+jitter)
-        const minDelay = latency * (1 - jitter)
-        const maxDelay = latency * (1 + jitter)
-        actualDelay = minDelay + Math.random() * (maxDelay - minDelay)
-      }
-
-      // Simulate network latency
-      if (actualDelay > 0) {
-        setTimeout(() => {
-          try {
-            client.callback(data, sender.id)
-          } catch (error) {
-            console.error('Error delivering message:', error)
-          }
-        }, actualDelay)
-      } else {
-        try {
-          client.callback(data, sender.id)
-        } catch (error) {
-          console.error('Error delivering message:', error)
-        }
+  /**
+   * One delivery: dropped with `dropRate`, after `latency` ms, randomized
+   * between latency*(1-jitter) and latency*(1+jitter).
+   */
+  private _deliver(
+    callback: (data: Uint8Array, from?: string) => void,
+    data: Uint8Array,
+    sender: DummyTransport,
+    options?: { latency?: number; dropRate?: number; jitter?: number },
+  ): void {
+    const dropRate = options?.dropRate ?? 0
+    if (dropRate > 0 && Math.random() < dropRate) return
+    const latency = options?.latency ?? 0
+    const jitter = options?.jitter ?? 0
+    const delay = latency > 0 && jitter > 0 ? latency * (1 - jitter) + Math.random() * (2 * latency * jitter) : latency
+    const deliver = () => {
+      try {
+        callback(data, sender.id)
+      } catch (error) {
+        console.error('Error delivering message:', error)
       }
     }
+    if (delay > 0) setTimeout(deliver, delay)
+    else deliver()
   }
 
   /**
@@ -251,23 +245,7 @@ export class DummyHub {
     if (!clients) return
     for (const client of clients) {
       if (client.transport.id !== targetId || client.transport === sender) continue
-      const dropRate = options?.dropRate ?? 0
-      if (dropRate > 0 && Math.random() < dropRate) return
-      const latency = options?.latency ?? 0
-      const jitter = options?.jitter ?? 0
-      let actualDelay = latency
-      if (latency > 0 && jitter > 0) {
-        actualDelay = latency * (1 - jitter) + Math.random() * (2 * latency * jitter)
-      }
-      const deliver = () => {
-        try {
-          client.callback(data, sender.id)
-        } catch (error) {
-          console.error('Error delivering message:', error)
-        }
-      }
-      if (actualDelay > 0) setTimeout(deliver, actualDelay)
-      else deliver()
+      this._deliver(client.callback, data, sender, options)
       return
     }
   }
@@ -353,8 +331,8 @@ export interface DummyTransportOptions {
   jitter?: number
 
   /**
-   * Automatically connect on first send.
-   * Useful for testing auto-reconnect behavior.
+   * Log a warning when send() drops a message because the transport is not
+   * connected (after a disconnect() - it never connects by itself).
    * @default false
    */
   autoConnect?: boolean
@@ -604,6 +582,7 @@ export class DummyTransport implements Transport {
       if (this.options.simulatePeerConnect) this.hub.notifyLeave(this._room, this)
       this.hub.unregisterPeerDisconnect(this._room, this)
     }
+    this._chunkBuffers.clear()
     this._connected = false
   }
 
@@ -727,9 +706,11 @@ export class DummyTransport implements Transport {
       this.hub.join(this._room, this, wrappedCallback)
     }
 
-    // Return unsubscribe function
+    // Unsubscribed is unsubscribed: off the hub too, not just the field.
     return () => {
+      if (this._callback !== wrappedCallback) return // a later onMessage() replaced it
       this._callback = undefined
+      this.hub?.leave(this._room, this)
     }
   }
 

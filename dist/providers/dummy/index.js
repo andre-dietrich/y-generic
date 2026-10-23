@@ -58,6 +58,9 @@ export class DummyHub {
      * Register a transport in a room.
      */
     join(room, transport, callback) {
+        // One entry per transport: a second onMessage() while connected added
+        // another, and every message arrived twice (test/providers/check-dummy.ts).
+        this.leave(room, transport);
         if (!this.rooms.has(room)) {
             this.rooms.set(room, new Set());
         }
@@ -158,45 +161,35 @@ export class DummyHub {
         const clients = this.rooms.get(room);
         if (!clients)
             return;
-        const latency = options?.latency ?? 0;
-        const dropRate = options?.dropRate ?? 0;
-        const jitter = options?.jitter ?? 0;
         for (const client of clients) {
             // Don't send back to sender
-            if (client.transport === sender)
-                continue;
-            // Simulate packet loss
-            if (dropRate > 0 && Math.random() < dropRate) {
-                continue;
-            }
-            // Calculate actual delay with jitter
-            let actualDelay = latency;
-            if (latency > 0 && jitter > 0) {
-                // Random delay between latency*(1-jitter) and latency*(1+jitter)
-                const minDelay = latency * (1 - jitter);
-                const maxDelay = latency * (1 + jitter);
-                actualDelay = minDelay + Math.random() * (maxDelay - minDelay);
-            }
-            // Simulate network latency
-            if (actualDelay > 0) {
-                setTimeout(() => {
-                    try {
-                        client.callback(data, sender.id);
-                    }
-                    catch (error) {
-                        console.error('Error delivering message:', error);
-                    }
-                }, actualDelay);
-            }
-            else {
-                try {
-                    client.callback(data, sender.id);
-                }
-                catch (error) {
-                    console.error('Error delivering message:', error);
-                }
-            }
+            if (client.transport !== sender)
+                this._deliver(client.callback, data, sender, options);
         }
+    }
+    /**
+     * One delivery: dropped with `dropRate`, after `latency` ms, randomized
+     * between latency*(1-jitter) and latency*(1+jitter).
+     */
+    _deliver(callback, data, sender, options) {
+        const dropRate = options?.dropRate ?? 0;
+        if (dropRate > 0 && Math.random() < dropRate)
+            return;
+        const latency = options?.latency ?? 0;
+        const jitter = options?.jitter ?? 0;
+        const delay = latency > 0 && jitter > 0 ? latency * (1 - jitter) + Math.random() * (2 * latency * jitter) : latency;
+        const deliver = () => {
+            try {
+                callback(data, sender.id);
+            }
+            catch (error) {
+                console.error('Error delivering message:', error);
+            }
+        };
+        if (delay > 0)
+            setTimeout(deliver, delay);
+        else
+            deliver();
     }
     /**
      * Deliver a message to ONE client in a room (Transport.sendTo), with the
@@ -211,27 +204,7 @@ export class DummyHub {
         for (const client of clients) {
             if (client.transport.id !== targetId || client.transport === sender)
                 continue;
-            const dropRate = options?.dropRate ?? 0;
-            if (dropRate > 0 && Math.random() < dropRate)
-                return;
-            const latency = options?.latency ?? 0;
-            const jitter = options?.jitter ?? 0;
-            let actualDelay = latency;
-            if (latency > 0 && jitter > 0) {
-                actualDelay = latency * (1 - jitter) + Math.random() * (2 * latency * jitter);
-            }
-            const deliver = () => {
-                try {
-                    client.callback(data, sender.id);
-                }
-                catch (error) {
-                    console.error('Error delivering message:', error);
-                }
-            };
-            if (actualDelay > 0)
-                setTimeout(deliver, actualDelay);
-            else
-                deliver();
+            this._deliver(client.callback, data, sender, options);
             return;
         }
     }
@@ -414,6 +387,7 @@ export class DummyTransport {
                 this.hub.notifyLeave(this._room, this);
             this.hub.unregisterPeerDisconnect(this._room, this);
         }
+        this._chunkBuffers.clear();
         this._connected = false;
     }
     /**
@@ -518,9 +492,12 @@ export class DummyTransport {
         if (this._connected && this._room && this.hub) {
             this.hub.join(this._room, this, wrappedCallback);
         }
-        // Return unsubscribe function
+        // Unsubscribed is unsubscribed: off the hub too, not just the field.
         return () => {
+            if (this._callback !== wrappedCallback)
+                return; // a later onMessage() replaced it
             this._callback = undefined;
+            this.hub?.leave(this._room, this);
         };
     }
     /**

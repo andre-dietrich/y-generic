@@ -95,6 +95,11 @@ export declare class DummyHub {
         jitter?: number;
     }): void;
     /**
+     * One delivery: dropped with `dropRate`, after `latency` ms, randomized
+     * between latency*(1-jitter) and latency*(1+jitter).
+     */
+    private _deliver;
+    /**
      * Deliver a message to ONE client in a room (Transport.sendTo), with the
      * same latency/jitter/drop model as broadcast(). Silently does nothing if
      * the target has left. Used only by transports created with
@@ -157,8 +162,8 @@ export interface DummyTransportOptions {
      */
     jitter?: number;
     /**
-     * Automatically connect on first send.
-     * Useful for testing auto-reconnect behavior.
+     * Log a warning when send() drops a message because the transport is not
+     * connected (after a disconnect() - it never connects by itself).
      * @default false
      */
     autoConnect?: boolean;

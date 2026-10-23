@@ -181,3 +181,11 @@ without a measurement.
   the round-13 departure findings, a measurement until GATE_DEPARTURE=1.
 - **_remember's cache is an array with shift().** O(1) amortized in V8 for a
   packed array; not measured at N=300 for this review.
+
+## Dummy
+
+- **Chunk buffers are never evicted.** With `chunkSizeLimit` and `dropRate`
+  together, a chunk set that lost a part stays in `_chunkBuffers` until
+  disconnect(). Test memory only.
+- **`autoConnect` does not connect.** It only warns when a send is dropped;
+  the doc says so now. Removing the option would break callers that pass it.

@@ -465,6 +465,7 @@ export class PeerJSTransport {
         }
         this._sessionState = 'idle';
         this._sessionFails = 0;
+        this._claimAt = undefined;
         if (this._sidecar) {
             try {
                 this._sidecar.destroy();
@@ -638,6 +639,7 @@ export class PeerJSTransport {
         if (this._sparse) {
             // A session is cheap and we may have missed a whole room while we were away.
             this._sessionFails = 0;
+            this._claimAt = undefined;
             if (!this.isCoordinator)
                 this.openSession();
             return;
@@ -1014,6 +1016,7 @@ export class PeerJSTransport {
                 settled = true;
                 this._sessionState = 'open';
                 this._sessionFails = 0;
+                this._claimAt = undefined;
                 this.sendCoordinationMessage(conn, this.joinMessage());
             });
             conn.on('data', (data) => {
@@ -1068,6 +1071,7 @@ export class PeerJSTransport {
         this.armHeartbeat();
     }
     clearSessionTimer() {
+        this._sessionDue = undefined;
         if (this._sessionTimer) {
             clearTimeout(this._sessionTimer);
             this._sessionTimer = undefined;
@@ -1077,14 +1081,19 @@ export class PeerJSTransport {
      * When to go back. Not a fixed period: a peer that has its links needs the coordinator
      * only to renew its lease, but one with NO links needs an id right now.
      */
-    armHeartbeat() {
+    armHeartbeat(onlyEarlier = false) {
         if (!this._sparse || this._destroying || this.isCoordinator)
             return;
-        this.clearSessionTimer();
         const ms = nextHeartbeatMs(this.linkCount(), this._sparse.dial, {
             renewMs: Math.max(this.options.coordinatorRenewMs, this._renewMs),
             attempt: this._sessionFails,
         });
+        // maybeRefill runs every 5 s: it may bring a pending visit forward, never push one back
+        // (a 4-6 s backoff re-armed every 5 s went out 9 s apart - repro-peerjs-sparse part 12).
+        if (onlyEarlier && this._sessionTimer && (this._sessionDue ?? 0) <= Date.now() + ms)
+            return;
+        this.clearSessionTimer();
+        this._sessionDue = Date.now() + ms;
         this._sessionTimer = setTimeout(() => {
             this._sessionTimer = undefined;
             this.openSession();
@@ -1101,9 +1110,21 @@ export class PeerJSTransport {
             return;
         if (this._sessionState === 'claiming')
             return;
+        let ms = claimDelayMs(this.peerId, this._successors, { passive: this._passive, roomSize: this._roomSize });
+        if (this._passive) {
+            // A leaf waits 12-22 s before it claims, and somebody else usually takes the name
+            // in that time: it keeps asking at the name meanwhile instead of sitting alone for
+            // all of it (repro-peerjs-sparse part 11). Past the deadline it claims at once.
+            this._claimAt ?? (this._claimAt = Date.now() + ms);
+            if (Date.now() < this._claimAt) {
+                this.armHeartbeat();
+                return;
+            }
+            ms = 0;
+        }
+        this._claimAt = undefined;
         this._sessionState = 'claiming';
         this.clearSessionTimer();
-        const ms = claimDelayMs(this.peerId, this._successors, { passive: this._passive, roomSize: this._roomSize });
         this.log(`🗳️ the coordinator does not answer - claiming its name in ${Math.round(ms)} ms`);
         this._sessionTimer = setTimeout(() => {
             this._sessionTimer = undefined;
@@ -1386,7 +1407,7 @@ export class PeerJSTransport {
         // Whatever heartbeat is pending was armed while we still had our links - a minute
         // away. Re-arm it for what we have now: a couple of seconds, or nothing at all if
         // we are down to zero (test/peerjs/e2e-handover.mjs part 2 lives on that case).
-        this.armHeartbeat();
+        this.armHeartbeat(true);
     }
     /**
      * Handle messages from coordinator (when we're a regular peer).

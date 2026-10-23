@@ -253,7 +253,9 @@ export declare class PeerJSTransport implements Transport {
     private _session?;
     private _sessionState;
     private _sessionTimer?;
+    private _sessionDue?;
     private _sessionFails;
+    private _claimAt?;
     private _sidecar?;
     /**
      * Create a new PeerJS transport.

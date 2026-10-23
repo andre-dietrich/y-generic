@@ -394,6 +394,7 @@ class LinkTransport implements Transport {
   private _successors: string[] = []
   private _renewMs = RENEW_MS
   private _sessionFails = 0
+  private _claimAt?: number
   private _roomSize = 0
   private _hbTimer?: ReturnType<typeof setTimeout>
 
@@ -404,6 +405,7 @@ class LinkTransport implements Transport {
   /** The sample is in: dial what we are short of, keep the rest. */
   gotSample(ids: string[], successors: string[], renewInMs: number): void {
     this._sessionFails = 0
+    this._claimAt = undefined
     this._successors = successors
     this._renewMs = renewInMs
     for (const id of ids) this._sparse?.heard(id)
@@ -434,7 +436,17 @@ class LinkTransport implements Transport {
       this.armHeartbeat()
       return
     }
-    const ms = claimDelayMs(this.id, this._successors, { passive: this.passive, roomSize: this._roomSize })
+    let ms = claimDelayMs(this.id, this._successors, { passive: this.passive, roomSize: this._roomSize })
+    if (this.passive) {
+      // As PeerJSTransport.coordinatorUnreachable: a leaf keeps asking until its deadline, then claims.
+      this._claimAt ??= Date.now() + ms
+      if (Date.now() < this._claimAt) {
+        this.armHeartbeat()
+        return
+      }
+      ms = 0
+    }
+    this._claimAt = undefined
     setTimeout(() => {
       if (this.isConnected) this.net.claim(this)
     }, ms)

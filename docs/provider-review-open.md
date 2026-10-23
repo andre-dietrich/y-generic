@@ -170,6 +170,17 @@ and repro-peerjs-sparse's 10).
   here, so unchecked. If it does not, the `oneway` scenario of
   room-scenarios.mjs peerjs is what would show it.
 - **`password` is XOR with the password's bytes,** as in simple-peer.
+- **Fixed in the regression run: a leaf that found nobody at the name sat
+  alone for its whole claim delay (12-22 s).** bench-partial-mesh
+  `rendezvousleaves` was red since feat/peerjs-rendezvous (every leaf that
+  joined before the first claim missed the join); now a leaf keeps asking at
+  the name until its deadline (repro-peerjs-sparse parts 11-12). Still not
+  run: a real phone with `LEAF=1` on `phone-session.mjs peerjs-conference` -
+  the browser harness has no leaves.
+- **`rendezvous` (no leaves) at N=100 failed once** in three runs: p76 never
+  had p58 in its roster for the whole run (`hw 4, state none`). Not reproduced.
+- **test/peerjs/coordinator-reelection.test.mjs cannot run** (on main too):
+  it imports `dist/`, whose ESM imports have no `.js` extension.
 
 ## Conference
 

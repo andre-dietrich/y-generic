@@ -42,6 +42,13 @@
  *           and does a sample stay long enough to dial with meanwhile?
  *  Part 10 - The peer falls below `dial` links, and to zero. Does it go
  *           back for more at once instead of waiting out its heartbeat?
+ *  Part 11 - A LEAF finds nobody at the name (a room that is starting, a
+ *           handover), then a relay peer takes it. A leaf waits 12-22 s
+ *           before it claims; does it go on asking meanwhile, or sit alone
+ *           for all of it? (bench-partial-mesh rendezvousleaves: every leaf
+ *           that joined in the first second missed the join - 18.9 s here.)
+ *  Part 12 - CONTROL: a room of leaves only. Does the leaf still claim the
+ *           name in the end? (20-22 s, as before part 11's change.)
  *  Part 9 - CONTROL: configureSparse never called. Everything of
  *           repro-peerjs-coordinator.ts's world must hold to the byte - the
  *           whole list dialed, the id rule in force, the re-dial unconditional.
@@ -533,6 +540,36 @@ async function main(): Promise<void> {
     }
     const back = await until(() => dialsTo('yjs-coordinator-r') > dialsBefore, 15000)
     check('it goes back for more within seconds', back >= 0 && back < 5000, back < 0 ? 'never went back' : `after ${back} ms`)
+    ;(transport as any).disconnect()
+  }
+
+  // --------------------------------------------------------------- Part 11
+  console.log('\nPart 11 - a LEAF finds nobody at the name, then somebody takes it')
+  {
+    reset()
+    const transport = new PeerJSTransport({ peer: Server } as any)
+    transport.configureSparse({ expectedPeers: 100, passive: true })
+    await transport.connect({ room: 'r' })
+    // Two sessions find nobody (peer-unavailable): from here a leaf waits 12-22 s before it claims.
+    await until(() => dialsTo('yjs-coordinator-r') >= 2, 5000)
+    await sleep(50)
+    const dialsBefore = dialsTo('yjs-coordinator-r')
+    Server.taken.add('yjs-coordinator-r') // a relay peer of the room claimed it meanwhile
+    const back = await until(() => dialsTo('yjs-coordinator-r') > dialsBefore, 25000)
+    check('it asks the new holder within seconds, not after its own claim', back >= 0 && back < 8000, back < 0 ? 'never asked' : `after ${back} ms`)
+    ;(transport as any).disconnect()
+  }
+
+  // --------------------------------------------------------------- Part 12
+  console.log('\nPart 12 - CONTROL: a room of leaves only - nobody else will ever take the name')
+  {
+    reset()
+    const transport = new PeerJSTransport({ peer: Server } as any)
+    transport.configureSparse({ expectedPeers: 100, passive: true })
+    const t0 = Date.now()
+    await transport.connect({ room: 'r' })
+    const held = await until(() => Server.all.some((p) => p.id === 'yjs-coordinator-r' && p.registered), 40000)
+    check('the leaf still claims it in the end', held >= 0, held < 0 ? 'never claimed' : `after ${Date.now() - t0} ms`)
     ;(transport as any).disconnect()
   }
 

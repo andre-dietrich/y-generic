@@ -18,12 +18,14 @@ matters, what a fix would take.
 
 ## Nostr
 
-- **Relay storage grows per session.** Without a `secretKey` every `connect()`
-  makes a new key, so every session gets its own addressable snapshot slot
-  `(kind, pubkey, d)` that is never replaced; a joiner fetches all of them (the
-  `#d` filter has no `authors`, no `limit`). A semester of sessions = hundreds of
-  whole documents per join. Options: `limit` in the filter (and in
-  `Docker/nostr/relay.js`, which ignores it), or a key per room.
+- **Relay storage per device: fixed for new sessions.** Snapshots are signed
+  with a key per browser and room (localStorage) since this review; before,
+  every page load left a slot. Left as it was: the slots older versions wrote
+  stay on the relay and every joiner still fetches them (the filter has no
+  `authors`, so old snapshots keep loading - dropping them would lose a room
+  stored by an older version). A private window or cleared storage still
+  starts a new slot. Two tabs of one browser that edit one room at once write
+  the same slot and could tear a multi-chunk snapshot.
 - **Every peer publishes a snapshot after every change, also a remote one.**
   Redundancy against a writer killed before its flush, at the cost of N uploads
   of the whole document per edit burst. Linear, not N² (that one is fixed).

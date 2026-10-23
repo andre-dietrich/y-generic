@@ -177,6 +177,8 @@ export class NostrTransport {
         this.persistMaxWaitMs = 10000;
         // When the oldest change the pending snapshot is for was made; 0 = none pending
         this.persistPendingSince = 0;
+        // What snapshots are signed with, see _snapshotKey()
+        this.snapshotSecretKey = new Uint8Array(32);
         // created_at of the last snapshot published, see _publishSnapshotNow
         this.lastSnapshotAt = 0;
         this.isPublishingSnapshot = false;
@@ -247,6 +249,7 @@ export class NostrTransport {
             this.persistDebounceMs = config.persistDebounceMs ?? 2000;
             this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000;
             this.sealFrame = config.sealFrame;
+            this.snapshotSecretKey = this._snapshotKey();
             const snapshotDTags = Array.from({ length: MAX_SNAPSHOT_CHUNKS }, (_, i) => `${this.roomTag}#${i}`);
             this.snapshotSub = this.pool.subscribeMany(this.relays, { kinds: [this.persistentKind], '#d': snapshotDTags }, {
                 onevent: (event) => {
@@ -547,7 +550,7 @@ export class NostrTransport {
                     created_at: this.lastSnapshotAt,
                     tags: [['d', `${this.roomTag}#${part.index}`]],
                     content: JSON.stringify(sealed ? { ...part, sealed } : part),
-                }, this.secretKey);
+                }, this.snapshotSecretKey);
                 published.push(...this.pool.publish(this.relays, event));
             }
             return Promise.allSettled(published);
@@ -555,6 +558,37 @@ export class NostrTransport {
         catch (err) {
             console.warn('[NostrTransport] Failed to publish snapshot:', err);
             return Promise.resolve();
+        }
+    }
+    /**
+     * The key snapshots are signed with. A relay keeps ONE snapshot per (kind,
+     * key, `d`), and without a `secretKey` every connect() made a new key: every
+     * page load left a whole document on the relay that nobody ever replaced,
+     * and every joiner fetched all of them (test/nostr/repro-persistent.mjs,
+     * part 7: 3 sessions, 3 stored snapshots). So one key per browser and room,
+     * kept in localStorage - the relay holds one per device, not per visit.
+     * Not one per ROOM: every editor would write the same slots, and two
+     * multi-chunk snapshots written at once tear (the chunks of two ids).
+     * Not the live identity either: two tabs of one browser would each drop
+     * the other's events as their own echo. No localStorage (Node, a blocked
+     * one): this connection's key, as before.
+     */
+    _snapshotKey() {
+        if (this.opts.secretKey)
+            return this.opts.secretKey;
+        try {
+            const store = globalThis.localStorage;
+            const name = `ygen-nostr-snapshot-key-${this.roomTag}`;
+            const stored = store.getItem(name);
+            if (stored && /^[0-9a-f]{64}$/.test(stored)) {
+                return Uint8Array.from(stored.match(/../g), (h) => parseInt(h, 16));
+            }
+            const key = crypto.getRandomValues(new Uint8Array(32));
+            store.setItem(name, Array.from(key, (b) => b.toString(16).padStart(2, '0')).join(''));
+            return key;
+        }
+        catch {
+            return this.secretKey;
         }
     }
     /**

@@ -115,6 +115,18 @@ missing from the room, and nothing was stored while somebody kept typing
 grows per peer: of two events of one address in the same second a relay
 keeps the lower id - an older snapshot, or per chunk a torn mix of two.
 
+**One snapshot per device, not per visit.** A relay keeps the latest
+snapshot per signing key, and without a `secretKey` the transport made a new
+key at every `connect()` - every page load left a whole document on the relay
+that nothing replaced, and every joiner fetched them all. Snapshots are now
+signed with a key kept per browser and room in `localStorage`
+(`ygen-nostr-snapshot-key-<room>`); a `secretKey` you pass is used instead.
+Not one key per room: every editor would write the same slots, and two
+multi-chunk snapshots written at once would tear. Without `localStorage`
+(Node, a blocked one) it is the connection's key, as before. Snapshots left by
+older versions stay on the relay and are still read (part 7 of
+`test/nostr/repro-persistent.mjs`).
+
 **Behind an encrypting wrapper** (LiaScript's `wrapTransport` with a
 password) the snapshot is built under the wrapper: it was stored in the
 clear and delivered as a frame the wrapper could not open, so a password

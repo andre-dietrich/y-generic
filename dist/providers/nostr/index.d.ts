@@ -248,6 +248,7 @@ export declare class NostrTransport implements Transport {
     private persistMaxWaitMs;
     private persistPendingSince;
     private sealFrame?;
+    private snapshotSecretKey;
     private lastSnapshotAt;
     private persistTimer?;
     private isPublishingSnapshot;
@@ -309,6 +310,20 @@ export declare class NostrTransport implements Transport {
      * older and a newer snapshot, and per chunk a torn mix of two.
      */
     private _publishSnapshotNow;
+    /**
+     * The key snapshots are signed with. A relay keeps ONE snapshot per (kind,
+     * key, `d`), and without a `secretKey` every connect() made a new key: every
+     * page load left a whole document on the relay that nobody ever replaced,
+     * and every joiner fetched all of them (test/nostr/repro-persistent.mjs,
+     * part 7: 3 sessions, 3 stored snapshots). So one key per browser and room,
+     * kept in localStorage - the relay holds one per device, not per visit.
+     * Not one per ROOM: every editor would write the same slots, and two
+     * multi-chunk snapshots written at once tear (the chunks of two ids).
+     * Not the live identity either: two tabs of one browser would each drop
+     * the other's events as their own echo. No localStorage (Node, a blocked
+     * one): this connection's key, as before.
+     */
+    private _snapshotKey;
     /**
      * Transport.flush: the page is unloading. A snapshot still in its
      * debounce goes now - a page that goes runs no further timer, and the

@@ -26,7 +26,13 @@
 //  6 fan-out   A and B in the room, A edits: no snapshot reaches B (or A) -
 //              the stored one is for joiners only, the live channel carries
 //              the edit; left open, every peer's snapshot reached every peer.
-// Exit code 1 unless all six hold.
+//  7 sessions  three page loads one after the other in one browser, each
+//              edits, then a joiner: it must get ONE stored snapshot, with all
+//              three edits. A relay keeps one snapshot per key, and without a
+//              `secretKey` every connect() made a new one - every visit left a
+//              whole document behind that nothing replaced, and every joiner
+//              fetched them all. (Control: without localStorage it is still 3.)
+// Exit code 1 unless parts 1-7 hold.
 // RELAY=wss://... runs it against that relay instead of Docker/nostr/relay.js
 // (part 4 then asks the relay for what it keeps).
 import { createRequire } from 'node:module'
@@ -245,6 +251,45 @@ const results = []
   b.kill()
   results.push(has && seen === 0)
   console.log(`6 fan-out: B ${has ? 'has' : 'MISSES'} the edit, ${seen} snapshot event(s) delivered to A and B (want 0)`)
+}
+
+async function sessions(room) {
+  let stored = 0
+  class Counting extends pool.SimplePool {
+    subscribeMany(r, f, h) {
+      if (f.kinds?.[0] !== 30078) return super.subscribeMany(r, f, h)
+      return super.subscribeMany(r, f, { ...h, onevent: (e) => (stored++, h.onevent?.(e)) })
+    }
+  }
+  const open = async (SimplePool) => {
+    const doc = new Y.Doc()
+    const t = new NostrTransport({ finalizeEvent: pure.finalizeEvent, getPublicKey: pure.getPublicKey, SimplePool, eventKind: ++liveKind })
+    const p = new GenericProvider(doc, t, { disableBc: true })
+    await p.connect({ room, relays, historyWindowSecs: 0, persistent: true, doc, persistDebounceMs: 300 })
+    return { doc, p }
+  }
+  for (const token of ['s1', 's2', 's3']) {
+    const s = await open(pool.SimplePool) // a page load
+    await sleep(1000) // the stored snapshot is in
+    s.doc.getText('t').insert(s.doc.getText('t').length, ` ${token}`)
+    await sleep(1500) // past persistDebounceMs
+    s.p.destroy()
+    await sleep(300)
+  }
+  const j = await open(Counting)
+  await sleep(1500)
+  const text = j.doc.getText('t').toString()
+  j.p.destroy()
+  return { stored, all: ['s1', 's2', 's3'].every((t) => text.includes(t)) }
+}
+{
+  const items = new Map()
+  globalThis.localStorage = { getItem: (k) => items.get(k) ?? null, setItem: (k, v) => items.set(k, String(v)) }
+  const r = await sessions(newRoom())
+  delete globalThis.localStorage
+  const control = await sessions(newRoom())
+  results.push(r.stored === 1 && r.all)
+  console.log(`7 sessions: 3 page loads, the joiner got ${r.stored} stored snapshot(s) (want 1), all three edits ${r.all}; without localStorage ${control.stored} (the old behaviour)`)
 }
 
 relay?.kill('SIGKILL')

@@ -18,6 +18,20 @@
  *               (src/providers/dial.ts), configured the way a user does it -
  *               `expectedPeers` on the wrapper (EXPECTED, default N)
  *   dialleaves  same, LEAF_SHARE of the peers are leaves
+ *   rendezvous  the OTHER way to find links, PeerJS's: there is no broadcast
+ *               channel, only a well-known NAME. So the dice move to the one
+ *               place with a census - whoever holds the name answers a join
+ *               with a random SAMPLE of its roster (leases, renewed by the
+ *               next join), holds it in a second Peer rather than as its
+ *               identity, and keeps no link to anybody: a session, a sample,
+ *               closed again. The REAL policy runs here
+ *               (src/providers/rendezvous.ts: sampleRoster, successorsOf,
+ *               nextHeartbeatMs, claimDelayMs) on top of the REAL dial rule -
+ *               only the server ("exactly one holder of a name") and the
+ *               signaling round trips are modelled. Reports what the design
+ *               exists for: the coordinator's open sessions at peak and at
+ *               rest, against the full mesh's link to every peer of the room.
+ *   rendezvousleaves  same, LEAF_SHARE of the peers are leaves
  *
  * Phases: N joins JOIN_MS apart -> idle -> peer 0 types KEYS characters
  * 100 ms apart -> the LAST joiner types -> cursor moves -> one pub/sub ->
@@ -39,7 +53,8 @@
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/dummy/bench-partial-mesh.js
  *      N=100,150 DIAL=10 HOP_MS=20 KEYS=30 JOIN_MS=25 SEED=1 LEAF_SHARE=0.5 MAX_RATIO=2 RELAY_RATIO=1.5
- *      VARIANTS=full,conference,leaves,dial,dialleaves[,flood]   (N=300: ~4 min per variant)
+ *      VARIANTS=full,conference,leaves,dial,dialleaves,rendezvous,rendezvousleaves[,flood]
+ *                                                            (N=300: ~4 min per variant)
  *      DIAG=1 names the holes of a roster and prints the frames around them; TRACE_FILE=path dumps all frames
  *      PHASES=join stops after the join.
  */
@@ -50,6 +65,7 @@ import { GenericProvider } from '../../src/index'
 import type { Transport } from '../../src/transport'
 import { ConferenceTransport } from '../../src/providers/conference'
 import { SparseDial } from '../../src/providers/dial'
+import { sampleRoster, successorsOf, nextHeartbeatMs, claimDelayMs, type RosterEntry } from '../../src/providers/rendezvous'
 import { sleep, silenced } from './bench-user-scaling'
 
 const NS = (process.env.N ?? '100').split(',').map(Number)
@@ -94,8 +110,12 @@ const RELOAD_SETTLE_MS = Number(process.env.RELOAD_SETTLE_MS ?? 6000)
 const IDLE_SUSPECT_MS = Number(process.env.IDLE_SUSPECT_MS ?? 0) // as shipped: off
 const IDLE_GATE_MS = Number(process.env.IDLE_GATE_MS ?? 4000)
 const SUSPECT_GATE_MS = Number(process.env.SUSPECT_GATE_MS ?? 2000)
-const VARIANTS = (process.env.VARIANTS ?? 'full,conference,leaves,dial,dialleaves').split(',')
+const VARIANTS = (process.env.VARIANTS ?? 'full,conference,leaves,dial,dialleaves,rendezvous,rendezvousleaves').split(',')
 const SIG_MS = Number(process.env.SIG_MS ?? 30)
+// 'rendezvous' variants: what a peer renews its roster lease with, and what the
+// coordinator is willing to handshake per second. The shipped defaults.
+const RENEW_MS = Number(process.env.RENEW_MS ?? 60000)
+const SESSIONS_PER_SEC = Number(process.env.SESSIONS_PER_SEC ?? 2)
 const ANNOUNCE_MS = Number(process.env.ANNOUNCE_MS ?? 5000)
 
 function mulberry32(seed: number): () => number {
@@ -216,6 +236,64 @@ class MeshNet {
     }, 3 * SIG_MS + HOP_MS)
   }
 
+  // --- 'rendezvous' variants: PeerJS's way - one NAME, and a sample from whoever holds it.
+  // Everything of the policy here is the shipped one (src/providers/rendezvous.ts): the
+  // sample, the successor chain, the heartbeat and the claim delay. What is modelled is
+  // only the server ("exactly one holder of a name") and the signaling round trips.
+  coordinator?: number
+  readonly roster = new Map<string, RosterEntry>()
+  sessions = 0 // open right now: the number this whole design exists to bound
+  sessionPeak = 0
+  sessionsOpened = 0
+  heartbeats = 0
+  claims = 0
+  staleDials = 0 // a sample named a peer that was already gone
+
+  /** A peer opens a signaling session: one trip to the name, one back. */
+  session(from: LinkTransport): void {
+    if (!from.isConnected) return
+    this.sessionsOpened++
+    this.sessions++
+    this.sessionPeak = Math.max(this.sessionPeak, this.sessions)
+    setTimeout(() => {
+      this.sessions--
+      if (!from.isConnected) return
+      const coord = this.coordinator !== undefined ? this.nodes[this.coordinator] : undefined
+      if (!coord?.isConnected) {
+        from.sessionFailed()
+        return
+      }
+      const now = Date.now()
+      const renewInMs = Math.max(RENEW_MS, Math.ceil(this.roster.size / SESSIONS_PER_SEC) * 1000)
+      this.roster.set(from.id, { expires: now + 2.5 * renewInMs, leaf: from.passive })
+      for (const [id, entry] of this.roster) if (entry.expires <= now) this.roster.delete(id)
+      const have = Array.from(this.adj[from.index], (j) => this.nodes[j]?.id).filter(Boolean) as string[]
+      const want = Math.max(0, from.dialTarget() - from.linkCount())
+      const peers = sampleRoster(this.roster, want, { self: from.id, have, now })
+      from.gotSample(peers, successorsOf(this.roster, now), renewInMs)
+    }, 2 * SIG_MS)
+  }
+
+  /** Claim the room's name. The server hands it to exactly one; everybody else is told no. */
+  claim(from: LinkTransport): void {
+    if (!from.isConnected) return
+    const held = this.coordinator !== undefined ? this.nodes[this.coordinator] : undefined
+    this.claims++
+    if (held?.isConnected) {
+      from.claimLost()
+      return
+    }
+    this.coordinator = from.index
+    // A fresh holder seeds its roster from what it has actually seen, on a short lease -
+    // an empty roster hands out empty samples and a joiner in that window sits alone.
+    const probation = Date.now() + RENEW_MS / 3
+    for (const j of this.adj[from.index]) {
+      const node = this.nodes[j]
+      if (node && !this.roster.has(node.id)) this.roster.set(node.id, { expires: probation, leaf: node.passive })
+    }
+    from.gotSample([], successorsOf(this.roster), RENEW_MS)
+  }
+
   /** A link between two living peers closes (ICE gave up on it): both ends hear it. */
   cut(a: number, b: number): void {
     this.adj[a].delete(b)
@@ -238,11 +316,20 @@ class LinkTransport implements Transport {
   constructor(
     readonly net: MeshNet,
     readonly index: number,
-    /** true: the links come from the dial rule, not from `net.adj` as built up front. */
-    readonly dynamic = false,
+    /**
+     * How this peer finds its links. 'static': `net.adj`, built up front. 'dial': the real
+     * dial rule over a broadcast announce (simple-peer). 'rendezvous': a sample from the
+     * peer holding the room's name (peerjs).
+     */
+    readonly kind: 'static' | 'dial' | 'rendezvous' = 'static',
   ) {
     this.id = 'p' + index
     net.nodes[index] = this
+  }
+
+  /** Both partial-mesh kinds: the links come from a rule, not from `net.adj` up front. */
+  get dynamic(): boolean {
+    return this.kind !== 'static'
   }
 
   private _neighbours(): LinkTransport[] {
@@ -256,6 +343,10 @@ class LinkTransport implements Transport {
 
   async connect(): Promise<void> {
     this.isConnected = true
+    if (this.kind === 'rendezvous') {
+      this.net.session(this)
+      return
+    }
     if (this.dynamic) {
       const announce = () => {
         if (this.isConnected && this._sparse!.wantsLinks(this.linkCount())) this.net.announce(this)
@@ -278,6 +369,9 @@ class LinkTransport implements Transport {
     const neighbours = this._neighbours()
     this.isConnected = false
     if (this._announceTimer !== undefined) clearInterval(this._announceTimer)
+    if (this._hbTimer !== undefined) clearTimeout(this._hbTimer)
+    // The name goes with the tab that held it: somebody else will have to take it over.
+    if (this.net.coordinator === this.index) this.net.coordinator = undefined
     for (const other of neighbours) {
       setTimeout(() => {
         this.net.adj[other.index].delete(this.index)
@@ -288,7 +382,83 @@ class LinkTransport implements Transport {
 
   linkClosed(peerId: string): void {
     this._onDisconnect?.(peerId)
-    if (this._sparse?.wantsLinks(this.linkCount())) this.net.announce(this)
+    if (!this._sparse?.wantsLinks(this.linkCount())) return
+    if (this.kind === 'rendezvous') {
+      this.refill()
+      this.armHeartbeat()
+    } else this.net.announce(this)
+  }
+
+  // --- 'rendezvous' variants: what PeerJSTransport does with ../../src/providers/rendezvous.ts ---
+  private _reserve: string[] = []
+  private _successors: string[] = []
+  private _renewMs = RENEW_MS
+  private _sessionFails = 0
+  private _roomSize = 0
+  private _hbTimer?: ReturnType<typeof setTimeout>
+
+  dialTarget(): number {
+    return this._sparse?.dial ?? 4
+  }
+
+  /** The sample is in: dial what we are short of, keep the rest. */
+  gotSample(ids: string[], successors: string[], renewInMs: number): void {
+    this._sessionFails = 0
+    this._successors = successors
+    this._renewMs = renewInMs
+    for (const id of ids) this._sparse?.heard(id)
+    this._reserve = ids
+    this.refill()
+    this.armHeartbeat()
+  }
+
+  refill(): void {
+    while (this._reserve.length > 0 && this._sparse?.wantsLinks(this.linkCount())) {
+      const other = this.net.nodes[Number(this._reserve.shift()!.slice(1))]
+      if (!other || other === this) continue
+      if (this.net.adj[this.index].has(other.index)) continue
+      // A roster is leases: an id can outlive the tab that held it by one of them.
+      if (!other.isConnected) {
+        this.net.staleDials++
+        continue
+      }
+      this.net.open(this, other)
+    }
+  }
+
+  /** Nobody answered at the name. Twice means it is time to claim it. */
+  sessionFailed(): void {
+    if (!this.isConnected) return
+    this._sessionFails++
+    if (this._sessionFails < 2) {
+      this.armHeartbeat()
+      return
+    }
+    const ms = claimDelayMs(this.id, this._successors, { passive: this.passive, roomSize: this._roomSize })
+    setTimeout(() => {
+      if (this.isConnected) this.net.claim(this)
+    }, ms)
+  }
+
+  /** Somebody else holds it: go and take a sample from them. */
+  claimLost(): void {
+    this._sessionFails = 0
+    this.armHeartbeat()
+  }
+
+  armHeartbeat(): void {
+    if (!this.isConnected || this.kind !== 'rendezvous') return
+    if (this._hbTimer !== undefined) clearTimeout(this._hbTimer)
+    const ms = nextHeartbeatMs(this.linkCount(), this.dialTarget(), {
+      renewMs: Math.max(RENEW_MS, this._renewMs),
+      attempt: this._sessionFails,
+    })
+    this._hbTimer = setTimeout(() => {
+      this._hbTimer = undefined
+      if (!this.isConnected) return
+      this.net.heartbeats++
+      this.net.session(this)
+    }, ms)
   }
 
   // --- 'dial' variants: what SimplePeerTransport does with ../../src/providers/dial.ts ---
@@ -304,6 +474,7 @@ class LinkTransport implements Transport {
     this._sparse = new SparseDial({ dial, maxConns: 64, passive: this.passive })
   }
   setRoomSize(peers: number): void {
+    this._roomSize = peers
     this._sparse?.setRoomSize(peers)
   }
   linkCount(): number {
@@ -362,8 +533,11 @@ interface Result {
 async function runVariant(name: string, n: number): Promise<Result> {
   const rand = mulberry32(SEED)
   const wrapped = name !== 'full'
-  const dynamic = name === 'dial' || name === 'dialleaves'
-  const leafAt = (i: number) => (name === 'leaves' || name === 'dialleaves') && i > 0 && i % Math.round(1 / LEAF_SHARE) !== 0
+  const rendezvous = name === 'rendezvous' || name === 'rendezvousleaves'
+  const dynamic = name === 'dial' || name === 'dialleaves' || rendezvous
+  const kind: 'static' | 'dial' | 'rendezvous' = rendezvous ? 'rendezvous' : dynamic ? 'dial' : 'static'
+  const leafAt = (i: number) =>
+    (name === 'leaves' || name === 'dialleaves' || name === 'rendezvousleaves') && i > 0 && i % Math.round(1 / LEAF_SHARE) !== 0
   const adj = dynamic
     ? Array.from({ length: n }, () => new Set<number>())
     : wrapped
@@ -436,7 +610,7 @@ async function runVariant(name: string, n: number): Promise<Result> {
 
   // --- join ---
   for (let i = 0; i < n; i++) {
-    const link = new LinkTransport(net, i, dynamic)
+    const link = new LinkTransport(net, i, kind)
     let transport: Transport = link
     if (wrapped) {
       const wrapper = new ConferenceTransport(link, {
@@ -490,6 +664,14 @@ async function runVariant(name: string, n: number): Promise<Result> {
     const built = adj.map((s) => s.size)
     row['links/peer'] = `${Math.min(...built)}-${Math.max(...built)} (mean ${(built.reduce((a, b) => a + b, 0) / n).toFixed(1)})`
     row['announces / links opened'] = `${net.announces} / ${net.linksOpened}`
+  }
+  if (rendezvous) {
+    // The number this variant exists for: the coordinator is a browser tab, and the full
+    // mesh's coordinator holds a link to every peer of the room.
+    row['coordinator: sessions (peak / at rest)'] = `${net.sessionPeak} / ${net.sessions}`
+    row['coordinator: sessions opened'] = net.sessionsOpened
+    row['sample: dials to peers that were gone'] = net.staleDials
+    row['claims of the name'] = net.claims
   }
   row['join frames'] = net.tx
   row['join KB'] = Math.round(net.bytes / 1024)
@@ -918,7 +1100,7 @@ async function runVariant(name: string, n: number): Promise<Result> {
       adj[i].clear()
       old.destroy()
       // ... and it comes back: a new page, a new address, dialling into the same room.
-      const link = new LinkTransport(net, i, dynamic)
+      const link = new LinkTransport(net, i, kind)
       const wrapper = new ConferenceTransport(link, {
         relay: !leafAt(i),
         mode: name === 'flood' ? 'flood' : 'tree',

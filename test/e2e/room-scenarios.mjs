@@ -66,10 +66,10 @@
  *              the relay transport must tell the provider that its link is
  *              back), until a text typed afterwards is; then a NEW peer
  *              joins: until it has the text and every roster shows it.
- *  coordinator (peerjs only) the tab of the room's coordinator is killed,
- *              then a new peer joins. Until every roster is complete.
+ *  coordinator (peerjs, peerjs-conference) the tab of the room's coordinator is
+ *              killed, then a new peer joins. Until every roster is complete.
  *
- * Usage: node test/e2e/room-scenarios.mjs <simple-peer|conference|peerjs|trystero|websocket|ably|pubnub|nostr|gun>
+ * Usage: node test/e2e/room-scenarios.mjs <simple-peer|conference|peerjs|peerjs-conference|trystero|websocket|ably|pubnub|nostr|gun>
  *   N=25 FREEZE_MS=40000 SCENARIOS=join,typing,... OUT=results.json override.
  *   FIREFOX=10: that many of the N peers run in a headless Firefox (FIREFOX_BIN,
  *   default /usr/bin/firefox) - the peers with an odd number, so three of the five
@@ -255,7 +255,31 @@ const ADAPTERS = {
   peerjs: {
     entry: 'test/peerjs/index.html',
     mesh: true,
+    coordinator: true,
     vanishTimeoutMs: 90000,
+    server: () =>
+      spawned(process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(SERVER_PORT), '--host', '127.0.0.1']),
+    async prepare() {},
+    async join(page) {
+      await fill(page, '#config-room', ROOM)
+      await fill(page, '#config-peerjs-host', 'localhost')
+      await fill(page, '#config-peerjs-port', String(SERVER_PORT))
+      await fill(page, '#config-ice-servers', '')
+      await check(page, '#config-secure', false)
+      await check(page, '#config-debug', true)
+      await page.click('#connect-btn')
+    },
+  },
+  // The PeerJS playground under ConferenceTransport. Unlike simple-peer the page takes it
+  // from the URL (the peerjs playground has no localStorage config, it reads its form).
+  // CONFERENCE_EXPECTED (default: N, floor 17 - below that the transport builds a full mesh).
+  'peerjs-conference': {
+    entry: 'test/peerjs/index.html',
+    mesh: true,
+    partial: true,
+    coordinator: true,
+    vanishTimeoutMs: 90000,
+    query: `?conference=${Number(process.env.CONFERENCE_EXPECTED ?? Math.max(17, N))}`,
     server: () =>
       spawned(process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(SERVER_PORT), '--host', '127.0.0.1']),
     async prepare() {},
@@ -656,7 +680,7 @@ async function main() {
     })
     await adapter.prepare(page)
     await page.evaluateOnNewDocument(METER)
-    await page.goto(`http://localhost:${APP_PORT}/`, { waitUntil: 'load' })
+    await page.goto(`http://localhost:${APP_PORT}/${adapter.query ?? ''}`, { waitUntil: 'load' })
     await adapter.join(page)
     await page.waitForSelector('.ql-editor', { timeout: 60000 })
     // A name per peer, so a roster says WHO is missing (see diag()).
@@ -1464,7 +1488,7 @@ async function main() {
     }
 
     // ---- coordinator (peerjs)
-    if (wanted.includes('coordinator') && TRANSPORT === 'peerjs') {
+    if (wanted.includes('coordinator') && adapter.coordinator) {
       console.log('coordinator (its tab is killed, then a new peer joins)')
       const coordinator = peers[0]
       await coordinator.page.close()

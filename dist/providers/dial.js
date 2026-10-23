@@ -13,6 +13,10 @@ export class SparseDial {
     setRoomSize(peers) {
         this._roomSize = peers;
     }
+    /** Links a peer asks for. A rendezvous transport needs the number, not just `wantsLinks` (providers/rendezvous.ts). */
+    get dial() {
+        return this._dial;
+    }
     /** Announce (again)? `links`: open and pending ones. */
     wantsLinks(links) {
         return links < this._dial;

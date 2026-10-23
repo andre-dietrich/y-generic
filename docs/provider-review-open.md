@@ -117,3 +117,21 @@ matters, what a fix would take.
   wrapper's sealFrame is not used. Behind an encrypting wrapper the snapshot
   would have Nostr's and Ably's old bug; not checked whether LiaScript wraps
   Gun that way.
+
+## Trystero
+
+- **rejoin() racing a new connect().** rejoin() awaits `old.leave()`; a
+  disconnect() and connect() in that window find `_connected` true again, so
+  both connect() and the rejoin join a room - the first is overwritten in
+  `this.room` but stays joined, links and all (its events are ignored by the
+  `joined !== this.room` guards). Needs a room switch within a rejoin; not
+  measured.
+- **The sleep rejoin's 5 s timer outlives disconnect().** It checks
+  `_connected` when it fires, so after a disconnect() and a new connect()
+  within those 5 s it rejoins the NEW session once - one needless rejoin.
+- **A falsy option now reaches Trystero.** The config is the caller's options
+  minus the transport's own; before, `password: ''` or `relayRedundancy: 0`
+  were dropped. Trystero treats an empty password as none; a redundancy of 0
+  was never meaningful.
+- **Not run against the real library.** The gate scripts Trystero's room; the
+  library is not installed here.

@@ -105,35 +105,10 @@ export class TrysteroTransport {
     }
     /** Join the Trystero room and wire it up - at connect() and again at every rejoin(). */
     joinTrysteroRoom() {
-        // Build Trystero config
-        const trysteroConfig = {
-            appId: this.options.appId,
-        };
-        // Add optional config
-        if (this.options.password)
-            trysteroConfig.password = this.options.password;
-        if (this.options.relayUrls)
-            trysteroConfig.relayUrls = this.options.relayUrls;
-        if (this.options.relayRedundancy)
-            trysteroConfig.relayRedundancy = this.options.relayRedundancy;
-        if (this.options.rtcConfig)
-            trysteroConfig.rtcConfig = this.options.rtcConfig;
-        if (this.options.turnConfig)
-            trysteroConfig.turnConfig = this.options.turnConfig;
-        if (this.options.rtcPolyfill)
-            trysteroConfig.rtcPolyfill = this.options.rtcPolyfill;
-        if (this.options.supabaseKey)
-            trysteroConfig.supabaseKey = this.options.supabaseKey;
-        if (this.options.firebaseApp)
-            trysteroConfig.firebaseApp = this.options.firebaseApp;
-        if (this.options.rootPath)
-            trysteroConfig.rootPath = this.options.rootPath;
-        if (this.options.manualRelayReconnection !== undefined) {
-            trysteroConfig.manualRelayReconnection =
-                this.options.manualRelayReconnection;
-        }
+        // Everything but our own options goes to Trystero as its config.
+        const { joinRoom, getRelaySockets, resumeAfterMs, debug, ...trysteroConfig } = this.options;
         // Join room with error handler
-        const joined = this.options.joinRoom(trysteroConfig, this._room, (details) => {
+        const joined = joinRoom(trysteroConfig, this._room, (details) => {
             this.log(`Join error: ${details.error}`, 'error');
             if (this.onJoinErrorCallback) {
                 this.onJoinErrorCallback(details);
@@ -170,7 +145,7 @@ export class TrysteroTransport {
             this.log(`Peer left: ${peerId} (${this.peers.size} remaining)`);
             this._peerDisconnectCallback?.(peerId);
         });
-        this._joinedSockets = new Map(Object.entries(this.options.getRelaySockets?.() ?? {}));
+        this._joinedSockets = new Map(Object.entries(getRelaySockets?.() ?? {}));
     }
     /**
      * Leave and join again: the only way to make Trystero subscribe again on

@@ -27,6 +27,9 @@
  * connection that is no change of the network (Android fires one for every
  * effectiveType estimate)?
  *
+ * Part 5 - the config Trystero is joined with: what the caller gave for Trystero
+ * (appId, password, relayUrls, ...), none of the transport's own options.
+ *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-trystero-oneway.js
  */
 
@@ -180,6 +183,29 @@ async function sleptWithRelaySockets(): Promise<boolean> {
   return ok
 }
 
+async function config(): Promise<boolean> {
+  let given: any
+  const room = { leave() {}, getPeers: () => ({}), onPeerJoin() {}, onPeerLeave() {}, makeAction: () => [async () => {}, () => {}, () => {}], ping: async () => 0 }
+  const transport = new TrysteroTransport({
+    joinRoom: ((c: any) => ((given = c), room)) as any,
+    appId: 'repro',
+    password: 'pw',
+    relayUrls: ['wss://relay.example'],
+    turnConfig: [{ urls: 'turn:t.example' }],
+    manualRelayReconnection: false,
+    getRelaySockets: () => ({}),
+    resumeAfterMs: 0,
+    debug: false,
+  })
+  await transport.connect({ room: 'repro-room' })
+  transport.disconnect()
+  const keys = Object.keys(given).sort().join(',')
+  const want = 'appId,manualRelayReconnection,password,relayUrls,turnConfig'
+  const ok = keys === want && given.password === 'pw' && given.manualRelayReconnection === false
+  console.log(`  keys: ${keys} (want ${want})`)
+  return ok
+}
+
 async function main() {
   console.log("a peer whose channel's send() throws, in a scripted Trystero room of three:")
   const ok = [await run('send'), await run('sendTo')]
@@ -187,6 +213,8 @@ async function main() {
   ok.push(await networkChange())
   console.log('\nthe page slept, with getRelaySockets given (as every playground does):')
   ok.push(await sleptWithRelaySockets())
+  console.log('\nthe config Trystero is joined with:')
+  ok.push(await config())
   process.exit(ok.every(Boolean) ? 0 : 1)
 }
 

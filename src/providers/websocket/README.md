@@ -152,6 +152,62 @@ y-websocket-server --port 1234
 
 Server will run on `ws://localhost:1234`
 
+### With docker
+
+The image `liascript/websocket-relay` (built from `Docker/websocket/`: the
+[edrys-websocket-server](https://github.com/edrys-labs/edrys-websocket-server)
+pinned to a commit). A plain `docker run` is the whole setup - the container
+detects its LAN address itself, generates the certificate, and prints the
+address to enter once the port actually answers:
+
+```
+docker run -d --name websocket-relay --network host -v websocket-relay-data:/srv liascript/websocket-relay
+docker run -d --name websocket-relay --network host -v websocket-relay-data:/srv -e MODE=https liascript/websocket-relay
+docker logs websocket-relay      # ends with the address to enter
+```
+
+`test/websocket/relay.sh` (Linux; `MODE=https`, `PORT=`, `IP=`) does the same
+with the container swap and the non-Linux warning around it, but nothing in
+the image needs it.
+
+Only the certificate is kept in the volume. The document is **not**
+persisted: after a restart the clients refill the relay's empty copy
+(`test/dummy/e2e-edrys-ws.ts`, check 5). Open the port in the firewall for
+other devices, e.g. `sudo ufw allow 1234/tcp`.
+
+`--network host` is what lets the container see the real LAN address; on
+Linux without it, `ip route get` finds a docker bridge address that no other
+device can reach - the entrypoint says so rather than letting a classroom
+fail quietly. `-e RELAY_IP=<address>` overrides the detection either way
+(on macOS/Windows Docker Desktop it has to, the host network is a VM).
+
+#### The certificate
+
+With `MODE=https` the entrypoint generates a self-signed one for the
+detected address on first start and keeps it in the volume - the server's
+own `--ssl` is deliberately not used, it writes
+`subjectAltName=DNS:localhost,IP:127.0.0.1,IP:0.0.0.0` and nothing else, so
+every device that reaches the relay by its LAN address - i.e. every device
+but the host - would reject it. Then open `https://<address>:1234/` **once
+in a browser on each device** and accept the warning before using the
+address: a browser shows no certificate dialog for a websocket, it just
+drops the connection.
+
+With a real certificate (own domain, Let's Encrypt) that step is not
+needed. Mount it and name it - `SSL_KEY`/`SSL_CERT` switch the server to
+https by themselves, `MODE` stays at its default:
+
+```
+docker run -d --name websocket-relay --network host \
+  -v /etc/letsencrypt/live/your.domain:/certs:ro \
+  -e SSL_KEY=/certs/privkey.pem -e SSL_CERT=/certs/fullchain.pem \
+  liascript/websocket-relay
+```
+
+A page served over **https** cannot open a plain-`ws://` socket (mixed
+content), so a course on GitHub Pages needs one of these two - or the nginx
+proxy below - and cannot talk to an http relay at all.
+
 ### Using y-websocket Programmatically
 
 ```javascript

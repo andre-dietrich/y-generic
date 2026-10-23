@@ -168,3 +168,16 @@ and repro-peerjs-sparse's 10).
   here, so unchecked. If it does not, the `oneway` scenario of
   room-scenarios.mjs peerjs is what would show it.
 - **`password` is XOR with the password's bytes,** as in simple-peer.
+
+## Conference
+
+Reviewed: the hot paths (_onFrame, _onGossip, _markSeen, _remember, the digest
+tick) and the lifecycle (connect, disconnect, _linkUp/_linkDown). Every rule in
+the protocol is a gate failure first (CLAUDE.md); nothing there was changed
+without a measurement.
+
+- **Reload ghosts in bench-partial-mesh.** The N=100 run for this review
+  printed "lists pX twice" and 1-4 rosters too short after the reloads phase -
+  the round-13 departure findings, a measurement until GATE_DEPARTURE=1.
+- **_remember's cache is an array with shift().** O(1) amortized in V8 for a
+  packed array; not measured at N=300 for this review.

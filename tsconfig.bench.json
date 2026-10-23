@@ -64,6 +64,7 @@
     "test/providers/repro-websocket-wake.ts",
     "test/ably/repro-liveobjects-persist.ts",
     "test/supabase/repro-persistent.ts",
-    "test/providers/repro-simple-peer-chunks.ts"
+    "test/providers/repro-simple-peer-chunks.ts",
+    "test/providers/repro-conference-reconnect.ts"
   ]
 }

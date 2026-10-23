@@ -497,6 +497,14 @@ export class ConferenceTransport implements Transport {
     this._cache = []
     this._cacheIndex.clear()
     this._cacheSize = 0
+    this._announced.clear()
+    this._announcedRounds.clear()
+    // A next connect() of this instance starts with no link again: its JOIN
+    // waits for the first one (_onHello) - kept set, it went nowhere
+    // (test/providers/repro-conference-reconnect.ts).
+    this._hadLink = false
+    this._unsent = []
+    this._connectedAt = Infinity
     this._firstLink?.()
   }
 
@@ -569,7 +577,6 @@ export class ConferenceTransport implements Transport {
    */
   private _eager(link: Link, origin: string, way: 'in' | 'out'): boolean {
     if (this._opts.mode === 'flood') return true
-    // A peer's own frames go over its own links, whatever their default.
     const set = (way === 'in' ? link.eagerIn : link.eagerOut).get(origin)
     if (set !== undefined) return set
     // A peer's own frames go over its own links, whatever their default.

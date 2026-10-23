@@ -23,7 +23,10 @@
 //  5 typing    A edits every 400 ms for 12 s and is killed: a debounce that
 //              every edit restarts never fires while somebody types
 //              (persistMaxWaitMs). B must have the first edit.
-// Exit code 1 unless all five hold.
+//  6 fan-out   A and B in the room, A edits: no snapshot reaches B (or A) -
+//              the stored one is for joiners only, the live channel carries
+//              the edit; left open, every peer's snapshot reached every peer.
+// Exit code 1 unless all six hold.
 // RELAY=wss://... runs it against that relay instead of Docker/nostr/relay.js
 // (part 4 then asks the relay for what it keeps).
 import { createRequire } from 'node:module'
@@ -115,13 +118,13 @@ function encrypting(t) {
 }
 
 let liveKind = 27370
-async function peer(room, password) {
+async function peer(room, password, eventKind = ++liveKind) {
   const doc = new Y.Doc()
   const t = new NostrTransport({
     finalizeEvent: pure.finalizeEvent,
     getPublicKey: pure.getPublicKey,
     SimplePool: pool.SimplePool,
-    eventKind: ++liveKind,
+    eventKind,
   })
   const w = password ? encrypting(t) : t
   const before = new Set(unloadHandlers)
@@ -222,6 +225,26 @@ const results = []
   const r = await bHas(room, 'token-typing-0 ')
   results.push(r.ms >= 0)
   console.log(`5 typing: 12 s of an edit every 400 ms, then killed - B has ${fmt(r)}`)
+}
+
+{
+  const room = newRoom()
+  const kind = ++liveKind // one live channel for both, unlike the parts above
+  const a = await peer(room, false, kind)
+  const b = await peer(room, false, kind)
+  await sleep(1000) // both past the stored snapshots (EOSE)
+  let seen = 0
+  for (const x of [a, b]) {
+    const push = x.t.snapshotChunks.push.bind(x.t.snapshotChunks)
+    x.t.snapshotChunks.push = (c) => (seen++, push(c))
+  }
+  a.doc.getText('t').insert(0, 'token-fanout')
+  await sleep(3000) // past persistDebounceMs: both have published
+  const has = b.text().includes('token-fanout')
+  a.kill()
+  b.kill()
+  results.push(has && seen === 0)
+  console.log(`6 fan-out: B ${has ? 'has' : 'MISSES'} the edit, ${seen} snapshot event(s) delivered to A and B (want 0)`)
 }
 
 relay?.kill('SIGKILL')

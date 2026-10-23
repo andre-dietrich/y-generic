@@ -105,6 +105,13 @@ function wrapFrame(data) {
     wrapped.set(data, 5);
     return wrapped;
 }
+/** A stored document as the frame the provider receives: a full-state push. */
+function snapshotFrame(update) {
+    const enc = encoding.createEncoder();
+    encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH);
+    encoding.writeVarUint8Array(enc, update);
+    return wrapFrame(encoding.toUint8Array(enc));
+}
 // ---------------------------------------------------------------------------
 // Base64 helpers (no Buffer/Node dependency)
 // ---------------------------------------------------------------------------
@@ -256,10 +263,8 @@ export class NostrTransport {
         this.roomTag = config.password
             ? `${config.room}-${await hashPassword(config.password)}`
             : config.room;
-        const historyWindowSecs = config.historyWindowSecs ?? 86400;
-        const since = historyWindowSecs > 0
-            ? Math.floor(Date.now() / 1000) - historyWindowSecs
-            : Math.floor(Date.now() / 1000); // real-time only
+        // 0 = real-time only
+        const since = Math.floor(Date.now() / 1000) - Math.max(0, config.historyWindowSecs ?? 86400);
         const filter = {
             kinds: [this.eventKind],
             '#r': [this.roomTag],
@@ -301,22 +306,21 @@ export class NostrTransport {
                         if (whole === null)
                             return;
                         const bytes = base64ToUint8Array(whole);
-                        if (parsed.sealed) {
-                            // A frame sealed by the wrapper above us (see sealFrame): it opens it.
-                            this._deliver(bytes);
-                        }
-                        else {
-                            const enc = encoding.createEncoder();
-                            encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH);
-                            encoding.writeVarUint8Array(enc, bytes);
-                            this._deliver(wrapFrame(encoding.toUint8Array(enc)));
-                        }
+                        // A sealed frame is opened by the wrapper above us (see sealFrame).
+                        this._deliver(parsed.sealed ? bytes : snapshotFrame(bytes));
                         if (debug)
                             console.log('[NostrTransport] Applied persisted snapshot,', bytes.length, 'bytes');
                     }
                     catch (err) {
                         console.warn('[NostrTransport] Failed to decode snapshot event:', err);
                     }
+                },
+                // What is stored is all a joiner needs: left open, every peer's next
+                // snapshot reached every peer - N² whole documents per edit, live
+                // updates carry the same. Closed once, nostr-tools' close() is not idempotent.
+                oneose: () => {
+                    this.snapshotSub?.close();
+                    this.snapshotSub = null;
                 },
             });
             this.doc.on('update', this._onDocUpdate);
@@ -373,7 +377,6 @@ export class NostrTransport {
             }
             this.pool = null;
         }
-        this._connected = false;
         this._buffer = [];
     }
     /**
@@ -573,15 +576,10 @@ export class NostrTransport {
         if (!this.pool || !this.doc)
             return Promise.resolve();
         try {
-            let bytes = Y.encodeStateAsUpdate(this.doc);
+            const update = Y.encodeStateAsUpdate(this.doc);
             const sealed = !!this.sealFrame;
-            if (this.sealFrame) {
-                // The frame as it is delivered (see connect()), sealed as the wrapper seals a sent one.
-                const enc = encoding.createEncoder();
-                encoding.writeVarUint(enc, MESSAGE_SYNC_PUSH);
-                encoding.writeVarUint8Array(enc, bytes);
-                bytes = this.sealFrame(wrapFrame(encoding.toUint8Array(enc)));
-            }
+            // Sealed: the frame as it is delivered (see connect()), sealed as the wrapper seals a sent one.
+            const bytes = this.sealFrame ? this.sealFrame(snapshotFrame(update)) : update;
             const parts = splitChunks(uint8ArrayToBase64(bytes), MAX_CONTENT_CHARS);
             if (parts.length > MAX_SNAPSHOT_CHUNKS) {
                 console.warn(`[NostrTransport] Snapshot needs ${parts.length} chunks, more than MAX_SNAPSHOT_CHUNKS ` +

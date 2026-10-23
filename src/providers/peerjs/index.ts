@@ -943,20 +943,14 @@ export class PeerJSTransport implements Transport {
       ? this.encrypt(data, this.options.password)
       : data
 
-    // Send to all connected peers
-    let sentCount = 0
     for (const peerConn of this.peers.values()) {
-      if (peerConn.connected) {
-        try {
-          peerConn.conn.send(dataToSend)
-          sentCount++
-        } catch (error) {
-          this.log('Error sending to peer:', peerConn.peerId, error)
-        }
+      if (!peerConn.connected) continue
+      try {
+        peerConn.conn.send(dataToSend)
+      } catch (error) {
+        this.log('Error sending to peer:', peerConn.peerId, error)
       }
     }
-
-    // Sent to peers
   }
 
   /**
@@ -2242,6 +2236,9 @@ export class PeerJSTransport implements Transport {
    * Returns the parsed message if successful, null otherwise.
    */
   private tryDecodeCoordinationMessage(data: Uint8Array): any | null {
+    // sendCoordinationMessage() sends JSON.stringify of an object: it starts
+    // with '{'. Anything else is a Yjs frame - no TextDecoder over all of it.
+    if (data[0] !== 0x7b) return null
     try {
       const decoder = new TextDecoder()
       const jsonStr = decoder.decode(data)

@@ -149,3 +149,22 @@ matters, what a fix would take.
   a dispatch runs in that same dispatch when the target has two or more
   listeners (spec: it does not). Anything in this repo that re-arms a `once`
   listener from inside it needs a microtask under Node (wrtc, node-datachannel).
+
+## PeerJS
+
+Reviewed: the data path (send, sendTo, setupConnection, the coordination
+decoder). Not reviewed line by line: the coordinator and rendezvous logic
+(feat/peerjs-rendezvous, fresh and gated by repro-peerjs-coordinator's 15 parts
+and repro-peerjs-sparse's 10).
+
+- **repro-peerjs-sparse failed once.** 1 of 12 runs with the decoder change,
+  0 of 5 without; the failing run's log was not kept, so the part is unknown.
+  The change only skips decoding frames that do not start with `{`, and every
+  call site passes a Uint8Array of what sendCoordinationMessage() sent. Run it
+  in a loop (`for i in $(seq 20)`) and keep the logs to find the part.
+- **A send() that throws is only logged.** CLAUDE.md's rule is to rebuild such
+  a link (simple-peer, Trystero do). PeerJS's own DataConnection may already
+  close itself when its channel's send throws - the library is not installed
+  here, so unchecked. If it does not, the `oneway` scenario of
+  room-scenarios.mjs peerjs is what would show it.
+- **`password` is XOR with the password's bytes,** as in simple-peer.

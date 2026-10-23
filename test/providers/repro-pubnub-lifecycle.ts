@@ -47,6 +47,12 @@
  *           SCENARIOS=join,linger LINGER_GAP_MS=5000). flush() must send what
  *           went out in this task once more as a keepalive request to the
  *           publish endpoint - and nothing that went out in an earlier task.
+ *  Part 7 - a frame above PubNub's 32 KiB goes as chunks and arrives whole in any
+ *           order (src/providers/chunking.ts, the envelope as before).
+ *  Part 8 - a message that arrives before onMessage() is registered keeps its
+ *           publisher: `from` is the peer id onPeerDisconnect reports.
+ *  Part 9 - a room name outside Latin-1 ('数学 🧮'): btoa() threw and connect()
+ *           failed. A Latin-1 name keeps its channel (older peers meet there).
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-pubnub-lifecycle.js
  * Exit code 1 if a part fails.
@@ -78,7 +84,9 @@ class ScriptedPubNub {
     this.channels.clear()
     this.looping = false
   }
-  publish(): Promise<any> {
+  published: any[] = []
+  publish({ message }: { message: any }): Promise<any> {
+    this.published.push(message)
     return Promise.resolve({ timetoken: '1' })
   }
   hereNow(): Promise<any> {
@@ -106,7 +114,7 @@ class ScriptedPubNub {
     this.status('PNReconnectedCategory')
   }
   /** a message another peer published to the room */
-  deliver(message: string, publisher: string): boolean {
+  deliver(message: any, publisher: string): boolean {
     if (!this.looping || this.channels.size === 0) return false
     for (const l of this.listeners) l.message?.({ message, publisher, channel: [...this.channels][0] })
     return true
@@ -160,6 +168,34 @@ async function main(): Promise<void> {
     `6 unload: keepalive requests ${kept.length} (want 1), to the publish endpoint ${kept[0]?.url.includes('/publish/pub/sub/0/') ?? false}, body the removal ${kept[0]?.init.body === want}`,
     kept.length === 1 && kept[0].url.includes('/publish/pub/sub/0/') && kept[0].init.body === want,
   ])
+
+  const before = pn.published.length
+  const payload = Uint8Array.from({ length: 100000 }, () => Math.floor(Math.random() * 256))
+  transport.send(payload)
+  const parts = pn.published.slice(before)
+  let frames = 0
+  let whole = false
+  const unsubscribe = transport.onMessage((data) => {
+    frames++
+    whole = data.length === payload.length && data.every((x, i) => x === payload[i])
+  })
+  for (const m of [...parts].reverse()) pn.deliver(m, 'big-peer')
+  unsubscribe()
+  results.push([`7 100 KB frame: ${parts.length} publishes (want > 1), delivered ${frames} frame(s), whole ${whole} (want 1, true)`, parts.length > 1 && frames === 1 && whole])
+
+  const early = new PubNubTransport()
+  await early.connect({ publishKey: 'pub', subscribeKey: 'sub', room: 'repro' } as any)
+  ScriptedPubNub.last.deliver(room, 'early-peer')
+  let earlyFrom: string | undefined
+  early.onMessage((_d, from) => (earlyFrom = from))
+  results.push([`8 message before onMessage(): from ${earlyFrom} (want early-peer)`, earlyFrom === 'early-peer'])
+  early.disconnect()
+
+  const unicode = new PubNubTransport()
+  const ok9 = await unicode.connect({ publishKey: 'pub', subscribeKey: 'sub', room: '数学 🧮' } as any).then(() => true, () => false)
+  unicode.disconnect()
+  const latin = (transport as any).channel === btoa('repro')
+  results.push([`9 room '数学 🧮': connect() resolved ${ok9} (want true); 'repro' still on channel btoa('repro') ${latin} (want true)`, ok9 && latin])
 
   for (const [line, ok] of results) console.log(`${ok ? 'ok  ' : 'FAIL'} ${line}`)
   transport.disconnect()

@@ -33,14 +33,15 @@ export interface PubNubConfig extends ConnectionConfig {
  * import { PubNubTransport } from 'y-generic/providers/pubnub'
  *
  * const doc = new Y.Doc()
- * const transport = new PubNubTransport({
+ * const transport = new PubNubTransport() // { presence: true } with the Presence add-on
+ *
+ * const provider = new GenericProvider(doc, transport)
+ * await provider.connect({
  *   publishKey: 'pub-c-xxx',
  *   subscribeKey: 'sub-c-xxx',
  *   room: 'my-room',
- *   password: 'optional-encryption-key'
+ *   cipherKey: 'optional-encryption-key',
  * })
- *
- * const provider = new GenericProvider(doc, transport)
  * ```
  */
 /** Constructor options for PubNubTransport. */
@@ -79,7 +80,7 @@ export declare class PubNubTransport implements Transport {
     private config;
     private debug;
     private messageBuffer;
-    private chunkBuffer;
+    private chunks;
     readonly preferredCompressMinBytes = 2048;
     private readonly MAX_MESSAGE_SIZE;
     get isConnected(): boolean;
@@ -101,6 +102,7 @@ export declare class PubNubTransport implements Transport {
      * Send data to all peers
      */
     send(data: Uint8Array): void;
+    private publish;
     /**
      * What send() published in the current task - what flush() sends once
      * more if this task turns out to be the page's last.
@@ -123,14 +125,6 @@ export declare class PubNubTransport implements Transport {
      * Not with a cipher key: the SDK encrypts, this path would not.
      */
     flush(): void;
-    /**
-     * Send large message in chunks
-     */
-    private sendChunked;
-    /**
-     * Handle incoming chunked message
-     */
-    private handleChunkedMessage;
     /**
      * Register message callback
      */

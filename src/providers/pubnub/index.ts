@@ -1,4 +1,5 @@
 import type { Transport, ConnectionConfig } from '../../transport'
+import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 
 /**
  * PubNub transport configuration
@@ -35,14 +36,15 @@ export interface PubNubConfig extends ConnectionConfig {
  * import { PubNubTransport } from 'y-generic/providers/pubnub'
  *
  * const doc = new Y.Doc()
- * const transport = new PubNubTransport({
+ * const transport = new PubNubTransport() // { presence: true } with the Presence add-on
+ *
+ * const provider = new GenericProvider(doc, transport)
+ * await provider.connect({
  *   publishKey: 'pub-c-xxx',
  *   subscribeKey: 'sub-c-xxx',
  *   room: 'my-room',
- *   password: 'optional-encryption-key'
+ *   cipherKey: 'optional-encryption-key',
  * })
- *
- * const provider = new GenericProvider(doc, transport)
  * ```
  */
 /** Constructor options for PubNubTransport. */
@@ -92,8 +94,8 @@ export class PubNubTransport implements Transport {
   private _isConnected: boolean = false
   private config: PubNubConfig | null = null
   private debug: boolean = false
-  private messageBuffer: Uint8Array[] = [] // Buffer messages until callback is set
-  private chunkBuffer: Map<string, Map<number, string>> = new Map() // Buffer for reassembling chunks
+  private messageBuffer: Array<{ data: Uint8Array; from?: string }> = [] // until onMessage()
+  private chunks = new ChunkAssembler()
   // Compress a full-document push before it is base64-encoded and chunked
   // (see Transport.preferredCompressMinBytes).
   readonly preferredCompressMinBytes = 2048
@@ -132,8 +134,11 @@ export class PubNubTransport implements Transport {
 
     // Generate unique ID for this client
     this.uuid = this.generateUUID()
-    // Use base64 encoded room name as channel
-    this.channel = btoa(config.room)
+    // The room name in base64 as the channel. btoa() takes Latin-1 only (it
+    // threw for '数学'); other names go as UTF-8, a Latin-1 one keeps its channel.
+    this.channel = /^[\x00-\xff]*$/.test(config.room)
+      ? btoa(config.room)
+      : this.uint8ToBase64(new TextEncoder().encode(config.room))
 
     this.log(`Connecting as ${this.uuid} to channel ${this.channel}`)
 
@@ -213,41 +218,21 @@ export class PubNubTransport implements Transport {
         },
         message: (event: any) => {
           // Ignore our own messages
-          if (event.publisher === this.uuid) return
-
-          if (event.message) {
-            try {
-              // Check if message is chunked
-              if (typeof event.message === 'object' && event.message.chunked) {
-                // Handle chunked message
-                this.handleChunkedMessage(event.message, event.publisher)
-                return
-              }
-
-              // Convert base64 to Uint8Array
-              const data =
-                typeof event.message === 'string'
-                  ? this.base64ToUint8(event.message)
-                  : new Uint8Array(event.message)
-
-              this.log(
-                `📨 Received ${data.length} bytes from ${event.publisher}`,
-              )
-
-              // If callback is set, process immediately (the publisher
-              // uuid is the peer id onPeerDisconnect reports)
-              if (this.messageCallback) {
-                this.messageCallback(data, event.publisher)
-              } else {
-                // Buffer message until callback is registered
-                this.log(
-                  '⚠️ Message received before callback registered, buffering...',
-                )
-                this.messageBuffer.push(data)
-              }
-            } catch (error) {
-              this.log('❌ Error processing message:', error)
+          if (event.publisher === this.uuid || !event.message) return
+          try {
+            let message = event.message
+            if (isChunk(message)) {
+              message = this.chunks.push(message)
+              if (message === null) return // more to come
             }
+            const data =
+              typeof message === 'string' ? this.base64ToUint8(message) : new Uint8Array(message)
+            this.log(`📨 Received ${data.length} bytes from ${event.publisher}`)
+            // the publisher uuid is the peer id onPeerDisconnect reports
+            if (this.messageCallback) this.messageCallback(data, event.publisher)
+            else this.messageBuffer.push({ data, from: event.publisher })
+          } catch (error) {
+            this.log('❌ Error processing message:', error)
           }
         },
         presence: (event: any) => {
@@ -308,35 +293,22 @@ export class PubNubTransport implements Transport {
 
     try {
       const base64Data = this.uint8ToBase64(data)
-      const estimatedSize = base64Data.length
-
-      // Check if message needs to be chunked
-      if (estimatedSize > this.MAX_MESSAGE_SIZE) {
-        this.log(
-          `📦 Message too large (${estimatedSize} bytes), chunking into smaller pieces...`,
-        )
-        this.sendChunked(base64Data, data.length)
+      // Above PubNub's message size: one message per chunk, not stored.
+      if (base64Data.length > this.MAX_MESSAGE_SIZE) {
+        for (const chunk of splitChunks(base64Data, this.MAX_MESSAGE_SIZE)) this.publish(chunk, false)
         return
       }
-
-      // Send as single message
-      this.log(`📤 Sending ${data.length} bytes`)
       this.remember(base64Data)
-      this.pubnub
-        .publish({
-          channel: this.channel,
-          message: base64Data,
-          storeInHistory: this.config?.storeInHistory ?? false,
-        })
-        .then((response: any) => {
-          this.log('✅ Message published', response)
-        })
-        .catch((error: any) => {
-          this.log('❌ Publish error:', error)
-        })
+      this.publish(base64Data, this.config?.storeInHistory ?? false)
     } catch (error) {
       this.log('❌ Send error:', error)
     }
+  }
+
+  private publish(message: unknown, storeInHistory: boolean): void {
+    this.pubnub
+      .publish({ channel: this.channel, message, storeInHistory })
+      .catch((error: any) => this.log('❌ Publish error:', error))
   }
 
   /**
@@ -389,102 +361,6 @@ export class PubNubTransport implements Transport {
   }
 
   /**
-   * Send large message in chunks
-   */
-  private sendChunked(base64Data: string, originalSize: number): void {
-    const chunkId = this.generateUUID()
-    const chunks: string[] = []
-
-    // Split into chunks
-    for (let i = 0; i < base64Data.length; i += this.MAX_MESSAGE_SIZE) {
-      chunks.push(base64Data.slice(i, i + this.MAX_MESSAGE_SIZE))
-    }
-
-    this.log(
-      `📦 Splitting ${originalSize} bytes into ${chunks.length} chunks (id: ${chunkId.slice(0, 8)}...)`,
-    )
-
-    // Send each chunk
-    chunks.forEach((chunk, index) => {
-      const message = {
-        chunked: true,
-        id: chunkId,
-        index,
-        total: chunks.length,
-        data: chunk,
-      }
-
-      this.pubnub
-        .publish({
-          channel: this.channel,
-          message,
-          storeInHistory: false, // Don't store chunks in history
-        })
-        .then(() => {
-          this.log(`✅ Chunk ${index + 1}/${chunks.length} sent`)
-        })
-        .catch((error: any) => {
-          this.log(`❌ Failed to send chunk ${index + 1}:`, error)
-        })
-    })
-  }
-
-  /**
-   * Handle incoming chunked message
-   */
-  private handleChunkedMessage(message: any, publisher: string): void {
-    const { id, index, total, data } = message
-
-    this.log(`📨 Received chunk ${index + 1}/${total} from ${publisher}`)
-
-    // Get or create chunk buffer for this message
-    if (!this.chunkBuffer.has(id)) {
-      this.chunkBuffer.set(id, new Map())
-    }
-
-    const chunks = this.chunkBuffer.get(id)!
-    chunks.set(index, data)
-
-    // Check if we have all chunks
-    if (chunks.size === total) {
-      this.log(
-        `📦 All chunks received, reassembling message ${id.slice(0, 8)}...`,
-      )
-
-      // Reassemble in order
-      let base64Data = ''
-      for (let i = 0; i < total; i++) {
-        const chunk = chunks.get(i)
-        if (!chunk) {
-          this.log(`❌ Missing chunk ${i}, cannot reassemble`)
-          this.chunkBuffer.delete(id)
-          return
-        }
-        base64Data += chunk
-      }
-
-      // Clean up
-      this.chunkBuffer.delete(id)
-
-      // Convert to Uint8Array and process
-      try {
-        const reassembledData = this.base64ToUint8(base64Data)
-        this.log(
-          `✅ Message reassembled: ${reassembledData.length} bytes from ${publisher}`,
-        )
-
-        if (this.messageCallback) {
-          this.messageCallback(reassembledData, publisher)
-        } else {
-          this.messageBuffer.push(reassembledData)
-        }
-      } catch (error) {
-        this.log('❌ Error reassembling chunked message:', error)
-      }
-    }
-  }
-
-  /**
    * Register message callback
    */
   onMessage(callback: (data: Uint8Array, from?: string) => void): () => void {
@@ -493,8 +369,8 @@ export class PubNubTransport implements Transport {
     // Flush any buffered messages
     if (this.messageBuffer.length > 0) {
       this.log(`📦 Flushing ${this.messageBuffer.length} buffered messages...`)
-      for (const data of this.messageBuffer) {
-        callback(data)
+      for (const { data, from } of this.messageBuffer) {
+        callback(data, from)
       }
       this.messageBuffer = []
     }

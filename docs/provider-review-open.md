@@ -61,3 +61,17 @@ matters, what a fix would take.
   not stored.
 - **Not run live.** The gates use a scripted Ably; `room-scenarios.mjs ably`
   against the real service (keys in `.env`) was not run for this review.
+
+## PubNub
+
+- **`disconnect()` keeps the SDK instance.** It calls `unsubscribeAll()` and
+  drops the reference, but not `destroy()`: the SDK's own `online`/`offline`
+  listeners and timers stay with every connect/disconnect cycle. Not measured;
+  check what `destroy()` sends before using it (a second leave?).
+- **`base64ToUint8` via `split('').map()`.** One string per byte; slow for a
+  large frame. Goes away with the shared `codec.ts` (see Cross-provider).
+- **`flush()` skips chunked frames.** Only single messages are remembered for
+  the unload keepalive copy. The one that matters there - the presence
+  removal - is small, so nothing lost today.
+- **Not run live.** The gate uses a scripted PubNub; `room-scenarios.mjs
+  pubnub` against the real service was not run for this review.

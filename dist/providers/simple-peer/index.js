@@ -402,12 +402,18 @@ export class SimplePeerTransport {
                 if (channel && channel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
                     // Wait for buffer to drain
                     this.log(`⏸️ Backpressure on ${peerConn.peerId}: buffered ${channel.bufferedAmount}B, waiting...`);
+                    // The event, not the `onbufferedamountlow` property: that has one
+                    // slot (simple-peer's own), and a second large frame waiting on
+                    // the same link replaced the first one's handler - the first never
+                    // sent another chunk (test/providers/repro-simple-peer-chunks.ts).
                     channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2;
-                    channel.onbufferedamountlow = () => {
-                        channel.onbufferedamountlow = null;
+                    // Resumed in a microtask, after the dispatch: Node's EventTarget
+                    // calls a listener added DURING a dispatch in that same dispatch
+                    // (with two or more listeners) - a full buffer re-adds it forever.
+                    channel.addEventListener('bufferedamountlow', () => {
                         this.log(`▶️ Buffer drained on ${peerConn.peerId}, resuming chunks`);
-                        sendNext();
-                    };
+                        queueMicrotask(sendNext);
+                    }, { once: true });
                     return;
                 }
                 // Send next chunk

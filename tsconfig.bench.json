@@ -62,6 +62,7 @@
     "test/providers/repro-pubnub-lifecycle.ts",
     "test/providers/repro-websocket-wake.ts",
     "test/ably/repro-liveobjects-persist.ts",
-    "test/supabase/repro-persistent.ts"
+    "test/supabase/repro-persistent.ts",
+    "test/providers/repro-simple-peer-chunks.ts"
   ]
 }

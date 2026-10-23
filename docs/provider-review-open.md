@@ -135,3 +135,17 @@ matters, what a fix would take.
   was never meaningful.
 - **Not run against the real library.** The gate scripts Trystero's room; the
   library is not installed here.
+
+## simple-peer
+
+- **`password` is XOR with the password's bytes.** Repeating-key XOR, no
+  nonce: anyone who knows one plaintext frame reads the key. The option says
+  "obfuscation" in its doc comment, the file header and README call it
+  encryption. Either say so plainly or use AES-GCM via `crypto.subtle` (which
+  needs a secure context - see Cross-provider).
+- **The receive copy.** Every complete frame is copied once (`slice(1)`); a
+  `subarray` would do. Small, not measured.
+- **Node's EventTarget differs from the browser's.** A listener added during
+  a dispatch runs in that same dispatch when the target has two or more
+  listeners (spec: it does not). Anything in this repo that re-arms a `once`
+  listener from inside it needs a microtask under Node (wrtc, node-datachannel).

@@ -212,14 +212,40 @@ core would take: `docs/superpowers/specs/2026-09-20-partial-mesh-relay-research.
 
 `src/providers/conference/` (`ConferenceTransport`) is the way past the full mesh: a wrapper
 UNDER the core around a mesh transport that holds a handful of links per peer (`dial`, the rule
-in `src/providers/dial.ts`, wired into simple-peer) and passes frames on - Plumtree with one tree
+in `src/providers/dial.ts`, wired into simple-peer and peerjs) and passes frames on - Plumtree with one tree
 PER ORIGIN and a state per DIRECTION of a link, digests + GRAFT as the repair path, unicast along
 the way the origin's broadcasts came, SUSPECT / ALIVE / REVIVE / LEAVE for who is there. Its gate
 is `test/dummy/bench-partial-mesh.ts` (N=100 by default, `N=150`, `N=300`; the real wrapper and the
 real dial rule over simulated data channels and signaling, no oracle; `DIAG=1` names a roster's
 holes and prints the frames around them, `TRACE_FILE=` dumps them all) plus
 `test/providers/repro-simple-peer-sparse.ts` (the real simple-peer on a loopback `wrtc`). Run
-both after touching either directory. Its last two phases - a page that UNLOADS (the core's
+both after touching either directory.
+
+PeerJS is wired under the wrapper too, but its rendezvous is not simple-peer's: there is no
+broadcast channel, only a well-known NAME, so the dice move to the one place with a census.
+The coordinator answers a join with a random SAMPLE of its roster instead of the roster; the
+roster is LEASES renewed by each peer's next join and by nothing else (a closed session expires
+nothing); it holds the name in a SECOND `Peer` object rather than as its identity, so a claim
+costs a Peer instead of every link the claimant had, and the election over a complete peer list
+- which a sample destroys - is replaced by "claim it, and let the server say no", ordered by a
+successor chain that rides in every sample; and nobody keeps a link to it: a session, a sample,
+closed again, back at once at zero links, in ~2 s while short of them, once a minute when
+settled. **The coordinator link must not be a wrapper link** (in `peers`, through
+`onPeerConnect`, carrying Yjs): a transient one would make every peer of the room broadcast a
+suspicion about the coordinator once a minute - the same avalanche `idleSuspectMs` ships off
+for. Because of that, a data link under a sample carries Yjs and nothing else, so
+`tryDecodeCoordinationMessage` (a `TextDecoder` plus a full decode of every frame on every
+link, and a frame that happens to parse as JSON is DROPPED) is off that path. The policy both
+the transport and the bench run is `src/providers/rendezvous.ts` - extracted for exactly that
+reason, as `dial.ts` was. Gates: `test/providers/repro-peerjs-sparse.ts` (10 parts, all gated,
+including the control that without `configureSparse` the full mesh is unchanged to the byte -
+`repro-peerjs-coordinator.ts`'s 15 parts stay green and are the proof), the `rendezvous` /
+`rendezvousleaves` variants of `bench-partial-mesh.ts` (N=40: 4-16 links per peer against the
+dial rule's 3-23, and the coordinator at 8 open sessions at the peak of the join, 0 at rest,
+against a link to all 39), and in real browsers `test/e2e/room-scenarios.mjs peerjs-conference`
+/ `phone-session.mjs peerjs-conference` (`?conference=<N>`, floor 17 - below that the rule
+builds a full mesh and the wrapper relays nothing; the phone is the only thing that shows
+whether a long absence brings back a FRESH sample instead of ids handed out minutes ago). Its last two phases - a page that UNLOADS (the core's
 `beforeunload` in order, then the channels close) and RELOADS pages coming back under new
 addresses (`RELOADS`, `RELOAD_GAP_MS`; 250 ms is the storm) - are measurements, not verdicts,
 until round 13's departure findings are fixed: `GATE_DEPARTURE=1` turns them into one. They

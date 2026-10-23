@@ -49,6 +49,8 @@ export declare class SparseDial {
     constructor(options: SparseDialOptions);
     /** The room size the layer above has counted (peers, this one included). */
     setRoomSize(peers: number): void;
+    /** Links a peer asks for. A rendezvous transport needs the number, not just `wantsLinks` (providers/rendezvous.ts). */
+    get dial(): number;
     /** Announce (again)? `links`: open and pending ones. */
     wantsLinks(links: number): boolean;
     /** May an offer from a peer we did not dial be accepted? */

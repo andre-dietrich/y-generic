@@ -12,18 +12,33 @@
  * - Optional encryption
  * - Automatic reconnection
  *
- * Discovery: the first peer of a room claims the well-known id
- * `yjs-coordinator-<room>` and introduces everybody else (join ->
- * peer-list / peer-joined / peer-left); data flows over the full mesh. When
- * the coordinator goes away the remaining peers elect the lowest id, which
- * claims the coordinator id with a second Peer and switches identity only
- * once the claim succeeded. Known limit: the PeerJS server keeps the
- * registration of a coordinator that went silent (a phone asleep) for up
- * to its alive_timeout (60 s) - the existing mesh keeps working meanwhile,
- * new joiners wait until the id is free. What phones do to this transport,
- * and the repro behind each guard below:
+ * Discovery, FULL MESH (the default): the first peer of a room claims the
+ * well-known id `yjs-coordinator-<room>` and introduces everybody else
+ * (join -> peer-list / peer-joined / peer-left); data flows over the full
+ * mesh. When the coordinator goes away the remaining peers elect the
+ * lowest id, which claims the coordinator id with a second Peer and
+ * switches identity only once the claim succeeded. Known limit: the PeerJS
+ * server keeps the registration of a coordinator that went silent (a phone
+ * asleep) for up to its alive_timeout (60 s) - the existing mesh keeps
+ * working meanwhile, new joiners wait until the id is free. What phones do
+ * to this transport, and the repro behind each guard below:
  * docs/superpowers/specs/2026-09-19-webrtc-mobile-resilience-research.md,
  * test/providers/repro-peerjs-coordinator.ts.
+ *
+ * Discovery, SAMPLED (the `dial` option, or configureSparse from
+ * ConferenceTransport - which is the only thing this mode is for, since
+ * GenericProvider alone needs a full mesh): the coordinator answers a join
+ * with a random SAMPLE of its roster rather than the roster, and the
+ * roster is leases renewed by each peer's next join. Nobody keeps a link
+ * to it: a peer opens a signaling session, takes its sample and closes it
+ * again, coming back to renew - at once when it has no links, in a couple
+ * of seconds while it is short of them, once a minute when it is settled.
+ * The name is held in a SECOND Peer object, so claiming it costs a Peer
+ * instead of every link the claimant has, which is what makes "claim first
+ * and let the server decide" affordable in place of an election over a
+ * complete peer list nobody has any more. The policy that both this and
+ * test/dummy/bench-partial-mesh.ts run is ../rendezvous.ts; the gate is
+ * test/providers/repro-peerjs-sparse.ts.
  *
  * @example
  * ```typescript
@@ -43,6 +58,8 @@
 
 import type { Transport, ConnectionConfig } from '../../transport'
 import { watchResume, watchPageBack, watchNetworkChange, type ResumeWatch } from '../resume'
+import { SparseDial } from '../dial'
+import { sampleRoster, successorsOf, nextHeartbeatMs, claimDelayMs, type RosterEntry } from '../rendezvous'
 
 /**
  * PeerJS constructor type (from peerjs library).
@@ -86,16 +103,89 @@ export interface PeerJSTransportOptions {
   password?: string
 
   /**
-   * Maximum number of peer connections. GenericProvider needs a FULL mesh
-   * (a peer's broadcast reaches everyone directly, nobody relays): every
-   * peer of the room must fit. A room larger than this loses pairs - they
-   * see neither each other's presence nor each other's edits as they
+   * Maximum number of peer connections. GenericProvider alone needs a FULL
+   * mesh (a peer's broadcast reaches everyone directly, nobody relays):
+   * every peer of the room must fit. A room larger than this loses pairs -
+   * they see neither each other's presence nor each other's edits as they
    * happen. The former default (20-34, y-webrtc's, which relays) cut rooms
    * of 21+ peers: with 25 real browsers one peer ended up with 20 links
    * and missing from four rosters (test/e2e/room-scenarios.mjs).
+   * Under ConferenceTransport (providers/conference), which passes frames
+   * on, this stops being "everybody fits" and becomes what it says - the
+   * hard cap of a PARTIAL mesh (see `dial`).
    * @default 64
    */
   maxConns?: number
+
+  /**
+   * A PARTIAL mesh: ask for this many links instead of one to every peer
+   * (see ../dial.ts; the average peer ends up with twice as many, and
+   * `maxConns` stays the hard cap). ONLY under ConferenceTransport
+   * (providers/conference), which passes frames on - GenericProvider alone
+   * needs the full mesh, and a partial one under it does not merely lose
+   * peers, it ERASES presence: a link that drops is reported as a departure.
+   *
+   * It also changes what the coordinator is. It answers a join with a
+   * SAMPLE of the room instead of the roster, it holds its name in a second
+   * Peer object rather than as its identity, and nobody keeps a link to it -
+   * a peer opens a signaling session, takes its sample and closes it again.
+   *
+   * Left undefined, ConferenceTransport's `expectedPeers` decides: a full
+   * mesh up to 16 peers, ln(N) links (at least 4) beyond.
+   * @default undefined (full mesh)
+   */
+  dial?: number
+
+  /**
+   * With `dial`: never dial a peer that announces itself, and never be
+   * handed out in somebody else's sample - a leaf that holds the links it
+   * asked for and nobody else's (a phone). It is also never a successor: a
+   * page that sleeps must not be the room's coordinator.
+   * ConferenceTransport sets it from its `relay: false`.
+   * @default false
+   */
+  passive?: boolean
+
+  /**
+   * With `dial`: how often (ms) a peer re-opens its session to the
+   * coordinator to renew its roster entry. The coordinator may ask for a
+   * LONGER interval (it divides its roster by `coordinatorSessionsPerSec`),
+   * never a shorter one, and each peer jitters what it was told by +-25 %.
+   * The lease is 2.5x the interval the coordinator asked for, so an entry
+   * survives one missed renewal. Shorter: fewer ghosts in a sample, more
+   * handshakes on the coordinator.
+   * @default 60000
+   */
+  coordinatorRenewMs?: number
+
+  /**
+   * With `dial`: how many signaling sessions per second the coordinator is
+   * willing to handle; it paces its clients' renewals to stay under it (a
+   * roster of 300 at 2/s is told to renew every 150 s). Every session is a
+   * full ICE handshake, and the coordinator is a browser tab that is also
+   * an ordinary peer of the room.
+   * @default 2
+   */
+  coordinatorSessionsPerSec?: number
+
+  /**
+   * With `dial`: a sample holds this many times the links that were asked
+   * for. Not dial.ts's 1.3, which covers a dice roll - this covers GHOSTS:
+   * the roster is leases, and an entry outlives a killed tab by up to one.
+   * What is not dialed right away is kept in reserve, so replacing a link
+   * that died usually costs no round trip to the coordinator at all.
+   * @default 2
+   */
+  sampleOversample?: number
+
+  /**
+   * With `dial`: how long (ms) a signaling session stays open after its
+   * sample has arrived. Joiners that overlap in this window hear each
+   * other's `peer-joined` - the only announcement a coordinator that holds
+   * no links can make.
+   * @default 2000
+   */
+  sessionLingerMs?: number
 
   /**
    * How long (ms) a data connection may take to open. An entry that is not
@@ -185,6 +275,31 @@ export class PeerJSTransport implements Transport {
   private _stopPageWatch?: () => void
   private _replacingPeer?: string // handleIncomingConnection(): this peer's close is not a departure
 
+  // ---- the partial mesh (options.dial / configureSparse). Undefined: the full mesh
+  // above, unchanged to the byte. Everything below is dead in that case.
+  private _sparse?: SparseDial
+  private _passive: boolean = false
+  private _roomSize: number = 0 // what ConferenceTransport has counted, via setRoomSize
+  private _sawRoomSize: boolean = false // ... ever: a partial mesh without the wrapper is a bug
+  // Ids we were handed and have not dialed: replacing a link that died usually costs no
+  // round trip to the coordinator at all.
+  private _reserve: string[] = []
+  private _redials: Map<string, number> = new Map() // a link that dropped is retried ONCE, then replaced
+  private _successors: string[] = [] // from the last sample: who claims the name if the coordinator goes
+  private _renewMs: number = 0 // what the coordinator asked for
+  // Coordinator side of a sampled room: a roster of LEASES, renewed by a peer's next join
+  // and by nothing else. A closed session expires nothing - that is the whole difference
+  // from the full mesh, where the roster is the set of open links.
+  private _roster: Map<string, RosterEntry> = new Map()
+  private _rosterSweep?: ReturnType<typeof setInterval>
+  private _sessions: Set<any> = new Set() // signaling sessions open right now
+  // Our own signaling session: one at a time, opened to take a sample and closed again.
+  private _session?: any
+  private _sessionState: 'idle' | 'dialing' | 'open' | 'claiming' = 'idle'
+  private _sessionTimer?: ReturnType<typeof setTimeout>
+  private _sessionFails: number = 0
+  private _sidecar?: any // the Peer holding yjs-coordinator-<room>, if we hold it
+
   /**
    * Create a new PeerJS transport.
    *
@@ -208,7 +323,16 @@ export class PeerJSTransport implements Transport {
       iceDisconnectTimeout: options.iceDisconnectTimeout ?? 15000,
       resumeAfterMs: options.resumeAfterMs ?? 30000,
       debug: options.debug ?? false,
+      dial: options.dial as number, // only read through _sparse, which is undefined without it
+      passive: options.passive ?? false,
+      coordinatorRenewMs: options.coordinatorRenewMs ?? 60000,
+      coordinatorSessionsPerSec: options.coordinatorSessionsPerSec ?? 2,
+      sampleOversample: options.sampleOversample ?? 2,
+      sessionLingerMs: options.sessionLingerMs ?? 2000,
     }
+
+    this._passive = options.passive ?? false
+    if (options.dial !== undefined) this.configureSparse({ dial: options.dial })
   }
 
   /**
@@ -280,6 +404,13 @@ export class PeerJSTransport implements Transport {
     // Strategy: Try to claim the coordinator ID first
     // If taken, we'll get an error and become a regular peer
     return new Promise((resolve, reject) => {
+      // ... except under a sample, where the room's name is NOT our identity: we always
+      // run our own Peer, and whoever ends up holding the name holds it in a second one
+      // (claimSidecar). A claim then costs a Peer object instead of every link we have.
+      if (this._sparse) {
+        this.createRegularPeer(resolve, reject)
+        return
+      }
       try {
         const coordinatorAttempt = new this.options.peer(this.coordinatorPeerId, {
           debug: this.options.debug ? 3 : 0,
@@ -320,6 +451,7 @@ export class PeerJSTransport implements Transport {
           this.isCoordinator = true
           this.roomPeers.add(this.peerId)
           this._connected = true
+          this.startSparseRoster()
           this.setupPeerDiscovery()
           this.wirePeer(coordinatorAttempt)
           resolve()
@@ -366,7 +498,15 @@ export class PeerJSTransport implements Transport {
         // on the connection: forget the peer (stops the re-dial) and drop
         // the entry that would otherwise block its id.
         const gone = /peer (\S+)$/.exec(String(error.message ?? ''))?.[1]
-        if (gone && gone !== this.coordinatorPeerId) {
+        if (gone === this.coordinatorPeerId && this._sparse) {
+          // Under a sample the coordinator is not a link of ours: nobody at the room's
+          // name is a session that failed, and two of those mean it is time to claim it.
+          this._session = undefined
+          this._sessionState = 'idle'
+          this._sessionFails++
+          if (this._sessionFails >= 2) this.coordinatorUnreachable()
+          else this.armHeartbeat()
+        } else if (gone && gone !== this.coordinatorPeerId) {
           this.knownPeers.delete(gone)
           this.removePeer(gone)
         }
@@ -411,6 +551,13 @@ export class PeerJSTransport implements Transport {
       // Setup peer discovery via BroadcastChannel (same-browser tabs)
       this.setupPeerDiscovery()
       this.wirePeer(peer)
+
+      if (this._sparse) {
+        // No permanent link to the coordinator: a session, a sample, and gone again.
+        this.openSession()
+        resolve()
+        return
+      }
 
       // Setup cross-browser discovery via coordinator pattern
       this.setupCrossBrowserDiscovery()
@@ -518,6 +665,37 @@ export class PeerJSTransport implements Transport {
       this.isCoordinator = false
       this.roomPeers.clear()
     }
+    this.clearSessionTimer()
+    if (this._session) {
+      try {
+        // A goodbye if a session happens to be open; otherwise the lease expires, which
+        // is what the roster is for. Presence itself is the provider's, not ours.
+        this.sendCoordinationMessage(this._session, { type: 'leave', peerId: this.peerId })
+        this._session.close()
+      } catch (err) {
+        // Ignore
+      }
+      this._session = undefined
+    }
+    this._sessionState = 'idle'
+    this._sessionFails = 0
+    if (this._sidecar) {
+      try {
+        this._sidecar.destroy()
+      } catch (err) {
+        // Ignore
+      }
+      this._sidecar = undefined
+    }
+    if (this._rosterSweep) {
+      clearInterval(this._rosterSweep)
+      this._rosterSweep = undefined
+    }
+    this._roster.clear()
+    this._sessions.clear()
+    this._reserve = []
+    this._redials.clear()
+    this._successors = []
 
     // Close all peer connections
     for (const peerConn of this.peers.values()) {
@@ -617,6 +795,46 @@ export class PeerJSTransport implements Transport {
     this._handlePeerServerDisconnect()
   }
 
+  /**
+   * ConferenceTransport, once, before connect(): how big the room is expected to be,
+   * and whether we are a leaf. Above 16 expected peers this stops being a full mesh.
+   *
+   * A partial mesh without that wrapper above is not merely incomplete, it ERASES
+   * presence - a dropped link is reported to GenericProvider as a departure, which
+   * drops that peer's awareness and broadcasts a removal. Hence the warning below:
+   * setRoomSize() is called by ConferenceTransport and by nothing else.
+   */
+  configureSparse(options: { dial?: number; expectedPeers?: number; passive?: boolean }): void {
+    if (options.passive !== undefined) this._passive = options.passive
+    const dial =
+      options.dial ??
+      (this._sparse === undefined && (options.expectedPeers ?? 0) > 16
+        ? Math.max(4, Math.ceil(Math.log(options.expectedPeers!)))
+        : undefined)
+    if (dial !== undefined) this._sparse = new SparseDial({ dial, maxConns: this.options.maxConns, passive: this._passive })
+    else if (this._sparse) this._sparse.passive = this._passive
+    if (this._sparse && !this._sawRoomSize) this.warnIfUnwrapped()
+  }
+
+  /** The room size ConferenceTransport has counted - origins heard, not the expected size. */
+  setRoomSize(peers: number): void {
+    this._roomSize = peers
+    this._sawRoomSize = true
+    this._sparse?.setRoomSize(peers)
+  }
+
+  /** A partial mesh that nobody relays for: say so, loudly, once. */
+  private warnIfUnwrapped(): void {
+    this.later(() => {
+      if (this._sawRoomSize || !this._sparse || !this._connected) return
+      console.warn(
+        '[PeerJSTransport] a partial mesh (dial) without ConferenceTransport: GenericProvider ' +
+          'needs every broadcast to reach every peer. Wrap this transport in ' +
+          "providers/conference, or drop the `dial` option. See the option's documentation.",
+      )
+    }, 5000)
+  }
+
   /** The server accepted us (again): re-open what the outage cost. */
   private onSignalingReopened(): void {
     this._reconnectAttempts = 0
@@ -629,12 +847,23 @@ export class PeerJSTransport implements Transport {
       if (!peerConn.connected) this.removePeer(peerId, false)
     }
 
-    // Re-establish connections to all known peers
+    // Re-establish connections to all known peers - under a sample only as many as we
+    // asked for. knownPeers holds every id ever handed to us, so dialing all of it after
+    // a server blip is a full-mesh rebuild, at every peer of the room at once.
     for (const peerId of this.knownPeers) {
+      if (this._sparse && !this._sparse.wantsLinks(this.linkCount())) break
       if (!this.peers.has(peerId) && peerId !== this.peerId) {
         this.log(`🔌 Re-connecting to known peer: ${peerId}`)
         this.connectToPeer(peerId)
       }
+    }
+    if (this._sparse) this.maybeRefill()
+
+    if (this._sparse) {
+      // A session is cheap and we may have missed a whole room while we were away.
+      this._sessionFails = 0
+      if (!this.isCoordinator) this.openSession()
+      return
     }
 
     // Regular peer: if coordinator connection was lost, reconnect to coordinator
@@ -801,7 +1030,12 @@ export class PeerJSTransport implements Transport {
         // Another peer announced
         // Discovered peer via BroadcastChannel
         this.knownPeers.add(msg.peerId)
-        this.connectToPeer(msg.peerId)
+        // Under a sample the tabs of one browser are room members like any other: left
+        // unconditional they build a full clique underneath the sampled mesh, and no
+        // harness would see it - they all run one isolated browser context per peer.
+        if (!this._sparse || this._sparse.answers(msg.peerId, this.linkCount(), msg.leaf === true)) {
+          this.connectToPeer(msg.peerId)
+        }
       } else if (msg.type === 'leave') {
         // Peer left
         // Peer left
@@ -815,7 +1049,13 @@ export class PeerJSTransport implements Transport {
 
     // Periodic announcements for new peers that join later
     this.discoveryInterval = setInterval(() => {
-      if (this._connected && this.peers.size < this.options.maxConns) {
+      if (!this._connected) return
+      if (this._sparse) {
+        // The twin of simple-peer's announce retry (:492): announcing is over once we
+        // have the links we asked for, and this is also where a short peer tops up.
+        if (this._sparse.wantsLinks(this.linkCount())) this.announcePeer()
+        this.maybeRefill()
+      } else if (this.peers.size < this.options.maxConns) {
         this.announcePeer()
       }
     }, 5000)
@@ -826,10 +1066,11 @@ export class PeerJSTransport implements Transport {
    */
   private announcePeer(): void {
     if (this.broadcastChannel) {
-      const message = {
+      const message: any = {
         type: 'announce',
         peerId: this.peerId,
       }
+      if (this._sparse) message.leaf = this._passive
       this.broadcastChannel.postMessage(message)
     }
   }
@@ -903,10 +1144,7 @@ export class PeerJSTransport implements Transport {
           this._peerConnectCallback?.(this.coordinatorPeerId)
 
           // Request peer list from coordinator (send as JSON-encoded binary)
-          this.sendCoordinationMessage(conn, {
-            type: 'join',
-            peerId: this.peerId,
-          })
+          this.sendCoordinationMessage(conn, this.joinMessage())
 
           // Handle messages from coordinator
           conn.on('data', (data: any) => {
@@ -966,6 +1204,411 @@ export class PeerJSTransport implements Transport {
     })
   }
 
+  // =====================================================================
+  // The signaling session (sparse only).
+  //
+  // In the full mesh the coordinator link IS a data link: it is in `peers`, it is
+  // reported through onPeerConnect, and it carries Yjs. Under a sample it must not be,
+  // because it is about to become transient - and a link that comes and goes every
+  // minute would, under ConferenceTransport, tear down its routes, re-GRAFT every
+  // neighbour and broadcast a suspicion about the coordinator, from every peer of the
+  // room, once a minute. So: never in `peers`, never a callback, coordination only.
+  // =====================================================================
+
+  /** Open a session to the coordinator, unless one is already in flight. */
+  private openSession(): void {
+    if (!this._sparse || this._destroying || !this.peer) return
+    if (this._sessionState !== 'idle' || this.isCoordinator) return
+    this.clearSessionTimer()
+    this._sessionState = 'dialing'
+    let settled = false
+    const fail = (why: string) => {
+      if (settled) return
+      settled = true
+      this.log(`📇 session to the coordinator failed: ${why}`)
+      this._session = undefined
+      this._sessionState = 'idle'
+      this._sessionFails++
+      // Twice is enough to believe it: the first may be a handover in progress.
+      if (this._sessionFails >= 2) this.coordinatorUnreachable()
+      else this.armHeartbeat()
+    }
+    try {
+      const conn = this.peer.connect(this.coordinatorPeerId, {
+        reliable: true,
+        serialization: 'binary',
+        metadata: { role: 'signal', peerId: this.peerId },
+      })
+      this._session = conn
+      this.later(() => {
+        if (this._session === conn && this._sessionState === 'dialing') {
+          try {
+            conn.close()
+          } catch (err) {
+            // Ignore
+          }
+          fail('no answer in 5 s')
+        }
+      }, 5000)
+      conn.on('open', () => {
+        if (this._session !== conn || this._destroying) return
+        settled = true
+        this._sessionState = 'open'
+        this._sessionFails = 0
+        this.sendCoordinationMessage(conn, this.joinMessage())
+      })
+      conn.on('data', (data: any) => {
+        if (this._session !== conn) return
+        this._stopResumeWatch?.alive()
+        const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+        const msg = this.tryDecodeCoordinationMessage(bytes)
+        // A session carries coordination and nothing else - a frame that is not
+        // coordination is not ours to hand to the document.
+        if (msg) this.handleCoordinatorMessage(msg)
+        if (msg?.type === 'peer-list') {
+          // Linger a moment: joiners that overlap here hear each other's peer-joined,
+          // the only announcement a coordinator that holds no links can make.
+          this.clearSessionTimer()
+          this._sessionTimer = setTimeout(() => this.endSession(), this.options.sessionLingerMs)
+        }
+      })
+      const done = () => {
+        if (this._session !== conn) return
+        if (this._sessionState === 'open') {
+          this._session = undefined
+          this._sessionState = 'idle'
+          this.armHeartbeat()
+        } else fail('closed before it opened')
+      }
+      conn.on('close', done)
+      conn.on('error', done)
+    } catch (err) {
+      fail(String(err))
+    }
+  }
+
+  /** The sample is in (or the linger is over): close it and come back later. */
+  private endSession(): void {
+    this.clearSessionTimer()
+    const conn = this._session
+    this._session = undefined
+    this._sessionState = 'idle'
+    if (conn) {
+      try {
+        conn.close()
+      } catch (err) {
+        // Ignore
+      }
+    }
+    this.armHeartbeat()
+  }
+
+  private clearSessionTimer(): void {
+    if (this._sessionTimer) {
+      clearTimeout(this._sessionTimer)
+      this._sessionTimer = undefined
+    }
+  }
+
+  /**
+   * When to go back. Not a fixed period: a peer that has its links needs the coordinator
+   * only to renew its lease, but one with NO links needs an id right now.
+   */
+  private armHeartbeat(): void {
+    if (!this._sparse || this._destroying || this.isCoordinator) return
+    this.clearSessionTimer()
+    const ms = nextHeartbeatMs(this.linkCount(), this._sparse.dial, {
+      renewMs: Math.max(this.options.coordinatorRenewMs, this._renewMs),
+      attempt: this._sessionFails,
+    })
+    this._sessionTimer = setTimeout(() => {
+      this._sessionTimer = undefined
+      this.openSession()
+    }, ms)
+  }
+
+  /**
+   * Nobody answers at the room's name. Claim it - the claim is its own probe, the server
+   * hands the name to exactly one and answers everybody else 'unavailable-id'. The delay
+   * comes from the successor chain of our last sample, so in the common case exactly one
+   * peer claims within a few hundred ms and the rest never try at all.
+   */
+  private coordinatorUnreachable(): void {
+    if (!this._sparse || this._destroying || this.isCoordinator) return
+    if (this._sessionState === 'claiming') return
+    this._sessionState = 'claiming'
+    this.clearSessionTimer()
+    const ms = claimDelayMs(this.peerId, this._successors, { passive: this._passive, roomSize: this._roomSize })
+    this.log(`🗳️ the coordinator does not answer - claiming its name in ${Math.round(ms)} ms`)
+    this._sessionTimer = setTimeout(() => {
+      this._sessionTimer = undefined
+      this.claimSidecar()
+    }, ms)
+  }
+
+  /**
+   * Claim the room's name in a SECOND Peer object. Our own identity, our links and our
+   * place in the mesh are untouched by this - which is what makes "claim first, ask
+   * questions later" affordable. A failed claim costs one destroyed Peer and nothing else.
+   */
+  private claimSidecar(): void {
+    if (!this._sparse || this._destroying || this.isCoordinator) return
+    let settled = false
+    const sidecar = new this.options.peer(this.coordinatorPeerId, {
+      debug: this.options.debug ? 3 : 0,
+      ...this.options.peerOptions,
+    })
+    this._sidecar = sidecar
+    const lost = (why: string) => {
+      if (settled) return
+      settled = true
+      this.log(`🗳️ the name went to somebody else (${why})`)
+      try {
+        sidecar.destroy()
+      } catch (err) {
+        // Ignore
+      }
+      if (this._sidecar === sidecar) this._sidecar = undefined
+      this._sessionState = 'idle'
+      this._sessionFails = 0
+      // Somebody holds it now: go and take a sample from them.
+      this.clearSessionTimer()
+      this._sessionTimer = setTimeout(() => {
+        this._sessionTimer = undefined
+        this.openSession()
+      }, 250 + Math.random() * 500)
+    }
+    this.later(() => {
+      if (!settled && this._sidecar === sidecar) lost('no answer in 5 s')
+    }, 5000)
+    sidecar.on('open', (id: string) => {
+      if (settled || this._destroying) return
+      settled = true
+      if (id !== this.coordinatorPeerId) {
+        lost('the server gave us another id')
+        return
+      }
+      this.log('👑 holding the room name in a sidecar Peer - our own links are untouched')
+      this._sessionState = 'idle'
+      this._sessionFails = 0
+      this.isCoordinator = true
+      this.startSparseRoster()
+      sidecar.on('connection', (conn: any) => {
+        if (this._sidecar === sidecar) this.onSession(conn)
+      })
+      this.maybeRefill()
+    })
+    sidecar.on('error', (error: any) => {
+      if (error?.type === 'unavailable-id') {
+        lost('unavailable-id')
+        return
+      }
+      if (settled) return // the sidecar is ours; non-fatal errors are PeerJS's to handle
+      lost(String(error?.type ?? error))
+    })
+    sidecar.on('disconnected', () => {
+      // The server dropped our registration: somebody else may take the name.
+      if (this._sidecar === sidecar && this.isCoordinator) {
+        try {
+          sidecar.reconnect()
+        } catch (err) {
+          // Ignore
+        }
+      }
+    })
+  }
+
+  /** Coordinator side: somebody opened a signaling session with us. */
+  private onSession(conn: any): void {
+    if (this._destroying) return
+    this._sessions.add(conn)
+    const remotePeerId = conn.metadata?.peerId ?? conn.peer
+    conn.on('data', (data: any) => {
+      const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+      const msg = this.tryDecodeCoordinationMessage(bytes)
+      if (msg?.type === 'join') this.answerSparseJoin(conn, msg.peerId ?? remotePeerId, msg)
+      else if (msg?.type === 'leave') this._roster.delete(msg.peerId ?? remotePeerId)
+    })
+    const gone = () => this._sessions.delete(conn)
+    conn.on('close', gone)
+    conn.on('error', gone)
+  }
+
+  /** What we ask the coordinator for. Under a sample it says how short we are. */
+  private joinMessage(): Record<string, unknown> {
+    const msg: Record<string, unknown> = { type: 'join', peerId: this.peerId }
+    if (!this._sparse) return msg
+    msg.sparse = true
+    msg.leaf = this._passive
+    msg.want = Math.max(0, this._sparse.dial - this.linkCount())
+    // What we already hold: handing it back would waste the sample. Capped, because the
+    // message goes over a data channel and a room of 300 is not a peer list.
+    msg.have = Array.from(this.peers.keys())
+      .filter((id) => id !== this.coordinatorPeerId)
+      .slice(0, 32)
+    return msg
+  }
+
+  /** Links that count towards the dial rule - never the coordinator's, which is signaling. */
+  private linkCount(): number {
+    return this.peers.has(this.coordinatorPeerId) ? this.peers.size - 1 : this.peers.size
+  }
+
+  /** Roster entries whose lease still runs. */
+  private liveRoster(now = Date.now()): number {
+    let n = 0
+    for (const entry of this._roster.values()) if (entry.expires > now) n++
+    return n
+  }
+
+  /**
+   * A peer asked to join a sampled room. It gets a SAMPLE, not the roster - that is the
+   * whole point: a peer list of 300 is a full mesh with extra steps.
+   */
+  private answerSparseJoin(conn: any, remotePeerId: string, msg: any): void {
+    const now = Date.now()
+    // Pace the room's renewals so the coordinator - a browser tab that is also an ordinary
+    // peer - stays under the handshakes per second it is willing to do.
+    const renewInMs = Math.max(
+      this.options.coordinatorRenewMs,
+      Math.ceil(this._roster.size / Math.max(1, this.options.coordinatorSessionsPerSec)) * 1000,
+    )
+    // The lease is derived from the interval we are about to hand out, so the two can
+    // never drift apart. 2.5x: an entry survives one missed renewal.
+    this._roster.set(remotePeerId, { expires: now + 2.5 * renewInMs, leaf: msg.leaf === true })
+
+    const want = Math.max(0, Number(msg.want) || 0)
+    const peers = sampleRoster(this._roster, want, {
+      self: remotePeerId,
+      have: Array.isArray(msg.have) ? msg.have.slice(0, 32) : undefined,
+      oversample: this.options.sampleOversample,
+      now,
+    })
+    this.sendCoordinationMessage(conn, {
+      type: 'peer-list',
+      sparse: true,
+      peers,
+      size: this.liveRoster(now),
+      successors: successorsOf(this._roster, now),
+      renewInMs,
+    })
+    // Nobody dials a leaf that did not ask for the link.
+    if (msg.leaf !== true) this.announceJoiner(remotePeerId)
+  }
+
+  /**
+   * Tell a few of the room about a joiner. Capped and random: the full mesh tells
+   * everybody, which is one message per peer per join, and every one of them a dial.
+   */
+  private announceJoiner(joinerId: string): void {
+    const dial = this._sparse?.dial ?? 4
+    const targets: any[] = this._sessions.size > 0 ? Array.from(this._sessions) : []
+    if (targets.length === 0) {
+      for (const [peerId, peerConn] of this.peers) {
+        if (peerId !== joinerId && peerConn.connected) targets.push(peerConn.conn)
+      }
+    }
+    for (let i = targets.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      const tmp = targets[i]
+      targets[i] = targets[j]
+      targets[j] = tmp
+    }
+    const leaf = this._roster.get(joinerId)?.leaf === true
+    for (const conn of targets.slice(0, dial)) {
+      try {
+        this.sendCoordinationMessage(conn, { type: 'peer-joined', peerId: joinerId, leaf })
+      } catch (err) {
+        this.log('⚠️ Failed to notify peer of new joiner')
+      }
+    }
+  }
+
+  /** We hold the room's name: seed the roster from what we have seen, and age it. */
+  private startSparseRoster(): void {
+    if (!this._sparse || this._rosterSweep) return
+    // A coordinator that starts with an empty roster hands out empty samples until the
+    // first renewals arrive, and a joiner in that window sits alone. Seed it from what we
+    // have actually seen, on a short probationary lease.
+    const probation = Date.now() + this.options.coordinatorRenewMs / 3
+    for (const id of this.peers.keys()) {
+      if (id !== this.coordinatorPeerId) this._roster.set(id, { expires: probation, leaf: false })
+    }
+    for (const id of this.knownPeers) {
+      if (id !== this.coordinatorPeerId && id !== this.peerId && !this._roster.has(id)) {
+        this._roster.set(id, { expires: probation, leaf: false })
+      }
+    }
+    this._rosterSweep = setInterval(() => {
+      const now = Date.now()
+      for (const [id, entry] of this._roster) if (entry.expires <= now) this._roster.delete(id)
+    }, Math.max(1000, this.options.coordinatorRenewMs / 4))
+  }
+
+  /**
+   * Ids the coordinator handed us: dial what we are short of, keep the rest in reserve.
+   *
+   * Shuffled even when the list arrives whole (an older coordinator, or a room below the
+   * sparse threshold): taking the first few of a Set means taking whoever joined first,
+   * and a partial mesh whose links all point at the room's oldest peers has no better
+   * diameter than y-webrtc's chain (../dial.ts).
+   */
+  private absorbSample(ids: string[], msg?: any): void {
+    if (!this._sparse) return
+    const fresh: string[] = []
+    for (const id of ids) {
+      if (id === this.peerId || id === this.coordinatorPeerId) continue
+      this._sparse.heard(id)
+      if (!this.peers.has(id)) fresh.push(id)
+    }
+    for (let i = fresh.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      const tmp = fresh[i]
+      fresh[i] = fresh[j]
+      fresh[j] = tmp
+    }
+    this._reserve = fresh
+    if (Array.isArray(msg?.successors)) this._successors = msg.successors
+    if (typeof msg?.renewInMs === 'number') this._renewMs = msg.renewInMs
+    this.drainReserve()
+  }
+
+  /** Dial out of the reserve until we have the links we asked for. */
+  private drainReserve(): void {
+    if (!this._sparse) return
+    while (this._reserve.length > 0 && this._sparse.wantsLinks(this.linkCount())) {
+      const id = this._reserve.shift()!
+      if (this.peers.has(id)) continue
+      this.knownPeers.add(id)
+      this.connectToPeer(id)
+    }
+  }
+
+  /** Short of links: the reserve first, and only then the coordinator. */
+  private maybeRefill(): void {
+    if (!this._sparse || !this._connected || this._destroying) return
+    this.drainReserve()
+    if (!this._sparse.wantsLinks(this.linkCount())) return
+    if (this.isCoordinator) {
+      // Holding the room's name does not excuse us from being in the room: the coordinator
+      // is an ordinary peer of the mesh and needs its `dial` links like everybody. It just
+      // has the census already, so it samples its own roster instead of opening a session.
+      this.absorbSample(
+        sampleRoster(this._roster, this._sparse.dial - this.linkCount(), {
+          self: this.peerId,
+          have: Array.from(this.peers.keys()),
+          oversample: this.options.sampleOversample,
+        }),
+      )
+      return
+    }
+    if (this._sessionState !== 'idle') return
+    // Whatever heartbeat is pending was armed while we still had our links - a minute
+    // away. Re-arm it for what we have now: a couple of seconds, or nothing at all if
+    // we are down to zero (test/peerjs/e2e-handover.mjs part 2 lives on that case).
+    this.armHeartbeat()
+  }
+
   /**
    * Handle messages from coordinator (when we're a regular peer).
    */
@@ -975,6 +1618,10 @@ export class PeerJSTransport implements Transport {
         // Received list of all peers in room from coordinator
         // Received peer list
 
+        if (this._sparse) {
+          this.absorbSample(data.peers ?? [], data)
+          break
+        }
         for (const peerId of data.peers) {
           if (peerId !== this.peerId && !this.peers.has(peerId)) {
             this.knownPeers.add(peerId)
@@ -987,6 +1634,9 @@ export class PeerJSTransport implements Transport {
         // A new peer joined the room
         // New peer joined
         if (data.peerId !== this.peerId && !this.peers.has(data.peerId)) {
+          // The one place the dice of the broadcast transports survive: an announcement
+          // we overheard, answered with probability ~ dial / room size (../dial.ts).
+          if (this._sparse && !this._sparse.answers(data.peerId, this.linkCount(), data.leaf === true)) break
           this.knownPeers.add(data.peerId)
           this.connectToPeer(data.peerId)
         }
@@ -996,7 +1646,11 @@ export class PeerJSTransport implements Transport {
         // A peer left the room
         // Peer left
         this.knownPeers.delete(data.peerId)
-        this.removePeer(data.peerId)
+        // Under a sample the coordinator's roster is leases, and a lease that ran out is a
+        // poor liveness signal: closing a HEALTHY link over one is how a partial mesh loses
+        // peers. Departures belong to ConferenceTransport (SUSPECT / ALIVE / LEAVE).
+        if (this._sparse) this._sparse.forget(data.peerId)
+        else this.removePeer(data.peerId)
         break
 
       case 'coordinator-change':
@@ -1184,6 +1838,7 @@ export class PeerJSTransport implements Transport {
     this.coordinatorConn = undefined
     this.roomPeers.clear()
     this.roomPeers.add(this.peerId)
+    this.startSparseRoster()
     this.reElectionInProgress = false // Re-election complete
 
     // Our old identity goes, and its links with it (each reports
@@ -1281,13 +1936,17 @@ export class PeerJSTransport implements Transport {
     if (this.peers.has(remotePeerId)) {
       return
     }
-    if (this.peers.size >= this.options.maxConns) {
+    if (this._sparse ? !this._sparse.accepts(this.linkCount()) : this.peers.size >= this.options.maxConns) {
       // Max connections reached
       return
     }
 
-    // Only initiate if our peer ID is lower (to prevent dual-initiation race condition)
-    if (this.peerId && this.peerId > remotePeerId) {
+    // Only initiate if our peer ID is lower (to prevent dual-initiation race condition).
+    // Not under a sample: there only ONE side is told about the pair, so whoever decides
+    // to dial has to dial, whatever the ids say - waiting for the other end means half of
+    // every sample yields no link at all (simple-peer/index.ts does the same, :944). Glare
+    // is resolved in handleIncomingConnection, where the lower id's dial is the one both keep.
+    if (this._sparse === undefined && this.peerId && this.peerId > remotePeerId) {
       // Waiting for peer to initiate
       return
     }
@@ -1338,14 +1997,16 @@ export class PeerJSTransport implements Transport {
       this._replacingPeer = undefined
     }
 
-    if (this.peers.size >= this.options.maxConns) {
+    if (this._sparse ? !this._sparse.accepts(this.linkCount()) : this.peers.size >= this.options.maxConns) {
       this.log('Max connections reached, rejecting peer:', remotePeerId)
       conn.close()
       return
     }
 
-    // If we're the coordinator, handle coordination duties
-    if (this.isCoordinator) {
+    // If we're the coordinator, handle coordination duties. Not under a sample: there the
+    // roster is leases (_roster), a link of ours closing says nothing about the room, and
+    // there are no links to announce it over anyway. Departures are the wrapper's.
+    if (this.isCoordinator && !this._sparse) {
       // Add to room peers immediately
       this.roomPeers.add(remotePeerId)
 
@@ -1415,6 +2076,7 @@ export class PeerJSTransport implements Transport {
     conn.on('open', () => {
       peerConn.connected = true
       this.knownPeers.add(remotePeerId)
+      this._redials.delete(remotePeerId) // it held: the next drop gets its own retry
       // Notify provider so it can push its local state to this new peer
       this._peerConnectCallback?.(remotePeerId)
     })
@@ -1424,8 +2086,12 @@ export class PeerJSTransport implements Transport {
       // Convert to Uint8Array if needed
       const uint8Data = data instanceof Uint8Array ? data : new Uint8Array(data)
 
-      // Try to decode as JSON coordination message
-      const coordMessage = this.tryDecodeCoordinationMessage(uint8Data)
+      // Under a sample, coordination lives on the signaling session and a data link
+      // carries the document and nothing else - so the JSON attempt below is not an
+      // optimisation to skip, it is simply not part of the protocol here. It also costs
+      // a TextDecoder and a full decode of every frame on every link, and a frame that
+      // happened to decode as JSON with a `type` would be DROPPED rather than synced.
+      const coordMessage = this._sparse ? undefined : this.tryDecodeCoordinationMessage(uint8Data)
       if (coordMessage) {
         // Handle coordination messages
         if (
@@ -1448,6 +2114,10 @@ export class PeerJSTransport implements Transport {
           this.handleCoordinatorMessage(coordMessage)
           return
         } else if (coordMessage.type === 'join' && this.isCoordinator) {
+          if (this._sparse && coordMessage.sparse === true) {
+            this.answerSparseJoin(conn, remotePeerId, coordMessage)
+            return
+          }
           // Handle join message if we're the coordinator
           // Coordinator: peer joined
 
@@ -1526,7 +2196,29 @@ export class PeerJSTransport implements Transport {
       // Ignore errors during cleanup
     }
     this._peerDisconnectCallback?.(peerId)
-    if (redial && !this._destroying && this.knownPeers.has(peerId)) {
+    if (!redial || this._destroying) return
+    if (this._sparse) {
+      // A partial mesh replaces what it lost with somebody, not with the same id forever:
+      // knownPeers holds every id ever sampled and only ever grows, so re-dialing out of it
+      // converges straight back to the full mesh, and a peer that is gone eats one failed
+      // dial every 2-3 s. One retry for a link that merely blipped, then let it go.
+      const tried = (this._redials.get(peerId) ?? 0) + 1
+      // Either way we are short NOW: the reserve goes in at once, and the heartbeat is
+      // re-armed for the link count we have rather than the one we had a minute ago.
+      // Waiting out the retry first cost 7 s where it costs 2 (part 10).
+      this.maybeRefill()
+      if (tried <= 1 && this.knownPeers.has(peerId)) {
+        this._redials.set(peerId, tried)
+        this.later(() => this.connectToPeer(peerId), 2000 + Math.random() * 1000)
+      } else {
+        this._redials.delete(peerId)
+        this.knownPeers.delete(peerId)
+        this._sparse.forget(peerId)
+        this.later(() => this.maybeRefill(), 2000 + Math.random() * 1000)
+      }
+      return
+    }
+    if (this.knownPeers.has(peerId)) {
       this.later(() => this.connectToPeer(peerId), 2000 + Math.random() * 1000)
     }
   }

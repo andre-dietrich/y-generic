@@ -11,6 +11,7 @@ import { QuillBinding } from 'y-quill'
 import QuillCursors from 'quill-cursors'
 import { GenericProvider } from '../../src/index'
 import { PeerJSTransport } from '../../src/providers/peerjs/index'
+import { ConferenceTransport } from '../../src/providers/conference/index'
 import { installPhoneReport } from '../e2e/phone-report'
 
 // test/e2e/phone-session.mjs: `?phone` (the real phone) and `?desk=<name>` (its headless room
@@ -269,8 +270,19 @@ async function initWithConfig(config: {
     debug: config.debug,
   })
 
+  // A room of 100+ peers under ConferenceTransport (?conference=<N>, &leaf).
+  // `transport` stays the PeerJS one: the peer count below is its WebRTC links.
+  const conference = session.has('conference')
+    ? { expectedPeers: Number(session.get('conference')) || undefined, relay: !session.has('leaf') }
+    : undefined
+  const roomTransport = conference ? new ConferenceTransport(transport, conference) : transport
+  if (conference) {
+    log(`🏛️ Conference mode: expecting ${conference.expectedPeers ?? '?'} peers${conference.relay === false ? ', a leaf' : ''}`, 'info')
+    ;(window as any).__conference = roomTransport // test/e2e/room-scenarios.mjs: tree links, room size
+  }
+
   // Create provider
-  const provider = new GenericProvider(doc, transport)
+  const provider = new GenericProvider(doc, roomTransport)
   ;(window as any).__provider = provider // test/e2e/room-scenarios.mjs reads presence clocks through it (DIAG=1)
   ;(window as any).__Y = Y // room-scenarios.mjs `storm`: relative positions in the page's own Yjs
 

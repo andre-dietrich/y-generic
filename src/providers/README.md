@@ -151,8 +151,21 @@ await provider.connect({ room: 'my-room' })
 **Options:**
 - `peerOptions`: PeerJS server configuration (default: uses PeerJS Cloud)
 - `password`: Optional encryption password
-- `maxConns`: Max peer connections (default: 64). The core needs a full mesh - a room larger
-  than this loses pairs of peers
+- `maxConns`: Max peer connections (default: 64). GenericProvider alone needs a full mesh - a
+  room larger than this loses pairs of peers. Under `providers/conference` it becomes what it
+  says: the hard cap of a partial mesh
+- `dial`: ask for this many links instead of one per peer - a PARTIAL mesh, and **only** under
+  `providers/conference`, which passes frames on. It also changes the coordinator: it answers a
+  join with a random SAMPLE of its roster, holds the room's name in a second `Peer` rather than
+  as its identity, and keeps no link to anybody. Left unset, the wrapper's `expectedPeers`
+  decides (full mesh up to 16, `ln(N)` links beyond)
+- `passive`: with `dial`, a leaf - it holds the links it asked for and nobody else's, is never
+  handed out in a sample and is never the room's coordinator. A phone
+- `coordinatorRenewMs` / `coordinatorSessionsPerSec` / `sampleOversample` / `sessionLingerMs`:
+  with `dial`, how often a peer renews its roster lease, how many handshakes per second the
+  coordinator is willing to do (it paces the room's renewals to stay under it), how much bigger
+  than the request a sample is (it covers ghosts: a lease outlives a killed tab), and how long a
+  signaling session lingers after its sample
 - `connectTimeout`: ms a data connection may take to open before its entry is dropped and
   re-dialed (default: 30000)
 - `iceDisconnectTimeout`: ms a link may stay in ICE state `disconnected` before it is closed
@@ -163,9 +176,10 @@ await provider.connect({ room: 'my-room' })
 - `debug`: Enable debug logging
 
 **Known limit:** peers find each other through one coordinator, the peer holding the id
-`yjs-coordinator-<room>`. When it goes silent (a phone asleep) the others elect a new one,
+`yjs-coordinator-<room>`. When it goes silent (a phone asleep) the others take the name over,
 but the PeerJS server keeps a dead registration for up to its `alive_timeout` (60 s): the
-existing mesh keeps working meanwhile, **new joiners wait** until the id is free. For rooms
+existing mesh keeps working meanwhile, **new joiners wait** until the id is free. Nothing about
+the partial mesh removes that - it is a property of the rendezvous, not of the mesh. For rooms
 opened from phones prefer the simple-peer or Trystero transport.
 
 ## Coming Soon

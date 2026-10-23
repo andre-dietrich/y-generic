@@ -69,8 +69,8 @@ inner transport re-dials under a new peer id (a phone that slept).
 
 ## The inner transport
 
-Anything with `sendTo`, `onPeerConnect` and `onPeerDisconnect`. **`SimplePeerTransport`**
-knows the two optional hooks the wrapper calls:
+Anything with `sendTo`, `onPeerConnect` and `onPeerDisconnect`. **`SimplePeerTransport`** and
+**`PeerJSTransport`** know the two optional hooks the wrapper calls:
 
 - `configureSparse({ expectedPeers, passive })` - before `connect()`. Up to 16 expected peers
   it builds the full mesh it always built; beyond, a partial one with `dial = max(4, ln N)`
@@ -84,8 +84,17 @@ knows the two optional hooks the wrapper calls:
   its links: a settled room is silent on the signaling channel, where a full mesh of 300
   sends 18,000 signaling messages a second.
 
-A transport without these hooks (PeerJS, Trystero) still works under the wrapper, as the full
-mesh it builds - which helps with nothing but the typist's upload.
+The two answer them differently, because their rendezvous differs. simple-peer announces on a
+topic the whole room hears, so the dice are rolled by the hearers - nobody has a census, and
+`dial / room size` is the best each of them can do. PeerJS has only "dial a name somebody
+claimed", so there the dice move to the one place that does have a census: the coordinator
+answers a join with a **sample** of its roster instead of the roster, holds that name in a
+second `Peer` object rather than as its identity, and keeps no link to anybody - a peer opens a
+signaling session, takes its sample and closes it again (`src/providers/rendezvous.ts`; gate:
+`test/providers/repro-peerjs-sparse.ts`).
+
+A transport without these hooks (Trystero) still works under the wrapper, as the full mesh it
+builds - which helps with nothing but the typist's upload.
 
 ## Options
 
@@ -141,8 +150,9 @@ never each other; a peer whose neighbours are all killed has links again.
   browsers reach each other directly and every link needs TURN - `dial` links per peer of it.
 - **Privacy between hops.** The inner transport encrypts per link; a relaying peer sees what
   it passes on, as every peer of the room does anyway.
-- **Not measured yet:** a real phone as a leaf, Firefox, PeerJS as the inner transport (its
-  coordinator would hold a link to every peer).
+- **Not measured yet:** a real phone as a leaf, Firefox, and PeerJS as the inner transport in
+  real browsers (`test/e2e/room-scenarios.mjs peerjs-conference`) - its sampled rendezvous is
+  gated under plain Node but has not been through a 25-browser room.
 
 Real browsers (`test/e2e/room-scenarios.mjs conference`, headless Chrome): 25 through every
 scenario (rosters complete 0.8 s after the last page, 3-14 links per peer, five frozen pages

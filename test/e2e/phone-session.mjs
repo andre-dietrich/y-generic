@@ -33,10 +33,15 @@
  *   4. display off for ~3 min (longer than the 30 s after which a room drops a silent link), come back
  *   5. type a word on the phone
  *
- * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|conference|peerjs|trystero|nostr|websocket|gun|ably|pubnub]
+ * Usage: PUPPETEER=/path/to/puppeteer-core node test/e2e/phone-session.mjs [simple-peer|conference|peerjs|peerjs-conference|trystero|nostr|websocket|gun|ably|pubnub]
  *   conference runs the simple-peer playground under ConferenceTransport (the same y-webrtc
  *   signaling server): CONFERENCE_EXPECTED=<N> overrides the expected room size, LEAF=1 puts the
  *   PHONE at the edge of the partial mesh (the desktop peers stay relays)
+ *   peerjs-conference runs the PeerJS playground under ConferenceTransport - the partial mesh
+ *   whose rendezvous is a SAMPLE from the coordinator instead of its roster. What only a real
+ *   phone shows here: does it come back to a FRESH sample after a long absence rather than
+ *   re-dialing ids it was handed minutes ago, does it come back in seconds rather than at the
+ *   next heartbeat, and has its own lease run out of the samples while it was away?
  *   peerjs needs a PeerJS server binary: PEERJS_BIN=/path/to/node_modules/.bin/peerjs (npm install peer)
  *   websocket needs a y-websocket style server: WS_SERVER_JS=/path/to/edrys-websocket-server/src/server.js;
  *   its one "link" is the socket to that server
@@ -109,7 +114,16 @@ const BACKENDS = {
   conference: {
     entry: 'test/simple-peer/index.html',
     server: (port) => spawned('node', ['node_modules/y-webrtc/bin/server.js'], { PORT: String(port) }),
-    params: (isPhone) => `&conference=${process.env.CONFERENCE_EXPECTED ?? PEERS + 1}${isPhone && process.env.LEAF ? '&leaf' : ''}`,
+    params: (isPhone) => conferenceParams(isPhone),
+  },
+  // The PeerJS playground under ConferenceTransport: a partial mesh whose rendezvous is
+  // the coordinator's SAMPLE rather than its roster (src/providers/rendezvous.ts).
+  // `&room=`: the peerjs playground falls back to a fixed 'phone-room' without it, and a
+  // live run must not land in the room of an earlier session.
+  'peerjs-conference': {
+    entry: 'test/peerjs/index.html',
+    server: (port) => spawned(process.env.PEERJS_BIN ?? 'peerjs', ['--port', String(port), '--host', '0.0.0.0']),
+    params: (isPhone) => `&room=${ROOM}${conferenceParams(isPhone)}`,
   },
   trystero: {
     entry: 'test/trystero/index.html',
@@ -163,6 +177,23 @@ const LAN_IP =
     .find((a) => a.family === 'IPv4' && !a.internal && !a.address.startsWith('172.'))?.address
 if (!LAN_IP) throw new Error('no LAN address found - pass LAN_IP=')
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * ConferenceTransport builds a dial rule only above 16 EXPECTED peers - below that the
+ * inner transport stays a full mesh and the wrapper relays nothing at all. PEERS is 8 by
+ * default, so `PEERS + 1` alone silently measured a full mesh in every conference run.
+ */
+function conferenceParams(isPhone) {
+  const expected = Number(process.env.CONFERENCE_EXPECTED ?? Math.max(17, PEERS + 1))
+  return `&conference=${expected}${isPhone && process.env.LEAF ? '&leaf' : ''}`
+}
+if (TRANSPORT.includes('conference') && PEERS <= 16 && !process.env.CONFERENCE_EXPECTED) {
+  console.log(
+    `  note: PEERS=${PEERS} is below the 17 the dial rule needs, so the room is told to expect 17.\n` +
+      '        With fewer than 17 REAL peers the mesh is full anyway and the wrapper only saves the\n' +
+      "        typist's uploads - raise PEERS to measure a partial mesh.",
+  )
+}
 
 const t0 = Date.now()
 const timeline = []

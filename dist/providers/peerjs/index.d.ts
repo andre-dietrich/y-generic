@@ -12,18 +12,33 @@
  * - Optional encryption
  * - Automatic reconnection
  *
- * Discovery: the first peer of a room claims the well-known id
- * `yjs-coordinator-<room>` and introduces everybody else (join ->
- * peer-list / peer-joined / peer-left); data flows over the full mesh. When
- * the coordinator goes away the remaining peers elect the lowest id, which
- * claims the coordinator id with a second Peer and switches identity only
- * once the claim succeeded. Known limit: the PeerJS server keeps the
- * registration of a coordinator that went silent (a phone asleep) for up
- * to its alive_timeout (60 s) - the existing mesh keeps working meanwhile,
- * new joiners wait until the id is free. What phones do to this transport,
- * and the repro behind each guard below:
+ * Discovery, FULL MESH (the default): the first peer of a room claims the
+ * well-known id `yjs-coordinator-<room>` and introduces everybody else
+ * (join -> peer-list / peer-joined / peer-left); data flows over the full
+ * mesh. When the coordinator goes away the remaining peers elect the
+ * lowest id, which claims the coordinator id with a second Peer and
+ * switches identity only once the claim succeeded. Known limit: the PeerJS
+ * server keeps the registration of a coordinator that went silent (a phone
+ * asleep) for up to its alive_timeout (60 s) - the existing mesh keeps
+ * working meanwhile, new joiners wait until the id is free. What phones do
+ * to this transport, and the repro behind each guard below:
  * docs/superpowers/specs/2026-09-19-webrtc-mobile-resilience-research.md,
  * test/providers/repro-peerjs-coordinator.ts.
+ *
+ * Discovery, SAMPLED (the `dial` option, or configureSparse from
+ * ConferenceTransport - which is the only thing this mode is for, since
+ * GenericProvider alone needs a full mesh): the coordinator answers a join
+ * with a random SAMPLE of its roster rather than the roster, and the
+ * roster is leases renewed by each peer's next join. Nobody keeps a link
+ * to it: a peer opens a signaling session, takes its sample and closes it
+ * again, coming back to renew - at once when it has no links, in a couple
+ * of seconds while it is short of them, once a minute when it is settled.
+ * The name is held in a SECOND Peer object, so claiming it costs a Peer
+ * instead of every link the claimant has, which is what makes "claim first
+ * and let the server decide" affordable in place of an election over a
+ * complete peer list nobody has any more. The policy that both this and
+ * test/dummy/bench-partial-mesh.ts run is ../rendezvous.ts; the gate is
+ * test/providers/repro-peerjs-sparse.ts.
  *
  * @example
  * ```typescript
@@ -79,16 +94,83 @@ export interface PeerJSTransportOptions {
      */
     password?: string;
     /**
-     * Maximum number of peer connections. GenericProvider needs a FULL mesh
-     * (a peer's broadcast reaches everyone directly, nobody relays): every
-     * peer of the room must fit. A room larger than this loses pairs - they
-     * see neither each other's presence nor each other's edits as they
+     * Maximum number of peer connections. GenericProvider alone needs a FULL
+     * mesh (a peer's broadcast reaches everyone directly, nobody relays):
+     * every peer of the room must fit. A room larger than this loses pairs -
+     * they see neither each other's presence nor each other's edits as they
      * happen. The former default (20-34, y-webrtc's, which relays) cut rooms
      * of 21+ peers: with 25 real browsers one peer ended up with 20 links
      * and missing from four rosters (test/e2e/room-scenarios.mjs).
+     * Under ConferenceTransport (providers/conference), which passes frames
+     * on, this stops being "everybody fits" and becomes what it says - the
+     * hard cap of a PARTIAL mesh (see `dial`).
      * @default 64
      */
     maxConns?: number;
+    /**
+     * A PARTIAL mesh: ask for this many links instead of one to every peer
+     * (see ../dial.ts; the average peer ends up with twice as many, and
+     * `maxConns` stays the hard cap). ONLY under ConferenceTransport
+     * (providers/conference), which passes frames on - GenericProvider alone
+     * needs the full mesh, and a partial one under it does not merely lose
+     * peers, it ERASES presence: a link that drops is reported as a departure.
+     *
+     * It also changes what the coordinator is. It answers a join with a
+     * SAMPLE of the room instead of the roster, it holds its name in a second
+     * Peer object rather than as its identity, and nobody keeps a link to it -
+     * a peer opens a signaling session, takes its sample and closes it again.
+     *
+     * Left undefined, ConferenceTransport's `expectedPeers` decides: a full
+     * mesh up to 16 peers, ln(N) links (at least 4) beyond.
+     * @default undefined (full mesh)
+     */
+    dial?: number;
+    /**
+     * With `dial`: never dial a peer that announces itself, and never be
+     * handed out in somebody else's sample - a leaf that holds the links it
+     * asked for and nobody else's (a phone). It is also never a successor: a
+     * page that sleeps must not be the room's coordinator.
+     * ConferenceTransport sets it from its `relay: false`.
+     * @default false
+     */
+    passive?: boolean;
+    /**
+     * With `dial`: how often (ms) a peer re-opens its session to the
+     * coordinator to renew its roster entry. The coordinator may ask for a
+     * LONGER interval (it divides its roster by `coordinatorSessionsPerSec`),
+     * never a shorter one, and each peer jitters what it was told by +-25 %.
+     * The lease is 2.5x the interval the coordinator asked for, so an entry
+     * survives one missed renewal. Shorter: fewer ghosts in a sample, more
+     * handshakes on the coordinator.
+     * @default 60000
+     */
+    coordinatorRenewMs?: number;
+    /**
+     * With `dial`: how many signaling sessions per second the coordinator is
+     * willing to handle; it paces its clients' renewals to stay under it (a
+     * roster of 300 at 2/s is told to renew every 150 s). Every session is a
+     * full ICE handshake, and the coordinator is a browser tab that is also
+     * an ordinary peer of the room.
+     * @default 2
+     */
+    coordinatorSessionsPerSec?: number;
+    /**
+     * With `dial`: a sample holds this many times the links that were asked
+     * for. Not dial.ts's 1.3, which covers a dice roll - this covers GHOSTS:
+     * the roster is leases, and an entry outlives a killed tab by up to one.
+     * What is not dialed right away is kept in reserve, so replacing a link
+     * that died usually costs no round trip to the coordinator at all.
+     * @default 2
+     */
+    sampleOversample?: number;
+    /**
+     * With `dial`: how long (ms) a signaling session stays open after its
+     * sample has arrived. Joiners that overlap in this window hear each
+     * other's `peer-joined` - the only announcement a coordinator that holds
+     * no links can make.
+     * @default 2000
+     */
+    sessionLingerMs?: number;
     /**
      * How long (ms) a data connection may take to open. An entry that is not
      * open by then is dropped (and re-dialed while the peer is still known) -
@@ -157,6 +239,22 @@ export declare class PeerJSTransport implements Transport {
     private _stopNetworkChangeWatch?;
     private _stopPageWatch?;
     private _replacingPeer?;
+    private _sparse?;
+    private _passive;
+    private _roomSize;
+    private _sawRoomSize;
+    private _reserve;
+    private _redials;
+    private _successors;
+    private _renewMs;
+    private _roster;
+    private _rosterSweep?;
+    private _sessions;
+    private _session?;
+    private _sessionState;
+    private _sessionTimer?;
+    private _sessionFails;
+    private _sidecar?;
     /**
      * Create a new PeerJS transport.
      *
@@ -214,6 +312,24 @@ export declare class PeerJSTransport implements Transport {
      * disconnect is immediate anyway.
      */
     private reconnectNow;
+    /**
+     * ConferenceTransport, once, before connect(): how big the room is expected to be,
+     * and whether we are a leaf. Above 16 expected peers this stops being a full mesh.
+     *
+     * A partial mesh without that wrapper above is not merely incomplete, it ERASES
+     * presence - a dropped link is reported to GenericProvider as a departure, which
+     * drops that peer's awareness and broadcasts a removal. Hence the warning below:
+     * setRoomSize() is called by ConferenceTransport and by nothing else.
+     */
+    configureSparse(options: {
+        dial?: number;
+        expectedPeers?: number;
+        passive?: boolean;
+    }): void;
+    /** The room size ConferenceTransport has counted - origins heard, not the expected size. */
+    setRoomSize(peers: number): void;
+    /** A partial mesh that nobody relays for: say so, loudly, once. */
+    private warnIfUnwrapped;
     /** The server accepted us (again): re-open what the outage cost. */
     private onSignalingReopened;
     /**
@@ -277,6 +393,62 @@ export declare class PeerJSTransport implements Transport {
      * The coordinator already exists because we failed to claim its ID.
      */
     private setupCrossBrowserDiscovery;
+    /** Open a session to the coordinator, unless one is already in flight. */
+    private openSession;
+    /** The sample is in (or the linger is over): close it and come back later. */
+    private endSession;
+    private clearSessionTimer;
+    /**
+     * When to go back. Not a fixed period: a peer that has its links needs the coordinator
+     * only to renew its lease, but one with NO links needs an id right now.
+     */
+    private armHeartbeat;
+    /**
+     * Nobody answers at the room's name. Claim it - the claim is its own probe, the server
+     * hands the name to exactly one and answers everybody else 'unavailable-id'. The delay
+     * comes from the successor chain of our last sample, so in the common case exactly one
+     * peer claims within a few hundred ms and the rest never try at all.
+     */
+    private coordinatorUnreachable;
+    /**
+     * Claim the room's name in a SECOND Peer object. Our own identity, our links and our
+     * place in the mesh are untouched by this - which is what makes "claim first, ask
+     * questions later" affordable. A failed claim costs one destroyed Peer and nothing else.
+     */
+    private claimSidecar;
+    /** Coordinator side: somebody opened a signaling session with us. */
+    private onSession;
+    /** What we ask the coordinator for. Under a sample it says how short we are. */
+    private joinMessage;
+    /** Links that count towards the dial rule - never the coordinator's, which is signaling. */
+    private linkCount;
+    /** Roster entries whose lease still runs. */
+    private liveRoster;
+    /**
+     * A peer asked to join a sampled room. It gets a SAMPLE, not the roster - that is the
+     * whole point: a peer list of 300 is a full mesh with extra steps.
+     */
+    private answerSparseJoin;
+    /**
+     * Tell a few of the room about a joiner. Capped and random: the full mesh tells
+     * everybody, which is one message per peer per join, and every one of them a dial.
+     */
+    private announceJoiner;
+    /** We hold the room's name: seed the roster from what we have seen, and age it. */
+    private startSparseRoster;
+    /**
+     * Ids the coordinator handed us: dial what we are short of, keep the rest in reserve.
+     *
+     * Shuffled even when the list arrives whole (an older coordinator, or a room below the
+     * sparse threshold): taking the first few of a Set means taking whoever joined first,
+     * and a partial mesh whose links all point at the room's oldest peers has no better
+     * diameter than y-webrtc's chain (../dial.ts).
+     */
+    private absorbSample;
+    /** Dial out of the reserve until we have the links we asked for. */
+    private drainReserve;
+    /** Short of links: the reserve first, and only then the coordinator. */
+    private maybeRefill;
     /**
      * Handle messages from coordinator (when we're a regular peer).
      */

@@ -120,6 +120,9 @@ export class IndexedDBTransport implements Transport {
   private _isConnected: boolean = false
   private updateCount: number = 0
   private isLoading: boolean = false
+  // One auto-compaction at a time: the row count drops only when it is done,
+  // and every row stored meanwhile queued another merge of the whole store.
+  private compacting: Promise<void> | null = null
 
   constructor(options: IndexedDBTransportOptions = {}) {
     this.options = {
@@ -284,10 +287,10 @@ export class IndexedDBTransport implements Transport {
         this.log('Stored update, count:', this.updateCount)
 
         // Check if we need to compact
-        if (this.shouldCompact()) {
-          this.compact().catch((err) => {
-            this.log('Compaction failed:', err)
-          })
+        if (this.shouldCompact() && !this.compacting) {
+          this.compacting = this.compact()
+            .catch((err) => this.log('Compaction failed:', err))
+            .finally(() => (this.compacting = null))
         }
       }
 

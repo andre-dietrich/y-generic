@@ -56,6 +56,9 @@ export class IndexedDBTransport {
         this._isConnected = false;
         this.updateCount = 0;
         this.isLoading = false;
+        // One auto-compaction at a time: the row count drops only when it is done,
+        // and every row stored meanwhile queued another merge of the whole store.
+        this.compacting = null;
         this.options = {
             prefix: options.prefix ?? 'yjs',
             version: options.version ?? 1,
@@ -186,10 +189,10 @@ export class IndexedDBTransport {
                 this.updateCount++;
                 this.log('Stored update, count:', this.updateCount);
                 // Check if we need to compact
-                if (this.shouldCompact()) {
-                    this.compact().catch((err) => {
-                        this.log('Compaction failed:', err);
-                    });
+                if (this.shouldCompact() && !this.compacting) {
+                    this.compacting = this.compact()
+                        .catch((err) => this.log('Compaction failed:', err))
+                        .finally(() => (this.compacting = null));
                 }
             };
             request.onerror = () => {

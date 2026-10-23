@@ -66,6 +66,7 @@
     "test/supabase/repro-persistent.ts",
     "test/providers/repro-simple-peer-chunks.ts",
     "test/providers/repro-conference-reconnect.ts",
-    "test/providers/check-dummy.ts"
+    "test/providers/check-dummy.ts",
+    "test/providers/repro-indexeddb-compact.ts"
   ]
 }

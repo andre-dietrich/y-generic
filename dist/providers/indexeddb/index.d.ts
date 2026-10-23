@@ -98,6 +98,7 @@ export declare class IndexedDBTransport implements Transport {
     private _isConnected;
     private updateCount;
     private isLoading;
+    private compacting;
     constructor(options?: IndexedDBTransportOptions);
     /**
      * Log debug messages if debug mode is enabled.

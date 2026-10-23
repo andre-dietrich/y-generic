@@ -189,3 +189,12 @@ without a measurement.
   disconnect(). Test memory only.
 - **`autoConnect` does not connect.** It only warns when a send is dropped;
   the doc says so now. Removing the option would break callers that pass it.
+
+## IndexedDB
+
+- **Nothing to flush on unload.** send() starts its IndexedDB transaction in
+  the calling task, which a browser normally commits after the page is gone;
+  not checked against a real unloading page.
+- **Compaction reads the whole store.** One getAll and mergeUpdates over every
+  row per compaction; with the guard that is once per threshold, fine for
+  documents of a few MB, not measured beyond.

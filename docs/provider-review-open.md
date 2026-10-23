@@ -75,3 +75,21 @@ matters, what a fix would take.
   removal - is small, so nothing lost today.
 - **Not run live.** The gate uses a scripted PubNub; `room-scenarios.mjs
   pubnub` against the real service was not run for this review.
+
+## Supabase
+
+- **No `sealFrame`.** Behind an encrypting wrapper (LiaScript's password rooms)
+  the stored row is the document in the clear, and the frame delivered on
+  load is one the wrapper cannot open - the bug Nostr and Ably had (their part
+  4/scenario 4). No user of Supabase behind such a wrapper was found locally;
+  fix as in Ably if one appears (store the sealed frame, marked in `content`).
+- **Concurrent writers.** One row per room, every editing peer upserts its
+  whole document: last write wins, so a concurrent edit the last writer had
+  not received yet is missing until the next write. Not torn (one row, one
+  write), unlike Ably's chunks.
+- **The unload write is a plain fetch.** flush() starts the upsert in the
+  unloading task, but supabase-js sets no `keepalive`; a browser may cancel it
+  with the page (PubNub needed a keepalive copy for that). Nostr and Ably
+  have the same open question.
+- **Not run live.** The new gate (test/supabase/repro-persistent.ts) uses a
+  scripted supabase-js; test/supabase/live-presence.mjs was not rerun.

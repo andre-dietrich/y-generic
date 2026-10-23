@@ -37,8 +37,8 @@ export interface SupabaseConfig extends ConnectionConfig {
      * after every document update. Needs a table with columns `id TEXT
      * PRIMARY KEY`, `content TEXT` (see the README for the SQL and the RLS
      * policy the anon key needs). Not usable together with
-     * `compressionThresholdBytes` (this transport reads the frame's type
-     * byte at a fixed offset). @default false
+     * `compressionThresholdBytes` (send() strips the CRC32 header at a fixed
+     * offset). @default false
      */
     persistent?: boolean;
     /** The Y.Doc to persist. Required when persistent is true. */
@@ -47,6 +47,12 @@ export interface SupabaseConfig extends ConnectionConfig {
     tableName?: string;
     /** Debounce delay in ms before a database write. @default 2000 */
     persistDebounceMs?: number;
+    /**
+     * The longest a change waits for its write while the debounce keeps being
+     * restarted - by somebody who types: nothing was written for as long as
+     * that went on (test/supabase/repro-persistent.ts, part 4). @default 10000
+     */
+    persistMaxWaitMs?: number;
     /** Enable debug logging */
     debug?: boolean;
 }
@@ -90,10 +96,19 @@ export declare class SupabaseTransport implements Transport {
     private doc;
     private tableName;
     private persistDebounceMs;
+    private persistMaxWaitMs;
+    private persistPendingSince;
     private persistTimer?;
     private isWritingToDb;
     private savePending;
     private pendingLoad;
+    /**
+     * A write is for a change made HERE (a local transaction); a change applied
+     * from the room is its author's to write. Told from send()'s frame before:
+     * every digest beacon wrote the whole document, in a room nobody edits, from
+     * every peer (test/supabase/repro-persistent.ts, parts 1 and 2).
+     */
+    private _onDocUpdate;
     constructor(options: SupabaseTransportOptions);
     get isConnected(): boolean;
     connect(config: SupabaseConfig): Promise<void>;
@@ -111,7 +126,14 @@ export declare class SupabaseTransport implements Transport {
      * flip (a stored copy says nothing about who is online).
      */
     private loadFromDatabase;
+    /** Debounced, but never beyond persistMaxWaitMs after the oldest change. */
     private queuePersist;
+    /**
+     * Transport.flush: the page is unloading. A write still in its debounce
+     * goes now - its request leaves in this task; a page that goes runs no
+     * further timer (test/supabase/repro-persistent.ts, part 3).
+     */
+    flush(): void;
     /** Upsert the full current state; a write that overlaps a change re-runs once. */
     private saveToDatabase;
     private handleMessage;

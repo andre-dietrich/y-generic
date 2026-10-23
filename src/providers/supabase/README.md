@@ -89,12 +89,15 @@ await provider.connect({
   password: 'optional-secret', // optional; hashed into the row id
   tableName: 'yjs_documents', // default
   persistDebounceMs: 2000, // default
+  persistMaxWaitMs: 10000, // default: a change waits no longer, however often the debounce restarts
 })
 
 // On connect the stored state is applied like a peer's full-state push;
-// every document update schedules a debounced write of the full state
-// (one row per room); disconnect() flushes a pending write. Not usable
-// together with compressionThresholdBytes.
+// every LOCAL document change schedules a debounced write of the full state
+// (one row per room) - a change from the room is its author's to write, and a
+// quiet room writes nothing. disconnect() and the page's unload (flush())
+// write a pending change at once. Not usable together with
+// compressionThresholdBytes.
 ```
 
 ### With Password Protection
@@ -124,6 +127,7 @@ interface SupabaseConfig {
   doc?: Y.Doc                // The Y.Doc to persist (required with persistent)
   tableName?: string         // Table name (default: 'yjs_documents')
   persistDebounceMs?: number // Debounce delay for DB writes (default: 2000)
+  persistMaxWaitMs?: number  // Longest wait for a write while edits keep coming (default: 10000)
   debug?: boolean            // Enable debug logging
 }
 ```
@@ -139,10 +143,10 @@ interface SupabaseConfig {
 ### Persistent Mode
 1. Connects to Supabase Realtime channel
 2. Loads initial document state from database (if exists)
-3. Broadcasts updates to peers AND queues for database
-4. Debounces database writes to reduce load
+3. Broadcasts updates to peers; a local change also queues a database write
+4. Debounces database writes to reduce load (at most `persistMaxWaitMs` late)
 5. Retries failed database operations automatically
-6. On disconnect, flushes pending updates to database
+6. On disconnect and on the page's unload, writes a pending change at once
 
 ## Error Handling
 

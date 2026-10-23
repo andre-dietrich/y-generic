@@ -3,8 +3,7 @@ import * as encoding from 'lib0/encoding'
 import type { Transport, ConnectionConfig } from '../../transport'
 import { splitChunks, isChunk, ChunkAssembler } from '../chunking'
 
-// GenericProvider's frame types this transport looks at (see src/index.ts).
-const MESSAGE_AWARENESS = 1
+// GenericProvider's full-state push frame (see src/index.ts).
 const MESSAGE_SYNC_PUSH = 6
 
 // Realtime caps a broadcast at 256 KB on the free tier (3 MB above). Below
@@ -113,8 +112,8 @@ export interface SupabaseConfig extends ConnectionConfig {
    * after every document update. Needs a table with columns `id TEXT
    * PRIMARY KEY`, `content TEXT` (see the README for the SQL and the RLS
    * policy the anon key needs). Not usable together with
-   * `compressionThresholdBytes` (this transport reads the frame's type
-   * byte at a fixed offset). @default false
+   * `compressionThresholdBytes` (send() strips the CRC32 header at a fixed
+   * offset). @default false
    */
   persistent?: boolean
   /** The Y.Doc to persist. Required when persistent is true. */
@@ -123,6 +122,12 @@ export interface SupabaseConfig extends ConnectionConfig {
   tableName?: string
   /** Debounce delay in ms before a database write. @default 2000 */
   persistDebounceMs?: number
+  /**
+   * The longest a change waits for its write while the debounce keeps being
+   * restarted - by somebody who types: nothing was written for as long as
+   * that went on (test/supabase/repro-persistent.ts, part 4). @default 10000
+   */
+  persistMaxWaitMs?: number
   /** Enable debug logging */
   debug?: boolean
 }
@@ -180,11 +185,23 @@ export class SupabaseTransport implements Transport {
   private doc: Y.Doc | null = null
   private tableName: string = 'yjs_documents'
   private persistDebounceMs: number = 2000
+  private persistMaxWaitMs: number = 10000
+  // When the oldest change the pending write is for was made; 0 = none pending
+  private persistPendingSince = 0
   private persistTimer?: ReturnType<typeof setTimeout>
   private isWritingToDb: boolean = false
   private savePending: boolean = false
   // State loaded from the table before GenericProvider registered onMessage
   private pendingLoad: Uint8Array | null = null
+  /**
+   * A write is for a change made HERE (a local transaction); a change applied
+   * from the room is its author's to write. Told from send()'s frame before:
+   * every digest beacon wrote the whole document, in a room nobody edits, from
+   * every peer (test/supabase/repro-persistent.ts, parts 1 and 2).
+   */
+  private _onDocUpdate = (_u: Uint8Array, _o: unknown, _d: Y.Doc, tr: Y.Transaction): void => {
+    if (tr.local) this.queuePersist()
+  }
 
   constructor(private readonly options: SupabaseTransportOptions) {}
 
@@ -210,6 +227,7 @@ export class SupabaseTransport implements Transport {
     this.doc = config.doc ?? null
     this.tableName = config.tableName ?? 'yjs_documents'
     this.persistDebounceMs = config.persistDebounceMs ?? 2000
+    this.persistMaxWaitMs = config.persistMaxWaitMs ?? 10000
     if (this.persistentMode && !this.doc) {
       throw new Error(
         'SupabaseTransport: a Y.Doc must be provided via config.doc when persistent is true',
@@ -278,7 +296,10 @@ export class SupabaseTransport implements Transport {
       })
     })
 
-    if (this.persistentMode) await this.loadFromDatabase()
+    if (this.persistentMode) {
+      await this.loadFromDatabase()
+      this.doc!.on('update', this._onDocUpdate)
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -288,6 +309,7 @@ export class SupabaseTransport implements Transport {
       clearTimeout(this.persistTimer)
       this.persistTimer = undefined
     }
+    this.doc?.off('update', this._onDocUpdate)
     if (this.persistentMode && this.doc) {
       try {
         await this.saveToDatabase()
@@ -306,6 +328,7 @@ export class SupabaseTransport implements Transport {
     this.config = null
     this.messageCallback = undefined
     this.pendingLoad = null
+    this.persistPendingSince = 0
   }
 
   send(data: Uint8Array): void {
@@ -316,11 +339,6 @@ export class SupabaseTransport implements Transport {
 
     // Strip CRC32 header before sending
     const payload = stripCRC32Header(data)
-
-    // Only document updates schedule a database write, not presence
-    if (this.persistentMode && payload[0] !== MESSAGE_AWARENESS) {
-      this.queuePersist()
-    }
 
     if (payload.length <= MAX_BINARY_BYTES) {
       // Binary broadcast: no base64 (33 % smaller on the wire)
@@ -403,9 +421,30 @@ export class SupabaseTransport implements Transport {
     }
   }
 
+  /** Debounced, but never beyond persistMaxWaitMs after the oldest change. */
   private queuePersist(): void {
+    const now = Date.now()
+    if (!this.persistPendingSince) this.persistPendingSince = now
     if (this.persistTimer) clearTimeout(this.persistTimer)
-    this.persistTimer = setTimeout(() => this.saveToDatabase(), this.persistDebounceMs)
+    this.persistTimer = setTimeout(
+      () => {
+        this.persistTimer = undefined
+        this.saveToDatabase()
+      },
+      Math.max(0, Math.min(this.persistDebounceMs, this.persistPendingSince + this.persistMaxWaitMs - now)),
+    )
+  }
+
+  /**
+   * Transport.flush: the page is unloading. A write still in its debounce
+   * goes now - its request leaves in this task; a page that goes runs no
+   * further timer (test/supabase/repro-persistent.ts, part 3).
+   */
+  flush(): void {
+    if (!this.persistTimer) return
+    clearTimeout(this.persistTimer)
+    this.persistTimer = undefined
+    void this.saveToDatabase()
   }
 
   /** Upsert the full current state; a write that overlaps a change re-runs once. */
@@ -417,6 +456,7 @@ export class SupabaseTransport implements Transport {
     }
     this.isWritingToDb = true
     this.savePending = false
+    this.persistPendingSince = 0
     try {
       const state = Y.encodeStateAsUpdate(this.doc)
       const { error } = await this.supabase.from(this.tableName).upsert({

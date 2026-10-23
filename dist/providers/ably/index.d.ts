@@ -174,7 +174,7 @@ export declare class AblyTransport implements Transport {
     private _stopPageWatch?;
     private _pageBackAt;
     private messageBuffer;
-    private chunkBuffer;
+    private chunks;
     private persistentMode;
     private persistDoc;
     private persistDebounceMs;
@@ -242,7 +242,6 @@ export declare class AblyTransport implements Transport {
      * partial data is worse than none.
      */
     private loadSnapshot;
-    private sendChunked;
     /**
      * Publish, and publish again what Ably REFUSED: over the channel's message
      * rate (free tier: 50/s) it rejects the publish - 42913 "Rate limit
@@ -258,7 +257,6 @@ export declare class AblyTransport implements Transport {
      * before (a dropped connection: the provider's reconnect sync covers it).
      */
     private _publish;
-    private handleChunkedMessage;
     private handleMessage;
     private deliver;
     /**

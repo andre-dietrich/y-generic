@@ -42,6 +42,7 @@
 import * as encoding from 'lib0/encoding';
 import * as syncProtocol from 'y-protocols/sync';
 import { watchPageBack } from '../resume';
+import { splitChunks, isChunk, ChunkAssembler } from '../chunking';
 // ---------------------------------------------------------------------------
 // CRC32 translation helpers
 //
@@ -151,7 +152,7 @@ export class AblyTransport {
         this.debug = false;
         this._pageBackAt = 0;
         this.messageBuffer = [];
-        this.chunkBuffer = new Map();
+        this.chunks = new ChunkAssembler();
         // No preferredCompressMinBytes: this transport strips the CRC32 header
         // and synthesizes frames from persisted snapshots, both of which assume
         // the uncompressed frame layout (see compressionThresholdBytes).
@@ -289,6 +290,7 @@ export class AblyTransport {
             });
             this.client.connection.on('failed', (stateChange) => {
                 clearTimeout(timeout);
+                this._isConnected = false; // ably-js gives up for good (repro-ably-lifecycle part 11)
                 reject(new Error(`Ably connection failed: ${stateChange?.reason?.message ?? 'unknown error'}`));
             });
             this.client.connection.on('suspended', () => {
@@ -417,7 +419,7 @@ export class AblyTransport {
         this._isConnected = false;
         this.messageCallback = undefined;
         this.messageBuffer = [];
-        this.chunkBuffer.clear();
+        this.chunks.clear();
         this.persistentMode = false;
         this.persistDoc = null;
         this.persistPendingSince = 0;
@@ -432,8 +434,10 @@ export class AblyTransport {
         }
         const payload = stripCRC32Header(data);
         const base64Data = uint8ToBase64(payload);
+        // Above Ably's message size: one message per chunk.
         if (base64Data.length > MAX_MESSAGE_SIZE) {
-            this.sendChunked(base64Data, payload.length);
+            for (const chunk of splitChunks(base64Data, MAX_MESSAGE_SIZE))
+                this._publish(chunk);
         }
         else {
             this._publish(base64Data);
@@ -600,17 +604,6 @@ export class AblyTransport {
     // ---------------------------------------------------------------------------
     // Private helpers
     // ---------------------------------------------------------------------------
-    sendChunked(base64Data, originalSize) {
-        const chunkId = generateUUID();
-        const chunks = [];
-        for (let i = 0; i < base64Data.length; i += MAX_MESSAGE_SIZE) {
-            chunks.push(base64Data.slice(i, i + MAX_MESSAGE_SIZE));
-        }
-        this.log(`Splitting ${originalSize} bytes into ${chunks.length} chunks (id: ${chunkId.slice(0, 8)}...)`);
-        chunks.forEach((chunk, index) => {
-            this._publish({ chunked: true, id: chunkId, index, total: chunks.length, data: chunk });
-        });
-    }
     /**
      * Publish, and publish again what Ably REFUSED: over the channel's message
      * rate (free tier: 50/s) it rejects the publish - 42913 "Rate limit
@@ -643,44 +636,16 @@ export class AblyTransport {
             }, delay);
         });
     }
-    handleChunkedMessage(message, from) {
-        const { id, index, total, data } = message;
-        if (!this.chunkBuffer.has(id)) {
-            this.chunkBuffer.set(id, new Map());
-        }
-        const chunks = this.chunkBuffer.get(id);
-        chunks.set(index, data);
-        if (chunks.size !== total)
-            return;
-        let base64Data = '';
-        for (let i = 0; i < total; i++) {
-            const chunk = chunks.get(i);
-            if (!chunk) {
-                this.log(`Missing chunk ${i}, cannot reassemble message ${id}`);
-                this.chunkBuffer.delete(id);
-                return;
-            }
-            base64Data += chunk;
-        }
-        this.chunkBuffer.delete(id);
-        try {
-            const raw = base64ToUint8(base64Data);
-            this.deliver(addCRC32Header(raw), from);
-        }
-        catch (error) {
-            this.log('Error reassembling chunked message:', error);
-        }
-    }
     handleMessage(data, from) {
         try {
-            if (data && typeof data === 'object' && data.chunked) {
-                this.handleChunkedMessage(data, from);
-                return;
+            if (isChunk(data)) {
+                data = this.chunks.push(data);
+                if (data === null)
+                    return; // more to come
             }
             if (typeof data !== 'string')
                 return;
-            const raw = base64ToUint8(data);
-            this.deliver(addCRC32Header(raw), from);
+            this.deliver(addCRC32Header(base64ToUint8(data)), from);
         }
         catch (error) {
             this.log('Error handling message:', error);

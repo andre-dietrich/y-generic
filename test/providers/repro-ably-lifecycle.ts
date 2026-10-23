@@ -57,6 +57,12 @@
  *           OUTAGE_MS). The transport passes 5 s (-> at most 10 s, the WebSocket
  *           transport's cap) and a suspended retry of 10 s instead of 30 s -
  *           and what the config says, if it says so.
+ *  Part 10 - a frame above Ably's message size goes as chunks and arrives whole,
+ *           whatever order they come in (src/providers/chunking.ts - the same
+ *           envelope as before, so older peers in the room still read it).
+ *  Part 11 - 'failed' after the connection was up (a token that can no longer
+ *           be renewed): isConnected goes false, the provider stops sending
+ *           into a dead connection.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/providers/repro-ably-lifecycle.js
  * Exit code 1 if a part fails.
@@ -71,6 +77,8 @@ class ScriptedRealtime {
   refusePublishes = 0 // the next n publish() calls are refused
   refused = 0
   published = 0
+  sent: any[] = []
+  subscriber?: (m: { data: any; clientId?: string }) => void
   enters = 0
   entered = false
   private handlers = new Map<string, Cb[]>()
@@ -90,14 +98,15 @@ class ScriptedRealtime {
   }
   channels = {
     get: () => ({
-      subscribe: () => {},
+      subscribe: (cb: any) => void (this.subscriber = cb),
       unsubscribe: () => {},
-      publish: async () => {
+      publish: async (_name: string, data: any) => {
         if (this.refusePublishes-- > 0) {
           this.refused++
           throw Object.assign(new Error('Rate limit exceeded; request rejected (nonfatal); metric = channel.maxRate'), { code: 42913, statusCode: 429 })
         }
         this.published++
+        this.sent.push(data)
       },
       detach: async () => {},
       presence: {
@@ -206,6 +215,23 @@ async function main(): Promise<void> {
     d.disconnectedRetryTimeout === 5000 && d.suspendedRetryTimeout === 10000 && o.disconnectedRetryTimeout === 2000 && o.suspendedRetryTimeout === 7000,
   ])
   await own.disconnect()
+
+  const big = new AblyTransport({ Realtime: ScriptedRealtime as any })
+  await big.connect({ room: 'repro', apiKey: 'x.y:z' } as any)
+  const b = ScriptedRealtime.last
+  const payload = Uint8Array.from({ length: 150000 }, () => Math.floor(Math.random() * 256))
+  const received: Uint8Array[] = []
+  big.onMessage((data) => received.push(data))
+  big.send(new Uint8Array([0, 0, 0, 0, ...payload]))
+  await new Promise((r) => setTimeout(r, 10))
+  const parts = b.sent.length
+  for (const data of [...b.sent].reverse()) b.subscriber!({ data, clientId: 'another-peer' })
+  const whole = received.length === 1 && received[0].length === payload.length + 4 && received[0].subarray(4).every((x, i) => x === payload[i])
+  results.push([`10 150 KB frame: ${parts} publishes (want > 1), delivered ${received.length} frame(s), whole ${whole} (want 1, true)`, parts > 1 && whole])
+
+  b.emit('failed')
+  results.push([`11 'failed' after connected: isConnected ${big.isConnected} (want false)`, !big.isConnected])
+  await big.disconnect()
 
   for (const [line, ok] of results) console.log(`${ok ? 'ok  ' : 'FAIL'} ${line}`)
   await transport.disconnect()

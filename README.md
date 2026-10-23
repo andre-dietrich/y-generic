@@ -216,7 +216,7 @@ class GenericProvider extends Observable<string> {
     trickleK?: number         // Skip a periodic beacon when this many equal digests were overheard since the last one (default: 1, 0 = off)
     awarenessTimeoutMs?: number // Presence lease; renew after half of it (default: 30000, or 300000 when the transport has onPeerDisconnect)
     verifyUpdates?: boolean   // Send hash with each update for fast desync detection (default: true)
-    batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = end of the current task, recommended: 50-200)
+    batchUpdates?: number     // Send updates at most this many ms after the first unsent one (default: 0 = end of the current task, recommended: 50-200)
   })
   
   connect(config: ConnectionConfig): Promise<void>
@@ -544,20 +544,20 @@ flight). `idleBackoffEnabled: false` keeps the fixed cadence.
 > has been the case since message batching landed and is not new to the
 > digest format.
 
-### Update Batching (Debouncing)
+### Update Batching
 
 By default, every document change is sent at the end of the task that
 produced it (a microtask, no timer): the several Yjs transactions one
 input event can produce leave as one message, and the cursor update an
 editor binding sets right after the text change rides in the same wire
 message - one keystroke, one message. For further reduction you can
-enable **update batching** (also called **debouncing**):
+enable **update batching**:
 
 ```typescript
 // Default behavior - send updates immediately
 const provider = new GenericProvider(doc, transport)
 
-// Batch updates: collect changes and send after 100ms of inactivity
+// Batch updates: collect changes and send them 100ms after the first one
 const provider = new GenericProvider(doc, transport, {
   batchUpdates: 100, // milliseconds
 })
@@ -565,7 +565,8 @@ const provider = new GenericProvider(doc, transport, {
 
 **How it works:**
 1. User types "hello" (5 keystrokes)
-2. Instead of 5 separate network messages, wait 100ms after last keystroke
+2. Instead of 5 separate network messages, wait 100ms after the first keystroke
+   (never longer: someone typing or drawing without a pause still sends every 100ms)
 3. Send **one combined update** containing all changes
 4. Result: 1 message instead of 5
 

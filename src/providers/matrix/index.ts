@@ -53,7 +53,7 @@ export class MatrixTransport implements Transport {
   /**
    * Every send() is its own HTTP PUT request with no internal coalescing —
    * unlike push-style transports, there's no cheaper round trip to lose by
-   * batching. Recommends GenericProvider debounce rapid edits by default.
+   * batching. Recommends GenericProvider batch rapid edits by default.
    */
   // Synapse's default rc_message is 0.2 messages/s per user with a burst of
   // 10: at 150 ms batches and 100 ms awareness a typing peer was

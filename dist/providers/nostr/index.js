@@ -184,7 +184,7 @@ export class NostrTransport {
     constructor(opts) {
         /**
          * Every send() signs and publishes its own event to every configured
-         * relay with no internal coalescing. Recommends GenericProvider debounce
+         * relay with no internal coalescing. Recommends GenericProvider batch
          * rapid edits by default to cut down on signing overhead and relay
          * round trips.
          */

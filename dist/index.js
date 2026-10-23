@@ -592,7 +592,7 @@ export class GenericProvider extends Observable {
         // positives from mere network reordering. See _trackRemoteSeq().
         this._remoteSeqInfo = new Map();
         this._gapCheckTimers = new Map();
-        // Update batching/debouncing. `_batchUpdates` 0 (the default) no longer
+        // Update batching. `_batchUpdates` 0 (the default) no longer
         // means a synchronous send from inside the Y.Doc 'update' event: the
         // update is merged into `_pendingUpdate` and flushed at the end of the
         // current task (a microtask - no timer, no measurable delay), so that
@@ -1436,7 +1436,7 @@ export class GenericProvider extends Observable {
     /**
      * Setup automatic document synchronization.
      * Listens to document updates and sends them to the transport.
-     * If batchUpdates is enabled, updates are debounced/batched.
+     * If batchUpdates is enabled, updates are batched.
      */
     _setupDocumentSync() {
         this._updateHandler = (update, origin) => {
@@ -1461,7 +1461,7 @@ export class GenericProvider extends Observable {
     }
     /**
      * Merge a local update into the pending batch and schedule its flush:
-     * after `batchUpdates` ms (debounced) when that is > 0, otherwise at the
+     * `batchUpdates` ms after the first pending update when that is > 0, otherwise at the
      * end of the current task via queueMicrotask - see `_pendingUpdate`.
      */
     _batchUpdate(update) {
@@ -1483,13 +1483,16 @@ export class GenericProvider extends Observable {
             this._pendingUpdate = update;
         }
         if (this._batchUpdates > 0) {
-            // Debounce: restart the timer on every update.
-            if (this._batchTimeoutId !== undefined)
-                clearTimeout(this._batchTimeoutId);
-            this._batchTimeoutId = setTimeout(() => {
-                this._batchTimeoutId = undefined;
-                this._flushPendingUpdate();
-            }, this._batchUpdates);
+            // At most `batchUpdates` ms after the FIRST pending update: a debounce
+            // never fired while updates came faster than that - 20 pages drawing
+            // on Nostr (150 ms) delivered nothing until they stopped
+            // (test/dummy/bench-batch-maxwait.ts).
+            if (this._batchTimeoutId === undefined) {
+                this._batchTimeoutId = setTimeout(() => {
+                    this._batchTimeoutId = undefined;
+                    this._flushPendingUpdate();
+                }, this._batchUpdates);
+            }
             this._flushScheduled = true;
             return;
         }

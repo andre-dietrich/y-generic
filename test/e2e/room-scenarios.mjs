@@ -653,7 +653,7 @@ async function main() {
 
   // One console line per refused send: ably-js reports each as Protocol.onNack, the
   // PubNub transport logs its failed publishes itself.
-  const refused = (p) => p.logs.filter((l) => /Protocol\.onNack|\[PubNubTransport\] ❌/.test(l)).length
+  const refused = (p) => p.logs.filter((l) => /Protocol\.onNack|\[(PubNub|Nostr)Transport\] ❌/.test(l)).length
 
   let serial = 0
   let firefoxPeers = 0
@@ -1548,7 +1548,7 @@ async function main() {
     // ... and what they were: one line per kind (timestamps and numbers stripped), with its count.
     const kinds = new Map()
     for (const p of peers)
-      for (const l of p.logs.filter((l) => /Protocol\.onNack|\[PubNubTransport\] ❌/.test(l))) {
+      for (const l of p.logs.filter((l) => /Protocol\.onNack|\[(PubNub|Nostr)Transport\] ❌/.test(l))) {
         const k = l.slice(10, 170).replace(/\d+/g, '#')
         kinds.set(k, (kinds.get(k) ?? 0) + 1)
       }

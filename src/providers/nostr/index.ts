@@ -721,8 +721,10 @@ export class NostrTransport implements Transport {
         this.secretKey,
       )
 
-      // Publish to all relays; ignore individual relay errors
-      await Promise.allSettled(this.pool.publish(this.relays, event))
+      // Publish to all relays; one that refuses (rate-limited, blocked) is not the caller's error
+      const results = await Promise.allSettled(this.pool.publish(this.relays, event))
+      if (this._debug)
+        results.forEach((r, i) => r.status === 'rejected' && console.warn(`[NostrTransport] ❌ ${this.relays[i]} refused: ${r.reason}`))
     }
   }
 

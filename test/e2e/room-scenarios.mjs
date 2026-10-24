@@ -9,6 +9,8 @@
  *              until a text typed by one peer is in every editor.
  *  typing      5 peers type at the same time, 12 characters each. Until all N
  *              editors hold all 60 characters and are identical.
+ *  pubsub      three peers publish on provider.pubsub (one message 50 KB: chunked
+ *              where the transport chunks). Until every other peer has all three.
  *  bandwidth   (opt-in: SCENARIOS=join,bandwidth; WebRTC transports) what a
  *              peer's links carry, from RTCPeerConnection.getStats(): BW_SECONDS
  *              (20) idle, then TYPISTS (5) peers typing a character every
@@ -576,7 +578,7 @@ const stats = (xs) => {
 async function main() {
   const adapter = ADAPTERS[TRANSPORT]
   if (!adapter) throw new Error(`usage: room-scenarios.mjs <${Object.keys(ADAPTERS).join('|')}>`)
-  const wanted = (process.env.SCENARIOS ?? 'join,typing,vanish,sleep,rejoin,restart,coordinator').split(',')
+  const wanted = (process.env.SCENARIOS ?? 'join,typing,pubsub,vanish,sleep,rejoin,restart,coordinator').split(',')
   const results = { transport: TRANSPORT, n: N, scenarios: {} }
   const record = (scenario, label, value) => {
     ;(results.scenarios[scenario] ??= {})[label] = value
@@ -999,6 +1001,25 @@ async function main() {
       record('typing', 'frames sent by the whole room', wire(t0))
       const same = await untilAll([peers[0]], async () => new Set(await Promise.all(peers.map(text))).size === 1, 30000)
       record('typing', 'editors identical', same.ms >= 0)
+    }
+
+    // ---- pubsub: provider.pubsub - a broadcast of the core next to the document, one per message
+    if (wanted.includes('pubsub')) {
+      console.log('pubsub (three peers publish, one message of them 50 KB)')
+      await Promise.all(
+        peers.map((p) =>
+          p.page.evaluate(() => {
+            window.__pubsubSeen = new Set()
+            window.__provider.pubsub.subscribe('e2e', (m) => window.__pubsubSeen.add(m.id))
+          }),
+        ),
+      )
+      const senders = [peers[0], peers[Math.floor(peers.length / 2)], peers[peers.length - 1]]
+      const sent = senders.map((p, i) => ({ p, id: `m${i}-${Math.random().toString(36).slice(2, 8)}`, pad: i === 2 ? 50000 : 0 }))
+      await Promise.all(sent.map(({ p, id, pad }) => p.page.evaluate((id, pad) => window.__provider.pubsub.publish('e2e', { id, pad: 'x'.repeat(pad) }), id, pad)))
+      const others = (p) => sent.filter((s) => s.p !== p).map((s) => s.id)
+      const all = await untilAll(peers, (p) => p.page.evaluate((ids) => ids.every((id) => window.__pubsubSeen.has(id)), others(p)), 30000)
+      record('pubsub', 'every message (two small, one 50 KB) at every other peer', all)
     }
 
     // ---- oneway (opt-in, WebRTC transports): a link that cannot send, made on purpose

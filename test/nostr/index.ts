@@ -192,6 +192,7 @@ async function connect() {
       relays,
       password: password || undefined,
       historyWindowSecs: 0,
+      ...(session.has('persistent') ? { persistent: true, doc } : {}), // ?persistent: durable snapshots
     })
     log(`Relays: ${relays.join(', ')}`)
 

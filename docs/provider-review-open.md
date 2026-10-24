@@ -80,6 +80,9 @@ matters, what a fix would take.
 
 ## Supabase
 
+- **Not run live in the regression run (2026-10-24):** the project of `.env`
+  does not resolve (paused or deleted free project). Once it is back:
+  `node --env-file=.env test/e2e/persist-reload.mjs supabase`.
 - **No `sealFrame`.** Behind an encrypting wrapper (LiaScript's password rooms)
   the stored row is the document in the clear, and the frame delivered on
   load is one the wrapper cannot open - the bug Nostr and Ably had (their part

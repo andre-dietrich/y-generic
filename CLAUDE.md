@@ -174,7 +174,10 @@ Firefox delays a hidden tab's timers by up to ~20 s in a busy room; `FIREFOX_EAC
 and a visible tab each). That is why a late timer is not a sleep: `watchResume` reports one only
 when ticks AND links were silent for `resumeAfterMs` (30 s), at the first sign of life after the
 silence - never "a message means awake", a waking page handles its queued messages first
-(`repro-simple-peer-sleep` parts 8-10). `test/e2e/phone-session.mjs <simple-peer|conference|peerjs|trystero|nostr|websocket|gun|ably|pubnub>`:
+(`repro-simple-peer-sleep` parts 8-10). `test/e2e/persist-reload.mjs <gun|nostr|supabase>`: a `persistent`
+room that is empty brings a closed page's text back - closed settled and inside the debounce, and a
+control without `persistent` (on Gun that one comes back too: the relay replays every update slot).
+`test/e2e/phone-session.mjs <simple-peer|conference|peerjs|trystero|nostr|websocket|gun|ably|pubnub>`:
 a real phone in a room of headless peers, reporting on itself through its presence
 (`conference`: `CONFERENCE_EXPECTED=`, `LEAF=1` puts the phone at the edge - and use more
 than 16 desktop peers or the dial rule builds a FULL mesh and the wrapper relays nothing;

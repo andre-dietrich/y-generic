@@ -125,6 +125,14 @@ matters, what a fix would take.
 
 ## Trystero
 
+- **With Firefox in the room, rosters fill slowly or never** (room-scenarios.mjs
+  trystero, `FIREFOX=10`, 2026-10-24) - on main as on this branch, so not the
+  review's: join 19-58 s (Chrome only: 0.4 s); after the relay restart 78 s or
+  NEVER (11 of 24); a new peer in every roster 53 s or NEVER (main: NEVER, 20 of
+  25). Text and Y.Text arrive everywhere at once; it is the presence/links of
+  Chrome-Firefox pairs. Not investigated. (The harness also counts Trystero's
+  resume as 0 in every run: it looks for "Page slept", Trystero logs "the page
+  slept".)
 - **rejoin() racing a new connect().** rejoin() awaits `old.leave()`; a
   disconnect() and connect() in that window find `_connected` true again, so
   both connect() and the rejoin join a room - the first is overwritten in

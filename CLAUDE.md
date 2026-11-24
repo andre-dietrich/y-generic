@@ -39,8 +39,18 @@ matrix, pubnub, supabase, nostr), each its own subpath export
   ```
   Read each file's header before changing it; it encodes the scenario being measured.
 
-There is no automated test runner. When changing sync/awareness/resync logic, add or extend a
-bench script rather than hand-testing.
+- `npm test` — vitest unit tests in `test/unit/` (Node, no browser; the publish workflow runs
+  them before `npm publish`). Fakes for the transport, WebSocket and simple-peer live in
+  `test/unit/helpers.ts`.
+  - `wire-format.test.ts` checks encode and decode against `fixtures/wire-2.0.3.json`, frames
+    captured from 2.0.3. If it fails, the wire changed: that breaks 2.0.x peers unless it was
+    intended. Never re-capture the fixture (`WIRE_CAPTURE=1`) to make it pass.
+  - `known-bugs.test.ts` holds `test.fails` tests that describe the correct behaviour of
+    known bugs. A fix makes its test pass, which vitest reports as an error: remove the
+    `.fails` marker in the same commit as the fix.
+
+When changing sync/awareness/resync logic, add a unit test; for load or scaling behaviour, add
+or extend a bench script.
 
 Releases: bump `package.json`, commit, push a tag matching the version (bare numbers, e.g.
 `2.0.1`); `.github/workflows/publish-npm.yml` publishes on tag push.

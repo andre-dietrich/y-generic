@@ -1,0 +1,358 @@
+/**
+ * SimplePeerTransport behaviour that edrys-Lite depends on (see CLAUDE.md,
+ * "How edrys-Lite uses this library"). Liveness tests ported from edrys-Lite's
+ * tests/unit/ts/SignalingLiveness.test.ts; peer lifecycle tests adapted from
+ * its EdrysSimplePeerTransport.test.ts.
+ */
+import { describe, test, expect, vi, beforeEach, afterEach } from 'vitest'
+import { SimplePeerTransport } from '../../src/providers/simple-peer/index'
+import { FakePeer, FakeWS, flush } from './helpers'
+
+beforeEach(() => {
+  FakeWS.instances = []
+  FakePeer.instances = []
+  vi.stubGlobal('WebSocket', FakeWS)
+  vi.spyOn(console, 'warn').mockImplementation(() => {})
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+  vi.restoreAllMocks()
+})
+
+/** Transport with no signaling servers and one open connection per id. */
+async function withPeers(ids: string[], opts: Record<string, any> = {}) {
+  const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: [], ...opts })
+  await t.connect({ room: 'room' })
+  const peers: Record<string, FakePeer> = {}
+  for (const id of ids) {
+    ;(t as any).handlePeerSignal(id, { type: 'offer' })
+    peers[id] = (t as any).peers.get(id).peer
+    peers[id].open()
+  }
+  await flush()
+  return { t, peers }
+}
+
+describe('peer lifecycle', () => {
+  test('onPeerConnect supports several listeners (provider + edrys transport)', async () => {
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: [] })
+    await t.connect({ room: 'room' })
+    const a: string[] = []
+    const b: string[] = []
+    t.onPeerConnect((id) => a.push(id))
+    const unsubB = t.onPeerConnect((id) => b.push(id))
+    ;(t as any).handlePeerSignal('p1', { type: 'offer' })
+    FakePeer.instances[0].open()
+    expect(a).toEqual(['p1'])
+    expect(b).toEqual(['p1'])
+
+    unsubB()
+    ;(t as any).handlePeerSignal('p2', { type: 'offer' })
+    FakePeer.instances[1].open()
+    expect(a).toEqual(['p1', 'p2'])
+    expect(b).toEqual(['p1'])
+    t.disconnect()
+  })
+
+  test('the first data frame counts as the channel opening', async () => {
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: [] })
+    await t.connect({ room: 'room' })
+    const opened: string[] = []
+    t.onPeerConnect((id) => opened.push(id))
+    ;(t as any).handlePeerSignal('p1', { type: 'offer' })
+    FakePeer.instances[0].receive(new Uint8Array([0x02, 1]))
+    expect(opened).toEqual(['p1'])
+    expect(t.connectedPeers).toBe(1)
+    t.disconnect()
+  })
+
+  test('onPeerDisconnect fires for every listener when a peer closes', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    const a: string[] = []
+    const b: string[] = []
+    t.onPeerDisconnect((id) => a.push(id))
+    t.onPeerDisconnect((id) => b.push(id))
+    peers.p1.destroy()
+    await flush()
+    expect(a).toEqual(['p1'])
+    expect(b).toEqual(['p1'])
+    t.disconnect()
+  })
+
+  test('a failed ICE connection is reported as a disconnect (no ghost peer)', async () => {
+    // simple-peer's own on* handlers turn ICE failure into 'close'; the
+    // transport must listen with addEventListener and not replace them.
+    const { t, peers } = await withPeers(['p1'])
+    const left: string[] = []
+    t.onPeerDisconnect((id) => left.push(id))
+    peers.p1._pc.fail()
+    await flush()
+    expect(left).toEqual(['p1'])
+    expect(t.connectedPeers).toBe(0)
+    t.disconnect()
+  })
+
+  test('onPeerDisconnect does not fire for a peer that never opened', async () => {
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: [] })
+    await t.connect({ room: 'room' })
+    const left: string[] = []
+    t.onPeerDisconnect((id) => left.push(id))
+    ;(t as any).handlePeerSignal('p1', { type: 'offer' })
+    FakePeer.instances[0].destroy()
+    await flush()
+    expect(left).toEqual([])
+    t.disconnect()
+  })
+
+  test('disconnectPeer tears one peer down and reports it', async () => {
+    const { t, peers } = await withPeers(['p1', 'p2'])
+    const left: string[] = []
+    t.onPeerDisconnect((id) => left.push(id))
+    t.disconnectPeer('p1')
+    await flush() // the late 'close' must not report p1 a second time
+    expect(peers.p1.destroyed).toBe(true)
+    expect(peers.p2.destroyed).toBe(false)
+    expect(left).toEqual(['p1'])
+    t.disconnect()
+  })
+
+  test('a late close of a replaced connection does not remove the new one', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    const old = peers.p1
+    ;(t as any).removePeer('p1')
+    ;(t as any).handlePeerSignal('p1', { type: 'offer' })
+    const fresh: FakePeer = (t as any).peers.get('p1').peer
+    expect(fresh).not.toBe(old)
+    old.emit('close')
+    old.emit('error', new Error('late'))
+    expect((t as any).peers.get('p1').peer).toBe(fresh)
+    t.disconnect()
+  })
+})
+
+describe('sending', () => {
+  test('send reaches every open peer, sendTo only its target', async () => {
+    const { t, peers } = await withPeers(['p1', 'p2'])
+    t.send(new Uint8Array([1]))
+    expect(peers.p1.sent).toHaveLength(1)
+    expect(peers.p2.sent).toHaveLength(1)
+
+    t.sendTo('p2', new Uint8Array([2]))
+    expect(peers.p1.sent).toHaveLength(1)
+    expect([...peers.p2.sent[1]]).toEqual([0x00, 2])
+    t.disconnect()
+  })
+
+  test('sendTo and sendControl to an unknown peer are dropped quietly', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.sendTo('nobody', new Uint8Array([1]))
+    t.sendControl('nobody', new Uint8Array([1]))
+    expect(peers.p1.sent).toHaveLength(0)
+    t.disconnect()
+  })
+})
+
+describe('peer discovery', () => {
+  test('a peer announced earlier but no longer connected is reconnected', async () => {
+    vi.useFakeTimers()
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: ['wss://sig'] })
+    const p = t.connect({ room: 'room' })
+    FakeWS.latest().open()
+    await p
+    const ws = FakeWS.latest()
+
+    // A lower id than ours: we are not the initiator.
+    const announce = { type: 'publish', topic: 'room', from: '0' }
+    ws.receive(JSON.stringify(announce))
+    expect(FakePeer.instances).toHaveLength(1)
+
+    FakePeer.instances[0].destroy() // connection lost
+    await flush()
+    ws.receive(JSON.stringify(announce))
+    expect(FakePeer.instances).toHaveLength(2)
+    t.disconnect()
+  })
+})
+
+describe('connect timeout', () => {
+  const TURN = [{ urls: 'turn:turn.example.com:3478', username: 'u', credential: 'c' }]
+
+  async function stalledInitiator(iceServers?: any[]) {
+    vi.useFakeTimers()
+    const t = new SimplePeerTransport({
+      peer: FakePeer as any,
+      signaling: [],
+      ...(iceServers ? { iceServers } : {}),
+    })
+    await t.connect({ room: 'room' })
+    ;(t as any)._peerLastSeen.set('remote', Date.now())
+    ;(t as any).createPeerConnection('remote', true)
+    return t
+  }
+
+  test('the initiator drops a connection that never opens and offers again', async () => {
+    const t = await stalledInitiator()
+    expect(FakePeer.instances).toHaveLength(1)
+    ;(t as any)._peerLastSeen.set('remote', Date.now() + 4000)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(FakePeer.instances[0].destroyed).toBe(true)
+    expect(FakePeer.instances).toHaveLength(2)
+    expect(FakePeer.instances[1].opts.initiator).toBe(true)
+    t.disconnect()
+  })
+
+  test('the retry goes relay-only when a TURN server is configured', async () => {
+    const t = await stalledInitiator(TURN)
+    expect(FakePeer.instances[0].opts.config.iceTransportPolicy).toBeUndefined()
+    ;(t as any)._peerLastSeen.set('remote', Date.now() + 4000)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(FakePeer.instances[1].opts.config.iceTransportPolicy).toBe('relay')
+    t.disconnect()
+  })
+
+  test('without a TURN server the retry stays direct', async () => {
+    const t = await stalledInitiator()
+    ;(t as any)._peerLastSeen.set('remote', Date.now() + 4000)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(FakePeer.instances[1].opts.config.iceTransportPolicy).toBeUndefined()
+    t.disconnect()
+  })
+
+  test('a peer that left the room is not offered again', async () => {
+    const t = await stalledInitiator()
+    await vi.advanceTimersByTimeAsync(5000 + 12000) // past PEER_SEEN_WINDOW
+    expect(FakePeer.instances.filter((p) => !p.destroyed)).toHaveLength(0)
+    t.disconnect()
+  })
+
+  test('an offer with a new attempt id replaces the stuck connection', async () => {
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: [] })
+    await t.connect({ room: 'room' })
+    ;(t as any).handlePeerSignal('remote', { type: 'offer', sdp: 'one' }, 'a1')
+    ;(t as any).handlePeerSignal('remote', { type: 'offer', sdp: 'two' }, 'a2')
+    expect(FakePeer.instances).toHaveLength(2)
+    expect(FakePeer.instances[0].destroyed).toBe(true)
+
+    // A candidate from the old attempt is ignored, not applied.
+    ;(t as any).handlePeerSignal('remote', { candidate: 'c' }, 'a1')
+    expect(FakePeer.instances[1].signals).toEqual([{ type: 'offer', sdp: 'two' }])
+    t.disconnect()
+  })
+
+  test('the same offer arriving twice (two signaling servers) is applied once', async () => {
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: [] })
+    await t.connect({ room: 'room' })
+    ;(t as any).handlePeerSignal('remote', { type: 'offer', sdp: 'one' }, 'a1')
+    ;(t as any).handlePeerSignal('remote', { type: 'offer', sdp: 'one' }, 'a1')
+    expect(FakePeer.instances).toHaveLength(1)
+    expect(FakePeer.instances[0].signals).toHaveLength(1)
+    t.disconnect()
+  })
+})
+
+describe('signaling liveness (ported from edrys-Lite)', () => {
+  async function connected() {
+    vi.useFakeTimers()
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: ['wss://sig'] })
+    const p = t.connect({ room: 'room' })
+    FakeWS.latest().open()
+    await p
+    return t
+  }
+
+  test('pings a quiet socket, then reconnects it after 30s of silence', async () => {
+    const t = await connected()
+    const dead = FakeWS.latest()
+
+    await vi.advanceTimersByTimeAsync(18000)
+    expect(dead.sent.some((m) => m.type === 'ping')).toBe(true)
+    expect(FakeWS.instances).toHaveLength(1)
+
+    // Dropped at the first check past 30s, reconnected after ~360ms backoff.
+    await vi.advanceTimersByTimeAsync(16000)
+    expect(FakeWS.instances).toHaveLength(2)
+    expect(t.signalingHealth.open).toBe(0)
+
+    // Replacement opens and re-subscribes to the room.
+    FakeWS.latest().open()
+    expect(FakeWS.latest().sent.some((m) => m.type === 'subscribe')).toBe(true)
+    expect(t.signalingHealth.open).toBe(1)
+    t.disconnect()
+  })
+
+  test('a socket that keeps receiving messages is never dropped', async () => {
+    const t = await connected()
+    const ws = FakeWS.latest()
+    for (let i = 0; i < 20; i++) {
+      await vi.advanceTimersByTimeAsync(5000)
+      // A healthy server echoes our own re-announce back.
+      ws.receive(JSON.stringify({ type: 'publish', topic: 'room', from: (t as any).peerId }))
+    }
+    expect(FakeWS.instances).toHaveLength(1)
+    expect(t.signalingHealth.open).toBe(1)
+    t.disconnect()
+  })
+
+  test('re-subscribes and re-announces every 5s', async () => {
+    const t = await connected()
+    const ws = FakeWS.latest()
+    ws.sent = []
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(ws.sent.map((m) => m.type)).toEqual(['subscribe', 'publish'])
+    t.disconnect()
+  })
+
+  test('retries when the first signaling connect fails', async () => {
+    vi.useFakeTimers()
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: ['wss://sig'] })
+    const p = t.connect({ room: 'room' })
+    FakeWS.latest().fail()
+    await p
+
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(FakeWS.instances).toHaveLength(2)
+    FakeWS.latest().open()
+    expect(t.signalingHealth.open).toBe(1)
+    expect(FakeWS.latest().sent.some((m) => m.type === 'subscribe')).toBe(true)
+    t.disconnect()
+  })
+
+  test('retries when the first signaling connect hangs', async () => {
+    vi.useFakeTimers()
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: ['wss://sig'] })
+    const p = t.connect({ room: 'room' })
+    const hung = FakeWS.latest()
+    await vi.advanceTimersByTimeAsync(10000) // connect timeout
+    await p
+
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(FakeWS.instances).toHaveLength(2)
+    FakeWS.latest().open()
+    // The abandoned socket opening late must not become a second connection.
+    hung.open()
+    expect(t.signalingHealth.open).toBe(1)
+    t.disconnect()
+  })
+
+  test('a dropped signaling socket is reconnected', async () => {
+    const t = await connected()
+    FakeWS.latest().fail()
+    expect(t.signalingHealth.reconnecting).toBe(1)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(FakeWS.instances).toHaveLength(2)
+    t.disconnect()
+  })
+
+  test('disconnect() stops the check and does not reconnect', async () => {
+    const t = await connected()
+    const ws = FakeWS.latest()
+    t.disconnect()
+    // A real socket fires onclose after close(); it must not count as a drop.
+    ws.onclose?.({ code: 1000 })
+    await vi.advanceTimersByTimeAsync(120000)
+    expect(FakeWS.instances).toHaveLength(1)
+    expect(t.signalingHealth.reconnecting).toBe(0)
+  })
+})

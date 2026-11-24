@@ -1,29 +1,10 @@
 /**
- * WebSocket Transport for Yjs
- *
- * Provides real-time synchronization using WebSocket connections.
- *
- * Features:
- * - Direct WebSocket connection to server
- * - Room-based collaboration
- * - Automatic reconnection
- * - Binary message support
- * - Low latency real-time sync
+ * WebSocket transport, URL layout compatible with y-websocket servers.
  *
  * @example
  * ```ts
- * import * as Y from 'yjs'
- * import { GenericProvider } from 'y-generic'
- * import { WebSocketTransport } from 'y-generic/providers/websocket'
- *
- * const doc = new Y.Doc()
- * const transport = new WebSocketTransport()
- *
- * const provider = new GenericProvider(doc, transport)
- * await provider.connect({
- *   serverUrl: 'ws://localhost:1234',
- *   room: 'my-room'
- * })
+ * const provider = new GenericProvider(doc, new WebSocketTransport())
+ * await provider.connect({ serverUrl: 'wss://example.com', room: 'my-room' })
  * ```
  */
 export class WebSocketTransport {
@@ -36,8 +17,8 @@ export class WebSocketTransport {
         this.debug = false;
         this.reconnectAttempts = 0;
         this.intentionalDisconnect = false;
-        this.messageQueue = []; // Queue messages until connected
-        this.receivedBuffer = []; // Buffer messages received before callback registered
+        this.messageQueue = []; // sent while not open
+        this.receivedBuffer = []; // received before onMessage()
         this.lastMessageAt = 0;
         this.wsUrl = '';
     }
@@ -45,13 +26,9 @@ export class WebSocketTransport {
         return this._isConnected;
     }
     /**
-     * Connect to WebSocket server.
-     *
-     * Resolves once a socket is open. With `autoReconnect` on (the default), a
-     * failed or timed-out attempt does not reject: the transport keeps retrying
-     * and the promise resolves when one succeeds. It rejects when
-     * `autoReconnect` is off, when `maxReconnectAttempts` runs out, or when
-     * disconnect() is called first.
+     * Resolves once a socket is open. With `autoReconnect`, failed attempts
+     * are retried instead of rejecting; it rejects only when retrying is off
+     * or exhausted, or disconnect() is called first.
      */
     async connect(config) {
         if (!config.serverUrl) {
@@ -64,13 +41,10 @@ export class WebSocketTransport {
         this.debug = config.debug ?? false;
         this.intentionalDisconnect = false;
         this.reconnectAttempts = 0;
-        // Build URL with room (y-websocket compatible)
         let wsUrl = config.serverUrl;
-        // Remove trailing slash if present
         if (wsUrl.endsWith('/')) {
             wsUrl = wsUrl.slice(0, -1);
         }
-        // Append room name to URL path
         this.wsUrl = `${wsUrl}/${encodeURIComponent(config.room)}`;
         return new Promise((resolve, reject) => {
             this.pendingConnect = { resolve, reject };
@@ -98,7 +72,6 @@ export class WebSocketTransport {
         this.log(`Connecting to WebSocket server: ${this.wsUrl}`);
         let ws;
         try {
-            // Create WebSocket connection with room in URL (y-websocket style)
             ws = new WebSocket(this.wsUrl, config.protocols);
             ws.binaryType = 'arraybuffer';
         }
@@ -130,7 +103,6 @@ export class WebSocketTransport {
             this.reconnectAttempts = 0;
             this.log(`✅ WebSocket connected to room: ${config.room}`);
             this.startLivenessCheck();
-            // Flush queued messages
             this.flushMessageQueue();
             this.settleConnect();
         };
@@ -169,9 +141,6 @@ export class WebSocketTransport {
             this.settleConnect(error);
         }
     }
-    /**
-     * Disconnect from WebSocket server
-     */
     disconnect() {
         this.intentionalDisconnect = true;
         this.settleConnect(new Error('WebSocket disconnected before it connected'));
@@ -187,9 +156,7 @@ export class WebSocketTransport {
         }
         this._isConnected = false;
     }
-    /**
-     * Send data to server
-     */
+    /** Send now, or queue until the socket opens. */
     send(data) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
             this.log('⚠️ WebSocket not ready, queueing message');
@@ -204,12 +171,8 @@ export class WebSocketTransport {
             this.log('❌ Send error:', error);
         }
     }
-    /**
-     * Register message callback
-     */
     onMessage(callback) {
         this.messageCallback = callback;
-        // Flush any buffered messages that arrived before callback was registered
         if (this.receivedBuffer.length > 0) {
             this.log(`📦 Flushing ${this.receivedBuffer.length} buffered received messages`);
             for (const data of this.receivedBuffer) {
@@ -221,13 +184,10 @@ export class WebSocketTransport {
             this.messageCallback = undefined;
         };
     }
-    /**
-     * Handle incoming WebSocket message
-     */
     handleMessage(data) {
         try {
             if (typeof data === 'string') {
-                // Handle text messages (control messages)
+                // Text frames aren't part of the protocol; log and ignore.
                 this.log('📨 Received text message:', data);
                 return;
             }
@@ -237,7 +197,6 @@ export class WebSocketTransport {
                 this.messageCallback(uint8Data);
             }
             else {
-                // Buffer message if callback not registered yet (race condition)
                 this.log('⏳ Buffering message (callback not yet registered)');
                 this.receivedBuffer.push(uint8Data);
             }
@@ -246,9 +205,6 @@ export class WebSocketTransport {
             this.log('❌ Error handling message:', error);
         }
     }
-    /**
-     * Flush queued messages
-     */
     flushMessageQueue() {
         if (this.messageQueue.length === 0)
             return;
@@ -259,9 +215,8 @@ export class WebSocketTransport {
         this.messageQueue = [];
     }
     /**
-     * Watch for a socket that stays OPEN but receives nothing (half-open: dead
-     * TCP path, NAT or proxy idle timeout). The browser may not fire onclose for
-     * many minutes; meanwhile sends vanish and nothing arrives.
+     * Reconnect a socket that stays OPEN but receives nothing (dead TCP path,
+     * NAT or proxy timeout); the browser may not fire onclose for minutes.
      */
     startLivenessCheck() {
         this.stopLivenessCheck();
@@ -297,10 +252,7 @@ export class WebSocketTransport {
             this.livenessTimer = undefined;
         }
     }
-    /**
-     * Schedule the next connection attempt. Returns false when
-     * `maxReconnectAttempts` is used up.
-     */
+    /** Schedule the next attempt; false once `maxReconnectAttempts` is used up. */
     attemptReconnect() {
         if (!this.config)
             return false;
@@ -322,9 +274,6 @@ export class WebSocketTransport {
         }, delay);
         return true;
     }
-    /**
-     * Debug logging
-     */
     log(message, ...args) {
         if (this.debug) {
             console.log(`[WebSocketTransport] ${message}`, ...args);

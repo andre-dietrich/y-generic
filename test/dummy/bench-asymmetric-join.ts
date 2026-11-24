@@ -1,6 +1,6 @@
 /**
  * Correctness check (not a performance benchmark): does the SyncStep2
- * reply-suppression NACK-suppression scheme (Task 3, `_scheduleSyncReply`/
+ * reply-suppression NACK-suppression scheme (`_scheduleSyncReply`/
  * `_cancelPendingSyncReply` in `src/index.ts`) ever leave a peer permanently
  * stuck on stale/empty state in a room of N>=3?
  *
@@ -16,10 +16,6 @@
  * SyncStep2 request being answered by a different (empty) peer instead of
  * the pre-loaded one, that peer would never receive the real content and
  * this script's convergence check fails.
- *
- * See docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md
- * "Part 4" for the underlying design and the "Known limitation, accepted"
- * paragraph this script's results are folded into.
  *
  * Run: npx tsc -p tsconfig.bench.json && node bench-dist/test/dummy/bench-asymmetric-join.js
  */
@@ -129,14 +125,12 @@ async function main() {
 
   if (anyFailure) {
     console.log(
-      'RESULT: at least one sample failed to converge - genuine correctness ' +
-        'concern, see docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md',
+      'RESULT: at least one sample failed to converge - genuine correctness concern',
     )
     process.exit(1)
   } else {
     console.log(
-      'RESULT: all samples converged reliably at every tested N. See spec ' +
-        '"Part 4" for interpretation.',
+      'RESULT: all samples converged reliably at every tested N.',
     )
     process.exit(0)
   }

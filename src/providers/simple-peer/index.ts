@@ -1,279 +1,137 @@
 /**
- * SimplePeer Transport Provider
- *
- * Peer-to-peer transport using WebRTC data channels with simple-peer library.
- * Connects directly to other clients without going through a central server.
- *
- * Features:
- * - Direct peer-to-peer connections
- * - Mesh network (each peer connects to multiple others)
- * - Uses signaling server only for peer discovery (not for data)
- * - Automatic connection management
- * - Resilient to peer disconnections
+ * WebRTC mesh transport over simple-peer; a y-webrtc-compatible signaling
+ * server is used only for discovery.
  *
  * @example
  * ```typescript
- * import { GenericProvider } from 'y-generic'
- * import { SimplePeerTransport } from 'y-generic/providers/simple-peer'
  * import Peer from 'simple-peer'
- *
- * const doc = new Y.Doc()
- * const transport = new SimplePeerTransport({
- *   peer: Peer, // Pass the simple-peer constructor
- *   signaling: ['wss://signaling.example.com'],
- * })
- * const provider = new GenericProvider(doc, transport)
- * await provider.connect({ room: 'my-room' })
+ * const transport = new SimplePeerTransport({ peer: Peer, signaling: ['wss://signaling.example.com'] })
+ * await new GenericProvider(doc, transport).connect({ room: 'my-room' })
  * ```
  */
 
 import type { Transport, ConnectionConfig } from '../../transport'
 
-/**
- * SimplePeer constructor type (from simple-peer library).
- */
 export type SimplePeerConstructor = any
 
-/**
- * ICE server configuration for STUN/TURN servers.
- * Used to establish WebRTC connections through NAT/firewalls.
- */
 export interface IceServer {
-  /**
-   * STUN/TURN server URLs.
-   * @example ['stun:stun.l.google.com:19302']
-   * @example ['turn:turn.example.com:3478']
-   */
   urls: string | string[]
-  /**
-   * Username for TURN server authentication.
-   */
   username?: string
-  /**
-   * Credential for TURN server authentication.
-   */
   credential?: string
 }
 
-/**
- * Configuration options for SimplePeer transport.
- */
 export interface SimplePeerTransportOptions {
-  /**
-   * The simple-peer library constructor.
-   * Users must provide this to avoid bundling the library.
-   * @example
-   * ```typescript
-   * import Peer from 'simple-peer'
-   * const transport = new SimplePeerTransport({ peer: Peer })
-   * ```
-   */
+  /** The simple-peer constructor, passed in so it isn't bundled. */
   peer: SimplePeerConstructor
-  /**
-   * Array of signaling server URLs for peer discovery.
-   * Signaling servers are only used to discover peers, not for data transfer.
-   * @default ['wss://signaling.yjs.dev']
-   */
+  /** @default ['wss://signaling.yjs.dev'] */
   signaling?: string[]
-
-  /**
-   * ICE servers for STUN/TURN configuration.
-   * Used to establish WebRTC connections through NAT/firewalls.
-   * @default [{ urls: 'stun:stun.l.google.com:19302' }]
-   * @example
-   * ```typescript
-   * iceServers: [
-   *   { urls: 'stun:stun.l.google.com:19302' },
-   *   {
-   *     urls: 'turn:turn.example.com:3478',
-   *     username: 'user',
-   *     credential: 'pass'
-   *   }
-   * ]
-   * ```
-   */
+  /** Merged into `peerOpts.config`. @default [{ urls: 'stun:stun.l.google.com:19302' }] */
   iceServers?: IceServer[]
-
-  /**
-   * Maximum number of WebRTC peer connections.
-   * Too many connections can overwhelm the browser.
-   * @default 20 + random(0-15)
-   */
+  /** @default 20 + random(0-15) */
   maxConns?: number
-
-  /**
-   * Options passed to simple-peer.
-   * See https://github.com/feross/simple-peer#api
-   * Note: iceServers will be merged into peerOpts.config if not already present
-   * @default {}
-   */
+  /** Passed to simple-peer (https://github.com/feross/simple-peer#api). */
   peerOpts?: Record<string, any>
-
-  /**
-   * Enable debug logging.
-   * @default false
-   */
   debug?: boolean
 
   /**
-   * Drop and reconnect a signaling socket that has received nothing for this
-   * long (ms). A ping is sent at half this interval. Catches half-open sockets
-   * that still report OPEN but deliver nothing. 0 disables.
-   * @default 30000
+   * Reconnect a signaling socket silent for this long (ms); a ping goes out
+   * at half of it. 0 disables. @default 30000
    */
   signalingTimeout?: number
 
   /**
-   * How long (ms) the initiator gives a peer connection to open its channel
-   * before tearing it down and offering again. Doubles after each consecutive
-   * failure with the same peer, up to 30s, so a slow (e.g. TURN-only) network
-   * is not torn down forever. See CONNECT_TIMEOUT_MAX.
-   * @default 5000
+   * How long (ms) the initiator waits for a channel to open before offering
+   * again; doubles per consecutive failure up to 30s. @default 5000
    */
   connectTimeout?: number
 
   /**
-   * After this many consecutive timed-out attempts to a peer, the initiator
-   * retries with `iceTransportPolicy: 'relay'`, so the connection runs via
-   * TURN. A stall that repeats for a pair (e.g. peers behind one NAT whose
-   * mDNS host candidates don't resolve) never clears on a direct retry; a
-   * relay-only connection has no direct pair to get stuck on. Only used when
-   * a `turn:`/`turns:` server is configured. `false` disables it.
+   * After this many timed-out attempts to a peer, the initiator retries with
+   * `iceTransportPolicy: 'relay'` (TURN only), for stalls a direct retry
+   * never clears. Needs a `turn:`/`turns:` server; `false` disables.
    * @default 1
    */
   relayFallbackAfter?: number | false
 
   /**
-   * Hold data frames from each peer until `trustPeer(peerId)` is called, e.g.
-   * after an out-of-band identity handshake over control frames. Held frames
-   * are delivered in order on trust and discarded if the peer disconnects
-   * first. Control frames are never held. Each new connection to a peer
-   * starts untrusted.
+   * Hold each peer's data frames until `trustPeer(peerId)`, e.g. after a
+   * handshake over control frames. Held frames are delivered in order on
+   * trust, discarded on disconnect; control frames are never held. Every new
+   * connection starts untrusted.
    * @default false
    */
   requireTrust?: boolean
 }
 
 interface PeerConnection {
-  peer: any // SimplePeer instance
+  peer: any // simple-peer instance
   connected: boolean
   peerId: string
-  /** Drops the connection if it never opens (see connectTimeout) */
   connectTimer?: ReturnType<typeof setTimeout>
   /** Random id of this attempt, sent with every signal we emit for it */
   attemptId: string
-  /** The remote's attempt id (from the offer/answer we applied), if tagged */
+  /** The remote's attempt id from the offer/answer we applied */
   remoteAttemptId?: string
-  /** SDP of the last remote offer/answer we applied (duplicate detection) */
+  /** SDP of the last remote offer/answer we applied, to detect duplicates */
   remoteSdp?: string
-  /** Buffer for reassembling chunked messages */
   chunkBuffers: Map<
     number,
     { chunks: Map<number, Uint8Array>; totalChunks: number; lastChunkAt: number }
   >
-  /**
-   * Outgoing frames (complete messages and chunks) waiting for the channel
-   * buffer to drain. One FIFO per peer keeps messages in order and leaves a
-   * single onbufferedamountlow handler per channel.
-   */
+  /** Outgoing frames, one FIFO per peer so messages stay in order */
   sendQueue: Uint8Array[]
   /** True while the queue waits for the channel buffer to drain */
   drainWait?: boolean
-  /** Set by trustPeer(); only consulted when `requireTrust` is on */
   trusted: boolean
-  /** Data frames received before the peer was trusted */
   heldFrames: Uint8Array[]
   heldBytes: number
 }
 
-/**
- * Maximum chunk size for WebRTC DataChannel messages.
- * Most browsers support up to 256KB, but we use 64KB for safety.
- */
 const CHUNK_SIZE = 64 * 1024
 
-/**
- * Maximum buffer size before we pause sending (16KB).
- * WebRTC DataChannel buffers data before sending over the network.
- * If we send too much too fast, the buffer overflows.
- */
+// Pause sending while the channel buffers more than this.
 const MAX_BUFFERED_AMOUNT = 16 * 1024
 
-/**
- * While waiting for the buffer to drain, check it at least this often (ms),
- * in case the 'bufferedamountlow' event doesn't fire.
- */
+// Recheck a full buffer this often (ms) in case 'bufferedamountlow' doesn't fire.
 const DRAIN_POLL_MS = 250
 
-/**
- * Receiver limits for chunked messages, so a misbehaving peer can't make us
- * buffer without bound. 4096 chunks is ~256MB per message; a partial message
- * whose next chunk doesn't arrive within CHUNK_TIMEOUT is discarded.
- */
+// Receiver limits for chunked messages from a misbehaving peer: 4096 chunks
+// is ~256MB; a partial message idle for CHUNK_TIMEOUT is discarded.
 const MAX_TOTAL_CHUNKS = 4096
 const MAX_PENDING_MESSAGES = 16
 const CHUNK_TIMEOUT = 30000
 
-/**
- * With `requireTrust`, how much an untrusted peer may have held for it. The
- * handshake normally completes within milliseconds, so this only has to fit
- * a peer's initial sync. Frames beyond it are dropped; the periodic sync
- * fetches whatever they carried once the peer is trusted.
- */
+// Held frames per untrusted peer; enough for an initial sync. Excess frames
+// are dropped and recovered by the periodic sync after trust.
 const MAX_HELD_FRAMES = 256
 const MAX_HELD_BYTES = 16 * 1024 * 1024
 
-/**
- * `reachesAllPeers` assumes a complete mesh only below this room size: 20 is
- * the smallest default `maxConns`, so any peer still on the default can
- * connect to everyone in a smaller room.
- */
+// `reachesAllPeers` only below this room size: the smallest default maxConns.
 const FULL_MESH_MAX_PEERS = 20
 
 /**
- * How long a peer connection may take to open its channel. Neither side ever
- * reaches 'failed' when an offer/answer is lost in signaling, or when ICE gets
- * stuck one-sided: the controlling side sees a successful check, nominates the
- * pair and stops checking, while the controlled side never gets a check
- * answered and stays 'checking' (seen between peers behind the same NAT, where
- * the only usable pair needed a hairpin that worked in one direction only).
- *
- * The initiator owns recovery: after `connectTimeout` (doubling per failure up
- * to CONNECT_TIMEOUT_MAX) it tears its side down and sends a fresh offer, which
- * the other side recognises by its new attempt id and accepts in place of the
- * stuck connection. The non-initiator only waits CONNECT_TIMEOUT_MAX, to
- * clean up when the initiator is gone.
+ * A lost offer/answer or a one-sided ICE stall (seen behind one NAT) never
+ * reaches 'failed', so the initiator tears down after `connectTimeout`
+ * (doubling up to CONNECT_TIMEOUT_MAX) and offers again under a new attempt
+ * id. The non-initiator waits CONNECT_TIMEOUT_MAX, to clean up if the
+ * initiator is gone.
  */
 const DEFAULT_CONNECT_TIMEOUT = 5000
 const CONNECT_TIMEOUT_MAX = 30000
 
-/**
- * A peer whose signaling messages we saw this recently is still in the room,
- * so a timed-out connection to it is retried right away. Two announce periods
- * plus slack.
- */
+// A peer seen in signaling this recently is still in the room (two announce
+// periods plus slack), so a timed-out connection to it is retried.
 const PEER_SEEN_WINDOW = 12000
 
-/**
- * Message type markers for chunking protocol.
- * - 0x00: Complete message (no chunking, raw data)
- * - 0x01: Chunked message with header
- * - 0x02: Consumer control frame — per-peer side-channel via sendControl()/
- *   onControlFrame(), never reaches the provider pipe. Not chunked.
- */
+// First byte of every data channel message.
 const MSG_TYPE_COMPLETE = 0x00
-const MSG_TYPE_CHUNKED = 0x01
-const MSG_TYPE_CONTROL = 0x02
+const MSG_TYPE_CHUNKED = 0x01 // [type][msgId:4][index:4][total:4][data]
+const MSG_TYPE_CONTROL = 0x02 // sendControl()/onControlFrame(), not chunked
 
-/**
- * Appended to the room name to form the signaling topic, so 3.x peers never
- * connect to 2.x ones: 2.x frames carry a CRC32 header and XOR "encryption",
- * and the two would mis-decode each other. Keep in step with WIRE_TAG in
- * src/index.ts.
- */
+// Part of the signaling topic so 3.x peers never meet 2.x ones (CRC32 + XOR
+// framing). Keep in step with WIRE_TAG in src/index.ts.
 const WIRE_TAG = 'v3'
 
-/** Counter for generating unique message IDs */
 let messageIdCounter = 0
 
 interface SignalingMessage {
@@ -282,14 +140,10 @@ interface SignalingMessage {
   to?: string
   signal?: any
   topics?: string[]
-  topic?: string // Room name for publish messages
+  topic?: string
   attempt?: string // sender's connection attempt id, on signal-bearing messages
 }
 
-/**
- * SimplePeer transport implementation using simple-peer library.
- * Creates direct peer-to-peer connections for data transfer.
- */
 export class SimplePeerTransport implements Transport {
   private options: {
     peer: SimplePeerConstructor
@@ -304,8 +158,7 @@ export class SimplePeerTransport implements Transport {
   }
   private _connected: boolean = false
   private _room: string = ''
-  /** Signaling topic: the room plus WIRE_TAG */
-  private _topic: string = ''
+  private _topic: string = '' // `${room}/${WIRE_TAG}`
   private _callback?: (data: Uint8Array) => void
   private _peerConnectCallbacks = new Set<(peerId: string) => void>()
   private _peerDisconnectCallbacks = new Set<(peerId: string) => void>()
@@ -317,31 +170,21 @@ export class SimplePeerTransport implements Transport {
   private signalingConns: WebSocket[] = []
   private announcedPeers: Set<string> = new Set()
   private announceInterval?: ReturnType<typeof setInterval>
-  // Signaling reconnect state, per URL: consecutive failures (for backoff) and
-  // the pending retry timer (so disconnect() can cancel it).
+  // Per signaling URL: consecutive failures (backoff) and the pending retry.
   private _reconnectAttempts: Map<string, number> = new Map()
   private _reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
     new Map()
-  // Liveness per open signaling socket: when it last received anything and
-  // whether a ping is outstanding. Mirrors lib0's WebsocketClient (y-webrtc).
   private _signalingLiveness: Map<
     WebSocket,
     { url: string; lastMessage: number; pinged: boolean }
   > = new Map()
   private _livenessInterval?: ReturnType<typeof setInterval>
-  // Per remote peerId, outliving its PeerConnection: when we last saw any
-  // signaling message from it, and how many connection attempts to it timed
-  // out in a row (for the connect timeout backoff).
+  // Per remote peerId, outliving its connection: last signaling message
+  // seen, and consecutive timed-out attempts (connect timeout backoff).
   private _peerLastSeen: Map<string, number> = new Map()
   private _connectFailures: Map<string, number> = new Map()
-  // Whether the ICE servers include a TURN server (relay fallback needs one).
   private _hasTurnServer: boolean = false
 
-  /**
-   * Create a new SimplePeer transport.
-   *
-   * @param options - Configuration options (must include peer constructor)
-   */
   constructor(options: SimplePeerTransportOptions) {
     if (!options.peer) {
       throw new Error(
@@ -351,15 +194,11 @@ export class SimplePeerTransport implements Transport {
       )
     }
 
-    // Default ICE servers (Google's public STUN server)
     const defaultIceServers: IceServer[] = [
       { urls: 'stun:stun.l.google.com:19302' },
     ]
 
-    // Prepare peerOpts with ICE servers
     const peerOpts = { ...options.peerOpts }
-
-    // Merge ICE servers into peerOpts.config
     if (options.iceServers || !peerOpts.config?.iceServers) {
       const iceServers = options.iceServers ?? defaultIceServers
       peerOpts.config = {
@@ -387,7 +226,6 @@ export class SimplePeerTransport implements Transport {
       ),
     )
 
-    // Generate unique peer ID
     this.peerId = this.generatePeerId()
 
     this.log(
@@ -397,9 +235,7 @@ export class SimplePeerTransport implements Transport {
     )
   }
 
-  /**
-   * Connect to the room via signaling servers and start discovering peers.
-   */
+  /** Join the room on the signaling servers and start discovering peers. */
   async connect(config: ConnectionConfig): Promise<void> {
     if (this._connected) {
       throw new Error('Already connected')
@@ -409,13 +245,10 @@ export class SimplePeerTransport implements Transport {
     this._topic = `${config.room}/${WIRE_TAG}`
     this.log(`🔌 Connecting to room "${config.room}" as ${this.peerId}`)
 
-    // Try to connect to signaling servers
-    // Use Promise.allSettled to allow partial success
     const results = await Promise.allSettled(
       this.options.signaling.map((url) => this.connectSignaling(url)),
     )
 
-    // Count successful connections
     const successCount = results.filter((r) => r.status === 'fulfilled').length
     const failCount = results.filter((r) => r.status === 'rejected').length
 
@@ -438,35 +271,29 @@ export class SimplePeerTransport implements Transport {
       })
     }
 
-    // Still mark as connected even if no signaling servers work
-    // This allows BroadcastChannel-only mode for same-browser tabs
+    // Connected even without signaling: cross-tab sync still works.
     this._connected = true
     this.log(
       `✅ Connected to room "${this._room}" — ${this.signalingConns.length}/${this.options.signaling.length} signaling server(s)`,
     )
 
-    // A first attempt that failed asked for a reconnect while _connected was
-    // still false, which reads as a deliberate disconnect and is ignored.
-    // Retry those servers now, or one unreachable at startup stays unused.
+    // Reconnects requested while _connected was still false were ignored;
+    // retry servers unreachable at startup now.
     results.forEach((result, index) => {
       if (result.status === 'rejected') {
         this.scheduleSignalingReconnect(this.options.signaling[index])
       }
     })
 
-    // Start periodic re-subscribe + re-announce to help late joiners discover us.
-    // Deliberately NOT gated on `peers.size < maxConns`: a full mesh must keep
-    // advertising, or peers that later drop out can never rediscover us.
+    // Re-subscribe and re-announce every 5s for late joiners. Not gated on
+    // maxConns: a full peer must keep advertising so dropped peers can return.
     this.announceInterval = setInterval(() => {
       if (this.signalingConns.length === 0) return
 
       this.log('Re-announcing presence...')
       this.forgetGonePeers()
       for (const ws of this.signalingConns) {
-        // Re-subscribe every tick: a signaling server can silently drop a
-        // subscription while the socket stays open (ping/pong alive), which
-        // makes us invisible to newcomers with no other symptom. `subscribe`
-        // is otherwise only sent once, in onopen.
+        // A server can silently drop a subscription on a live socket.
         this.sendSignaling(ws, {
           type: 'subscribe',
           topics: [this._topic],
@@ -477,7 +304,7 @@ export class SimplePeerTransport implements Transport {
           from: this.peerId,
         })
       }
-    }, 5000) // Re-announce every 5 seconds for better peer discovery
+    }, 5000)
 
     if (this.options.signalingTimeout > 0) {
       this._livenessInterval = setInterval(
@@ -487,9 +314,6 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Disconnect from all peers and signaling servers.
-   */
   disconnect(): void {
     if (!this._connected) return
 
@@ -497,12 +321,9 @@ export class SimplePeerTransport implements Transport {
       `🔌 Disconnecting — ${this.peers.size} peer(s), ${this.signalingConns.length} signaling server(s)`,
     )
 
-    // Clear BEFORE closing sockets: ws.close() fires onclose asynchronously,
-    // and scheduleSignalingReconnect() keys off this flag to tell a deliberate
-    // disconnect from a dropped connection.
+    // Before closing sockets: onclose checks it to skip reconnecting.
     this._connected = false
 
-    // Stop re-announce interval
     if (this.announceInterval) {
       clearInterval(this.announceInterval)
       this.announceInterval = undefined
@@ -513,21 +334,18 @@ export class SimplePeerTransport implements Transport {
     }
     this._signalingLiveness.clear()
 
-    // Cancel any pending signaling reconnects
     for (const timer of this._reconnectTimers.values()) {
       clearTimeout(timer)
     }
     this._reconnectTimers.clear()
     this._reconnectAttempts.clear()
 
-    // Close all peer connections
     for (const peerConn of this.peers.values()) {
       clearTimeout(peerConn.connectTimer)
       peerConn.peer.destroy()
     }
     this.peers.clear()
 
-    // Close all signaling connections
     for (const ws of this.signalingConns) {
       ws.close()
     }
@@ -538,17 +356,13 @@ export class SimplePeerTransport implements Transport {
     this._connectFailures.clear()
   }
 
-  /**
-   * Send data to all connected peers.
-   * Large messages are automatically chunked to fit within WebRTC DataChannel limits.
-   */
+  /** Send to every connected peer, chunking large messages. */
   send(data: Uint8Array): void {
     if (!this._connected) {
       this.log('Not connected, cannot send')
       return
     }
 
-    // Send to all connected peers
     let sentCount = 0
     for (const peerConn of this.peers.values()) {
       if (peerConn.connected) {
@@ -564,7 +378,6 @@ export class SimplePeerTransport implements Transport {
       }
     }
 
-    // Only log when the picture is non-trivial (missing peers or no peers at all)
     if (sentCount === 0) {
       this.log(`⚠️ Send: 0 peers connected — ${data.length}B dropped`)
     } else if (sentCount < this.peers.size) {
@@ -575,9 +388,6 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Send data to a single connected peer by ID (targeted delivery).
-   */
   sendTo(peerId: string, data: Uint8Array): void {
     if (!this._connected) {
       this.log('Not connected, cannot sendTo')
@@ -597,12 +407,8 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Queue data for a single peer, chunking if necessary, and send as much as
-   * the channel buffer allows.
-   */
+  /** Queue a message for one peer (chunked if large) and pump the queue. */
   private sendToPeer(peerConn: PeerConnection, data: Uint8Array): void {
-    // Small messages can be sent directly with type marker
     if (data.length <= CHUNK_SIZE - 1) {
       const msg = new Uint8Array(data.length + 1)
       msg[0] = MSG_TYPE_COMPLETE
@@ -612,7 +418,6 @@ export class SimplePeerTransport implements Transport {
       return
     }
 
-    // Large messages need chunking with flow control
     const messageId = messageIdCounter++ >>> 0
     const totalChunks = Math.ceil(data.length / (CHUNK_SIZE - 13))
     this.log(
@@ -624,7 +429,6 @@ export class SimplePeerTransport implements Transport {
       const end = Math.min(start + (CHUNK_SIZE - 13), data.length)
       const chunkData = data.subarray(start, end)
 
-      // Chunk header: [type:1][messageId:4][chunkIndex:4][totalChunks:4][data]
       const chunk = new Uint8Array(13 + chunkData.length)
       const view = new DataView(chunk.buffer)
       chunk[0] = MSG_TYPE_CHUNKED
@@ -639,13 +443,9 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * Send queued frames until the queue is empty or the channel buffer is
-   * full; in the latter case resume when the buffer drains. One wait per
-   * peer at a time (`drainWait`), so concurrent large messages can't strand
-   * each other. It listens with addEventListener: simple-peer sets the
-   * channel's onbufferedamountlow property itself, so a check for that
-   * property being free never passed and the queue stalled until the next
-   * send. DRAIN_POLL_MS covers a drain event that doesn't fire.
+   * Send queued frames until the channel buffer is full, then resume when it
+   * drains (one wait per peer). Uses addEventListener because simple-peer
+   * owns the channel's onbufferedamountlow property.
    */
   private pumpSendQueue(peerConn: PeerConnection): void {
     const peer = peerConn.peer
@@ -665,8 +465,7 @@ export class SimplePeerTransport implements Transport {
             `⏸️ Backpressure on ${peerConn.peerId}: buffered ${channel.bufferedAmount}B, ${queue.length} frame(s) queued`,
           )
           peerConn.drainWait = true
-          // The event fires when the buffer falls to the threshold, so it must
-          // sit below the pause mark (simple-peer sets it to 64KB).
+          // Must sit below the pause mark; simple-peer sets it to 64KB.
           channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2
           const resume = () => {
             if (!peerConn.drainWait) return
@@ -692,9 +491,6 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Register callback for incoming messages.
-   */
   onMessage(callback: (data: Uint8Array) => void): () => void {
     this._callback = callback
     return () => {
@@ -702,9 +498,6 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Register callback for new peer data-channel connections.
-   */
   onPeerConnect(callback: (peerId: string) => void): () => void {
     this._peerConnectCallbacks.add(callback)
     return () => {
@@ -712,10 +505,7 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Register callback for peer disconnects (channel close or error). Only fires
-   * for peers that had reached the connected state.
-   */
+  /** Fires only for peers whose channel had opened. */
   onPeerDisconnect(callback: (peerId: string) => void): () => void {
     this._peerDisconnectCallbacks.add(callback)
     return () => {
@@ -723,10 +513,6 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Register callback for consumer control frames (MSG_TYPE_CONTROL).
-   * These bypass the provider pipe — use for per-peer handshakes/auth.
-   */
   onControlFrame(
     callback: (peerId: string, payload: Uint8Array) => void,
   ): () => void {
@@ -736,18 +522,11 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Tear down a single peer connection (e.g. to reject a peer that failed an
-   * out-of-band handshake). Fires onPeerDisconnect if the peer was connected.
-   */
   disconnectPeer(peerId: string): void {
     this.removePeer(peerId)
   }
 
-  /**
-   * Send a control frame to a single peer. Not chunked — keep
-   * payloads small (they must fit one DataChannel message).
-   */
+  /** Not chunked: the payload must fit one data channel message. */
   sendControl(peerId: string, payload: Uint8Array): void {
     const peerConn = this.peers.get(peerId)
     if (!peerConn || !peerConn.connected) {
@@ -764,11 +543,7 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Mark the current connection to a peer as trusted and deliver the data
-   * frames held for it (see `requireTrust`). Returns false if there is no
-   * connection to that peer.
-   */
+  /** Trust the current connection to a peer and deliver its held frames; false if none. */
   trustPeer(peerId: string): boolean {
     const peerConn = this.peers.get(peerId)
     if (!peerConn) return false
@@ -788,21 +563,18 @@ export class SimplePeerTransport implements Transport {
     return true
   }
 
-  /** Whether trustPeer() was called for the current connection to a peer. */
   isPeerTrusted(peerId: string): boolean {
     return this.peers.get(peerId)?.trusted ?? false
   }
 
-  /** This transport's peer id, as remote peers and signaling see it. */
+  /** Our peer id, as remote peers and signaling see it. */
   get localPeerId(): string {
     return this.peerId
   }
 
   /**
-   * DTLS certificate fingerprints of a peer connection, from the local and
-   * remote session descriptions (`a=fingerprint:` lines, e.g.
-   * "sha-256 AB:CD:…"). A field is undefined until that description is set.
-   * Returns undefined if there is no connection to the peer.
+   * DTLS fingerprints ("sha-256 AB:CD:…") from the local and remote SDP; a
+   * field is undefined until that description is set.
    */
   getPeerFingerprints(
     peerId: string,
@@ -817,10 +589,8 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * True while this looks like a complete mesh: every peer seen via signaling
-   * recently is connected to us, and the room is small enough that every peer
-   * can connect to every other (see FULL_MESH_MAX_PEERS). Otherwise the
-   * provider relays remote awareness so presence crosses the gaps.
+   * True while every peer recently seen in signaling is connected and the
+   * room is below FULL_MESH_MAX_PEERS, i.e. a complete mesh.
    */
   get reachesAllPeers(): boolean {
     const now = Date.now()
@@ -837,31 +607,18 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * Check if connected.
-   *
-   * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
-   * a health check — it stays true with zero signaling servers, which is what
-   * makes BroadcastChannel-only mode work. For "can we still discover peers?"
-   * use `signalingHealth`.
+   * Lifecycle flag (between connect() and disconnect()), not health: it stays
+   * true with no signaling server. See `signalingHealth`.
    */
   get isConnected(): boolean {
     return this._connected
   }
 
-  /**
-   * Get number of connected peers (for debugging).
-   */
   get connectedPeers(): number {
     return Array.from(this.peers.values()).filter((p) => p.connected).length
   }
 
-  /**
-   * Signaling/discovery health, for diagnostics and monitoring.
-   *
-   * `isConnected` deliberately cannot express this: a transport whose signaling
-   * sockets have all dropped still reports connected, and peer discovery is
-   * silently dead until they come back.
-   */
+  /** Signaling sockets and peers, for diagnostics. */
   get signalingHealth(): {
     open: number
     configured: number
@@ -879,11 +636,8 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * Reconnect to a signaling server after it drops, with exponential backoff.
-   *
-   * Mirrors lib0's WebsocketClient (what y-webrtc gets for free): delay grows
-   * as log10(attempts + 1) * 1200ms, capped at 30s. No-ops after an explicit
-   * disconnect(), and never stacks duplicate timers for the same URL.
+   * Retry a dropped signaling server after log10(attempts + 1) * 1200ms,
+   * capped at 30s (as lib0's WebsocketClient). One timer per URL.
    */
   private scheduleSignalingReconnect(url: string): void {
     if (!this._connected) return // deliberate disconnect(), not a drop
@@ -903,19 +657,13 @@ export class SimplePeerTransport implements Transport {
         this._reconnectTimers.delete(url)
         if (!this._connected) return
         this.connectSignaling(url).catch(() => {
-          // connectSignaling rejects on error/timeout; onclose schedules the
-          // next attempt, so swallow here to avoid an unhandled rejection.
+          // onclose or the timeout schedules the next attempt.
         })
       }, delay),
     )
   }
 
-  /**
-   * Forget a signaling socket and schedule its reconnect. Without the
-   * reconnect, a single socket drop is terminal: the re-announce loop is gated
-   * on `signalingConns.length > 0`, so peer discovery stops forever while
-   * `isConnected` still reports true.
-   */
+  /** Forget a signaling socket and schedule its reconnect. */
   private dropSignaling(ws: WebSocket, url: string): void {
     const index = this.signalingConns.indexOf(ws)
     if (index > -1) {
@@ -926,11 +674,9 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * Ping signaling sockets that went quiet, and drop the ones that stayed
-   * silent past `signalingTimeout`. A half-open socket (dead TCP path, NAT or
-   * proxy idle timeout) keeps reporting OPEN and may not fire onclose for many
-   * minutes, during which we are invisible to new peers. Healthy sockets see
-   * traffic every 5s anyway (our own re-announce is echoed by the server).
+   * Ping quiet signaling sockets and drop those silent past
+   * `signalingTimeout` (half-open: OPEN but delivering nothing). Healthy
+   * sockets get our own re-announce echoed every 5s.
    */
   private checkSignalingLiveness(): void {
     const now = Date.now()
@@ -956,9 +702,6 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Connect to a signaling server.
-   */
   private async connectSignaling(url: string): Promise<void> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url)
@@ -966,25 +709,20 @@ export class SimplePeerTransport implements Transport {
 
       ws.onopen = () => {
         this.log(`🟢 Signaling connected: ${url}`)
-
-        // Reached a good state — restart backoff from zero for the next drop.
         this._reconnectAttempts.delete(url)
 
-        // Subscribe to room
         this.sendSignaling(ws, {
           type: 'subscribe',
           topics: [this._topic],
         })
 
-        // Announce presence with topic (room) for y-webrtc protocol
+        // 'publish' for y-webrtc servers, 'announce' for simpler ones.
         if (this.peers.size < this.options.maxConns) {
-          // y-webrtc uses 'publish' with from field
           this.sendSignaling(ws, {
             type: 'publish',
             topic: this._topic,
             from: this.peerId,
           })
-          // Also send announce for basic protocol compatibility
           this.sendSignaling(ws, {
             type: 'announce',
             from: this.peerId,
@@ -1013,7 +751,6 @@ export class SimplePeerTransport implements Transport {
         }
         try {
           const msg: SignalingMessage = JSON.parse(event.data)
-          // Only log signal-bearing messages to avoid flooding with pure topology pings
           if (msg.signal || msg.type === 'announce') {
             this.log(
               `📩 Signaling ‹${msg.type}›`,
@@ -1043,14 +780,11 @@ export class SimplePeerTransport implements Transport {
         this.dropSignaling(ws, url)
 
         if (!resolved) {
-          // Closed before ever opening — settle connect()'s promise so
-          // Promise.allSettled() in connect() isn't left hanging.
           resolved = true
           reject(new Error(`Signaling closed before open: ${url}`))
         }
       }
 
-      // Timeout after 10 seconds
       setTimeout(() => {
         if (!resolved) {
           resolved = true
@@ -1069,21 +803,15 @@ export class SimplePeerTransport implements Transport {
     })
   }
 
-  /**
-   * Handle messages from signaling server.
-   */
   private handleSignalingMessage(msg: SignalingMessage): void {
-    // Skip messages from ourselves
     if (msg.from && msg.from === this.peerId) return
 
     if (msg.from) this._peerLastSeen.set(msg.from, Date.now())
 
     switch (msg.type) {
       case 'publish':
-        // y-webrtc protocol: messages are published to topics
-        // This is an envelope, the actual message could be an announce or signal
+        // y-webrtc envelope: an announce, possibly carrying a signal.
         if (msg.from) {
-          // Treat as announce if it's a publish from another peer
           this.pruneStalePeer(msg.from)
           if (
             !this.peers.has(msg.from) &&
@@ -1098,8 +826,7 @@ export class SimplePeerTransport implements Transport {
             this.announcedPeers.add(msg.from)
             this.createPeerConnection(msg.from, shouldInitiate)
 
-            // If we're NOT the initiator, immediately re-announce so the initiator
-            // can discover us (they may have missed our initial publish)
+            // The initiator may have missed our publish; announce again.
             if (!shouldInitiate) {
               this.log('📢 Re-announcing so initiator can find us...')
               for (const ws of this.signalingConns) {
@@ -1112,7 +839,6 @@ export class SimplePeerTransport implements Transport {
             }
           }
         }
-        // Handle embedded signal if present
         if (msg.signal && msg.from) {
           if (!msg.to || msg.to === this.peerId) {
             this.handlePeerSignal(msg.from, msg.signal, msg.attempt)
@@ -1125,7 +851,6 @@ export class SimplePeerTransport implements Transport {
           this.log('Announce message missing from field')
           return
         }
-        // Another peer announced - connect to them if we have capacity
         this.pruneStalePeer(msg.from)
         if (
           !this.peers.has(msg.from) &&
@@ -1151,11 +876,10 @@ export class SimplePeerTransport implements Transport {
           this.log('Signal message missing from field')
           return
         }
-        // Received WebRTC signal from peer
+        // Some servers strip `to`; accept those too.
         if (msg.to === this.peerId && msg.signal) {
           this.handlePeerSignal(msg.from, msg.signal, msg.attempt)
         } else if (!msg.to && msg.signal) {
-          // Signal without explicit target — handle anyway (some servers strip `to`)
           this.handlePeerSignal(msg.from, msg.signal, msg.attempt)
         }
         break
@@ -1169,27 +893,18 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Send message to signaling server.
-   */
   private sendSignaling(ws: WebSocket, msg: SignalingMessage): void {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg))
     }
   }
 
-  /**
-   * Broadcast message to all signaling servers.
-   */
   private broadcastSignaling(msg: SignalingMessage): void {
     for (const ws of this.signalingConns) {
       this.sendSignaling(ws, msg)
     }
   }
 
-  /**
-   * Create a WebRTC peer connection.
-   */
   private createPeerConnection(remotePeerId: string, initiator: boolean): void {
     if (this.peers.has(remotePeerId)) {
       this.log(`⏭️ Peer connection already exists: ${remotePeerId}`)
@@ -1197,8 +912,7 @@ export class SimplePeerTransport implements Transport {
     }
 
     const failures = this._connectFailures.get(remotePeerId) ?? 0
-    // See relayFallbackAfter. Only the initiator switches: relay-only on one
-    // side already leaves no direct pair, and the other side needs no change.
+    // relayFallbackAfter: relay-only on the initiator alone leaves no direct pair.
     const relayAfter = this.options.relayFallbackAfter
     const relay =
       initiator &&
@@ -1236,8 +950,7 @@ export class SimplePeerTransport implements Transport {
 
     this.peers.set(remotePeerId, peerConn)
 
-    // See DEFAULT_CONNECT_TIMEOUT: the initiator times out early and offers
-    // again; the non-initiator waits for that new offer.
+    // See DEFAULT_CONNECT_TIMEOUT.
     const timeout = initiator
       ? Math.min(this.options.connectTimeout * 2 ** failures, CONNECT_TIMEOUT_MAX)
       : CONNECT_TIMEOUT_MAX
@@ -1256,12 +969,10 @@ export class SimplePeerTransport implements Transport {
       }
     }, timeout)
 
-    // Handle signaling data (ICE candidates and SDP)
     peer.on('signal', (signal: any) => {
       this.log(`📤 Signal to ${remotePeerId}: ${signal.type ?? 'candidate'}`)
-      // Send as 'publish' only — broadcasting as BOTH 'publish' and 'signal' causes the
-      // receiving peer to apply the same SDP offer twice, which triggers a WebRTC error
-      // and destroys the peer before it can fully connect.
+      // 'publish' only: also sending 'signal' would apply the SDP twice and
+      // destroy the peer.
       this.broadcastSignaling({
         type: 'publish',
         from: this.peerId,
@@ -1272,11 +983,10 @@ export class SimplePeerTransport implements Transport {
       })
     })
 
-    // Mark channel open and notify provider — called by either 'connect' or the first
-    // 'data' event, whichever fires first (WebRTC can deliver data before 'connect' on
-    // some browsers, causing replies to be dropped if we wait for 'connect' only).
+    // On 'connect' or the first 'data', whichever comes first: some browsers
+    // deliver data before 'connect'.
     const onChannelOpen = (via: string) => {
-      if (peerConn.connected) return // already fired
+      if (peerConn.connected) return
       peerConn.connected = true
       clearTimeout(peerConn.connectTimer)
       this._connectFailures.delete(remotePeerId)
@@ -1289,12 +999,9 @@ export class SimplePeerTransport implements Transport {
       for (const cb of this._peerConnectCallbacks) cb(remotePeerId)
     }
 
-    // Handle connection
     peer.on('connect', () => onChannelOpen('connect'))
 
-    // Handle ICE connection state for debugging. addEventListener, not the
-    // on* properties: simple-peer's own handlers there destroy the peer on
-    // failure, which is what fires 'close' for a peer that vanished.
+    // Debug logging. addEventListener: simple-peer owns the on* handlers.
     if (peer._pc) {
       peer._pc.addEventListener('iceconnectionstatechange', () => {
         this.log(`🧊 ICE ${remotePeerId}: ${peer._pc.iceConnectionState}`)
@@ -1304,10 +1011,7 @@ export class SimplePeerTransport implements Transport {
       })
     }
 
-    // Handle incoming data
     peer.on('data', (data: ArrayBuffer) => {
-      // Data flowing proves the channel is open — handle the race where 'data' fires
-      // before 'connect' (seen on Chrome when the remote initiator sends immediately).
       onChannelOpen('data')
 
       let uint8Data: Uint8Array
@@ -1319,7 +1023,7 @@ export class SimplePeerTransport implements Transport {
       }
       if (uint8Data.length === 0) return
 
-      // Control frames bypass the provider pipe (identity/auth handshakes etc.)
+      // Control frames never reach the provider and are never held.
       if (uint8Data[0] === MSG_TYPE_CONTROL) {
         const payload = uint8Data.slice(1)
         for (const cb of this._controlCallbacks) cb(remotePeerId, payload)
@@ -1332,10 +1036,8 @@ export class SimplePeerTransport implements Transport {
         const msgType = uint8Data[0]
 
         if (msgType === MSG_TYPE_COMPLETE) {
-          // Complete message, extract payload (skip type byte)
           this.deliver(peerConn, uint8Data.slice(1))
         } else if (msgType === MSG_TYPE_CHUNKED) {
-          // Chunked message - reassemble
           if (uint8Data.length < 13) {
             this.log(`🗑️ Dropping truncated chunk from ${remotePeerId}`)
             return
@@ -1366,7 +1068,6 @@ export class SimplePeerTransport implements Transport {
             }
           }
 
-          // Get or create buffer for this message
           let buffer = peerConn.chunkBuffers.get(messageId)
           if (buffer && buffer.totalChunks !== totalChunks) {
             // Same id, different message: drop the old partial one.
@@ -1383,13 +1084,10 @@ export class SimplePeerTransport implements Transport {
             peerConn.chunkBuffers.set(messageId, buffer)
           }
 
-          // Store chunk
           buffer.chunks.set(chunkIndex, chunkData)
           buffer.lastChunkAt = now
 
-          // Check if complete
           if (buffer.chunks.size === totalChunks) {
-            // Reassemble message
             let totalLength = 0
             for (let i = 0; i < totalChunks; i++) {
               totalLength += buffer.chunks.get(i)!.length
@@ -1403,7 +1101,6 @@ export class SimplePeerTransport implements Transport {
               offset += chunk.length
             }
 
-            // Clean up buffer
             peerConn.chunkBuffers.delete(messageId)
 
             this.deliver(peerConn, fullMessage)
@@ -1419,15 +1116,13 @@ export class SimplePeerTransport implements Transport {
       }
     })
 
-    // Handle errors
-    // close/error fire asynchronously after destroy(); by then a fresh
-    // connection to the same peer may exist, which they must not remove.
+    // close/error fire asynchronously after destroy(), possibly once a new
+    // connection to the same peer exists; leave that one alone.
     peer.on('error', (error: Error) => {
       this.log(`❌ Peer error [${remotePeerId}]: ${error.message ?? error}`)
       if (this.peers.get(remotePeerId) === peerConn) this.removePeer(remotePeerId)
     })
 
-    // Handle close
     peer.on('close', () => {
       if (this.peers.get(remotePeerId) !== peerConn) return
       const connectedCount = Array.from(this.peers.values()).filter(
@@ -1440,9 +1135,6 @@ export class SimplePeerTransport implements Transport {
     })
   }
 
-  /**
-   * Handle WebRTC signal from peer.
-   */
   private handlePeerSignal(
     remotePeerId: string,
     signal: any,
@@ -1451,18 +1143,14 @@ export class SimplePeerTransport implements Transport {
     let peerConn = this.peers.get(remotePeerId)
 
     if (peerConn && signal?.sdp && signal.sdp === peerConn.remoteSdp) {
-      // The same offer/answer again (one copy per signaling server); applying
-      // it twice makes simple-peer destroy the connection.
+      // Duplicate (one per signaling server); applying it twice destroys the peer.
       return
     }
 
     if (peerConn && signal?.type === 'offer') {
-      // An offer from a new attempt means the remote gave up on the old
-      // connection (e.g. its connect timeout fired): start over with a fresh
-      // one instead of renegotiating the stuck one. A renegotiation offer
-      // carries the same attempt id; peers without attempt ids (older
-      // versions) are recognised by a second offer on a connection that
-      // never opened.
+      // An offer under a new attempt id (or, from untagged peers, a second
+      // offer before the channel opened) replaces the connection;
+      // renegotiation keeps the same id.
       const restarted =
         attempt !== undefined
           ? peerConn.remoteAttemptId !== undefined &&
@@ -1476,8 +1164,7 @@ export class SimplePeerTransport implements Transport {
     }
 
     if (peerConn && signal?.candidate && attempt !== undefined) {
-      // A candidate from an attempt other than the one we negotiate with is
-      // stale; simple-peer destroys the connection when adding it fails.
+      // A stale candidate would fail to add and destroy the peer.
       if (attempt !== peerConn.remoteAttemptId) {
         this.log(`🗑️ Ignoring candidate from an old attempt of ${remotePeerId}`)
         return
@@ -1485,8 +1172,7 @@ export class SimplePeerTransport implements Transport {
     }
 
     if (!peerConn && signal?.candidate && attempt !== undefined) {
-      // A tagged candidate always follows its offer on the same socket, so
-      // one for a peer we have no connection to belongs to a closed attempt.
+      // Tagged candidates follow their offer, so this one's attempt is closed.
       this.log(`🗑️ Ignoring candidate for unknown peer ${remotePeerId}`)
       return
     }
@@ -1518,16 +1204,14 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  // Forget a peer we announced but hold no live connection to, so its next
-  // re-announce can reconnect instead of being deduped forever (ghost peer).
+  // Forget an announced peer with no connection, so its next announce reconnects.
   private pruneStalePeer(peerId: string): void {
     if (this.announcedPeers.has(peerId) && !this.peers.has(peerId)) {
       this.announcedPeers.delete(peerId)
     }
   }
 
-  // Drop the per-peer bookkeeping of peers we hold no connection to and have
-  // not heard from for a while, so it does not grow with every visitor.
+  // Drop bookkeeping for long-gone peers so it doesn't grow with every visitor.
   private forgetGonePeers(): void {
     const cutoff = Date.now() - 5 * PEER_SEEN_WINDOW
     for (const [peerId, seenAt] of this._peerLastSeen) {
@@ -1555,9 +1239,6 @@ export class SimplePeerTransport implements Transport {
     peerConn.heldBytes += data.length
   }
 
-  /**
-   * Remove and cleanup a peer connection.
-   */
   private removePeer(peerId: string): void {
     const peerConn = this.peers.get(peerId)
     if (peerConn) {
@@ -1565,8 +1246,8 @@ export class SimplePeerTransport implements Transport {
       clearTimeout(peerConn.connectTimer)
       try {
         peerConn.peer.destroy()
-      } catch (error) {
-        // Ignore errors during cleanup
+      } catch {
+        // already destroyed
       }
       this.peers.delete(peerId)
       this.announcedPeers.delete(peerId)
@@ -1581,16 +1262,10 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
-  /**
-   * Generate a unique peer ID.
-   */
   private generatePeerId(): string {
     return Date.now().toString(36) + Math.random().toString(36).substr(2, 9)
   }
 
-  /**
-   * Log debug messages if enabled.
-   */
   private log(...args: any[]): void {
     if (this.options.debug) {
       console.log('[SimplePeerTransport]', ...args)

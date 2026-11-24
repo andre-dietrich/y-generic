@@ -1,57 +1,30 @@
 import type { Transport, ConnectionConfig } from '../../transport'
 
-/**
- * WebSocket transport configuration
- */
 export interface WebSocketConfig extends ConnectionConfig {
-  /** WebSocket server URL (required) e.g., 'ws://localhost:1234' or 'wss://example.com' */
+  /** e.g. 'wss://example.com'; the room is appended as a path segment. */
   serverUrl: string
-  /** Enable automatic reconnection on disconnect (default: true) */
+  /** @default true */
   autoReconnect?: boolean
-  /** Reconnection delay in milliseconds (default: 2000) */
+  /** ms between attempts. @default 2000 */
   reconnectDelay?: number
-  /** Maximum reconnection attempts (0 = infinite, default: 0) */
+  /** 0 = unlimited. @default 0 */
   maxReconnectAttempts?: number
-  /** WebSocket protocols (optional) */
   protocols?: string | string[]
-  /** Enable debug logging */
   debug?: boolean
   /**
-   * Drop and reconnect when nothing has been received for this long (ms).
-   * Catches half-open sockets that still report OPEN but deliver nothing.
-   * Same rule as y-websocket's client; relies on regular server traffic
-   * (GenericProvider's periodic sync and awareness renewals). 0 disables.
-   * (default: 30000)
+   * Reconnect after this many ms without a received message (half-open
+   * socket), like y-websocket's client. 0 disables. @default 30000
    */
   messageTimeout?: number
 }
 
 /**
- * WebSocket Transport for Yjs
- *
- * Provides real-time synchronization using WebSocket connections.
- *
- * Features:
- * - Direct WebSocket connection to server
- * - Room-based collaboration
- * - Automatic reconnection
- * - Binary message support
- * - Low latency real-time sync
+ * WebSocket transport, URL layout compatible with y-websocket servers.
  *
  * @example
  * ```ts
- * import * as Y from 'yjs'
- * import { GenericProvider } from 'y-generic'
- * import { WebSocketTransport } from 'y-generic/providers/websocket'
- *
- * const doc = new Y.Doc()
- * const transport = new WebSocketTransport()
- *
- * const provider = new GenericProvider(doc, transport)
- * await provider.connect({
- *   serverUrl: 'ws://localhost:1234',
- *   room: 'my-room'
- * })
+ * const provider = new GenericProvider(doc, new WebSocketTransport())
+ * await provider.connect({ serverUrl: 'wss://example.com', room: 'my-room' })
  * ```
  */
 export class WebSocketTransport implements Transport {
@@ -65,13 +38,12 @@ export class WebSocketTransport implements Transport {
   private reconnectAttempts: number = 0
   private reconnectTimer?: ReturnType<typeof setTimeout>
   private intentionalDisconnect: boolean = false
-  private messageQueue: Uint8Array[] = [] // Queue messages until connected
-  private receivedBuffer: Uint8Array[] = [] // Buffer messages received before callback registered
+  private messageQueue: Uint8Array[] = [] // sent while not open
+  private receivedBuffer: Uint8Array[] = [] // received before onMessage()
   private lastMessageAt: number = 0
   private livenessTimer?: ReturnType<typeof setInterval>
   private wsUrl: string = ''
-  // The promise returned by connect(), settled by whichever socket attempt
-  // opens first (or rejected once retrying is off or exhausted).
+  // connect()'s promise, settled by the first attempt that opens.
   private pendingConnect?: {
     resolve: () => void
     reject: (error: Error) => void
@@ -82,13 +54,9 @@ export class WebSocketTransport implements Transport {
   }
 
   /**
-   * Connect to WebSocket server.
-   *
-   * Resolves once a socket is open. With `autoReconnect` on (the default), a
-   * failed or timed-out attempt does not reject: the transport keeps retrying
-   * and the promise resolves when one succeeds. It rejects when
-   * `autoReconnect` is off, when `maxReconnectAttempts` runs out, or when
-   * disconnect() is called first.
+   * Resolves once a socket is open. With `autoReconnect`, failed attempts
+   * are retried instead of rejecting; it rejects only when retrying is off
+   * or exhausted, or disconnect() is called first.
    */
   async connect(config: WebSocketConfig): Promise<void> {
     if (!config.serverUrl) {
@@ -104,13 +72,10 @@ export class WebSocketTransport implements Transport {
     this.intentionalDisconnect = false
     this.reconnectAttempts = 0
 
-    // Build URL with room (y-websocket compatible)
     let wsUrl = config.serverUrl
-    // Remove trailing slash if present
     if (wsUrl.endsWith('/')) {
       wsUrl = wsUrl.slice(0, -1)
     }
-    // Append room name to URL path
     this.wsUrl = `${wsUrl}/${encodeURIComponent(config.room)}`
 
     return new Promise((resolve, reject) => {
@@ -139,7 +104,6 @@ export class WebSocketTransport implements Transport {
 
     let ws: WebSocket
     try {
-      // Create WebSocket connection with room in URL (y-websocket style)
       ws = new WebSocket(this.wsUrl, config.protocols)
       ws.binaryType = 'arraybuffer'
     } catch (error) {
@@ -169,8 +133,6 @@ export class WebSocketTransport implements Transport {
       this.reconnectAttempts = 0
       this.log(`✅ WebSocket connected to room: ${config.room}`)
       this.startLivenessCheck()
-
-      // Flush queued messages
       this.flushMessageQueue()
 
       this.settleConnect()
@@ -213,9 +175,6 @@ export class WebSocketTransport implements Transport {
     }
   }
 
-  /**
-   * Disconnect from WebSocket server
-   */
   disconnect(): void {
     this.intentionalDisconnect = true
     this.settleConnect(new Error('WebSocket disconnected before it connected'))
@@ -235,9 +194,7 @@ export class WebSocketTransport implements Transport {
     this._isConnected = false
   }
 
-  /**
-   * Send data to server
-   */
+  /** Send now, or queue until the socket opens. */
   send(data: Uint8Array): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       this.log('⚠️ WebSocket not ready, queueing message')
@@ -253,13 +210,9 @@ export class WebSocketTransport implements Transport {
     }
   }
 
-  /**
-   * Register message callback
-   */
   onMessage(callback: (data: Uint8Array) => void): () => void {
     this.messageCallback = callback
 
-    // Flush any buffered messages that arrived before callback was registered
     if (this.receivedBuffer.length > 0) {
       this.log(
         `📦 Flushing ${this.receivedBuffer.length} buffered received messages`,
@@ -275,13 +228,10 @@ export class WebSocketTransport implements Transport {
     }
   }
 
-  /**
-   * Handle incoming WebSocket message
-   */
   private handleMessage(data: ArrayBuffer | string): void {
     try {
       if (typeof data === 'string') {
-        // Handle text messages (control messages)
+        // Text frames aren't part of the protocol; log and ignore.
         this.log('📨 Received text message:', data)
         return
       }
@@ -292,7 +242,6 @@ export class WebSocketTransport implements Transport {
       if (this.messageCallback) {
         this.messageCallback(uint8Data)
       } else {
-        // Buffer message if callback not registered yet (race condition)
         this.log('⏳ Buffering message (callback not yet registered)')
         this.receivedBuffer.push(uint8Data)
       }
@@ -301,9 +250,6 @@ export class WebSocketTransport implements Transport {
     }
   }
 
-  /**
-   * Flush queued messages
-   */
   private flushMessageQueue(): void {
     if (this.messageQueue.length === 0) return
 
@@ -317,9 +263,8 @@ export class WebSocketTransport implements Transport {
   }
 
   /**
-   * Watch for a socket that stays OPEN but receives nothing (half-open: dead
-   * TCP path, NAT or proxy idle timeout). The browser may not fire onclose for
-   * many minutes; meanwhile sends vanish and nothing arrives.
+   * Reconnect a socket that stays OPEN but receives nothing (dead TCP path,
+   * NAT or proxy timeout); the browser may not fire onclose for minutes.
    */
   private startLivenessCheck(): void {
     this.stopLivenessCheck()
@@ -354,10 +299,7 @@ export class WebSocketTransport implements Transport {
     }
   }
 
-  /**
-   * Schedule the next connection attempt. Returns false when
-   * `maxReconnectAttempts` is used up.
-   */
+  /** Schedule the next attempt; false once `maxReconnectAttempts` is used up. */
   private attemptReconnect(): boolean {
     if (!this.config) return false
     if (this.reconnectTimer) return true // already scheduled
@@ -383,9 +325,6 @@ export class WebSocketTransport implements Transport {
     return true
   }
 
-  /**
-   * Debug logging
-   */
   private log(message: string, ...args: any[]): void {
     if (this.debug) {
       console.log(`[WebSocketTransport] ${message}`, ...args)

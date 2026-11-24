@@ -4,6 +4,12 @@
   "description": "A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.",
   "license": "ISC",
   "author": "André Dietrich",
+  "contributors": [
+    {
+      "name": "jh-488",
+      "url": "https://github.com/jh-488"
+    }
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/andre-dietrich/y-generic.git"

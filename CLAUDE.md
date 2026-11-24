@@ -126,9 +126,10 @@ edrys-Lite (`src/ts/`: `GenericWebrtcProviderAdapter`, `GenericWebsocketProvider
   peer's data frames are held (max 256 frames / 16 MB, discarded on disconnect), so an
   unverified peer can't inject doc, awareness or pubsub data. Holding instead of dropping
   keeps the newcomer's initial sync; control frames are never held.
-- **`localPeerId` / `getPeerFingerprints(peerId)`** (simple-peer) — not used yet; meant for
-  binding the handshake signature to the connection (peer ids + DTLS fingerprints) so it
-  can't be replayed.
+- **`localPeerId` / `getPeerFingerprints(peerId)`** (simple-peer) — the handshake signature
+  covers both peer ids and both DTLS fingerprints, so it can't be replayed on another
+  connection. Missing fingerprints mean the peer is rejected, so `getPeerFingerprints` must
+  keep returning both once the channel is open.
 - **Set-based `onPeerConnect`/`onPeerDisconnect` in simple-peer** — `EdrysSimplePeerTransport`
   and the provider both register listeners; single callback slots would drop one of them.
 - **simple-peer `scheduleSignalingReconnect` / `signalingHealth` / `pruneStalePeer`** — retry

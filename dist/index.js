@@ -5,79 +5,37 @@ import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { Observable } from 'lib0/observable';
 import * as bc from 'lib0/broadcastchannel';
-// Message type identifiers
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
 const MESSAGE_PUBSUB = 2;
-// Sync update with sequence number and state-vector hash, sent by 2.0.x
-// peers. No longer sent (see the MESSAGE_SYNC_VERIFIED case in
-// _handleIncomingMessage); still decoded so those peers keep working.
+// Sent only by 2.0.x peers; decoded, never sent.
 const MESSAGE_SYNC_VERIFIED = 3;
-const MESSAGE_PUBSUB_TARGETED = 4; // Pub/sub message aimed at a single target
-// Sub-channel inside a MESSAGE_AWARENESS frame: [opcode 1][channel][update].
+const MESSAGE_PUBSUB_TARGETED = 4;
+// Channel byte in a MESSAGE_AWARENESS frame: [opcode 1][channel][update].
 const AWARENESS_CHANNEL_MAIN = 0;
 const AWARENESS_CHANNEL_APP = 1;
-// Wire generation, in names peers meet under (BroadcastChannel here, the
-// simple-peer signaling topic). 2.x framed every message as
-// [CRC32][opcode]..., 3.x sends [opcode]... with no checksum; the tag keeps
-// the two from meeting and mis-decoding each other. The WebSocket relay never
-// saw the CRC (the transport stripped it), so it needs no tag. Keep in step
-// with WIRE_TAG in providers/simple-peer.
+// Part of the BroadcastChannel name so tabs still running 2.x (CRC32-framed)
+// never meet 3.x tabs. Keep in step with WIRE_TAG in providers/simple-peer.
 const WIRE_TAG = 'v3';
-/**
- * PubSub channel for real-time messaging alongside Yjs.
- * Allows sending ephemeral messages that don't need CRDT properties.
- */
+/** Ephemeral JSON messages alongside the Yjs document. */
 export class PubSubChannel extends Observable {
     constructor(provider) {
         super();
         this.provider = provider;
     }
-    /**
-     * Publish a message to a topic.
-     *
-     * @param topic - Topic name (e.g., 'notifications', 'rpc', 'events')
-     * @param message - Any JSON-serializable data
-     *
-     * @example
-     * ```typescript
-     * provider.pubsub.publish('chat', { user: 'Alice', text: 'Hello!' })
-     * provider.pubsub.publish('cursor', { x: 100, y: 200 })
-     * ```
-     */
+    /** Broadcast a JSON-serializable message on a topic. */
     publish(topic, message) {
         this.provider._sendPubSub(topic, message);
     }
     /**
-     * Publish a message to a single target instead of broadcasting.
-     *
-     * On transports with `sendTo`, `target` is the peer's ID and delivery is
-     * direct. On transports without it, the message is broadcast with the
-     * target embedded and dropped by every provider whose `localId` differs.
-     *
-     * @param target - Recipient id (transport peerId, or a `localId`)
-     * @param topic - Topic name
-     * @param message - Any JSON-serializable data
+     * Send a message to one target: direct via `transport.sendTo` where
+     * available, otherwise broadcast and dropped by providers whose `localId`
+     * differs.
      */
     publishTo(target, topic, message) {
         this.provider._sendPubSubTo(target, topic, message);
     }
-    /**
-     * Subscribe to messages on a topic.
-     *
-     * @param topic - Topic name to listen to (use '*' for all topics)
-     * @param callback - Function called when message received
-     * @returns Unsubscribe function
-     *
-     * @example
-     * ```typescript
-     * const unsub = provider.pubsub.subscribe('chat', (msg) => {
-     *   console.log('Chat:', msg)
-     * })
-     *
-     * // Later: unsub()
-     * ```
-     */
+    /** Subscribe to a topic ('*' for all); returns an unsubscribe function. */
     subscribe(topic, callback) {
         const handler = (message, receivedTopic) => {
             if (topic === '*' || topic === receivedTopic) {
@@ -87,82 +45,43 @@ export class PubSubChannel extends Observable {
         this.on('message', handler);
         return () => this.off('message', handler);
     }
-    /**
-     * Internal: Handle incoming pub/sub message
-     */
+    /** @internal */
     _handleMessage(topic, message) {
         this.emit('message', [message, topic]);
     }
 }
 /**
- * Generic Yjs provider that works with any transport implementation.
- *
- * This provider handles all Yjs synchronization logic including:
- * - Document updates (automatic sync)
- * - Awareness protocol (presence, cursors, etc.)
- * - State vector synchronization
- * - Optional pub/sub channel for real-time messaging
- *
- * You only need to implement the Transport interface for your backend.
+ * Yjs provider over any `Transport`: document sync, two awareness channels
+ * (`awareness`, `appAwareness`), pub/sub and cross-tab BroadcastChannel.
  *
  * @example
  * ```typescript
- * // Create your transport
- * const transport = new MyCustomTransport()
- *
- * // Create provider with Yjs document
- * const doc = new Y.Doc()
- * const provider = new GenericProvider(doc, transport)
- *
- * // Connect
+ * const provider = new GenericProvider(new Y.Doc(), new MyTransport())
  * await provider.connect({ room: 'my-room' })
- *
- * // Provider automatically syncs all changes
- * const ytext = doc.getText('content')
- * ytext.insert(0, 'Hello') // Automatically synced!
  * ```
  */
 export class GenericProvider extends Observable {
-    /**
-     * Create a new generic provider.
-     *
-     * @param doc - The Yjs document to sync
-     * @param transport - Transport implementation for your backend
-     * @param options - Optional configuration
-     */
     constructor(doc, transport, options = {}) {
         super();
         this._status = { state: 'disconnected' };
         this._synced = false;
         this._destroying = false;
-        // BroadcastChannel state for cross-tab sync
         this._bcChannel = '';
         this._bcConnected = false;
-        // Rate limiting for sync requests
+        // Shared budget for SyncStep1 pulls, syncNow() pushes and SyncStep2 replies.
         this._syncRequestTimes = [];
-        // SyncStep2 reply suppression (NACK-suppression style): delay a reply to
-        // a SyncStep1 request briefly, and drop it if another peer's reply is
-        // overheard first - since every reply is broadcast to the whole room
-        // anyway, this avoids every peer answering the same request redundantly.
-        // Only engages when there's genuine redundancy (see _handleSyncMessage)
-        // - with 0-1 other known
-        // peers there's no "someone else" to rely on, so replies go out
-        // immediately as before.
+        // A SyncStep2 reply waits a random delay and is dropped if another peer's
+        // reply arrives first (see _scheduleSyncReply).
         this._pendingSyncReply = null;
-        // Update batching/debouncing
-        this._batchUpdates = 0; // milliseconds delay (0 = disabled)
+        this._batchUpdates = 0; // ms, 0 = send immediately
         this._pendingUpdate = null;
-        // Awareness throttling - prevents awareness from flooding document sync
-        this._awarenessInterval = 100; // ms between awareness broadcasts
+        // Awareness throttling, one set of state per channel.
+        this._awarenessInterval = 100;
         this._pendingAwarenessClients = new Set();
         this._lastAwarenessTime = 0;
-        // Independent throttle state for the app awareness channel.
         this._pendingAppAwarenessClients = new Set();
         this._lastAppAwarenessTime = 0;
-        // Origins whose updates are never sent to the transport (local-only txns).
         this._excludeOrigins = new Set();
-        // Connect-time sync strategy: 'push-pull' (default) sends full local state
-        // then requests remote; 'pull' only requests remote state.
         this._syncMode = 'push-pull';
         this.doc = doc;
         this.transport = transport;
@@ -184,16 +103,11 @@ export class GenericProvider extends Observable {
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
-    /**
-     * Connect to the backend and start syncing.
-     *
-     * @param config - Connection configuration passed to transport
-     */
+    /** Connect the transport and start syncing. */
     async connect(config) {
         if (this._destroying) {
             throw new Error('Provider is being destroyed');
         }
-        // Prevent double connect race condition
         if (this._status.state === 'connected') {
             console.warn('[GenericProvider] Already connected, ignoring connect() call');
             return;
@@ -204,17 +118,13 @@ export class GenericProvider extends Observable {
         }
         this._setStatus({ state: 'connecting' });
         try {
-            // Setup BroadcastChannel for cross-tab sync (if enabled and available)
             this._setupBroadcastChannel(config);
-            // Register for incoming messages BEFORE connecting: a transport that
-            // keeps retrying on its own (e.g. WebSocket with autoReconnect) may
-            // deliver messages from a later attempt, and nothing would ever
-            // register the handler if connect() threw first.
+            // Register before connecting: a transport that retries on its own
+            // (WebSocket autoReconnect) may deliver messages from a later attempt.
             this._unsubscribeTransport = this.transport.onMessage((data) => {
                 this._handleIncomingMessage(data);
             });
-            // When a new WebRTC peer channel opens, immediately push our full state
-            // so peers that reconnected after offline edits receive our changes.
+            // Push full state to each new peer so offline edits reach it.
             if (this.transport.onPeerConnect) {
                 const unsubPeer = this.transport.onPeerConnect((_peerId) => {
                     if (!this._destroying)
@@ -226,7 +136,6 @@ export class GenericProvider extends Observable {
                     unsubPeer();
                 };
             }
-            // Connect the transport
             await this.transport.connect(config);
             // disconnect()/destroy() was called while the transport was connecting.
             if (!this._isConnecting()) {
@@ -234,24 +143,15 @@ export class GenericProvider extends Observable {
                 return;
             }
             this._setStatus({ state: 'connected' });
-            // Send initial sync. In 'push-pull' mode, syncNow() pushes our local
-            // state (so offline edits reach currently-connected peers) then requests
-            // remote state. In 'pull' mode, only request remote state — a relay/server
-            // holds authoritative state and we adopt it rather than pushing a
-            // competing local copy on every (re)connect.
             if (this._syncMode === 'pull') {
                 this._sendSyncStep1();
             }
             else {
                 this.syncNow();
             }
-            // Broadcast local awareness state
             this._broadcastAwareness([this.doc.clientID]);
             this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP);
-            // Start periodic sync to handle packet loss
-            // Just request sync without sending full state (avoid redundant broadcasts)
-            // _sendSyncStep1() already checks the shared rate limiter internally
-            // and silently drops the request if it's exceeded.
+            // Periodic pull only (no full-state push) to recover lost updates.
             if (this._syncInterval > 0) {
                 this._syncIntervalId = setInterval(() => {
                     if (this.transport.isConnected && !this._destroying) {
@@ -261,8 +161,7 @@ export class GenericProvider extends Observable {
             }
         }
         catch (error) {
-            // Undo the setup above so a later connect() starts clean (otherwise a
-            // retry would subscribe to BroadcastChannel and the transport twice).
+            // Undo the setup so a retry doesn't subscribe twice.
             this._unsubscribeTransport?.();
             this._unsubscribeTransport = undefined;
             this._disconnectBroadcastChannel();
@@ -276,41 +175,29 @@ export class GenericProvider extends Observable {
             throw error;
         }
     }
-    /**
-     * Disconnect from the backend.
-     * The provider can be reconnected later with connect().
-     */
+    /** Disconnect; connect() may be called again later. */
     disconnect() {
-        // Stop periodic sync
         if (this._syncIntervalId !== undefined) {
             clearInterval(this._syncIntervalId);
             this._syncIntervalId = undefined;
         }
-        // Reset the sync rate-limit budget. Without this, a reconnect inherits
-        // whatever budget was left over from before the disconnect - and since
-        // syncNow()'s full-state push now shares this same limiter (see
-        // _tryReserveSyncSlot()), a rate-limited reconnect could silently skip
-        // the very push that delivers edits made while offline.
+        // A fresh budget, so the reconnect push carrying offline edits isn't
+        // rate-limited by requests made before the disconnect.
         this._syncRequestTimes = [];
-        // Drop any pending suppressed sync reply - safe to simply discard (not
-        // flush/send like batched updates/awareness below), since a suppressed
-        // reply is by design redundant with whatever the room already has.
+        // A suppressed reply is redundant by design; discard rather than flush.
         this._cancelPendingSyncReply();
-        // Flush any pending batched updates before disconnecting
+        // Flush pending batched updates and awareness.
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
             this._batchTimeoutId = undefined;
-            // Send pending update if transport is still connected
             if (this._pendingUpdate && this.transport.isConnected) {
                 this._sendUpdate(this._pendingUpdate);
             }
             this._pendingUpdate = null;
         }
-        // Flush pending awareness updates before disconnecting
         if (this._awarenessTimeoutId !== undefined) {
             clearTimeout(this._awarenessTimeoutId);
             this._awarenessTimeoutId = undefined;
-            // Send pending awareness if transport is still connected
             if (this._pendingAwarenessClients.size > 0 &&
                 this.transport.isConnected) {
                 const clientsToSend = Array.from(this._pendingAwarenessClients);
@@ -318,7 +205,6 @@ export class GenericProvider extends Observable {
             }
         }
         this._pendingAwarenessClients.clear();
-        // Flush pending app awareness updates before disconnecting
         if (this._appAwarenessTimeoutId !== undefined) {
             clearTimeout(this._appAwarenessTimeoutId);
             this._appAwarenessTimeoutId = undefined;
@@ -328,50 +214,25 @@ export class GenericProvider extends Observable {
             }
         }
         this._pendingAppAwarenessClients.clear();
-        // Disconnect BroadcastChannel
         this._disconnectBroadcastChannel();
         if (this._unsubscribeTransport) {
             this._unsubscribeTransport();
             this._unsubscribeTransport = undefined;
         }
-        // Mark local client as offline in awareness
         awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'disconnect');
         awarenessProtocol.removeAwarenessStates(this.appAwareness, [this.doc.clientID], 'disconnect');
         this.transport.disconnect();
         this._synced = false;
         this._setStatus({ state: 'disconnected' });
     }
-    /**
-     * Destroy the provider permanently.
-     * Removes all event listeners and cleans up resources.
-     */
+    /** Disconnect and remove all listeners; the provider can't be reused. */
     destroy() {
         this._destroying = true;
-        // Stop periodic sync (disconnect() will also do this, but be explicit)
-        if (this._syncIntervalId !== undefined) {
-            clearInterval(this._syncIntervalId);
-            this._syncIntervalId = undefined;
-        }
-        // Drop any pending suppressed sync reply (disconnect() will also do
-        // this, but be explicit)
-        this._cancelPendingSyncReply();
-        // Flush any pending batched updates before destroying
-        if (this._batchTimeoutId !== undefined) {
-            clearTimeout(this._batchTimeoutId);
-            this._batchTimeoutId = undefined;
-            // Send pending update if transport is still connected
-            if (this._pendingUpdate && this.transport.isConnected) {
-                this._sendUpdate(this._pendingUpdate);
-            }
-            this._pendingUpdate = null;
-        }
         this.disconnect();
-        // Remove document update listener
         if (this._updateHandler) {
             this.doc.off('update', this._updateHandler);
             this._updateHandler = undefined;
         }
-        // Remove awareness update listeners
         if (this._awarenessUpdateHandler) {
             this.awareness.off('update', this._awarenessUpdateHandler);
             this._awarenessUpdateHandler = undefined;
@@ -380,7 +241,6 @@ export class GenericProvider extends Observable {
             this.appAwareness.off('update', this._appAwarenessUpdateHandler);
             this._appAwarenessUpdateHandler = undefined;
         }
-        // Remove beforeunload handler
         if (this._beforeUnloadHandler && typeof window !== 'undefined') {
             window.removeEventListener('beforeunload', this._beforeUnloadHandler);
             this._beforeUnloadHandler = undefined;
@@ -389,118 +249,72 @@ export class GenericProvider extends Observable {
         this.appAwareness.destroy();
         super.destroy();
     }
-    /**
-     * Current connection status
-     */
     get status() {
         return this._status;
     }
-    /**
-     * Whether the provider is connected to the backend
-     */
     get connected() {
         return this.transport.isConnected;
     }
-    /**
-     * Whether BroadcastChannel is connected for cross-tab sync
-     */
     get bcConnected() {
         return this._bcConnected;
     }
-    /**
-     * Whether the document is synced with remote peers
-     */
+    /** True once a SyncStep2 has been received. */
     get synced() {
         return this._synced;
     }
-    /**
-     * Force an immediate sync with remote peers.
-     * Useful after network interruptions or to manually trigger re-sync.
-     */
+    /** Push the full document state, request missing updates and re-send awareness. */
     syncNow() {
         if (!this.transport.isConnected) {
             console.warn('Cannot sync: transport not connected');
             return;
         }
-        // Push (full document state) and pull (SyncStep1 request) share a
-        // single rate-limit reservation. syncNow() is called from several
-        // triggers that can all fire in a short window when many peers are
-        // converging at once (per-peer connect events on mesh transports) -
-        // without this gate the
-        // push above had NO limit at all, so each trigger broadcast the full
-        // document state to the whole room, and those broadcasts caused more
-        // reordering/mismatches elsewhere, causing more triggers. Measured in
-        // test/dummy/bench-user-scaling.ts: at 100 simulated users this drove
-        // message counts to 20-200x the theoretical linear cost. See
-        // docs/superpowers/specs/2026-07-26-dummy-benchmark-scaling-design.md.
+        // Rate-limited: many peers joining at once each trigger a full-state
+        // broadcast (see test/dummy/bench-user-scaling.ts).
         if (this._tryReserveSyncSlot()) {
-            // Send our current document state to all peers
-            // This ensures any changes made while offline are transmitted
             const update = Y.encodeStateAsUpdate(this.doc);
             if (update.length > 0) {
                 this._sendUpdate(update);
             }
-            // Send sync request to get updates from others
             this._writeSyncStep1();
         }
-        // Broadcast current awareness state - independently throttled and much
-        // cheaper than a full document push, so it isn't gated by the sync
-        // rate limiter above even when the sync half is skipped.
+        // Awareness has its own throttle and isn't rate-limited.
         this._broadcastAwareness([this.doc.clientID]);
         this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP);
     }
-    /**
-     * Setup automatic document synchronization.
-     * Listens to document updates and sends them to the transport.
-     * If batchUpdates is enabled, updates are debounced/batched.
-     */
     _setupDocumentSync() {
         this._updateHandler = (update, origin) => {
-            // Don't send updates that originated from this provider
-            // This prevents infinite loops when receiving updates
+            // Skip updates we applied from the network, and local-only origins.
             if (origin === this)
                 return;
-            // Don't send updates from excluded origins (local-only txns)
             if (this._excludeOrigins.has(origin))
                 return;
             if (this._batchUpdates > 0) {
-                // Batch mode: merge updates and debounce
                 this._batchUpdate(update);
             }
             else {
-                // Immediate mode: send right away
                 this._sendUpdate(update);
             }
         };
         this.doc.on('update', this._updateHandler);
     }
-    /**
-     * Batch/debounce updates to reduce network traffic.
-     * Merges multiple updates and sends after delay.
-     */
+    /** Merge updates and send them once no new one arrived for `batchUpdates` ms. */
     _batchUpdate(update) {
-        // Merge with pending update if exists
         if (this._pendingUpdate) {
             try {
-                // Yjs automatically merges sequential updates
                 this._pendingUpdate = Y.mergeUpdates([this._pendingUpdate, update]);
             }
             catch (error) {
                 console.error('[GenericProvider] Failed to merge updates:', error);
-                // Send the pending update immediately to avoid data loss
                 this._sendUpdate(this._pendingUpdate);
-                // Start a new batch with the current update
                 this._pendingUpdate = update;
             }
         }
         else {
             this._pendingUpdate = update;
         }
-        // Clear existing timeout
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
         }
-        // Set new timeout to send after delay
         this._batchTimeoutId = setTimeout(() => {
             if (this._pendingUpdate) {
                 this._sendUpdate(this._pendingUpdate);
@@ -509,10 +323,6 @@ export class GenericProvider extends Observable {
             this._batchTimeoutId = undefined;
         }, this._batchUpdates);
     }
-    /**
-     * Setup automatic awareness synchronization.
-     * Listens to awareness changes and broadcasts them.
-     */
     _setupAwarenessSync() {
         this._awarenessUpdateHandler = ({ added, updated, removed, }, _origin) => {
             this._broadcastAwareness(this._awarenessClientsToSend(added.concat(updated, removed)));
@@ -522,24 +332,20 @@ export class GenericProvider extends Observable {
             this._broadcastAwareness(this._awarenessClientsToSend(added.concat(updated, removed)), AWARENESS_CHANNEL_APP);
         };
         this.appAwareness.on('update', this._appAwarenessUpdateHandler);
-        // Cleanup: mark as offline and disconnect BC when page unloads
+        // On page unload, go offline and tell other tabs.
         if (typeof window !== 'undefined') {
             this._beforeUnloadHandler = () => {
                 awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'window unload');
                 awarenessProtocol.removeAwarenessStates(this.appAwareness, [this.doc.clientID], 'window unload');
-                // Disconnect BroadcastChannel to notify other tabs
                 this._disconnectBroadcastChannel();
             };
             window.addEventListener('beforeunload', this._beforeUnloadHandler);
         }
     }
     /**
-     * Which of the changed awareness clients to broadcast. When the transport
-     * reaches every peer, each peer speaks only for itself: re-sending states
-     * received from others just duplicates them (N² frames through a relay),
-     * and re-sending a remote state we timed out can briefly remove that user
-     * at peers that still hear from them. Otherwise remote changes are relayed
-     * too, which is how presence crosses a partial mesh.
+     * Changed awareness clients to broadcast. If the transport reaches every
+     * peer, only our own state (relaying others' is N² duplication). Otherwise
+     * all of them, which is how presence crosses a partial mesh.
      */
     _awarenessClientsToSend(changed) {
         if (this.transport.reachesAllPeers !== true)
@@ -547,12 +353,8 @@ export class GenericProvider extends Observable {
         return changed.filter((client) => client === this.doc.clientID);
     }
     /**
-     * Handle a frame from the transport or another tab: [opcode][payload].
-     *
-     * Frames carry no checksum: both transports run over reliable, ordered
-     * channels (WebSocket/TCP, WebRTC data channels/SCTP) that already detect
-     * corruption. A frame that fails to decode is dropped; if it carried an
-     * update, the periodic SyncStep1 fetches it.
+     * Handle a frame [opcode][payload] from the transport or another tab.
+     * An undecodable frame is dropped; the periodic SyncStep1 recovers it.
      */
     _handleIncomingMessage(message) {
         try {
@@ -563,13 +365,8 @@ export class GenericProvider extends Observable {
                     this._handleSyncMessage(decoder);
                     break;
                 case MESSAGE_SYNC_VERIFIED:
-                    // From a 2.0.x peer: [seqNum][senderClientID][sync message][hash].
-                    // The sync message is applied like MESSAGE_SYNC; the sequence
-                    // number and state-vector hash are skipped. That hash mismatched on
-                    // ordinary concurrent edits (the receiver had applied a third
-                    // peer's edit the sender hadn't seen yet), so acting on it caused
-                    // full-document resyncs without any data loss to repair. Lost
-                    // updates are recovered by the periodic SyncStep1 instead.
+                    // 2.0.x: [seqNum][senderClientID][sync message][hash]. The hash
+                    // mismatched on ordinary concurrent edits, so it's ignored.
                     decoding.readVarUint(decoder); // seqNum
                     decoding.readVarUint(decoder); // senderClientID
                     this._handleSyncMessage(decoder);
@@ -582,16 +379,12 @@ export class GenericProvider extends Observable {
                     break;
                 }
                 case MESSAGE_PUBSUB: {
-                    // Read topic
                     const topic = decoding.readVarString(decoder);
-                    // Read message payload
                     const payloadBytes = decoding.readVarUint8Array(decoder);
                     try {
-                        // Decode JSON payload
                         const decoder = new TextDecoder();
                         const payloadStr = decoder.decode(payloadBytes);
                         const message = JSON.parse(payloadStr);
-                        // Emit to pubsub channel
                         this.pubsub._handleMessage(topic, message);
                     }
                     catch (error) {
@@ -633,19 +426,14 @@ export class GenericProvider extends Observable {
         encoding.writeVarUint(encoder, MESSAGE_SYNC);
         const syncMessageType = syncProtocol.readSyncMessage(decoder, encoder, this.doc, this);
         if (syncMessageType === syncProtocol.messageYjsSyncStep2) {
-            // If we received SyncStep2, we're synced
             if (!this._synced) {
                 this._synced = true;
                 this.emit('synced', [true]);
             }
-            // Someone else's SyncStep2 reply just arrived - our own pending
-            // reply (if any) is now most likely redundant.
+            // Another peer answered; our pending reply is likely redundant.
             this._cancelPendingSyncReply();
         }
-        // Send reply if needed. Suppression only engages with genuine
-        // redundancy (>=2 other known peers via awareness) - below that,
-        // there's no "someone else" to rely on, so reply immediately
-        // (still rate-limited via _sendSyncReply() as a hard backstop).
+        // Delay the reply only if ≥2 other peers could answer too.
         if (encoding.length(encoder) > 1) {
             if (this.awareness.getStates().size >= 3) {
                 this._scheduleSyncReply(encoding.toUint8Array(encoder));
@@ -656,17 +444,9 @@ export class GenericProvider extends Observable {
         }
     }
     /**
-     * Schedule a SyncStep2 reply after a short random delay instead of
-     * sending immediately. If another peer's reply is overheard in the
-     * meantime (`_cancelPendingSyncReply`), this reply is dropped as
-     * redundant - the requester likely already got what it needed.
-     *
-     * A reply that is already pending when this is called answers a
-     * *different* SyncStep1 request (e.g. peer A's request, followed 5ms
-     * later by peer B's) - it must not be silently overwritten by the new
-     * one. Flush it immediately, then schedule the new reply fresh. The only
-     * sanctioned way a reply gets dropped is `_cancelPendingSyncReply()`,
-     * because we overheard someone else's SyncStep2 for the SAME request.
+     * Send a SyncStep2 reply after a random delay unless another peer's reply
+     * arrives first. A reply already pending answers a different request, so
+     * it is flushed, not overwritten.
      */
     _scheduleSyncReply(reply) {
         if (this._pendingSyncReplyTimeoutId !== undefined) {
@@ -686,7 +466,6 @@ export class GenericProvider extends Observable {
             }
         }, delay);
     }
-    /** Cancel a pending suppressed reply, if any. */
     _cancelPendingSyncReply() {
         if (this._pendingSyncReplyTimeoutId !== undefined) {
             clearTimeout(this._pendingSyncReplyTimeoutId);
@@ -695,40 +474,18 @@ export class GenericProvider extends Observable {
         this._pendingSyncReply = null;
     }
     /**
-     * Send a SyncStep2 reply, gated by the same shared per-peer budget as
-     * SyncStep1 requests/syncNow() pushes (`_tryReserveSyncSlot()`).
-     *
-     * Previously SyncStep2 replies were completely unrated - the only
-     * defense against redundant replies was the best-effort NACK-style
-     * suppression in `_scheduleSyncReply()`/`_cancelPendingSyncReply()`,
-     * which itself is just an ordinary broadcast message that can be delayed
-     * or lost like everything else. When it is, more competing repliers
-     * independently miss the "someone already answered" signal as peer count
-     * grows, and none of that traffic was bounded (measured in 2.x: the
-     * SyncStep2/SyncStep1 ratio grew from ~1.1-1.3 at N=2 to ~4.5-5.9 at
-     * N=10 under message loss). This is a hard backstop on top of that
-     * suppression, not a replacement for it - a rate-limited reply is
-     * dropped silently (no warn) since under normal
-     * operation this path is rarely exercised and logging every drop here
-     * would itself become log spam exactly when things are already noisy.
+     * Send a SyncStep2 reply within the shared sync budget, a backstop for
+     * when suppression fails. Dropped silently: logging would spam exactly
+     * when the room is already noisy.
      */
     _sendSyncReply(reply) {
-        if (!this._tryReserveSyncSlot()) {
-            return; // Rate limited - drop the reply silently
-        }
+        if (!this._tryReserveSyncSlot())
+            return;
         this._send(reply);
     }
-    /**
-     * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`
-     * per `_syncRequestWindowMs`), recording the request if there's room.
-     * Shared by `_sendSyncStep1()`, `syncNow()` and SyncStep2 replies so a
-     * burst of triggers from different sources (periodic sync, peer joins)
-     * draws from one combined budget instead of each
-     * having its own uncapped or separately-capped allowance.
-     */
+    /** Take a slot from the shared sync budget; false if it's used up. */
     _tryReserveSyncSlot() {
         const now = Date.now();
-        // Clean up old entries outside the rate limit window
         this._syncRequestTimes = this._syncRequestTimes.filter((t) => now - t < this._syncRequestWindowMs);
         if (this._syncRequestTimes.length >= this._maxSyncRequestsPerWindow) {
             return false;
@@ -736,42 +493,28 @@ export class GenericProvider extends Observable {
         this._syncRequestTimes.push(now);
         return true;
     }
-    /**
-     * Encode and send a SyncStep1 message requesting missing updates.
-     * Does not check the rate limiter itself - callers must reserve a slot
-     * via `_tryReserveSyncSlot()` first.
-     */
+    /** Send a SyncStep1; the caller must have reserved a sync slot. */
     _writeSyncStep1() {
         const encoder = encoding.createEncoder();
-        // SyncStep1 is always sent as standard MESSAGE_SYNC (no verification)
-        // It's just a request, not an assertion of state
         encoding.writeVarUint(encoder, MESSAGE_SYNC);
         syncProtocol.writeSyncStep1(encoder, this.doc);
         this._send(encoding.toUint8Array(encoder));
     }
-    /**
-     * Send SyncStep1 message to request missing updates.
-     * This is sent when first connecting to sync with remote peers.
-     * Rate limited to prevent spam.
-     */
+    /** Send a SyncStep1 if the sync budget allows. */
     _sendSyncStep1() {
         if (!this._tryReserveSyncSlot()) {
             console.warn(`[GenericProvider] Sync rate limit exceeded (${this._maxSyncRequestsPerWindow} requests per ${this._syncRequestWindowMs / 1000}s), throttling...`);
-            return; // Drop the request
+            return;
         }
         this._writeSyncStep1();
     }
-    /** Send a document update to the transport as a plain sync message. */
     _sendUpdate(update) {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_SYNC);
         syncProtocol.writeUpdate(encoder, update);
         this._send(encoding.toUint8Array(encoder));
     }
-    /**
-     * Send a pub/sub message.
-     * Internal method called by PubSubChannel.
-     */
+    /** @internal Frame: [MESSAGE_PUBSUB][topic][JSON bytes]. */
     _sendPubSub(topic, message) {
         if (!this.transport.isConnected) {
             console.warn('Cannot send pub/sub message: not connected');
@@ -779,15 +522,9 @@ export class GenericProvider extends Observable {
         }
         try {
             const encoder = encoding.createEncoder();
-            // Write message type
             encoding.writeVarUint(encoder, MESSAGE_PUBSUB);
-            // Write topic
             encoding.writeVarString(encoder, topic);
-            // Encode message as JSON
-            const messageStr = JSON.stringify(message);
-            const textEncoder = new TextEncoder();
-            const messageBytes = textEncoder.encode(messageStr);
-            // Write message payload
+            const messageBytes = new TextEncoder().encode(JSON.stringify(message));
             encoding.writeVarUint8Array(encoder, messageBytes);
             this._send(encoding.toUint8Array(encoder));
         }
@@ -795,12 +532,7 @@ export class GenericProvider extends Observable {
             console.error('Error sending pub/sub message:', error);
         }
     }
-    /**
-     * Send a targeted pub/sub message.
-     * Uses transport.sendTo when available (direct delivery), otherwise
-     * broadcasts a targeted frame that non-target providers drop.
-     * Internal method called by PubSubChannel.
-     */
+    /** @internal Frame: [MESSAGE_PUBSUB_TARGETED][target][topic][JSON bytes]. */
     _sendPubSubTo(target, topic, message) {
         if (!this.transport.isConnected) {
             console.warn('Cannot send targeted pub/sub message: not connected');
@@ -815,9 +547,8 @@ export class GenericProvider extends Observable {
             encoding.writeVarUint8Array(encoder, messageBytes);
             const frame = encoding.toUint8Array(encoder);
             if (this.transport.sendTo) {
-                // Direct delivery to the target peer.
-                // The target may be another tab of this browser, reachable only
-                // through BroadcastChannel; tabs it isn't for drop it by localId.
+                // The target may be another tab, reachable only via BroadcastChannel;
+                // other tabs drop it by localId.
                 if (this._bcConnected) {
                     bc.publish(this._bcChannel, frame, this);
                 }
@@ -829,7 +560,6 @@ export class GenericProvider extends Observable {
                 }
             }
             else {
-                // Broadcast-and-filter: dropped by non-target providers on receive.
                 this._send(frame);
             }
         }
@@ -837,11 +567,7 @@ export class GenericProvider extends Observable {
             console.error('Error sending targeted pub/sub message:', error);
         }
     }
-    /**
-     * Broadcast awareness state for the specified clients.
-     * Throttled to prevent awareness updates from flooding document sync.
-     * Multiple rapid updates are batched together.
-     */
+    /** Broadcast these clients' awareness, batched to one frame per `awarenessInterval`. */
     _broadcastAwareness(clients, channel = AWARENESS_CHANNEL_MAIN) {
         if (clients.length === 0)
             return;
@@ -849,25 +575,21 @@ export class GenericProvider extends Observable {
         const pending = isApp
             ? this._pendingAppAwarenessClients
             : this._pendingAwarenessClients;
-        // If throttling is disabled, send immediately
         if (this._awarenessInterval <= 0) {
             this._sendAwarenessNow(clients, channel);
             return;
         }
-        // Add clients to pending set
         for (const client of clients) {
             pending.add(client);
         }
-        // If we already have a scheduled broadcast, let it handle the batched clients
+        // A broadcast is already scheduled and will include them.
         if ((isApp ? this._appAwarenessTimeoutId : this._awarenessTimeoutId) !==
             undefined) {
             return;
         }
-        // Calculate delay - respect minimum interval since last broadcast
         const now = Date.now();
         const lastTime = isApp ? this._lastAppAwarenessTime : this._lastAwarenessTime;
         const delay = Math.max(0, this._awarenessInterval - (now - lastTime));
-        // Schedule the batched broadcast
         const timeoutId = setTimeout(() => {
             if (isApp) {
                 this._appAwarenessTimeoutId = undefined;
@@ -877,7 +599,6 @@ export class GenericProvider extends Observable {
                 this._awarenessTimeoutId = undefined;
                 this._lastAwarenessTime = Date.now();
             }
-            // Send all pending clients in one message
             const clientsToSend = Array.from(pending);
             pending.clear();
             if (clientsToSend.length > 0) {
@@ -889,9 +610,6 @@ export class GenericProvider extends Observable {
         else
             this._awarenessTimeoutId = timeoutId;
     }
-    /**
-     * Send awareness update immediately without throttling.
-     */
     _sendAwarenessNow(clients, channel = AWARENESS_CHANNEL_MAIN) {
         const aw = channel === AWARENESS_CHANNEL_APP ? this.appAwareness : this.awareness;
         const encoder = encoding.createEncoder();
@@ -900,44 +618,30 @@ export class GenericProvider extends Observable {
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(aw, clients));
         this._send(encoding.toUint8Array(encoder));
     }
-    /**
-     * Setup BroadcastChannel for cross-tab communication.
-     * Automatically disabled in non-browser environments.
-     */
+    /** Join the room's BroadcastChannel and send our state to other tabs. */
     _setupBroadcastChannel(config) {
-        // Check if BroadcastChannel is available and not disabled
         if (this._disableBc ||
             typeof BroadcastChannel === 'undefined' ||
             typeof window === 'undefined') {
             return;
         }
-        // Channel name per room. The wire tag keeps a tab still running 2.x
-        // (CRC32 header) out of the channel: it would mis-decode our frames.
         this._bcChannel = `yjs-${WIRE_TAG}-${config.room}`;
-        // Setup subscriber for incoming messages from other tabs
         this._bcSubscriber = (data, origin) => {
-            // Ignore messages from this provider instance
-            if (origin === this) {
+            if (origin === this)
                 return;
-            }
-            const uint8Data = new Uint8Array(data);
-            this._handleIncomingMessage(uint8Data);
+            this._handleIncomingMessage(new Uint8Array(data));
         };
-        // Subscribe to the channel
         bc.subscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = true;
-        // Send initial sync via BroadcastChannel
-        // This allows syncing with other tabs immediately
+        // SyncStep1 + SyncStep2 + awareness, so other tabs sync immediately.
         const encoderSync = encoding.createEncoder();
         encoding.writeVarUint(encoderSync, MESSAGE_SYNC);
         syncProtocol.writeSyncStep1(encoderSync, this.doc);
         bc.publish(this._bcChannel, encoding.toUint8Array(encoderSync), this);
-        // Broadcast local state via BroadcastChannel
         const encoderState = encoding.createEncoder();
         encoding.writeVarUint(encoderState, MESSAGE_SYNC);
         syncProtocol.writeSyncStep2(encoderState, this.doc);
         bc.publish(this._bcChannel, encoding.toUint8Array(encoderState), this);
-        // Broadcast local awareness state via BroadcastChannel
         if (this.awareness.getLocalState() !== null) {
             this._publishAwarenessToBroadcastChannel(this.awareness, AWARENESS_CHANNEL_MAIN);
         }
@@ -945,9 +649,6 @@ export class GenericProvider extends Observable {
             this._publishAwarenessToBroadcastChannel(this.appAwareness, AWARENESS_CHANNEL_APP);
         }
     }
-    /**
-     * Encode and publish an awareness update for the local client to the BroadcastChannel.
-     */
     _publishAwarenessToBroadcastChannel(awareness, channel) {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
@@ -955,14 +656,11 @@ export class GenericProvider extends Observable {
         encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, [this.doc.clientID]));
         bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this);
     }
-    /**
-     * Disconnect from BroadcastChannel and mark local client as offline.
-     */
+    /** Tell other tabs we're offline (null awareness) and leave the channel. */
     _disconnectBroadcastChannel() {
         if (!this._bcConnected || !this._bcSubscriber) {
             return;
         }
-        // Broadcast awareness state with null (indicating disconnect)
         for (const [awareness, channel] of [
             [this.awareness, AWARENESS_CHANNEL_MAIN],
             [this.appAwareness, AWARENESS_CHANNEL_APP],
@@ -973,27 +671,20 @@ export class GenericProvider extends Observable {
             encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, [this.doc.clientID], new Map()));
             bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this);
         }
-        // Unsubscribe from channel
         bc.unsubscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = false;
         this._bcSubscriber = undefined;
     }
-    /**
-     * Send a frame through both BroadcastChannel (if connected) and transport,
-     * so updates reach both local tabs and remote peers.
-     */
+    /** Send a frame to other tabs and through the transport. */
     _send(data) {
-        // Send via BroadcastChannel to other tabs first
         if (this._bcConnected) {
             bc.publish(this._bcChannel, data, this);
         }
-        // Send via network transport
         if (!this.transport.isConnected) {
             return;
         }
         try {
             const result = this.transport.send(data);
-            // Handle async send
             if (result instanceof Promise) {
                 result.catch((error) => {
                     console.error('Error sending data:', error);
@@ -1005,12 +696,8 @@ export class GenericProvider extends Observable {
         }
     }
     /**
-     * Update connection status and emit event.
-     */
-    /**
-     * Whether connect() is still in progress. A method rather than an inline
-     * check so TypeScript doesn't narrow `_status` across the await in
-     * connect(), where disconnect() may change it.
+     * A method rather than an inline check so TypeScript doesn't narrow
+     * `_status` across the await in connect(), where disconnect() may change it.
      */
     _isConnecting() {
         return this._status.state === 'connecting';

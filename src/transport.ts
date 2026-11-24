@@ -109,6 +109,16 @@ export interface Transport {
    * without reducing round trips that were already cheap.
    */
   readonly preferredBatchMs?: number
+
+  /**
+   * Optional hint: true while every `send()` reaches every peer in the room,
+   * either through a relay server that fans out to all clients or over a
+   * complete mesh. The provider then broadcasts only its own awareness state.
+   * When false or absent, it also re-broadcasts awareness changes it received
+   * from others, so presence crosses a partial mesh where some peers aren't
+   * directly connected. May be a getter whose value changes over time.
+   */
+  readonly reachesAllPeers?: boolean
 }
 
 /**

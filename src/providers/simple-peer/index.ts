@@ -151,6 +151,16 @@ export interface SimplePeerTransportOptions {
    * @default 1
    */
   relayFallbackAfter?: number | false
+
+  /**
+   * Hold data frames from each peer until `trustPeer(peerId)` is called, e.g.
+   * after an out-of-band identity handshake over control frames. Held frames
+   * are delivered in order on trust and discarded if the peer disconnects
+   * first. Control frames are never held. Each new connection to a peer
+   * starts untrusted.
+   * @default false
+   */
+  requireTrust?: boolean
 }
 
 interface PeerConnection {
@@ -176,6 +186,11 @@ interface PeerConnection {
    * single onbufferedamountlow handler per channel.
    */
   sendQueue: Uint8Array[]
+  /** Set by trustPeer(); only consulted when `requireTrust` is on */
+  trusted: boolean
+  /** Decrypted data frames received before the peer was trusted */
+  heldFrames: Uint8Array[]
+  heldBytes: number
 }
 
 /**
@@ -199,6 +214,22 @@ const MAX_BUFFERED_AMOUNT = 16 * 1024
 const MAX_TOTAL_CHUNKS = 4096
 const MAX_PENDING_MESSAGES = 16
 const CHUNK_TIMEOUT = 30000
+
+/**
+ * With `requireTrust`, how much an untrusted peer may have held for it. The
+ * handshake normally completes within milliseconds, so this only has to fit
+ * a peer's initial sync. Frames beyond it are dropped; the periodic sync
+ * fetches whatever they carried once the peer is trusted.
+ */
+const MAX_HELD_FRAMES = 256
+const MAX_HELD_BYTES = 16 * 1024 * 1024
+
+/**
+ * `reachesAllPeers` assumes a complete mesh only below this room size: 20 is
+ * the smallest default `maxConns`, so any peer still on the default can
+ * connect to everyone in a smaller room.
+ */
+const FULL_MESH_MAX_PEERS = 20
 
 /**
  * How long a peer connection may take to open its channel. Neither side ever
@@ -263,6 +294,7 @@ export class SimplePeerTransport implements Transport {
     signalingTimeout: number
     connectTimeout: number
     relayFallbackAfter: number | false
+    requireTrust: boolean
   }
   private _connected: boolean = false
   private _room: string = ''
@@ -338,6 +370,7 @@ export class SimplePeerTransport implements Transport {
       signalingTimeout: options.signalingTimeout ?? 30000,
       connectTimeout: options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT,
       relayFallbackAfter: options.relayFallbackAfter ?? 1,
+      requireTrust: options.requireTrust ?? false,
     }
     this._hasTurnServer = (
       (peerOpts.config?.iceServers as IceServer[] | undefined) ?? []
@@ -719,6 +752,78 @@ export class SimplePeerTransport implements Transport {
     } catch (error) {
       this.log(`❌ sendControl failed to ${peerId}:`, (error as Error).message)
     }
+  }
+
+  /**
+   * Mark the current connection to a peer as trusted and deliver the data
+   * frames held for it (see `requireTrust`). Returns false if there is no
+   * connection to that peer.
+   */
+  trustPeer(peerId: string): boolean {
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn) return false
+    if (peerConn.trusted) return true
+    peerConn.trusted = true
+    const held = peerConn.heldFrames
+    peerConn.heldFrames = []
+    peerConn.heldBytes = 0
+    for (const frame of held) {
+      if (this.peers.get(peerId) !== peerConn) break // removed meanwhile
+      try {
+        this._callback?.(frame)
+      } catch (error) {
+        this.log('Error handling peer data:', error)
+      }
+    }
+    return true
+  }
+
+  /** Whether trustPeer() was called for the current connection to a peer. */
+  isPeerTrusted(peerId: string): boolean {
+    return this.peers.get(peerId)?.trusted ?? false
+  }
+
+  /** This transport's peer id, as remote peers and signaling see it. */
+  get localPeerId(): string {
+    return this.peerId
+  }
+
+  /**
+   * DTLS certificate fingerprints of a peer connection, from the local and
+   * remote session descriptions (`a=fingerprint:` lines, e.g.
+   * "sha-256 AB:CD:…"). A field is undefined until that description is set.
+   * Returns undefined if there is no connection to the peer.
+   */
+  getPeerFingerprints(
+    peerId: string,
+  ): { local?: string; remote?: string } | undefined {
+    const peerConn = this.peers.get(peerId)
+    if (!peerConn) return undefined
+    const pc = peerConn.peer?._pc
+    return {
+      local: parseFingerprint(pc?.localDescription?.sdp),
+      remote: parseFingerprint(pc?.remoteDescription?.sdp),
+    }
+  }
+
+  /**
+   * True while this looks like a complete mesh: every peer seen via signaling
+   * recently is connected to us, and the room is small enough that every peer
+   * can connect to every other (see FULL_MESH_MAX_PEERS). Otherwise the
+   * provider relays remote awareness so presence crosses the gaps.
+   */
+  get reachesAllPeers(): boolean {
+    const now = Date.now()
+    const room = new Set<string>()
+    for (const [peerId, seenAt] of this._peerLastSeen) {
+      if (now - seenAt >= PEER_SEEN_WINDOW) continue
+      if (!this.peers.get(peerId)?.connected) return false
+      room.add(peerId)
+    }
+    for (const [peerId, peerConn] of this.peers) {
+      if (peerConn.connected) room.add(peerId)
+    }
+    return room.size < Math.min(FULL_MESH_MAX_PEERS, this.options.maxConns)
   }
 
   /**
@@ -1114,6 +1219,9 @@ export class SimplePeerTransport implements Transport {
       attemptId: Math.random().toString(36).slice(2, 10),
       chunkBuffers: new Map(),
       sendQueue: [],
+      trusted: false,
+      heldFrames: [],
+      heldBytes: 0,
     }
 
     this.peers.set(remotePeerId, peerConn)
@@ -1219,7 +1327,7 @@ export class SimplePeerTransport implements Transport {
           const decryptedData = this.options.password
             ? this.decrypt(payload, this.options.password)
             : payload
-          this._callback(decryptedData)
+          this.deliver(peerConn, decryptedData)
         } else if (msgType === MSG_TYPE_CHUNKED) {
           // Chunked message - reassemble
           if (uint8Data.length < 13) {
@@ -1296,7 +1404,7 @@ export class SimplePeerTransport implements Transport {
             const decryptedData = this.options.password
               ? this.decrypt(fullMessage, this.options.password)
               : fullMessage
-            this._callback(decryptedData)
+            this.deliver(peerConn, decryptedData)
             this.log(
               `📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`,
             )
@@ -1306,7 +1414,7 @@ export class SimplePeerTransport implements Transport {
           const decryptedData = this.options.password
             ? this.decrypt(uint8Data, this.options.password)
             : uint8Data
-          this._callback(decryptedData)
+          this.deliver(peerConn, decryptedData)
         }
       } catch (error) {
         this.log('Error handling peer data:', error)
@@ -1432,6 +1540,23 @@ export class SimplePeerTransport implements Transport {
     }
   }
 
+  /** Hand a data frame to the provider, or hold it until the peer is trusted. */
+  private deliver(peerConn: PeerConnection, data: Uint8Array): void {
+    if (!this.options.requireTrust || peerConn.trusted) {
+      this._callback?.(data)
+      return
+    }
+    if (
+      peerConn.heldFrames.length >= MAX_HELD_FRAMES ||
+      peerConn.heldBytes + data.length > MAX_HELD_BYTES
+    ) {
+      this.log(`🗑️ Dropping frame from untrusted peer ${peerConn.peerId} (hold full)`)
+      return
+    }
+    peerConn.heldFrames.push(data)
+    peerConn.heldBytes += data.length
+  }
+
   /**
    * Remove and cleanup a peer connection.
    */
@@ -1501,4 +1626,10 @@ export class SimplePeerTransport implements Transport {
       console.log('[SimplePeerTransport]', ...args)
     }
   }
+}
+
+/** The value of an SDP `a=fingerprint:` line, e.g. "sha-256 AB:CD:…". */
+function parseFingerprint(sdp: string | undefined): string | undefined {
+  const match = sdp?.match(/^a=fingerprint:(.+)$/m)
+  return match ? match[1].trim() : undefined
 }

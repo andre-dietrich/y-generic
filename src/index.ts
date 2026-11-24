@@ -820,11 +820,11 @@ export class GenericProvider extends Observable<string> {
         updated: number[]
         removed: number[]
       },
-      origin: any,
+      _origin: any,
     ) => {
-      // Broadcast awareness changes (unless they came from remote)
-      const changedClients = added.concat(updated).concat(removed)
-      this._broadcastAwareness(changedClients)
+      this._broadcastAwareness(
+        this._awarenessClientsToSend(added.concat(updated, removed)),
+      )
     }
 
     this.awareness.on('update', this._awarenessUpdateHandler)
@@ -841,8 +841,10 @@ export class GenericProvider extends Observable<string> {
       },
       _origin: any,
     ) => {
-      const changedClients = added.concat(updated).concat(removed)
-      this._broadcastAwareness(changedClients, AWARENESS_CHANNEL_APP)
+      this._broadcastAwareness(
+        this._awarenessClientsToSend(added.concat(updated, removed)),
+        AWARENESS_CHANNEL_APP,
+      )
     }
     this.appAwareness.on('update', this._appAwarenessUpdateHandler)
 
@@ -864,6 +866,19 @@ export class GenericProvider extends Observable<string> {
       }
       window.addEventListener('beforeunload', this._beforeUnloadHandler)
     }
+  }
+
+  /**
+   * Which of the changed awareness clients to broadcast. When the transport
+   * reaches every peer, each peer speaks only for itself: re-sending states
+   * received from others just duplicates them (N² frames through a relay),
+   * and re-sending a remote state we timed out can briefly remove that user
+   * at peers that still hear from them. Otherwise remote changes are relayed
+   * too, which is how presence crosses a partial mesh.
+   */
+  private _awarenessClientsToSend(changed: number[]): number[] {
+    if (this.transport.reachesAllPeers !== true) return changed
+    return changed.filter((client) => client === this.doc.clientID)
   }
 
   /**

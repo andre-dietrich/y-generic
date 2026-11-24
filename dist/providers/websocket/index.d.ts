@@ -53,6 +53,8 @@ export interface WebSocketConfig extends ConnectionConfig {
  * ```
  */
 export declare class WebSocketTransport implements Transport {
+    /** The server relays every frame to all clients in the room. */
+    readonly reachesAllPeers = true;
     private ws;
     private config;
     private messageCallback?;

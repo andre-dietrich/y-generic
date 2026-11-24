@@ -271,6 +271,15 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _setupAwarenessSync;
     /**
+     * Which of the changed awareness clients to broadcast. When the transport
+     * reaches every peer, each peer speaks only for itself: re-sending states
+     * received from others just duplicates them (N² frames through a relay),
+     * and re-sending a remote state we timed out can briefly remove that user
+     * at peers that still hear from them. Otherwise remote changes are relayed
+     * too, which is how presence crosses a partial mesh.
+     */
+    private _awarenessClientsToSend;
+    /**
      * Handle incoming messages from the transport.
      * Verifies message integrity with CRC32 before processing.
      * Corrupt messages are rejected immediately without attempting to decode.

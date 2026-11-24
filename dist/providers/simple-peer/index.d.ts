@@ -139,6 +139,15 @@ export interface SimplePeerTransportOptions {
      * @default 1
      */
     relayFallbackAfter?: number | false;
+    /**
+     * Hold data frames from each peer until `trustPeer(peerId)` is called, e.g.
+     * after an out-of-band identity handshake over control frames. Held frames
+     * are delivered in order on trust and discarded if the peer disconnects
+     * first. Control frames are never held. Each new connection to a peer
+     * starts untrusted.
+     * @default false
+     */
+    requireTrust?: boolean;
 }
 /**
  * SimplePeer transport implementation using simple-peer library.
@@ -228,6 +237,33 @@ export declare class SimplePeerTransport implements Transport {
      */
     sendControl(peerId: string, payload: Uint8Array): void;
     /**
+     * Mark the current connection to a peer as trusted and deliver the data
+     * frames held for it (see `requireTrust`). Returns false if there is no
+     * connection to that peer.
+     */
+    trustPeer(peerId: string): boolean;
+    /** Whether trustPeer() was called for the current connection to a peer. */
+    isPeerTrusted(peerId: string): boolean;
+    /** This transport's peer id, as remote peers and signaling see it. */
+    get localPeerId(): string;
+    /**
+     * DTLS certificate fingerprints of a peer connection, from the local and
+     * remote session descriptions (`a=fingerprint:` lines, e.g.
+     * "sha-256 AB:CD:…"). A field is undefined until that description is set.
+     * Returns undefined if there is no connection to the peer.
+     */
+    getPeerFingerprints(peerId: string): {
+        local?: string;
+        remote?: string;
+    } | undefined;
+    /**
+     * True while this looks like a complete mesh: every peer seen via signaling
+     * recently is connected to us, and the room is small enough that every peer
+     * can connect to every other (see FULL_MESH_MAX_PEERS). Otherwise the
+     * provider relays remote awareness so presence crosses the gaps.
+     */
+    get reachesAllPeers(): boolean;
+    /**
      * Check if connected.
      *
      * NOTE: this is a lifecycle flag (connect() called, disconnect() not yet), not
@@ -303,6 +339,8 @@ export declare class SimplePeerTransport implements Transport {
     private handlePeerSignal;
     private pruneStalePeer;
     private forgetGonePeers;
+    /** Hand a data frame to the provider, or hold it until the peer is trusted. */
+    private deliver;
     /**
      * Remove and cleanup a peer connection.
      */

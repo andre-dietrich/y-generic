@@ -67,6 +67,8 @@ function addCRC32Header(data) {
  */
 export class WebSocketTransport {
     constructor() {
+        /** The server relays every frame to all clients in the room. */
+        this.reachesAllPeers = true;
         this.ws = null;
         this.config = null;
         this._isConnected = false;

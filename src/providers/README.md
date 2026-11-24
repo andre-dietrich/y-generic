@@ -32,9 +32,16 @@ await provider.connect({ room: 'my-room' })
 - `maxConns`: Max peer connections (default: 20-35 random)
 - `peerOpts`: Options passed to simple-peer
 - `debug`: Enable debug logging
+- `requireTrust`: Hold each peer's data frames until `trustPeer(peerId)` is called, e.g.
+  after an identity handshake over `sendControl`/`onControlFrame` (default: false)
 
 See [simple-peer/index.ts](./simple-peer/index.ts) for the full option list (signaling
-retry, TURN fallback, control frames).
+retry, TURN fallback, control frames) and `localPeerId` / `getPeerFingerprints(peerId)`.
+
+While every peer in the room is connected to this one and the room has fewer than 20 peers,
+`reachesAllPeers` is true and the provider sends only its own awareness state. In larger or
+partial meshes it also relays awareness it received, so presence reaches peers that aren't
+directly connected.
 
 ## WebSocket Transport (Client-Server)
 
@@ -57,6 +64,10 @@ interface Transport {
   send(data: Uint8Array): void | Promise<void>
   onMessage(callback: (data: Uint8Array) => void): () => void
   readonly isConnected: boolean
-  // optional: onPeerConnect, onPeerDisconnect, sendTo, preferredBatchMs
+  // optional: onPeerConnect, onPeerDisconnect, sendTo, preferredBatchMs, reachesAllPeers
 }
 ```
+
+Set `reachesAllPeers` to true if every `send()` reaches every peer in the room (a relay
+server or a complete mesh). Leave it unset for partial meshes, so the provider relays
+awareness between peers that aren't directly connected.

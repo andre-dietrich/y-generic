@@ -98,6 +98,8 @@ export interface WebSocketConfig extends ConnectionConfig {
  * ```
  */
 export class WebSocketTransport implements Transport {
+  /** The server relays every frame to all clients in the room. */
+  readonly reachesAllPeers = true
   private ws: WebSocket | null = null
   private config: WebSocketConfig | null = null
   private messageCallback?: (data: Uint8Array) => void

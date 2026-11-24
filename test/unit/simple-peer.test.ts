@@ -490,3 +490,175 @@ describe('signaling liveness (ported from edrys-Lite)', () => {
     expect(t.signalingHealth.reconnecting).toBe(0)
   })
 })
+
+describe('trust gate (requireTrust)', () => {
+  /** A data frame as a peer sends it without a password: [0x00][payload]. */
+  const frame = (...bytes: number[]) => new Uint8Array([0x00, ...bytes])
+
+  async function gated(ids = ['p1']) {
+    const { t, peers } = await withPeers(ids, { requireTrust: true })
+    const got: number[][] = []
+    t.onMessage((d) => got.push([...d]))
+    return { t, peers, got }
+  }
+
+  test('frames from an untrusted peer are held, then delivered in order on trust', async () => {
+    const { t, peers, got } = await gated()
+    peers.p1.receive(frame(1))
+    peers.p1.receive(frame(2))
+    expect(got).toEqual([])
+    expect(t.isPeerTrusted('p1')).toBe(false)
+
+    expect(t.trustPeer('p1')).toBe(true)
+    expect(got).toEqual([[1], [2]])
+    peers.p1.receive(frame(3))
+    expect(got).toEqual([[1], [2], [3]])
+    expect(t.isPeerTrusted('p1')).toBe(true)
+    t.disconnect()
+  })
+
+  test('trust is per peer', async () => {
+    const { t, peers, got } = await gated(['p1', 'p2'])
+    t.trustPeer('p1')
+    peers.p1.receive(frame(1))
+    peers.p2.receive(frame(2))
+    expect(got).toEqual([[1]])
+    t.disconnect()
+  })
+
+  test('control frames bypass the gate', async () => {
+    const { t, peers } = await gated()
+    const control: number[][] = []
+    t.onControlFrame((_id, payload) => control.push([...payload]))
+    peers.p1.receive(new Uint8Array([0x02, 7]))
+    expect(control).toEqual([[7]])
+    t.disconnect()
+  })
+
+  test('chunked messages are held until trust as well', async () => {
+    const { t, peers, got } = await gated()
+    const header = (i: number, total: number) => {
+      const h = new Uint8Array(13)
+      const v = new DataView(h.buffer)
+      h[0] = 0x01
+      v.setUint32(1, 42, true)
+      v.setUint32(5, i, true)
+      v.setUint32(9, total, true)
+      return h
+    }
+    peers.p1.receive(new Uint8Array([...header(0, 2), 1]))
+    peers.p1.receive(new Uint8Array([...header(1, 2), 2]))
+    expect(got).toEqual([])
+    t.trustPeer('p1')
+    expect(got).toEqual([[1, 2]])
+    t.disconnect()
+  })
+
+  test('held frames are discarded when the peer disconnects; a new connection starts untrusted', async () => {
+    const { t, peers, got } = await gated()
+    peers.p1.receive(frame(1))
+    t.disconnectPeer('p1')
+    await flush()
+    expect(t.trustPeer('p1')).toBe(false) // no connection
+
+    ;(t as any).handlePeerSignal('p1', { type: 'offer' })
+    const again = (t as any).peers.get('p1').peer as FakePeer
+    again.open()
+    again.receive(frame(2))
+    expect(t.isPeerTrusted('p1')).toBe(false)
+    t.trustPeer('p1')
+    expect(got).toEqual([[2]])
+    t.disconnect()
+  })
+
+  test('at most 256 frames are held per peer', async () => {
+    const { t, peers, got } = await gated()
+    for (let i = 0; i < 300; i++) peers.p1.receive(frame(i % 256))
+    t.trustPeer('p1')
+    expect(got).toHaveLength(256)
+    t.disconnect()
+  })
+
+  test('without requireTrust, frames are delivered right away', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    const got: number[][] = []
+    t.onMessage((d) => got.push([...d]))
+    peers.p1.receive(frame(1))
+    expect(got).toEqual([[1]])
+    t.disconnect()
+  })
+})
+
+describe('reachesAllPeers (awareness relay hint)', () => {
+  const seen = (t: SimplePeerTransport, id: string) =>
+    (t as any)._peerLastSeen.set(id, Date.now())
+
+  test('true while every peer seen via signaling is connected', async () => {
+    const { t } = await withPeers(['p1', 'p2'])
+    seen(t, 'p1')
+    seen(t, 'p2')
+    expect(t.reachesAllPeers).toBe(true)
+    t.disconnect()
+  })
+
+  test('false while a peer in the room is not connected to us', async () => {
+    const { t } = await withPeers(['p1'])
+    seen(t, 'p1')
+    seen(t, 'p3') // announced, but no connection (yet, or at capacity)
+    expect(t.reachesAllPeers).toBe(false)
+    t.disconnect()
+  })
+
+  test('a peer not seen for a while no longer counts', async () => {
+    vi.useFakeTimers()
+    const { t } = await withPeers(['p1'])
+    seen(t, 'p1')
+    seen(t, 'gone')
+    expect(t.reachesAllPeers).toBe(false)
+    vi.advanceTimersByTime(13000)
+    expect(t.reachesAllPeers).toBe(true)
+    t.disconnect()
+  })
+
+  test('false from 20 peers on, where some may be at their connection limit', async () => {
+    const ids = Array.from({ length: 20 }, (_, i) => `p${i}`)
+    const { t } = await withPeers(ids, { maxConns: 34 })
+    expect(t.reachesAllPeers).toBe(false)
+    ;(t as any).removePeer('p0')
+    await flush()
+    expect(t.reachesAllPeers).toBe(true)
+    t.disconnect()
+  })
+
+  test('a lower maxConns lowers the limit', async () => {
+    const { t } = await withPeers(['p1', 'p2', 'p3'], { maxConns: 3 })
+    expect(t.reachesAllPeers).toBe(false)
+    t.disconnect()
+  })
+})
+
+describe('identity info (prep for binding the handshake)', () => {
+  test('localPeerId is the id announced to signaling', async () => {
+    const t = new SimplePeerTransport({ peer: FakePeer as any, signaling: ['wss://s'] })
+    void t.connect({ room: 'room' })
+    FakeWS.latest().open()
+    const announced = FakeWS.latest().sent.find((m) => m.from)
+    expect(t.localPeerId).toBeTruthy()
+    expect(announced.from).toBe(t.localPeerId)
+    t.disconnect()
+  })
+
+  test('getPeerFingerprints reads both DTLS fingerprints from the SDP', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    const pc = peers.p1._pc as any
+    expect(t.getPeerFingerprints('p1')).toEqual({ local: undefined, remote: undefined })
+    pc.localDescription = { sdp: 'v=0\r\na=fingerprint:sha-256 AA:BB\r\na=setup:actpass\r\n' }
+    pc.remoteDescription = { sdp: 'v=0\r\na=fingerprint:sha-256 CC:DD\r\n' }
+    expect(t.getPeerFingerprints('p1')).toEqual({
+      local: 'sha-256 AA:BB',
+      remote: 'sha-256 CC:DD',
+    })
+    expect(t.getPeerFingerprints('nobody')).toBeUndefined()
+    t.disconnect()
+  })
+})

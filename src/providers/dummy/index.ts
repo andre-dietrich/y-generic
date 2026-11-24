@@ -236,6 +236,8 @@ export interface DummyTransportOptions {
  * Routes messages through a DummyHub instance.
  */
 export class DummyTransport implements Transport {
+  /** The hub delivers every frame to all other transports in the room. */
+  readonly reachesAllPeers = true
   private hub?: DummyHub
   private explicitHub: boolean
   private options: DummyTransportOptions

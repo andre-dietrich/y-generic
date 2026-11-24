@@ -48,6 +48,20 @@ const MAX_TOTAL_CHUNKS = 4096;
 const MAX_PENDING_MESSAGES = 16;
 const CHUNK_TIMEOUT = 30000;
 /**
+ * With `requireTrust`, how much an untrusted peer may have held for it. The
+ * handshake normally completes within milliseconds, so this only has to fit
+ * a peer's initial sync. Frames beyond it are dropped; the periodic sync
+ * fetches whatever they carried once the peer is trusted.
+ */
+const MAX_HELD_FRAMES = 256;
+const MAX_HELD_BYTES = 16 * 1024 * 1024;
+/**
+ * `reachesAllPeers` assumes a complete mesh only below this room size: 20 is
+ * the smallest default `maxConns`, so any peer still on the default can
+ * connect to everyone in a smaller room.
+ */
+const FULL_MESH_MAX_PEERS = 20;
+/**
  * How long a peer connection may take to open its channel. Neither side ever
  * reaches 'failed' when an offer/answer is lost in signaling, or when ICE gets
  * stuck one-sided: the controlling side sees a successful check, nominates the
@@ -143,6 +157,7 @@ export class SimplePeerTransport {
             signalingTimeout: options.signalingTimeout ?? 30000,
             connectTimeout: options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT,
             relayFallbackAfter: options.relayFallbackAfter ?? 1,
+            requireTrust: options.requireTrust ?? false,
         };
         this._hasTurnServer = (peerOpts.config?.iceServers ?? []).some((s) => (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => /^turns?:/.test(u)));
         // Generate unique peer ID
@@ -452,6 +467,79 @@ export class SimplePeerTransport {
         catch (error) {
             this.log(`❌ sendControl failed to ${peerId}:`, error.message);
         }
+    }
+    /**
+     * Mark the current connection to a peer as trusted and deliver the data
+     * frames held for it (see `requireTrust`). Returns false if there is no
+     * connection to that peer.
+     */
+    trustPeer(peerId) {
+        const peerConn = this.peers.get(peerId);
+        if (!peerConn)
+            return false;
+        if (peerConn.trusted)
+            return true;
+        peerConn.trusted = true;
+        const held = peerConn.heldFrames;
+        peerConn.heldFrames = [];
+        peerConn.heldBytes = 0;
+        for (const frame of held) {
+            if (this.peers.get(peerId) !== peerConn)
+                break; // removed meanwhile
+            try {
+                this._callback?.(frame);
+            }
+            catch (error) {
+                this.log('Error handling peer data:', error);
+            }
+        }
+        return true;
+    }
+    /** Whether trustPeer() was called for the current connection to a peer. */
+    isPeerTrusted(peerId) {
+        return this.peers.get(peerId)?.trusted ?? false;
+    }
+    /** This transport's peer id, as remote peers and signaling see it. */
+    get localPeerId() {
+        return this.peerId;
+    }
+    /**
+     * DTLS certificate fingerprints of a peer connection, from the local and
+     * remote session descriptions (`a=fingerprint:` lines, e.g.
+     * "sha-256 AB:CD:…"). A field is undefined until that description is set.
+     * Returns undefined if there is no connection to the peer.
+     */
+    getPeerFingerprints(peerId) {
+        const peerConn = this.peers.get(peerId);
+        if (!peerConn)
+            return undefined;
+        const pc = peerConn.peer?._pc;
+        return {
+            local: parseFingerprint(pc?.localDescription?.sdp),
+            remote: parseFingerprint(pc?.remoteDescription?.sdp),
+        };
+    }
+    /**
+     * True while this looks like a complete mesh: every peer seen via signaling
+     * recently is connected to us, and the room is small enough that every peer
+     * can connect to every other (see FULL_MESH_MAX_PEERS). Otherwise the
+     * provider relays remote awareness so presence crosses the gaps.
+     */
+    get reachesAllPeers() {
+        const now = Date.now();
+        const room = new Set();
+        for (const [peerId, seenAt] of this._peerLastSeen) {
+            if (now - seenAt >= PEER_SEEN_WINDOW)
+                continue;
+            if (!this.peers.get(peerId)?.connected)
+                return false;
+            room.add(peerId);
+        }
+        for (const [peerId, peerConn] of this.peers) {
+            if (peerConn.connected)
+                room.add(peerId);
+        }
+        return room.size < Math.min(FULL_MESH_MAX_PEERS, this.options.maxConns);
     }
     /**
      * Check if connected.
@@ -786,6 +874,9 @@ export class SimplePeerTransport {
             attemptId: Math.random().toString(36).slice(2, 10),
             chunkBuffers: new Map(),
             sendQueue: [],
+            trusted: false,
+            heldFrames: [],
+            heldBytes: 0,
         };
         this.peers.set(remotePeerId, peerConn);
         // See DEFAULT_CONNECT_TIMEOUT: the initiator times out early and offers
@@ -879,7 +970,7 @@ export class SimplePeerTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(payload, this.options.password)
                         : payload;
-                    this._callback(decryptedData);
+                    this.deliver(peerConn, decryptedData);
                 }
                 else if (msgType === MSG_TYPE_CHUNKED) {
                     // Chunked message - reassemble
@@ -945,7 +1036,7 @@ export class SimplePeerTransport {
                         const decryptedData = this.options.password
                             ? this.decrypt(fullMessage, this.options.password)
                             : fullMessage;
-                        this._callback(decryptedData);
+                        this.deliver(peerConn, decryptedData);
                         this.log(`📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`);
                     }
                 }
@@ -954,7 +1045,7 @@ export class SimplePeerTransport {
                     const decryptedData = this.options.password
                         ? this.decrypt(uint8Data, this.options.password)
                         : uint8Data;
-                    this._callback(decryptedData);
+                    this.deliver(peerConn, decryptedData);
                 }
             }
             catch (error) {
@@ -1059,6 +1150,20 @@ export class SimplePeerTransport {
             }
         }
     }
+    /** Hand a data frame to the provider, or hold it until the peer is trusted. */
+    deliver(peerConn, data) {
+        if (!this.options.requireTrust || peerConn.trusted) {
+            this._callback?.(data);
+            return;
+        }
+        if (peerConn.heldFrames.length >= MAX_HELD_FRAMES ||
+            peerConn.heldBytes + data.length > MAX_HELD_BYTES) {
+            this.log(`🗑️ Dropping frame from untrusted peer ${peerConn.peerId} (hold full)`);
+            return;
+        }
+        peerConn.heldFrames.push(data);
+        peerConn.heldBytes += data.length;
+    }
     /**
      * Remove and cleanup a peer connection.
      */
@@ -1121,5 +1226,10 @@ export class SimplePeerTransport {
             console.log('[SimplePeerTransport]', ...args);
         }
     }
+}
+/** The value of an SDP `a=fingerprint:` line, e.g. "sha-256 AB:CD:…". */
+function parseFingerprint(sdp) {
+    const match = sdp?.match(/^a=fingerprint:(.+)$/m);
+    return match ? match[1].trim() : undefined;
 }
 //# sourceMappingURL=index.js.map

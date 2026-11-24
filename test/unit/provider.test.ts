@@ -1,10 +1,11 @@
 /**
- * GenericProvider connect lifecycle and cross-tab delivery.
+ * GenericProvider connect lifecycle, cross-tab delivery and awareness relay.
  */
 import { describe, test, expect, vi, afterEach } from 'vitest'
 import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import * as syncProtocol from 'y-protocols/sync'
+import * as awarenessProtocol from 'y-protocols/awareness'
 import { GenericProvider } from '../../src/index'
 import { WebSocketTransport } from '../../src/providers/websocket/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
@@ -245,5 +246,103 @@ describe('cross-tab delivery via BroadcastChannel', () => {
     a.destroy()
     b.destroy()
     expect(got).not.toHaveBeenCalled()
+  })
+})
+
+describe('awareness relay (B4)', () => {
+  /**
+   * Three providers on one hub. Counts the awareness frames each one sends,
+   * per channel. `reachesAllPeers: false` makes a transport look like part of
+   * a partial mesh.
+   */
+  async function threePeers(reachesAllPeers = true) {
+    const hub = new DummyHub()
+    const sent = new Map<string, number>()
+    const peers = await Promise.all(
+      [1, 2, 3].map(async (id) => {
+        const doc = new Y.Doc()
+        doc.clientID = id
+        const transport = new DummyTransport({ hub })
+        if (!reachesAllPeers) {
+          Object.defineProperty(transport, 'reachesAllPeers', { value: false })
+        }
+        const send = transport.send.bind(transport)
+        transport.send = (data: Uint8Array) => {
+          // [CRC32 x4][opcode][channel]: count awareness frames.
+          if (data[4] === 1) {
+            const key = `${id}:${data[5]}`
+            sent.set(key, (sent.get(key) ?? 0) + 1)
+          }
+          send(data)
+        }
+        const provider = new GenericProvider(doc, transport, {
+          disableBc: true,
+          syncInterval: 0,
+          awarenessInterval: 0,
+        })
+        await provider.connect({ room: 'b4' })
+        return provider
+      }),
+    )
+    await flush()
+    sent.clear()
+    const count = (channel: number) => [1, 2, 3].map((id) => sent.get(`${id}:${channel}`) ?? 0)
+    return { peers, sent, count }
+  }
+
+  test('peers do not echo an awareness update they received', async () => {
+    const { peers, count } = await threePeers()
+    peers[0].awareness.setLocalStateField('user', { name: 'alice' })
+    await flush()
+    const seen = peers[1].awareness.getStates().get(1)
+    const counts = count(0)
+    for (const p of peers) p.destroy()
+    expect(seen).toEqual({ user: { name: 'alice' } })
+    expect(counts).toEqual([1, 0, 0])
+  })
+
+  test('app awareness (module cursors) is not echoed either', async () => {
+    const { peers, count } = await threePeers()
+    peers[0].appAwareness.setLocalStateField('cursor', { x: 1 })
+    await flush()
+    const seen = peers[2].appAwareness.getStates().get(1)
+    const counts = count(1)
+    for (const p of peers) p.destroy()
+    expect(seen).toEqual({ cursor: { x: 1 } })
+    expect(counts).toEqual([1, 0, 0])
+  })
+
+  test('a remote state we timed out is not broadcast as a removal', async () => {
+    const { peers, count } = await threePeers()
+    peers[0].awareness.setLocalStateField('user', { name: 'alice' })
+    await flush()
+    // peers[1] stops hearing alice and times her out locally.
+    awarenessProtocol.removeAwarenessStates(peers[1].awareness, [1], 'timeout')
+    await flush()
+    const stillAtThird = peers[2].awareness.getStates().get(1)
+    const counts = count(0)
+    for (const p of peers) p.destroy()
+    expect(counts).toEqual([1, 0, 0])
+    expect(stillAtThird).toEqual({ user: { name: 'alice' } })
+  })
+
+  test('on a partial mesh, each peer relays remote changes once', async () => {
+    const { peers, count } = await threePeers(false)
+    peers[0].awareness.setLocalStateField('user', { name: 'alice' })
+    await flush()
+    const counts = count(0)
+    for (const p of peers) p.destroy()
+    expect(counts).toEqual([1, 1, 1])
+  })
+
+  test('our own state is still sent when the transport reaches all peers', async () => {
+    const { peers, count } = await threePeers()
+    awarenessProtocol.removeAwarenessStates(peers[0].awareness, [1], 'window unload')
+    await flush()
+    const gone = peers[1].awareness.getStates().has(1)
+    const counts = count(0)
+    for (const p of peers) p.destroy()
+    expect(counts).toEqual([1, 0, 0])
+    expect(gone).toBe(false)
   })
 })

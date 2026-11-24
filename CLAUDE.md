@@ -21,13 +21,13 @@ allow-list, must match.
 A backend-agnostic Yjs provider. The core (`src/index.ts`'s `GenericProvider`) implements all
 Yjs sync/awareness/pub-sub protocol logic; a `Transport` (`src/transport.ts`) is a small
 interface (`connect`, `disconnect`, `send`, `onMessage`, optional `onPeerConnect`,
-`onPeerDisconnect`, `sendTo`, `preferredBatchMs`) implemented per backend. The package ships
-only what edrys-Lite uses: `GenericProvider` (root export) and the `simple-peer` and `websocket`
-transports (`@edryslabs/genericprovider/providers/<name>`; simple-peer is an optional peer
-dependency). `src/providers/dummy` is an in-memory transport for tests and benches; it is
-excluded from the build and not exported. The other upstream transports (gun, trystero,
-peerjs, indexeddb, matrix, pubnub, supabase, nostr) and `sync-monitor` were removed in 3.0.0;
-don't re-add them here.
+`onPeerDisconnect`, `sendTo`, `preferredBatchMs`, `reachesAllPeers`) implemented per backend.
+The package ships only what edrys-Lite uses: `GenericProvider` (root export) and the
+`simple-peer` and `websocket` transports (`@edryslabs/genericprovider/providers/<name>`;
+simple-peer is an optional peer dependency). `src/providers/dummy` is an in-memory transport
+for tests and benches; it is excluded from the build and not exported. The other upstream
+transports (gun, trystero, peerjs, indexeddb, matrix, pubnub, supabase, nostr) and
+`sync-monitor` were removed in 3.0.0; don't re-add them here.
 
 ## Commands
 
@@ -48,9 +48,10 @@ don't re-add them here.
   - `wire-format.test.ts` checks encode and decode against `fixtures/wire-2.0.3.json`, frames
     captured from 2.0.3. If it fails, the wire changed: that breaks 2.0.x peers unless it was
     intended. Never re-capture the fixture (`WIRE_CAPTURE=1`) to make it pass.
-  - `known-bugs.test.ts` holds `test.fails` tests that describe the correct behaviour of
-    known bugs. A fix makes its test pass, which vitest reports as an error: remove the
-    `.fails` marker in the same commit as the fix.
+  - Known but unfixed bugs go in `known-bugs.test.ts` as `test.fails` tests that describe the
+    correct behaviour (none at the moment, so the file doesn't exist). A fix makes its test
+    pass, which vitest reports as an error: remove the `.fails` marker and move the test next
+    to the related tests in the same commit as the fix.
 
 When changing sync/awareness/resync logic, add a unit test; for load or scaling behaviour, add
 or extend a bench script.
@@ -90,6 +91,12 @@ peers mis-decode silently instead of failing.
 - **SyncStep2 reply suppression** (`_pendingSyncReply`) when ≥3 awareness states are known.
 - **Update batching** (`batchUpdates`, defaulting to `transport.preferredBatchMs`) and
   **awareness throttling** are separate debounce paths.
+- **Awareness relay** (`_awarenessClientsToSend`): when `transport.reachesAllPeers` is true
+  (WebSocket, dummy, a small complete simple-peer mesh) a provider broadcasts only its own
+  awareness state. Otherwise it re-broadcasts every remote change once, which is how presence
+  crosses a partial WebRTC mesh (room ≥ 20 peers or a pair that can't connect); remote
+  states expire after 30s without renewal. Re-broadcasting on a full mesh or relay is pure
+  duplication (N² frames, see `bench-awareness-relay.ts`).
 - **Cross-tab sync** via `BroadcastChannel` (`_setupBroadcastChannel`), replaying both
   awareness channels to other tabs.
 - **Peer join**: `onPeerConnect` triggers a full-state `syncNow()` broadcast. On mesh
@@ -108,6 +115,14 @@ edrys-Lite (`src/ts/`: `GenericWebrtcProviderAdapter`, `GenericWebsocketProvider
 - **`sendControl` / `onControlFrame` / `disconnectPeer`** (simple-peer `MSG_TYPE_CONTROL`,
   0x02) — per-peer side-channel for edrys' signed identity handshake. These frames bypass the
   provider pipe: never CRC-verified, decrypted or decoded as Yjs data.
+- **`requireTrust` / `trustPeer`** (simple-peer) — `EdrysSimplePeerTransport` turns on
+  `requireTrust` and calls `trustPeer(peerId)` once the handshake verifies. Until then the
+  peer's data frames are held (max 256 frames / 16 MB, discarded on disconnect), so an
+  unverified peer can't inject doc, awareness or pubsub data. Holding instead of dropping
+  keeps the newcomer's initial sync; control frames are never held.
+- **`localPeerId` / `getPeerFingerprints(peerId)`** (simple-peer) — not used yet; meant for
+  binding the handshake signature to the connection (peer ids + DTLS fingerprints) so it
+  can't be replayed.
 - **Set-based `onPeerConnect`/`onPeerDisconnect` in simple-peer** — `EdrysSimplePeerTransport`
   and the provider both register listeners; single callback slots would drop one of them.
 - **simple-peer `scheduleSignalingReconnect` / `signalingHealth` / `pruneStalePeer`** — retry

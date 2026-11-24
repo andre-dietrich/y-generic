@@ -81,7 +81,7 @@ async function captureProviderFrames(): Promise<Record<string, string>> {
   // update_verified (opcode 3) is no longer sent: see DECODE_ONLY.
   {
     // SyncStep2 reply to an empty peer's SyncStep1.
-    const { doc, transport } = await makeProvider(1, { verifyUpdates: false })
+    const { doc, transport } = await makeProvider(1)
     doc.getText('t').insert(0, 'hi')
     transport.sent = []
     transport.deliver(fromHex(frames.sync_step1_empty))
@@ -171,13 +171,6 @@ describe('wire format (2.0.3 golden)', async () => {
         expect(current[name]).toBe(golden[name])
       })
     }
-
-    test('updates are sent as opcode 0 even with verifyUpdates: true', async () => {
-      const { doc, transport } = await makeProvider(1, { verifyUpdates: true })
-      transport.sent = []
-      doc.getText('t').insert(0, 'hi')
-      expect(toHex(transport.sent[0])).toBe(golden.update_plain)
-    })
   })
 
   describe('decode: a fresh provider understands the 2.0.3 bytes', () => {
@@ -209,7 +202,7 @@ describe('wire format (2.0.3 golden)', async () => {
     })
 
     test('opcode 0 SyncStep1 gets a SyncStep2 reply', async () => {
-      const { doc, transport } = await makeProvider(1, { verifyUpdates: false })
+      const { doc, transport } = await makeProvider(1)
       doc.getText('t').insert(0, 'hi')
       transport.sent = []
       transport.deliver(fromHex(golden.sync_step1_empty))

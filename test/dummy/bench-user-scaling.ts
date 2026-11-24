@@ -116,7 +116,6 @@ export function makeProviders(
     })
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
-      verifyUpdates: true,
       syncInterval: 0,
     })
     // Bump local awareness state past the library's genesis clock (0) -

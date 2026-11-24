@@ -2,11 +2,9 @@
  * Dummy Transport for Testing
  *
  * A simple in-memory transport that simulates network behavior without
- * any external dependencies. Perfect for:
- * - Unit testing
- * - Learning how transports work
- * - Local development without a server
- * - Reference implementation for custom transports
+ * any external dependencies. Used by the unit tests, the benchmarks in
+ * test/dummy/ and as a reference implementation. Not part of the published
+ * package (excluded from the build); import it from source.
  *
  * Features:
  * - Simulated network latency
@@ -17,8 +15,8 @@
  *
  * @example
  * ```typescript
- * import { GenericProvider } from 'y-generic'
- * import { DummyTransport } from 'y-generic/providers/dummy'
+ * import { GenericProvider } from 'src/index'
+ * import { DummyTransport } from 'src/providers/dummy'
  *
  * // Simple usage - hub is auto-managed
  * const doc1 = new Y.Doc()
@@ -37,7 +35,7 @@
  * @example
  * ```typescript
  * // Advanced: Explicit hub for fine control
- * import { DummyHub } from 'y-generic/providers/dummy'
+ * import { DummyHub } from 'src/providers/dummy'
  *
  * const hub = new DummyHub()
  * const transport1 = new DummyTransport({ hub })

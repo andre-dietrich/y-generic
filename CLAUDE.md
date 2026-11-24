@@ -5,14 +5,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## This branch: `edrys`
 
 `edrys` is the long-lived branch for edrys-Lite, published as `@edryslabs/genericprovider`
-(2.x). It was cut from `dev-premerge-backup` — the pre-merge `dev`, published as 1.0.4 — and
+(2.x, 3.x). It was cut from `dev-premerge-backup` — the pre-merge `dev`, published as 1.0.4 — and
 **is never merged with `main`**. `main` is upstream `genericprovider` (1.5.x, used by
 LiaScript) and evolves independently. If an upstream fix is wanted here, port it as a
 targeted cherry-pick or re-implementation, never as a merge: the last full merge (v1.5.0 into
 `dev`, now history on the `dev` branch and the 1.5.1/1.5.2 releases) silently broke edrys
 module cursors and simple-peer discovery.
 
-Wire compatibility: 2.x speaks the same wire format as 1.0.4 and is **not** compatible with
+Wire compatibility: 2.x and 3.x speak the same wire format as 1.0.4 and are **not** compatible with
 1.5.x (see wire types below). Every peer in a room, and the edrys WebSocket relay's opcode
 allow-list, must match.
 
@@ -21,17 +21,20 @@ allow-list, must match.
 A backend-agnostic Yjs provider. The core (`src/index.ts`'s `GenericProvider`) implements all
 Yjs sync/awareness/pub-sub protocol logic; a `Transport` (`src/transport.ts`) is a small
 interface (`connect`, `disconnect`, `send`, `onMessage`, optional `onPeerConnect`,
-`onPeerDisconnect`, `sendTo`, `preferredBatchMs`) implemented per backend. `src/providers/*`
-are reference transports (dummy, websocket, gun, trystero, peerjs, simple-peer, indexeddb,
-matrix, pubnub, supabase, nostr), each its own subpath export
-(`@edryslabs/genericprovider/providers/<name>`), mostly behind optional peer dependencies.
+`onPeerDisconnect`, `sendTo`, `preferredBatchMs`) implemented per backend. The package ships
+only what edrys-Lite uses: `GenericProvider` (root export) and the `simple-peer` and `websocket`
+transports (`@edryslabs/genericprovider/providers/<name>`; simple-peer is an optional peer
+dependency). `src/providers/dummy` is an in-memory transport for tests and benches; it is
+excluded from the build and not exported. The other upstream transports (gun, trystero,
+peerjs, indexeddb, matrix, pubnub, supabase, nostr) and `sync-monitor` were removed in 3.0.0;
+don't re-add them here.
 
 ## Commands
 
 - `npm run build` — `rm -rf dist && tsc`. `dist/` is **tracked and committed**: every commit
   that touches `src/` rebuilds it and includes the result.
-- `npm run dev:<provider>` — serves `test/<provider>/index.html` via Parcel for manual browser
-  testing (`test/TEST.md` lists the Dummy-transport scenarios).
+- `npm run dev:dummy` / `dev:simple-peer` / `dev:websocket` — serves `test/<name>/index.html`
+  via Parcel for manual browser testing (`test/TEST.md` lists the Dummy-transport scenarios).
 - Benchmarks/repros in `test/dummy/bench-*.ts` / `repro-*.ts`, compiled with
   `tsconfig.bench.json` and run under plain Node (output in gitignored `bench-dist/`):
   ```
@@ -65,8 +68,8 @@ frame is prefixed with a 4-byte CRC32 (`wrapMessageWithChecksum`).
 
 Opcode 3 is receive-only: updates are always sent as opcode 0, but 2.0.x peers still send 3,
 so it is decoded with its sequence number and hash skipped. Its hash mismatched on ordinary
-concurrent edits and caused needless full-document resyncs. The deprecated `verifyUpdates`,
-`gapGraceMs` and `seqWindowSize` options are accepted and ignored until the next major.
+concurrent edits and caused needless full-document resyncs. The `verifyUpdates`, `gapGraceMs`
+and `seqWindowSize` options that controlled it were removed in 3.0.0.
 
 `MESSAGE_AWARENESS` carries a channel byte after the type: `AWARENESS_CHANNEL_MAIN` (0) for
 edrys' own identity/presence, `AWARENESS_CHANNEL_APP` (1) for `appAwareness`. This differs
@@ -113,11 +116,10 @@ edrys-Lite (`src/ts/`: `GenericWebrtcProviderAdapter`, `GenericWebsocketProvider
   be set before closing sockets.
 - **`localId` + `pubsub.publishTo`** (type 4) — direct messages addressed by edrys userid;
   unicast via `sendTo` where available, broadcast-and-filtered on `localId` otherwise.
-- **`excludeOrigins`** — both adapters pass `[REVERT_INVALID_ORIGIN]` so local rollback
-  transactions stay off the wire.
 - **`syncMode: 'pull'`** — WebSocket adapter only: a pull-only join adopts the server's
-  document instead of pushing a stale local copy. (It also passes `verifyUpdates: false`, now
-  ignored; the edrys relay doesn't forward opcode 3, which is no longer sent anyway.)
+  document instead of pushing a stale local copy. (Up to 2.0.3 it also needed
+  `verifyUpdates: false`: the edrys relay passes opcode 3 on to other clients but doesn't
+  apply it to its stored document, so late joiners pulling from it missed those edits.)
 - **WebSocket `connect()` stays pending while the server is unreachable** and resolves once a
   retry opens (with `autoReconnect`, the default). The adapter doesn't await it; it sends its
   first heartbeat in `.then()`.

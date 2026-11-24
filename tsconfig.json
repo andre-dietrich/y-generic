@@ -16,6 +16,6 @@
     "sourceMap": true,
     "types": []
   },
-  "include": ["src/**/*", "examples/provider"],
-  "exclude": ["node_modules", "dist", "test", "examples", "version"]
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "test", "version", "src/providers/dummy"]
 }

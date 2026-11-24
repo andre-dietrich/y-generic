@@ -143,14 +143,6 @@ export declare class GenericProvider extends Observable<string> {
          */
         syncInterval?: number;
         /**
-         * @deprecated Ignored. Updates are always sent as plain sync messages
-         * (opcode 0); verified ones (opcode 3) from 2.0.x peers are still
-         * accepted. Its state-vector hash mismatched on ordinary concurrent
-         * edits and triggered needless full-document resyncs. Will be removed
-         * in the next major version.
-         */
-        verifyUpdates?: boolean;
-        /**
          * Batch (debounce) document updates to reduce network traffic.
          * Updates are collected and sent after this delay in milliseconds.
          * Set to 0 to send updates immediately (no batching).
@@ -224,15 +216,6 @@ export declare class GenericProvider extends Observable<string> {
          * @default 30
          */
         syncReplySuppressionMs?: number;
-        /**
-         * @deprecated Ignored: sequence-gap detection was removed along with
-         * verified sync (see `verifyUpdates`). Lost updates are recovered by
-         * the periodic sync (`syncInterval`). Will be removed in the next
-         * major version.
-         */
-        gapGraceMs?: number;
-        /** @deprecated Ignored; see `gapGraceMs`. */
-        seqWindowSize?: number;
     });
     /**
      * Connect to the backend and start syncing.

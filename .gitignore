@@ -8,7 +8,5 @@ bench-dist/
 bench-dist-baseline/
 bench-dist-*/
 
-# Local secrets (Supabase URL/anon key for the live tests)
 .env
-.gun-relay-*/
 *.tgz

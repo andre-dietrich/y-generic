@@ -2,22 +2,14 @@
 
 A clean, minimal, backend-agnostic provider for Yjs that lets you implement any transport mechanism.
 
-## 🚀 Live Demos
+This is the edrys-Lite build, published as `@edryslabs/genericprovider`. It ships two
+transports:
 
-Try out all the different transport providers in action:
+- **SimplePeer** (`@edryslabs/genericprovider/providers/simple-peer`) - WebRTC peer-to-peer
+- **WebSocket** (`@edryslabs/genericprovider/providers/websocket`) - client-server (y-websocket compatible)
 
-**[👉 View Live Demos](https://andre-dietrich.github.io/y-generic/)**
-
-Explore 9 different transport implementations:
-- **Dummy** - In-memory testing with network simulation
-- **SimplePeer** - WebRTC peer-to-peer
-- **PeerJS** - Simplified WebRTC with cloud signaling
-- **IndexedDB** - Local browser persistence
-- **Gun** - Decentralized graph database
-- **Trystero** - Serverless WebRTC (Nostr, BitTorrent, MQTT, IPFS)
-- **PubNub** - Cloud pub/sub with global CDN
-- **WebSocket** - Standard client-server (y-websocket compatible)
-- **Matrix** - Federated communication protocol
+See [src/providers/README.md](src/providers/README.md). Run `npm run dev:simple-peer`,
+`dev:websocket` or `dev:dummy` (in-memory, with simulated latency and loss) for local browser demos.
 
 ## Design Philosophy
 
@@ -280,10 +272,8 @@ const yhistory = doc.getArray('chatHistory')
 
 ## Example Implementations
 
-See `examples.ts` for complete implementations of:
-- **WebSocketTransport**: Real-time WebSocket communication
-- **PubNubTransport**: Pub/sub messaging
-- **IndexedDBTransport**: Local persistence (acts as a "transport")
+See [src/providers/](src/providers/) for the WebSocket and SimplePeer transports, and the
+in-memory `DummyTransport` used by the tests and benchmarks.
 
 ## How It Works
 
@@ -481,10 +471,10 @@ corrupted message is dropped and triggers a resync (one at a time, with exponent
 Yjs updates are idempotent and commutative, so duplicates and out-of-order delivery need no
 special handling.
 
-> `verifyUpdates`, `gapGraceMs` and `seqWindowSize` are deprecated and ignored. Earlier
-> versions sent each update with a document hash and sequence number (message type 3). The
-> hash differed between peers during ordinary concurrent editing, which triggered needless
-> full-document resyncs. Type 3 messages from older peers are still accepted.
+> Up to 2.0.3, updates were sent with a document hash and sequence number (message type 3,
+> options `verifyUpdates`, `gapGraceMs`, `seqWindowSize`, now removed). The hash differed
+> between peers during ordinary concurrent editing, which triggered needless full-document
+> resyncs. Type 3 messages from older peers are still accepted.
 
 ### Built-in Rate Limiting
 
@@ -540,43 +530,6 @@ class PubNubTransportAdapter implements Transport {
   // ... etc
 }
 ```
-
-## Optional Monitoring Utilities
-
-The GenericProvider recovers lost updates on its own (CRC32 checks plus periodic sync). This is sufficient for most use cases.
-
-However, for **advanced diagnostics and monitoring**, the `SyncHealthMonitor` utility is available:
-
-```typescript
-import { SyncHealthMonitor } from './sync-monitor'
-
-const monitor = new SyncHealthMonitor(provider, {
-  checkInterval: 10000, // Check every 10 seconds
-  onDesync: (details) => {
-    // Send to error tracking, alerting system, etc.
-    console.error('Desync detected across peers!', details)
-  }
-})
-monitor.start()
-```
-
-### When to use SyncHealthMonitor:
-- ✅ You need to **monitor ALL peers simultaneously** via pub/sub broadcasts
-- ✅ You want **periodic health checks** for diagnostics/alerting
-- ✅ You need separate monitoring infrastructure from core sync
-- ✅ Production monitoring and error tracking
-
-### When to use built-in verification (default):
-- ✅ **Fast desync detection** (immediate, on every update)
-- ✅ **Zero configuration** (automatic)
-- ✅ Exponential backoff, rate limiting, sequence numbers
-- ✅ Recommended for most applications
-
-**Key difference:**
-- Built-in: Point-to-point verification (sender ↔ receiver) on each update
-- SyncHealthMonitor: Periodic broadcasts across all peers for diagnostics
-
-Most applications should use the built-in verification. Use SyncHealthMonitor only if you need additional monitoring for alerting/diagnostics.
 
 ## License
 

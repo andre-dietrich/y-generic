@@ -35,7 +35,6 @@ describe('connect with a WebSocket server unreachable at startup (B2)', () => {
     const provider = new GenericProvider(doc, new WebSocketTransport(), {
       disableBc: true,
       syncMode: 'pull',
-      verifyUpdates: false,
     })
     return { doc, provider }
   }

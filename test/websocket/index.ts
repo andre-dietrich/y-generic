@@ -171,12 +171,7 @@ async function initWithConfig(config: {
   const transport = new WebSocketTransport()
 
   // Create provider
-  // IMPORTANT: verifyUpdates must be false for y-websocket compatibility
-  // y-websocket uses message type 3 for "messageQueryAwareness" but GenericProvider
-  // uses type 3 for "MESSAGE_SYNC_VERIFIED" when verifyUpdates=true
-  const provider = new GenericProvider(doc, transport, {
-    verifyUpdates: false, // Required for y-websocket server compatibility
-  })
+  const provider = new GenericProvider(doc, transport)
 
   // Listen to status changes
   provider.on('status', (event: any) => {

@@ -325,13 +325,6 @@
             📦 Test Batch Lost on Disconnect
           </button>
           <button
-            id="test-sequence-overflow"
-            style="background: #ff5722; color: white; font-size: 12px"
-            title="Sets sequence number to MAX_SAFE_INTEGER-10 and triggers overflow. Takes ~285 years in real usage at 1000 msg/sec."
-          >
-            🔢 Test Sequence Overflow (9 Quadrillion)
-          </button>
-          <button
             id="test-merge-failure"
             style="background: #ff5722; color: white; font-size: 12px"
             title="Tests Y.mergeUpdates failure handling"
@@ -359,9 +352,6 @@
             🌐 Network Simulation
           </h3>
           <div style="margin-bottom: 10px; font-size: 12px; color: #2196f3">
-            ℹ️ Fast desync detection enabled (hash verification on each
-            update)<br />
-            ℹ️ Sequence numbers for ordering & duplicate detection<br />
             ℹ️ Auto-sync retries every 2 seconds as backup<br />
             ℹ️ Exponential backoff on repeated failures (10ms → 10s)<br />
             ℹ️ Rate limiting: max 20 sync requests per 10 seconds<br />
@@ -539,11 +529,6 @@
               <li>
                 <strong>📦 Batch Lost</strong> - Disconnects while updates are
                 pending in batch buffer (tests flush-before-disconnect)
-              </li>
-              <li>
-                <strong>🔢 Sequence Overflow</strong> - Sets sequence number to
-                9,007,199,254,740,981 (near MAX_SAFE_INTEGER) to test overflow
-                handling. In real usage at 1000 msg/sec, this takes ~285 years!
               </li>
               <li>
                 <strong>💥 Merge Failure</strong> - Simulates Y.mergeUpdates

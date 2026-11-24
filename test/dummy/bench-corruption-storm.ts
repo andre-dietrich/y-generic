@@ -180,7 +180,6 @@ function makeProviders(
     restoreFns.push(withCorruption(transport, corruptionRate))
     const provider = new GenericProvider(doc, transport, {
       batchUpdates: 0,
-      verifyUpdates: true,
       syncInterval: 0,
       ...(syncReplySuppressionMs !== undefined ? { syncReplySuppressionMs } : {}),
     })

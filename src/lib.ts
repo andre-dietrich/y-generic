@@ -2,12 +2,12 @@
  * Generic Yjs Provider
  *
  * A minimal, backend-agnostic provider for Yjs that lets you implement
- * any transport mechanism (WebSocket, WebRTC, PubNub, IndexedDB, etc.)
+ * any transport mechanism (WebSocket, WebRTC, etc.)
  *
  * @example
  * ```typescript
  * import * as Y from 'yjs'
- * import { GenericProvider, type Transport } from './GenericProvider'
+ * import { GenericProvider, type Transport } from '@edryslabs/genericprovider'
  *
  * // Implement your transport
  * class MyTransport implements Transport {
@@ -33,7 +33,3 @@
 export { GenericProvider, PubSubChannel } from './index'
 export type { Transport, ConnectionConfig, ConnectionStatus } from './transport'
 
-// Optional monitoring utilities (for advanced diagnostics)
-// SyncHealthMonitor is useful for monitoring across ALL peers simultaneously via pub/sub
-export { SyncHealthMonitor, computeDocumentHash } from './sync-monitor'
-export type { DesyncDetails } from './sync-monitor'

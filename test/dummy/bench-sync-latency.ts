@@ -1,6 +1,7 @@
 /**
- * Benchmark: does `batchUpdates` and `verifyUpdates` cost materially affect
- * time-to-convergence under different simulated transport latency profiles?
+ * Benchmark: does `batchUpdates` materially affect time-to-convergence under
+ * different simulated transport latency profiles? (Up to 2.0.3 this also
+ * compared `verifyUpdates`; that option was removed.)
  *
  * Runs entirely in Node against DummyTransport - no browser needed.
  *
@@ -40,14 +41,11 @@ const PROFILES: Profile[] = [
 
 interface RunConfig {
   batchUpdates: number
-  verifyUpdates: boolean
 }
 
 const CONFIGS: RunConfig[] = [
-  { batchUpdates: 0, verifyUpdates: true }, // current default
-  { batchUpdates: 150, verifyUpdates: true },
-  { batchUpdates: 0, verifyUpdates: false },
-  { batchUpdates: 150, verifyUpdates: false },
+  { batchUpdates: 0 }, // current default
+  { batchUpdates: 150 },
 ]
 
 const EDIT_COUNT = 30 // simulated rapid keystrokes
@@ -94,12 +92,10 @@ async function runOnce(
 
   const providerA = new GenericProvider(docA, transportA, {
     batchUpdates: cfg.batchUpdates,
-    verifyUpdates: cfg.verifyUpdates,
     syncInterval: 0,
   })
   const providerB = new GenericProvider(docB, transportB, {
     batchUpdates: cfg.batchUpdates,
-    verifyUpdates: cfg.verifyUpdates,
     syncInterval: 0,
   })
   // Bump local awareness state past the library's genesis clock (0), same as
@@ -158,12 +154,12 @@ async function main() {
     for (const profile of PROFILES) {
       console.log(`\n-- Profile: ${profile.name} (latency=${profile.latency}ms, jitter=${profile.jitter}) --`)
       console.log(
-        'batchUpdates | verifyUpdates | totalMs | msgCount',
+        'batchUpdates | totalMs | msgCount',
       )
       for (const cfg of CONFIGS) {
         const { totalMs, msgCount } = await runOnce(profile, cfg, preload)
         console.log(
-          `${String(cfg.batchUpdates).padStart(12)} | ${String(cfg.verifyUpdates).padStart(13)} | ${String(totalMs).padStart(7)} | ${String(msgCount).padStart(8)}`,
+          `${String(cfg.batchUpdates).padStart(12)} | ${String(totalMs).padStart(7)} | ${String(msgCount).padStart(8)}`,
         )
       }
     }

@@ -259,14 +259,12 @@ class TestClient {
 
     // Create transport and provider
     // Use 2 second sync interval for testing (helps with packet loss)
-    // Enable verifyUpdates for immediate desync detection (faster than waiting 2s)
     // batchUpdates can be used to reduce network traffic (e.g., batchUpdates: 100)
     // IMPORTANT: disableBc prevents cross-tab sync, forcing all sync through simulated network
     this.transport = new Dummy()
     this.provider = new GenericProvider(this.doc, this.transport, {
       batchUpdates: 100, // Optional: batch updates for 100ms to reduce traffic
       syncInterval: 2000, // Retry sync every 2 seconds to handle packet loss
-      verifyUpdates: true, // Send hash with each update for immediate desync detection
       disableBc: true, // CRITICAL: Disable BroadcastChannel to test network simulation properly
     })
 
@@ -652,8 +650,6 @@ class TestClient {
     // Set initial awareness
     this.updateAwareness()
 
-    // Built-in hash verification (verifyUpdates: true) handles desync detection automatically
-    // No need for separate SyncHealthMonitor - see sync-monitor.ts for optional monitoring utilities
   }
 
   disconnect(): void {
@@ -754,9 +750,6 @@ async function init() {
   const testBatchDisconnectBtn = document.getElementById(
     'test-batch-disconnect',
   )!
-  const testSequenceOverflowBtn = document.getElementById(
-    'test-sequence-overflow',
-  )!
   const testMergeFailureBtn = document.getElementById('test-merge-failure')!
   const testRapidConnectBtn = document.getElementById('test-rapid-connect')!
 
@@ -766,14 +759,6 @@ async function init() {
       return
     }
     await testBatchUpdateLostOnDisconnect(clients[0])
-  })
-
-  testSequenceOverflowBtn.addEventListener('click', () => {
-    if (clients.length === 0) {
-      log('⚠️ No clients available for testing')
-      return
-    }
-    testSequenceNumberOverflow(clients[0])
   })
 
   testMergeFailureBtn.addEventListener('click', () => {
@@ -896,43 +881,17 @@ async function init() {
     'TIP: Jitter causes out-of-order message delivery (realistic network behavior)',
   )
   log('TIP: 💥 Enable data corruption to test Y.mergeUpdates error handling!')
-  log('INFO: Fast desync detection with exponential backoff (10ms → 10s max)')
+  log('INFO: Corrupted messages trigger a resync with exponential backoff')
   log('INFO: Rate limiting active - max 20 sync requests per 10 seconds')
-  log('INFO: Sequence numbers enabled for ordering & duplicate detection')
 
-  // Intercept console.warn to catch hash mismatch warnings
+  // Intercept console.warn to surface provider warnings in the log
   const originalWarn = console.warn
   console.warn = function (...args: any[]) {
-    if (args[0]?.includes?.('Hash mismatch')) {
-      // Extract the mismatch count and delay from the message
-      const match = args[0].match(/#(\d+)/)
-      const delayMatch = args[1]?.match?.(/(\d+)ms/)
-      if (match && delayMatch) {
-        log(
-          `⚡ Hash mismatch #${match[1]} detected - retry in ${delayMatch[1]}ms (exponential backoff)`,
-        )
-      } else {
-        log('⚡ FAST DESYNC DETECTED - Immediate re-sync triggered!')
-      }
-    } else if (args[0]?.includes?.('rate limit exceeded')) {
+    if (args[0]?.includes?.('rate limit exceeded')) {
       // Extract rate limit info
       const match = args[0].match(/(\d+) requests per (\d+)s/)
       if (match) {
         log(`🚫 Rate limit hit: max ${match[1]} sync requests per ${match[2]}s`)
-      }
-    } else if (args[0]?.includes?.('Duplicate or out-of-order')) {
-      // Extract sequence info
-      const match = args[0].match(/seqNum (\d+) <= lastSeen (\d+)/)
-      if (match) {
-        log(`🔁 Duplicate update skipped: seqNum ${match[1]} <= ${match[2]}`)
-      }
-    } else if (args[0]?.includes?.('Sequence gap')) {
-      // Extract gap info
-      const match = args[0].match(/expected (\d+), got (\d+) \(gap of (\d+)/)
-      if (match) {
-        log(
-          `📦 Packet loss detected: expected seq ${match[1]}, got ${match[2]} (${match[3]} missing)`,
-        )
       }
     } else if (args[0]?.includes?.('Corrupted message detected')) {
       // Extract corruption count
@@ -1045,95 +1004,6 @@ async function testBatchUpdateLostOnDisconnect(
       log('   The bug may have been fixed, or timing was different')
     }
   }
-}
-
-/**
- * Edge Case Test #2: Sequence Number Overflow
- *
- * This tests what happens when the sequence number counter approaches MAX_SAFE_INTEGER.
- * JavaScript can safely represent integers up to 2^53 - 1 (9,007,199,254,740,991).
- * After this, precision is lost and sequence ordering may break.
- *
- * Expected behavior: Wraparound or use BigInt
- * Actual behavior (bug): No overflow handling, sequence numbers become unreliable
- */
-function testSequenceNumberOverflow(client: TestClient): void {
-  log('🧪 TEST #2: Sequence Number Overflow')
-  log('──────────────────────────────────────────────')
-
-  // Use the new test helper method
-  const provider = client.provider as any
-
-  if (!provider._testGetSequenceNumber) {
-    log(
-      '⚠️ Provider does not have test helpers - verifyUpdates may be disabled',
-    )
-    return
-  }
-
-  const currentSeq = provider._testGetSequenceNumber()
-  log(`1️⃣ Current sequence number: ${currentSeq.toLocaleString()}`)
-
-  // Set to near MAX_SAFE_INTEGER to trigger overflow quickly
-  const testSeq = Number.MAX_SAFE_INTEGER - 10
-  provider._testSetSequenceNumber(testSeq)
-  log(`2️⃣ Set sequence to: ${testSeq.toLocaleString()}`)
-  log(`   (MAX_SAFE_INTEGER = ${Number.MAX_SAFE_INTEGER.toLocaleString()})`)
-  log(
-    `   (This simulates ~9 quadrillion messages - would take centuries at 1000 msg/sec)`,
-  )
-
-  log('3️⃣ Making 15 changes to trigger overflow...')
-  log('   Watch console for "Duplicate or out-of-order" warnings')
-
-  // Make changes that will increment past MAX_SAFE_INTEGER
-  for (let i = 0; i < 15; i++) {
-    client.ytext.insert(0, `[${i}]`)
-    const newSeq = provider._testGetSequenceNumber()
-
-    // Check if we crossed the threshold
-    if (i === 10) {
-      log(`   After change ${i + 1}: seqNum = ${newSeq.toLocaleString()}`)
-      if (newSeq > Number.MAX_SAFE_INTEGER) {
-        log(`   🔴 OVERFLOW! Sequence exceeded MAX_SAFE_INTEGER`)
-        log(`   JavaScript can no longer represent this integer safely!`)
-      }
-    }
-  }
-
-  const finalSeq = provider._testGetSequenceNumber()
-  log(`4️⃣ Final sequence number: ${finalSeq.toLocaleString()}`)
-
-  if (finalSeq > Number.MAX_SAFE_INTEGER) {
-    log('❌ CONFIRMED: Sequence overflow occurred!')
-    log('📍 Affected code: _localSeqNum++ in _sendUpdate()')
-    log('⚠️ Consequences:')
-    log('   - Sequence numbers lose precision (start rounding)')
-    log('   - Duplicate detection may fail')
-    log('   - Out-of-order detection unreliable')
-    log('   - Sequence gaps appear incorrectly')
-    log('')
-    log('💡 Solutions:')
-    log('   1. Use BigInt for sequence numbers (breaking change)')
-    log('   2. Implement wraparound with modulo (2^32 or 2^53)')
-    log('   3. Reset counter periodically (requires coordination)')
-    log('   4. Accept it (overflow takes ~285 years at 1000 msg/sec)')
-  } else {
-    log('⚠️ Did not overflow in this test (needed more changes)')
-  }
-
-  log('──────────────────────────────────────────────')
-  log('🔍 To observe real impact:')
-  log('   1. Open browser DevTools Console')
-  log('   2. Run test again and make edits on BOTH clients')
-  log('   3. Look for warnings about duplicate/out-of-order messages')
-  log('   4. Sequence comparison will fail when numbers lose precision')
-  log('')
-  log('📊 Real-world relevance:')
-  log('   At 1000 messages/second:')
-  log('   - Takes ~285 years to reach MAX_SAFE_INTEGER')
-  log('   - In practice, this is a non-issue for most applications')
-  log('   - Long-running servers might need BigInt after decades')
 }
 
 /**

@@ -76,23 +76,31 @@ export class WebSocketTransport {
         this.messageQueue = []; // Queue messages until connected
         this.receivedBuffer = []; // Buffer messages received before callback registered
         this.lastMessageAt = 0;
+        this.wsUrl = '';
     }
     get isConnected() {
         return this._isConnected;
     }
     /**
-     * Connect to WebSocket server
+     * Connect to WebSocket server.
+     *
+     * Resolves once a socket is open. With `autoReconnect` on (the default), a
+     * failed or timed-out attempt does not reject: the transport keeps retrying
+     * and the promise resolves when one succeeds. It rejects when
+     * `autoReconnect` is off, when `maxReconnectAttempts` runs out, or when
+     * disconnect() is called first.
      */
     async connect(config) {
-        this.config = config;
-        this.debug = config.debug ?? false;
-        this.intentionalDisconnect = false;
         if (!config.serverUrl) {
             throw new Error('WebSocket serverUrl is required');
         }
         if (!config.room) {
             throw new Error('Room name is required');
         }
+        this.config = config;
+        this.debug = config.debug ?? false;
+        this.intentionalDisconnect = false;
+        this.reconnectAttempts = 0;
         // Build URL with room (y-websocket compatible)
         let wsUrl = config.serverUrl;
         // Remove trailing slash if present
@@ -100,61 +108,110 @@ export class WebSocketTransport {
             wsUrl = wsUrl.slice(0, -1);
         }
         // Append room name to URL path
-        wsUrl = `${wsUrl}/${encodeURIComponent(config.room)}`;
-        this.log(`Connecting to WebSocket server: ${wsUrl}`);
+        this.wsUrl = `${wsUrl}/${encodeURIComponent(config.room)}`;
         return new Promise((resolve, reject) => {
-            try {
-                // Create WebSocket connection with room in URL (y-websocket style)
-                this.ws = new WebSocket(wsUrl, config.protocols);
-                this.ws.binaryType = 'arraybuffer';
-                const timeout = setTimeout(() => {
-                    if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
-                        this.ws.close();
-                        reject(new Error('WebSocket connection timeout'));
-                    }
-                }, 10000);
-                this.ws.onopen = () => {
-                    clearTimeout(timeout);
-                    this._isConnected = true;
-                    this.reconnectAttempts = 0;
-                    this.log(`✅ WebSocket connected to room: ${config.room}`);
-                    this.startLivenessCheck();
-                    // Flush queued messages
-                    this.flushMessageQueue();
-                    resolve();
-                };
-                this.ws.onmessage = (event) => {
-                    this.lastMessageAt = Date.now();
-                    this.handleMessage(event.data);
-                };
-                this.ws.onerror = (error) => {
-                    clearTimeout(timeout);
-                    this.log('❌ WebSocket error:', error);
-                    if (!this._isConnected) {
-                        reject(new Error('WebSocket connection failed'));
-                    }
-                };
-                this.ws.onclose = (event) => {
-                    clearTimeout(timeout);
-                    this.stopLivenessCheck();
-                    this._isConnected = false;
-                    this.log(`WebSocket closed: code=${event.code}, reason=${event.reason || 'none'}`);
-                    // Attempt reconnection if not intentional
-                    if (!this.intentionalDisconnect && (config.autoReconnect ?? true)) {
-                        this.attemptReconnect();
-                    }
-                };
-            }
-            catch (error) {
-                reject(error);
-            }
+            this.pendingConnect = { resolve, reject };
+            this.openSocket();
         });
+    }
+    settleConnect(error) {
+        const pending = this.pendingConnect;
+        if (!pending)
+            return;
+        this.pendingConnect = undefined;
+        if (error)
+            pending.reject(error);
+        else
+            pending.resolve();
+    }
+    get autoReconnect() {
+        return this.config?.autoReconnect ?? true;
+    }
+    /** One connection attempt; on failure, retries or rejects connect(). */
+    openSocket() {
+        if (!this.config)
+            return;
+        const config = this.config;
+        this.log(`Connecting to WebSocket server: ${this.wsUrl}`);
+        let ws;
+        try {
+            // Create WebSocket connection with room in URL (y-websocket style)
+            ws = new WebSocket(this.wsUrl, config.protocols);
+            ws.binaryType = 'arraybuffer';
+        }
+        catch (error) {
+            this.connectFailed(error instanceof Error ? error : new Error(String(error)));
+            return;
+        }
+        this.ws = ws;
+        const timeout = setTimeout(() => {
+            if (ws.readyState === WebSocket.OPEN)
+                return;
+            this.log('⏱️ WebSocket connection timeout');
+            // Abandon the attempt so it can't open late next to its retry; the
+            // close handshake of a socket that never opened can hang.
+            ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+            try {
+                ws.close();
+            }
+            catch {
+                // already closing
+            }
+            if (this.ws === ws)
+                this.ws = null;
+            this.connectFailed(new Error('WebSocket connection timeout'));
+        }, 10000);
+        ws.onopen = () => {
+            clearTimeout(timeout);
+            this._isConnected = true;
+            this.reconnectAttempts = 0;
+            this.log(`✅ WebSocket connected to room: ${config.room}`);
+            this.startLivenessCheck();
+            // Flush queued messages
+            this.flushMessageQueue();
+            this.settleConnect();
+        };
+        ws.onmessage = (event) => {
+            this.lastMessageAt = Date.now();
+            this.handleMessage(event.data);
+        };
+        ws.onerror = (error) => {
+            // onclose always follows and decides about retrying.
+            this.log('❌ WebSocket error:', error);
+        };
+        ws.onclose = (event) => {
+            clearTimeout(timeout);
+            this.stopLivenessCheck();
+            const wasOpen = this._isConnected;
+            this._isConnected = false;
+            if (this.ws === ws)
+                this.ws = null;
+            this.log(`WebSocket closed: code=${event.code}, reason=${event.reason || 'none'}`);
+            if (this.intentionalDisconnect)
+                return;
+            if (wasOpen) {
+                if (this.autoReconnect)
+                    this.attemptReconnect();
+            }
+            else {
+                this.connectFailed(new Error('WebSocket connection failed'));
+            }
+        };
+    }
+    /** A socket that never opened: retry, or give up and reject connect(). */
+    connectFailed(error) {
+        if (this.intentionalDisconnect)
+            return;
+        if (!this.autoReconnect || !this.attemptReconnect()) {
+            this.settleConnect(error);
+        }
     }
     /**
      * Disconnect from WebSocket server
      */
     disconnect() {
         this.intentionalDisconnect = true;
+        this.settleConnect(new Error('WebSocket disconnected before it connected'));
         this.stopLivenessCheck();
         if (this.reconnectTimer) {
             clearTimeout(this.reconnectTimer);
@@ -281,28 +338,29 @@ export class WebSocketTransport {
         }
     }
     /**
-     * Attempt to reconnect
+     * Schedule the next connection attempt. Returns false when
+     * `maxReconnectAttempts` is used up.
      */
     attemptReconnect() {
         if (!this.config)
-            return;
+            return false;
+        if (this.reconnectTimer)
+            return true; // already scheduled
         const maxAttempts = this.config.maxReconnectAttempts ?? 0;
         if (maxAttempts > 0 && this.reconnectAttempts >= maxAttempts) {
             this.log(`❌ Max reconnection attempts (${maxAttempts}) reached`);
-            return;
+            return false;
         }
         this.reconnectAttempts++;
         const delay = this.config.reconnectDelay ?? 2000;
         this.log(`🔄 Attempting reconnection #${this.reconnectAttempts} in ${delay}ms...`);
-        this.reconnectTimer = setTimeout(async () => {
-            try {
-                await this.connect(this.config);
-                this.log('✅ Reconnected successfully');
-            }
-            catch (error) {
-                this.log('❌ Reconnection failed:', error);
-            }
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = undefined;
+            if (this.intentionalDisconnect)
+                return;
+            this.openSocket();
         }, delay);
+        return true;
     }
     /**
      * Debug logging

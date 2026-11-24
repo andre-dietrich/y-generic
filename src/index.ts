@@ -514,10 +514,10 @@ export class GenericProvider extends Observable<string> {
       // Setup BroadcastChannel for cross-tab sync (if enabled and available)
       this._setupBroadcastChannel(config)
 
-      // Connect the transport
-      await this.transport.connect(config)
-
-      // Register for incoming messages
+      // Register for incoming messages BEFORE connecting: a transport that
+      // keeps retrying on its own (e.g. WebSocket with autoReconnect) may
+      // deliver messages from a later attempt, and nothing would ever
+      // register the handler if connect() threw first.
       this._unsubscribeTransport = this.transport.onMessage((data) => {
         this._handleIncomingMessage(data)
       })
@@ -533,6 +533,15 @@ export class GenericProvider extends Observable<string> {
           originalUnsub?.()
           unsubPeer()
         }
+      }
+
+      // Connect the transport
+      await this.transport.connect(config)
+
+      // disconnect()/destroy() was called while the transport was connecting.
+      if (!this._isConnecting()) {
+        this.transport.disconnect()
+        return
       }
 
       this._setStatus({ state: 'connected' })
@@ -564,6 +573,14 @@ export class GenericProvider extends Observable<string> {
         }, this._syncInterval)
       }
     } catch (error) {
+      // Undo the setup above so a later connect() starts clean (otherwise a
+      // retry would subscribe to BroadcastChannel and the transport twice).
+      this._unsubscribeTransport?.()
+      this._unsubscribeTransport = undefined
+      this._disconnectBroadcastChannel()
+
+      // disconnect() during connecting already set the final status.
+      if (!this._isConnecting()) return
       this._setStatus({
         state: 'error',
         error: error instanceof Error ? error : new Error(String(error)),
@@ -1516,6 +1533,11 @@ export class GenericProvider extends Observable<string> {
       if (this.transport.sendTo) {
         // Direct delivery to the target peer.
         const wrapped = wrapMessageWithChecksum(frame)
+        // The target may be another tab of this browser, reachable only
+        // through BroadcastChannel; tabs it isn't for drop it by localId.
+        if (this._bcConnected) {
+          bc.publish(this._bcChannel, wrapped, this)
+        }
         const result = this.transport.sendTo(target, wrapped)
         if (result instanceof Promise) {
           result.catch((error) => {
@@ -1776,6 +1798,15 @@ export class GenericProvider extends Observable<string> {
   /**
    * Update connection status and emit event.
    */
+  /**
+   * Whether connect() is still in progress. A method rather than an inline
+   * check so TypeScript doesn't narrow `_status` across the await in
+   * connect(), where disconnect() may change it.
+   */
+  private _isConnecting(): boolean {
+    return this._status.state === 'connecting'
+  }
+
   private _setStatus(status: ConnectionStatus): void {
     this._status = status
     this.emit('status', [status])

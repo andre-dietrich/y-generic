@@ -447,6 +447,12 @@ export declare class GenericProvider extends Observable<string> {
     /**
      * Update connection status and emit event.
      */
+    /**
+     * Whether connect() is still in progress. A method rather than an inline
+     * check so TypeScript doesn't narrow `_status` across the await in
+     * connect(), where disconnect() may change it.
+     */
+    private _isConnecting;
     private _setStatus;
     /**
      * TEST HELPER: Set local sequence number to a specific value.

@@ -188,15 +188,17 @@ export declare class SimplePeerTransport implements Transport {
      */
     sendTo(peerId: string, data: Uint8Array): void;
     /**
-     * Send data to a single peer, chunking if necessary.
-     * Uses flow control to avoid overwhelming the WebRTC buffer.
+     * Queue data for a single peer, chunking if necessary, and send as much as
+     * the channel buffer allows.
      */
     private sendToPeer;
     /**
-     * Send chunks with backpressure handling.
-     * Waits for buffer to drain before sending more data.
+     * Send queued frames until the queue is empty or the channel buffer is
+     * full; in the latter case resume when the buffer drains. Only this method
+     * sets onbufferedamountlow, so concurrent large messages can't overwrite
+     * each other's handler.
      */
-    private sendChunksWithFlowControl;
+    private pumpSendQueue;
     /**
      * Register callback for incoming messages.
      */

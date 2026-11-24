@@ -154,6 +154,140 @@ describe('sending', () => {
   })
 })
 
+describe('send queue and flow control (B3)', () => {
+  const big = (fill: number) => new Uint8Array(200_000).fill(fill)
+  const chunksFor = (n: number) => Math.ceil(n / (64 * 1024 - 13))
+  const drainAll = (peer: FakePeer) => {
+    for (let i = 0; i < 50; i++) peer._channel.drain()
+  }
+
+  test('two large messages to one peer are both sent completely', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.send(big(1))
+    t.send(big(2))
+    drainAll(peers.p1)
+    expect(peers.p1.sent).toHaveLength(2 * chunksFor(200_000))
+    t.disconnect()
+  })
+
+  test('frames leave in the order they were sent', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.send(big(1))
+    t.send(new Uint8Array([42]))
+    t.send(big(2))
+    drainAll(peers.p1)
+
+    const n = chunksFor(200_000)
+    const types = peers.p1.sent.map((f) => f[0])
+    expect(types).toEqual([...Array(n).fill(0x01), 0x00, ...Array(n).fill(0x01)])
+    t.disconnect()
+  })
+
+  test('both large messages arrive intact at the other side', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.send(big(1))
+    t.send(big(2))
+    drainAll(peers.p1)
+
+    const { t: rx, peers: rxPeers } = await withPeers(['tx'])
+    const got: Uint8Array[] = []
+    rx.onMessage((d) => got.push(d))
+    for (const f of peers.p1.sent) rxPeers.tx.receive(f)
+    expect(got.map((m) => [m.length, m[0], m[m.length - 1]])).toEqual([
+      [200_000, 1, 1],
+      [200_000, 2, 2],
+    ])
+    t.disconnect()
+    rx.disconnect()
+  })
+
+  test('sends go out immediately while the buffer has room', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.send(new Uint8Array([1]))
+    t.send(new Uint8Array([2]))
+    expect(peers.p1.sent).toHaveLength(2)
+    t.disconnect()
+  })
+
+  test('control frames skip the queue', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.send(big(1)) // fills the buffer, rest waits
+    const before = peers.p1.sent.length
+    t.sendControl('p1', new Uint8Array([7]))
+    expect(peers.p1.sent).toHaveLength(before + 1)
+    expect([...peers.p1.sent[before]]).toEqual([0x02, 7])
+    t.disconnect()
+  })
+
+  test('a removed peer’s queue is dropped, not sent on drain', async () => {
+    const { t, peers } = await withPeers(['p1'])
+    t.send(big(1))
+    const before = peers.p1.sent.length
+    t.disconnectPeer('p1')
+    drainAll(peers.p1)
+    expect(peers.p1.sent).toHaveLength(before)
+    t.disconnect()
+  })
+})
+
+describe('chunk reassembly limits (B3)', () => {
+  function chunk(messageId: number, index: number, total: number, data = [0]) {
+    const c = new Uint8Array(13 + data.length)
+    const v = new DataView(c.buffer)
+    c[0] = 0x01
+    v.setUint32(1, messageId, true)
+    v.setUint32(5, index, true)
+    v.setUint32(9, total, true)
+    c.set(data, 13)
+    return c
+  }
+  async function receiver() {
+    const { t, peers } = await withPeers(['p1'])
+    const got: Uint8Array[] = []
+    t.onMessage((d) => got.push(d))
+    const buffers = () => (t as any).peers.get('p1').chunkBuffers as Map<number, any>
+    return { t, peer: peers.p1, got, buffers }
+  }
+
+  test('chunks with an invalid header are dropped', async () => {
+    const { t, peer, buffers } = await receiver()
+    peer.receive(chunk(1, 5, 2)) // index out of range
+    peer.receive(chunk(2, 0, 0)) // zero chunks
+    peer.receive(chunk(3, 0, 1_000_000)) // absurd count
+    peer.receive(new Uint8Array([0x01, 0, 0])) // truncated header
+    expect(buffers().size).toBe(0)
+    t.disconnect()
+  })
+
+  test('at most 16 partial messages are kept per peer, oldest evicted', async () => {
+    const { t, peer, buffers } = await receiver()
+    for (let id = 0; id < 20; id++) peer.receive(chunk(id, 0, 2))
+    expect(buffers().size).toBe(16)
+    expect(buffers().has(0)).toBe(false)
+    expect(buffers().has(19)).toBe(true)
+    t.disconnect()
+  })
+
+  test('a partial message is discarded after 30s without a chunk', async () => {
+    vi.useFakeTimers()
+    const { t, peer, buffers } = await receiver()
+    peer.receive(chunk(1, 0, 2))
+    vi.advanceTimersByTime(31000)
+    peer.receive(chunk(2, 0, 2)) // any later chunk triggers the sweep
+    expect([...buffers().keys()]).toEqual([2])
+    t.disconnect()
+  })
+
+  test('a reused message id with a different chunk count starts over', async () => {
+    const { t, peer, got } = await receiver()
+    peer.receive(chunk(1, 0, 3, [9]))
+    peer.receive(chunk(1, 0, 2, [1]))
+    peer.receive(chunk(1, 1, 2, [2]))
+    expect(got.map((m) => [...m])).toEqual([[1, 2]])
+    t.disconnect()
+  })
+})
+
 describe('peer discovery', () => {
   test('a peer announced earlier but no longer connected is reconnected', async () => {
     vi.useFakeTimers()

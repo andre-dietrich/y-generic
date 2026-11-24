@@ -65,11 +65,25 @@ export declare class WebSocketTransport implements Transport {
     private receivedBuffer;
     private lastMessageAt;
     private livenessTimer?;
+    private wsUrl;
+    private pendingConnect?;
     get isConnected(): boolean;
     /**
-     * Connect to WebSocket server
+     * Connect to WebSocket server.
+     *
+     * Resolves once a socket is open. With `autoReconnect` on (the default), a
+     * failed or timed-out attempt does not reject: the transport keeps retrying
+     * and the promise resolves when one succeeds. It rejects when
+     * `autoReconnect` is off, when `maxReconnectAttempts` runs out, or when
+     * disconnect() is called first.
      */
     connect(config: WebSocketConfig): Promise<void>;
+    private settleConnect;
+    private get autoReconnect();
+    /** One connection attempt; on failure, retries or rejects connect(). */
+    private openSocket;
+    /** A socket that never opened: retry, or give up and reject connect(). */
+    private connectFailed;
     /**
      * Disconnect from WebSocket server
      */
@@ -98,7 +112,8 @@ export declare class WebSocketTransport implements Transport {
     private startLivenessCheck;
     private stopLivenessCheck;
     /**
-     * Attempt to reconnect
+     * Schedule the next connection attempt. Returns false when
+     * `maxReconnectAttempts` is used up.
      */
     private attemptReconnect;
     /**

@@ -168,8 +168,14 @@ interface PeerConnection {
   /** Buffer for reassembling chunked messages */
   chunkBuffers: Map<
     number,
-    { chunks: Map<number, Uint8Array>; totalChunks: number }
+    { chunks: Map<number, Uint8Array>; totalChunks: number; lastChunkAt: number }
   >
+  /**
+   * Outgoing frames (complete messages and chunks) waiting for the channel
+   * buffer to drain. One FIFO per peer keeps messages in order and leaves a
+   * single onbufferedamountlow handler per channel.
+   */
+  sendQueue: Uint8Array[]
 }
 
 /**
@@ -184,6 +190,15 @@ const CHUNK_SIZE = 64 * 1024
  * If we send too much too fast, the buffer overflows.
  */
 const MAX_BUFFERED_AMOUNT = 16 * 1024
+
+/**
+ * Receiver limits for chunked messages, so a misbehaving peer can't make us
+ * buffer without bound. 4096 chunks is ~256MB per message; a partial message
+ * whose next chunk doesn't arrive within CHUNK_TIMEOUT is discarded.
+ */
+const MAX_TOTAL_CHUNKS = 4096
+const MAX_PENDING_MESSAGES = 16
+const CHUNK_TIMEOUT = 30000
 
 /**
  * How long a peer connection may take to open its channel. Neither side ever
@@ -551,8 +566,8 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * Send data to a single peer, chunking if necessary.
-   * Uses flow control to avoid overwhelming the WebRTC buffer.
+   * Queue data for a single peer, chunking if necessary, and send as much as
+   * the channel buffer allows.
    */
   private sendToPeer(peerConn: PeerConnection, data: Uint8Array): void {
     // Small messages can be sent directly with type marker
@@ -560,79 +575,78 @@ export class SimplePeerTransport implements Transport {
       const msg = new Uint8Array(data.length + 1)
       msg[0] = MSG_TYPE_COMPLETE
       msg.set(data, 1)
-      peerConn.peer.send(msg)
+      peerConn.sendQueue.push(msg)
+      this.pumpSendQueue(peerConn)
       return
     }
 
     // Large messages need chunking with flow control
-    const messageId = messageIdCounter++
+    const messageId = messageIdCounter++ >>> 0
     const totalChunks = Math.ceil(data.length / (CHUNK_SIZE - 13))
     this.log(
       `📦 Chunking ${data.length}B → ${totalChunks} chunks (msgId=${messageId})`,
     )
 
-    // Queue all chunks and send with backpressure handling
-    const chunks: Uint8Array[] = []
     for (let i = 0; i < totalChunks; i++) {
       const start = i * (CHUNK_SIZE - 13)
       const end = Math.min(start + (CHUNK_SIZE - 13), data.length)
-      const chunkData = data.slice(start, end)
+      const chunkData = data.subarray(start, end)
 
       // Chunk header: [type:1][messageId:4][chunkIndex:4][totalChunks:4][data]
       const chunk = new Uint8Array(13 + chunkData.length)
+      const view = new DataView(chunk.buffer)
       chunk[0] = MSG_TYPE_CHUNKED
-      new DataView(chunk.buffer).setUint32(1, messageId, true)
-      new DataView(chunk.buffer).setUint32(5, i, true)
-      new DataView(chunk.buffer).setUint32(9, totalChunks, true)
+      view.setUint32(1, messageId, true)
+      view.setUint32(5, i, true)
+      view.setUint32(9, totalChunks, true)
       chunk.set(chunkData, 13)
-      chunks.push(chunk)
+      peerConn.sendQueue.push(chunk)
     }
 
-    // Send chunks with flow control
-    this.sendChunksWithFlowControl(peerConn, chunks)
+    this.pumpSendQueue(peerConn)
   }
 
   /**
-   * Send chunks with backpressure handling.
-   * Waits for buffer to drain before sending more data.
+   * Send queued frames until the queue is empty or the channel buffer is
+   * full; in the latter case resume when the buffer drains. Only this method
+   * sets onbufferedamountlow, so concurrent large messages can't overwrite
+   * each other's handler.
    */
-  private sendChunksWithFlowControl(
-    peerConn: PeerConnection,
-    chunks: Uint8Array[],
-  ): void {
-    let index = 0
+  private pumpSendQueue(peerConn: PeerConnection): void {
     const peer = peerConn.peer
+    const queue = peerConn.sendQueue
 
-    const sendNext = () => {
-      while (index < chunks.length) {
-        // Check if buffer is too full
-        const channel = peer._channel
-        if (channel && channel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          // Wait for buffer to drain
+    while (queue.length > 0) {
+      // The connection was replaced or closed: its queue goes with it.
+      if (this.peers.get(peerConn.peerId) !== peerConn) {
+        queue.length = 0
+        return
+      }
+
+      const channel = peer._channel
+      if (channel && channel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
+        if (!channel.onbufferedamountlow) {
           this.log(
-            `⏸️ Backpressure on ${peerConn.peerId}: buffered ${channel.bufferedAmount}B, waiting...`,
+            `⏸️ Backpressure on ${peerConn.peerId}: buffered ${channel.bufferedAmount}B, ${queue.length} frame(s) queued`,
           )
           channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2
           channel.onbufferedamountlow = () => {
             channel.onbufferedamountlow = null
-            this.log(`▶️ Buffer drained on ${peerConn.peerId}, resuming chunks`)
-            sendNext()
+            this.pumpSendQueue(peerConn)
           }
-          return
         }
+        return
+      }
 
-        // Send next chunk
-        try {
-          peer.send(chunks[index])
-          index++
-        } catch (error) {
-          this.log('Error sending chunk:', index, error)
-          return
-        }
+      try {
+        peer.send(queue.shift()!)
+      } catch (error) {
+        // The channel is closing; the rest can't be delivered either.
+        this.log(`❌ Send failed to ${peerConn.peerId}:`, (error as Error).message)
+        queue.length = 0
+        return
       }
     }
-
-    sendNext()
   }
 
   /**
@@ -1099,6 +1113,7 @@ export class SimplePeerTransport implements Transport {
       peerId: remotePeerId,
       attemptId: Math.random().toString(36).slice(2, 10),
       chunkBuffers: new Map(),
+      sendQueue: [],
     }
 
     this.peers.set(remotePeerId, peerConn)
@@ -1207,21 +1222,56 @@ export class SimplePeerTransport implements Transport {
           this._callback(decryptedData)
         } else if (msgType === MSG_TYPE_CHUNKED) {
           // Chunked message - reassemble
+          if (uint8Data.length < 13) {
+            this.log(`🗑️ Dropping truncated chunk from ${remotePeerId}`)
+            return
+          }
           const view = new DataView(uint8Data.buffer, uint8Data.byteOffset)
           const messageId = view.getUint32(1, true)
           const chunkIndex = view.getUint32(5, true)
           const totalChunks = view.getUint32(9, true)
           const chunkData = uint8Data.slice(13)
 
+          if (
+            totalChunks === 0 ||
+            totalChunks > MAX_TOTAL_CHUNKS ||
+            chunkIndex >= totalChunks
+          ) {
+            this.log(
+              `🗑️ Dropping invalid chunk ${chunkIndex}/${totalChunks} from ${remotePeerId}`,
+            )
+            return
+          }
+
+          const now = Date.now()
+          // Forget partial messages whose sender stopped mid-way.
+          for (const [id, b] of peerConn.chunkBuffers) {
+            if (now - b.lastChunkAt > CHUNK_TIMEOUT) {
+              this.log(`🗑️ Discarding stale partial message ${id} from ${remotePeerId}`)
+              peerConn.chunkBuffers.delete(id)
+            }
+          }
+
           // Get or create buffer for this message
           let buffer = peerConn.chunkBuffers.get(messageId)
+          if (buffer && buffer.totalChunks !== totalChunks) {
+            // Same id, different message: drop the old partial one.
+            peerConn.chunkBuffers.delete(messageId)
+            buffer = undefined
+          }
           if (!buffer) {
-            buffer = { chunks: new Map(), totalChunks }
+            if (peerConn.chunkBuffers.size >= MAX_PENDING_MESSAGES) {
+              // Evict the oldest partial message (Map keeps insertion order).
+              const oldest = peerConn.chunkBuffers.keys().next().value!
+              peerConn.chunkBuffers.delete(oldest)
+            }
+            buffer = { chunks: new Map(), totalChunks, lastChunkAt: now }
             peerConn.chunkBuffers.set(messageId, buffer)
           }
 
           // Store chunk
           buffer.chunks.set(chunkIndex, chunkData)
+          buffer.lastChunkAt = now
 
           // Check if complete
           if (buffer.chunks.size === totalChunks) {

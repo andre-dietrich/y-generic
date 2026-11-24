@@ -122,15 +122,28 @@ export class FakePC {
 /**
  * RTCDataChannel stand-in with a buffer the test drains by hand, to exercise
  * the transport's backpressure path. Every send() adds to bufferedAmount.
+ * Like a channel set up by simple-peer, `onbufferedamountlow` already holds
+ * simple-peer's own handler.
  */
 export class FakeChannel {
   bufferedAmount = 0
   bufferedAmountLowThreshold = 0
-  onbufferedamountlow: (() => void) | null = null
-  /** Empty the buffer and fire onbufferedamountlow, like the browser does. */
+  simplePeerDrains = 0
+  onbufferedamountlow: (() => void) | null = () => {
+    this.simplePeerDrains++
+  }
+  private listeners = new Set<() => void>()
+  addEventListener(event: string, cb: () => void) {
+    if (event === 'bufferedamountlow') this.listeners.add(cb)
+  }
+  removeEventListener(event: string, cb: () => void) {
+    if (event === 'bufferedamountlow') this.listeners.delete(cb)
+  }
+  /** Empty the buffer and fire 'bufferedamountlow', like the browser does. */
   drain() {
     this.bufferedAmount = 0
     this.onbufferedamountlow?.()
+    for (const cb of [...this.listeners]) cb()
   }
 }
 

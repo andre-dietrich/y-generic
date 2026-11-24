@@ -219,6 +219,33 @@ describe('send queue and flow control (B3)', () => {
     t.disconnect()
   })
 
+  test('a small frame queued behind a full buffer goes out when it drains (simple-peer’s own handler set)', async () => {
+    // simple-peer assigns channel.onbufferedamountlow itself; a queue that only
+    // resumes from that property never resumed, and a join's awareness frame
+    // waited behind the full-state push until some later send.
+    const { t, peers } = await withPeers(['p1'])
+    t.send(new Uint8Array(40_000)) // one frame, over the 16KB pause mark
+    t.send(new Uint8Array([42]))
+    expect(peers.p1.sent).toHaveLength(1)
+    peers.p1._channel.drain()
+    expect(peers.p1.sent).toHaveLength(2)
+    expect([...peers.p1.sent[1]]).toEqual([0x00, 42])
+    expect(peers.p1._channel.simplePeerDrains).toBe(1) // its handler still runs
+    t.disconnect()
+  })
+
+  test('a queue whose drain event never fires resumes on the fallback timer', async () => {
+    vi.useFakeTimers()
+    const { t, peers } = await withPeers(['p1'])
+    t.send(new Uint8Array(40_000))
+    t.send(new Uint8Array([42]))
+    expect(peers.p1.sent).toHaveLength(1)
+    peers.p1._channel.bufferedAmount = 0 // drained, but no event
+    vi.advanceTimersByTime(300)
+    expect(peers.p1.sent).toHaveLength(2)
+    t.disconnect()
+  })
+
   test('a removed peer’s queue is dropped, not sent on drain', async () => {
     const { t, peers } = await withPeers(['p1'])
     t.send(big(1))

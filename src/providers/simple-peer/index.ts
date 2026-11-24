@@ -186,6 +186,8 @@ interface PeerConnection {
    * single onbufferedamountlow handler per channel.
    */
   sendQueue: Uint8Array[]
+  /** True while the queue waits for the channel buffer to drain */
+  drainWait?: boolean
   /** Set by trustPeer(); only consulted when `requireTrust` is on */
   trusted: boolean
   /** Decrypted data frames received before the peer was trusted */
@@ -205,6 +207,12 @@ const CHUNK_SIZE = 64 * 1024
  * If we send too much too fast, the buffer overflows.
  */
 const MAX_BUFFERED_AMOUNT = 16 * 1024
+
+/**
+ * While waiting for the buffer to drain, check it at least this often (ms),
+ * in case the 'bufferedamountlow' event doesn't fire.
+ */
+const DRAIN_POLL_MS = 250
 
 /**
  * Receiver limits for chunked messages, so a misbehaving peer can't make us
@@ -641,9 +649,12 @@ export class SimplePeerTransport implements Transport {
 
   /**
    * Send queued frames until the queue is empty or the channel buffer is
-   * full; in the latter case resume when the buffer drains. Only this method
-   * sets onbufferedamountlow, so concurrent large messages can't overwrite
-   * each other's handler.
+   * full; in the latter case resume when the buffer drains. One wait per
+   * peer at a time (`drainWait`), so concurrent large messages can't strand
+   * each other. It listens with addEventListener: simple-peer sets the
+   * channel's onbufferedamountlow property itself, so a check for that
+   * property being free never passed and the queue stalled until the next
+   * send. DRAIN_POLL_MS covers a drain event that doesn't fire.
    */
   private pumpSendQueue(peerConn: PeerConnection): void {
     const peer = peerConn.peer
@@ -658,15 +669,23 @@ export class SimplePeerTransport implements Transport {
 
       const channel = peer._channel
       if (channel && channel.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-        if (!channel.onbufferedamountlow) {
+        if (!peerConn.drainWait) {
           this.log(
             `⏸️ Backpressure on ${peerConn.peerId}: buffered ${channel.bufferedAmount}B, ${queue.length} frame(s) queued`,
           )
+          peerConn.drainWait = true
+          // The event fires when the buffer falls to the threshold, so it must
+          // sit below the pause mark (simple-peer sets it to 64KB).
           channel.bufferedAmountLowThreshold = MAX_BUFFERED_AMOUNT / 2
-          channel.onbufferedamountlow = () => {
-            channel.onbufferedamountlow = null
+          const resume = () => {
+            if (!peerConn.drainWait) return
+            peerConn.drainWait = false
+            clearTimeout(timer)
+            channel.removeEventListener?.('bufferedamountlow', resume)
             this.pumpSendQueue(peerConn)
           }
+          channel.addEventListener?.('bufferedamountlow', resume)
+          const timer = setTimeout(resume, DRAIN_POLL_MS)
         }
         return
       }

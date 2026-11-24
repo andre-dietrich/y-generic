@@ -203,9 +203,12 @@ export declare class SimplePeerTransport implements Transport {
     private sendToPeer;
     /**
      * Send queued frames until the queue is empty or the channel buffer is
-     * full; in the latter case resume when the buffer drains. Only this method
-     * sets onbufferedamountlow, so concurrent large messages can't overwrite
-     * each other's handler.
+     * full; in the latter case resume when the buffer drains. One wait per
+     * peer at a time (`drainWait`), so concurrent large messages can't strand
+     * each other. It listens with addEventListener: simple-peer sets the
+     * channel's onbufferedamountlow property itself, so a check for that
+     * property being free never passed and the queue stalled until the next
+     * send. DRAIN_POLL_MS covers a drain event that doesn't fire.
      */
     private pumpSendQueue;
     /**

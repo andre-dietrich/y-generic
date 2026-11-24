@@ -31,7 +31,6 @@
  */
 export { GenericProvider, PubSubChannel } from './index';
 // Optional monitoring utilities (for advanced diagnostics)
-// Note: Built-in hash verification (verifyUpdates: true) is recommended for most use cases
 // SyncHealthMonitor is useful for monitoring across ALL peers simultaneously via pub/sub
 export { SyncHealthMonitor, computeDocumentHash } from './sync-monitor';
 //# sourceMappingURL=lib.js.map

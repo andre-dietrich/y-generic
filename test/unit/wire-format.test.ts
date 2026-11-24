@@ -9,11 +9,12 @@
  * - encode: the current code still produces exactly those bytes
  * - decode: a fresh provider still understands the 2.0.3 bytes
  *
- * A planned wire change (e.g. no longer sending opcode 3) updates the encode
- * expectations deliberately; the decode side must keep passing for as long as
- * 2.0.x peers have to be supported.
+ * Frames the current code deliberately no longer sends are listed in
+ * DECODE_ONLY: they skip the encode check, but must keep decoding for as long
+ * as 2.0.x peers have to be supported.
  *
- * To re-capture (only when the current code IS the reference):
+ * To re-capture (only when the current code IS the reference; existing
+ * DECODE_ONLY entries are kept):
  *   WIRE_CAPTURE=1 npx vitest run test/unit/wire-format.test.ts
  */
 import { describe, test, expect, vi, afterEach } from 'vitest'
@@ -26,6 +27,14 @@ import { WebSocketTransport } from '../../src/providers/websocket/index'
 import { RecordingTransport, FakePeer, FakeWS, toHex, fromHex } from './helpers'
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'wire-2.0.3.json')
+
+/**
+ * 2.0.3 frames the current code no longer produces, on purpose:
+ * - update_verified: opcode 3 (seq + state-vector hash). Updates go out as
+ *   opcode 0 (update_plain) since the cleanup's batch 3; its hash check caused
+ *   needless resyncs on concurrent edits.
+ */
+const DECODE_ONLY = new Set(['update_verified'])
 
 const providers: GenericProvider[] = []
 afterEach(() => {
@@ -64,17 +73,12 @@ async function captureProviderFrames(): Promise<Record<string, string>> {
     frames.sync_step1_empty = toHex(transport.sent[0])
   }
   {
-    const { doc, transport } = await makeProvider(1, { verifyUpdates: false })
+    const { doc, transport } = await makeProvider(1)
     transport.sent = []
     doc.getText('t').insert(0, 'hi')
     frames.update_plain = toHex(transport.sent[0])
   }
-  {
-    const { doc, transport } = await makeProvider(1) // verifyUpdates defaults to true
-    transport.sent = []
-    doc.getText('t').insert(0, 'hi')
-    frames.update_verified = toHex(transport.sent[0])
-  }
+  // update_verified (opcode 3) is no longer sent: see DECODE_ONLY.
   {
     // SyncStep2 reply to an empty peer's SyncStep1.
     const { doc, transport } = await makeProvider(1, { verifyUpdates: false })
@@ -151,17 +155,29 @@ describe('wire format (2.0.3 golden)', async () => {
   const current = { ...providerFrames, ...spFrames }
 
   if (process.env.WIRE_CAPTURE) {
+    const existing = fs.existsSync(FIXTURE) ? JSON.parse(fs.readFileSync(FIXTURE, 'utf8')) : {}
+    const kept = Object.fromEntries(
+      Object.entries(existing).filter(([name]) => DECODE_ONLY.has(name)),
+    )
     fs.mkdirSync(path.dirname(FIXTURE), { recursive: true })
-    fs.writeFileSync(FIXTURE, JSON.stringify(current, null, 2) + '\n')
+    fs.writeFileSync(FIXTURE, JSON.stringify({ ...current, ...kept }, null, 2) + '\n')
   }
   const golden: Record<string, string> = JSON.parse(fs.readFileSync(FIXTURE, 'utf8'))
 
   describe('encode: current code produces the 2.0.3 bytes', () => {
     for (const name of Object.keys(golden)) {
+      if (DECODE_ONLY.has(name)) continue
       test(name, () => {
         expect(current[name]).toBe(golden[name])
       })
     }
+
+    test('updates are sent as opcode 0 even with verifyUpdates: true', async () => {
+      const { doc, transport } = await makeProvider(1, { verifyUpdates: true })
+      transport.sent = []
+      doc.getText('t').insert(0, 'hi')
+      expect(toHex(transport.sent[0])).toBe(golden.update_plain)
+    })
   })
 
   describe('decode: a fresh provider understands the 2.0.3 bytes', () => {
@@ -171,12 +187,25 @@ describe('wire format (2.0.3 golden)', async () => {
       expect(doc.getText('t').toString()).toBe('hi')
     })
 
-    test('opcode 3 verified update applies without a hash mismatch', async () => {
+    test('opcode 3 verified update applies', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
       const { doc, transport } = await makeProvider(2)
       transport.deliver(fromHex(golden.update_verified))
       expect(doc.getText('t').toString()).toBe('hi')
-      expect(warn.mock.calls.flat().join(' ')).not.toMatch(/Hash mismatch/)
+      expect(warn).not.toHaveBeenCalled()
+    })
+
+    test('opcode 3 with a hash that does not match ours schedules no resync', async () => {
+      // A 2.0.x sender's hash differs from ours whenever we applied an edit
+      // it hadn't seen yet; that is not data loss.
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      const { doc, transport } = await makeProvider(2)
+      doc.getText('other').insert(0, 'local edit')
+      transport.sent = []
+      transport.deliver(fromHex(golden.update_verified))
+      expect(doc.getText('t').toString()).toBe('hi')
+      expect(warn).not.toHaveBeenCalled()
+      expect(transport.sent).toEqual([]) // no resync push, no SyncStep1
     })
 
     test('opcode 0 SyncStep1 gets a SyncStep2 reply', async () => {

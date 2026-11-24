@@ -53,24 +53,13 @@ await provider.connect({
 })
 ```
 
-### 🔴 Important: y-websocket Server Compatibility
+### y-websocket Server Compatibility
 
-When connecting to y-websocket servers, you **must disable verifyUpdates**:
-
-```typescript
-// Create provider with verifyUpdates disabled
-const provider = new GenericProvider(doc, transport, {
-  verifyUpdates: false, // Required for y-websocket compatibility
-})
-
-// Then connect as normal
-await provider.connect({
-  serverUrl: 'ws://localhost:1234',
-  room: 'my-room',
-})
-```
-
-**Why?** GenericProvider's `MESSAGE_SYNC_VERIFIED` (type 3) conflicts with y-websocket's `messageQueryAwareness` (type 3). Setting `verifyUpdates: false` uses standard sync messages (type 0) that are compatible.
+Updates are sent as standard sync messages (type 0), which a stock y-websocket server
+understands. Awareness frames carry an extra channel byte, and pub/sub messages (types 2 and 4)
+are not y-websocket message types, so presence and pub/sub need a relay that forwards them
+unchanged, such as the edrys websocket-server. (`verifyUpdates: false` was required here in
+older versions; the option is now ignored.)
 
 ### With Auto-reconnect
 

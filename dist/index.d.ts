@@ -95,7 +95,6 @@ export declare class GenericProvider extends Observable<string> {
     private _destroying;
     private _syncInterval;
     private _syncIntervalId?;
-    private _verifyUpdates;
     private _disableBc;
     private _bcChannel;
     private _bcConnected;
@@ -109,11 +108,6 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingSyncReply;
     private _pendingSyncReplyTimeoutId?;
     private _syncReplySuppressionMs;
-    private _localSeqNum;
-    private _remoteSeqInfo;
-    private _gapCheckTimers;
-    private _seqWindowSize;
-    private _gapGraceMs;
     private _batchUpdates;
     private _pendingUpdate;
     private _batchTimeoutId?;
@@ -149,9 +143,11 @@ export declare class GenericProvider extends Observable<string> {
          */
         syncInterval?: number;
         /**
-         * Send document hash with each update for immediate desync detection.
-         * When enabled, mismatch triggers instant re-sync instead of waiting.
-         * @default true
+         * @deprecated Ignored. Updates are always sent as plain sync messages
+         * (opcode 0); verified ones (opcode 3) from 2.0.x peers are still
+         * accepted. Its state-vector hash mismatched on ordinary concurrent
+         * edits and triggered needless full-document resyncs. Will be removed
+         * in the next major version.
          */
         verifyUpdates?: boolean;
         /**
@@ -206,8 +202,8 @@ export declare class GenericProvider extends Observable<string> {
         /**
          * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
          * combined) this provider will send within `syncRequestWindowMs`.
-         * Protects against self-inflicted resync storms (e.g. many hash
-         * mismatches firing in a short window under packet loss). Raise this
+         * Protects against self-inflicted resync storms (e.g. many corrupted
+         * messages or peer joins in a short window). Raise this
          * if legitimate resyncs are being throttled under heavy loss; lower
          * it to bound worst-case traffic more aggressively per peer.
          * @default 20
@@ -229,20 +225,13 @@ export declare class GenericProvider extends Observable<string> {
          */
         syncReplySuppressionMs?: number;
         /**
-         * Grace period (ms) after detecting a suspected sequence-number gap
-         * before requesting a resync. Tolerates mere network reordering
-         * without treating it as loss; lower it to detect genuine packet loss
-         * faster at the risk of more false-positive resyncs under jitter.
-         * @default 300
+         * @deprecated Ignored: sequence-gap detection was removed along with
+         * verified sync (see `verifyUpdates`). Lost updates are recovered by
+         * the periodic sync (`syncInterval`). Will be removed in the next
+         * major version.
          */
         gapGraceMs?: number;
-        /**
-         * Number of recent sequence numbers retained per remote peer for
-         * duplicate/gap detection. Raise if a transport can deliver messages
-         * extremely out of order across a wide window; the default is ample
-         * for typical reordering/jitter.
-         * @default 64
-         */
+        /** @deprecated Ignored; see `gapGraceMs`. */
         seqWindowSize?: number;
     });
     /**
@@ -305,6 +294,11 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _handleIncomingMessage;
     /**
+     * Apply a y-protocols sync message (SyncStep1, SyncStep2 or update) and
+     * send the reply it calls for, if any.
+     */
+    private _handleSyncMessage;
+    /**
      * Schedule a SyncStep2 reply after a short random delay instead of
      * sending immediately. If another peer's reply is overheard in the
      * meantime (`_cancelPendingSyncReply`), this reply is dropped as
@@ -341,48 +335,22 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _sendSyncReply;
     /**
-     * Track a received sequence number for reordering-tolerant gap detection.
-     * Does not gate whether the update gets applied — only decides whether a
-     * gap looks suspicious enough to (eventually) request a resync.
-     */
-    private _trackRemoteSeq;
-    /**
-     * Re-check a suspected sequence gap after a short grace period instead of
-     * requesting a resync immediately. Pure network reordering (a message
-     * that's merely late, not lost) typically resolves itself within the
-     * grace window, so this avoids the resync storms that immediate gap
-     * detection caused under jitter. Real packet loss still gets caught —
-     * just `_gapGraceMs` later — and the periodic sync interval / hash
-     * verification remain as further safety nets regardless.
-     */
-    private _scheduleGapCheck;
-    /**
-     * Unified entry point for ALL resync triggers (hash mismatch, corrupted
-     * message, confirmed sequence gap). Coalesces them behind a single
-     * pending timer and a single shared escalation counter, so a burst of
-     * triggers from different causes in a short window schedules exactly one
-     * resync instead of three independent ones each able to draw on the
-     * shared `_tryReserveSyncSlot()` budget on their own.
+     * Request a resync after a corrupted (CRC-failed) message, whose content
+     * - possibly an update - is lost. Coalesces bursts behind a single pending
+     * timer with exponential backoff, so many corrupted messages in a short
+     * window schedule exactly one resync.
      *
-     * Always resolves to `syncNow()` (push + pull) rather than distinguishing
-     * a push-only/pull-only variant per trigger. `syncNow()`'s push half is
-     * already a no-op when there's nothing to send (it only calls
-     * `_sendUpdate()` when `update.length > 0`), so unifying on push+pull is
-     * strictly simpler than threading a `push` flag through a *shared*
-     * coordinator (where the "right" answer for an absorbed trigger is
-     * ambiguous anyway - was it push-worthy or not?). It also closes a latent
-     * gap where the corrupted-message and gap-confirmed triggers previously
-     * called pull-only `_sendSyncStep1()` and could never deliver this peer's
-     * own surplus edits made during a divergence window.
+     * Resolves to `syncNow()` (push + pull): the lost message may have been a
+     * request for our state as well as an update for us.
      */
     private _requestResync;
     /**
      * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`
      * per `_syncRequestWindowMs`), recording the request if there's room.
-     * Shared by `_sendSyncStep1()` and `syncNow()` so a burst of triggers from
-     * different sources (periodic sync, hash-mismatch resyncs, gap-check
-     * confirmations) draws from one combined budget instead of each having
-     * its own uncapped or separately-capped allowance.
+     * Shared by `_sendSyncStep1()`, `syncNow()` and SyncStep2 replies so a
+     * burst of triggers from different sources (periodic sync, corruption
+     * resyncs, peer joins) draws from one combined budget instead of each
+     * having its own uncapped or separately-capped allowance.
      */
     private _tryReserveSyncSlot;
     /**
@@ -394,14 +362,10 @@ export declare class GenericProvider extends Observable<string> {
     /**
      * Send SyncStep1 message to request missing updates.
      * This is sent when first connecting to sync with remote peers.
-     * Note: SyncStep1 is just a request and doesn't include hash verification.
      * Rate limited to prevent spam.
      */
     private _sendSyncStep1;
-    /**
-     * Send a document update to the transport.
-     * If verifyUpdates is enabled, includes sequence number and document hash for ordering and desync detection.
-     */
+    /** Send a document update to the transport as a plain sync message. */
     private _sendUpdate;
     /**
      * Send a pub/sub message.
@@ -454,16 +418,5 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _isConnecting;
     private _setStatus;
-    /**
-     * TEST HELPER: Set local sequence number to a specific value.
-     * Used for testing sequence number overflow scenarios.
-     * @internal
-     */
-    _testSetSequenceNumber(seqNum: number): void;
-    /**
-     * TEST HELPER: Get current local sequence number.
-     * @internal
-     */
-    _testGetSequenceNumber(): number;
 }
 //# sourceMappingURL=index.d.ts.map

@@ -155,7 +155,6 @@ class GenericProvider extends Observable<string> {
   constructor(doc: Y.Doc, transport: Transport, options?: {
     awareness?: Awareness
     syncInterval?: number     // Auto-sync interval in ms (default: 5000, set 0 to disable)
-    verifyUpdates?: boolean   // Send hash with each update for fast desync detection (default: true)
     batchUpdates?: number     // Batch/debounce updates in ms (default: 0 = disabled, recommended: 50-200)
   })
   
@@ -468,100 +467,24 @@ const provider = new GenericProvider(doc, transport, {
 ```typescript
 const provider = new GenericProvider(doc, transport, {
   batchUpdates: 100,      // Batch updates for efficiency
-  verifyUpdates: true,    // Hash verification for reliability
   syncInterval: 5000,     // Periodic backup sync
 })
 ```
 
-### Fast Desync Detection
+### Recovering Lost Updates
 
-By default, the provider includes a **document hash with every update** for immediate detection of sync problems:
+Updates are sent as plain Yjs sync messages. Every message carries a CRC32 checksum; a
+corrupted message is dropped and triggers a resync (one at a time, with exponential backoff:
+100ms, 500ms, 2.5s, then 5s). Lost messages are recovered by the periodic sync
+(`syncInterval`, default 5s), which asks peers for anything this client is missing.
 
-```typescript
-// Default behavior - hash verification enabled
-const provider = new GenericProvider(doc, transport, {
-  verifyUpdates: true, // Default: true
-})
-```
+Yjs updates are idempotent and commutative, so duplicates and out-of-order delivery need no
+special handling.
 
-**How it works:**
-1. When sending an update, include hash of document state after the update
-2. Receiver applies update, computes own hash, compares
-3. If hashes don't match → **immediately trigger re-sync** (no waiting!)
-4. Much faster than waiting for periodic sync interval
-
-**Exponential backoff:**
-- First mismatch: retry after 10ms
-- Second mismatch: retry after 50ms
-- Third mismatch: retry after 250ms
-- Fourth mismatch: retry after 1.25s
-- Further mismatches: retry after 6.25s, capped at 10s
-- If stable for 10 seconds, counter resets
-- Prevents "sync storm" if clients persistently disagree
-
-**Performance:**
-- Hash computation is fast (~1ms for typical documents)
-- Only happens when updates occur (not constantly)
-- Adds minimal bandwidth (~4 bytes per update message)
-
-**When to disable:**
-```typescript
-// Disable for lowest possible bandwidth usage
-const provider = new GenericProvider(doc, transport, {
-  verifyUpdates: false, // Rely only on periodic sync
-})
-```
-
-Only disable if you have a very reliable transport (no packet loss) or bandwidth is extremely constrained.
-
-**Comparison:**
-- **Without verification**: Lost message → wait up to 5 seconds → retry
-- **With verification** (default): Lost message → next update detects mismatch → immediate retry
-
-This makes sync much more responsive on unreliable networks!
-
-### Sequence Numbers for Ordering
-
-When `verifyUpdates` is enabled, the provider automatically includes **sequence numbers** with each update for total ordering guarantees:
-
-```typescript
-// Automatic with verifyUpdates enabled (default)
-const provider = new GenericProvider(doc, transport, {
-  verifyUpdates: true, // Includes sequence numbers
-})
-```
-
-**How it works:**
-1. Each client maintains its own sequence counter (increments with each update sent)
-2. Updates include: `[seqNum, clientID, update, hash]`
-3. Receiver tracks last seen sequence number for each remote client
-4. Detects and handles:
-   - **Duplicates**: seqNum ≤ last seen → skip (already processed)
-   - **Out-of-order**: seqNum arrives before earlier ones → log warning
-   - **Gaps**: seqNum jumps (e.g., 5 → 8) → log packet loss, Yjs handles recovery
-
-**Benefits:**
-- **Duplicate detection**: Prevents processing the same update twice
-- **Order verification**: Confirms updates arrive in causal order
-- **Gap detection**: Identifies packet loss immediately (diagnostic)
-- **Debugging**: Easier to trace message flow and diagnose issues
-
-**Example console output:**
-```
-[GenericProvider] Sequence gap detected from client 423891: expected 12, got 15 (gap of 3 messages)
-[GenericProvider] Duplicate update detected from client 892301: seqNum 8 <= lastSeen 10
-```
-
-**Performance:**
-- Adds ~2-8 bytes per update (variable-length encoding)
-- O(1) duplicate detection (hash map lookup)
-- Negligible CPU overhead
-
-**Why this matters:**
-- In unreliable networks (high packet loss), updates can arrive multiple times via retries
-- Without sequence numbers, duplicate updates would cause unnecessary reprocessing
-- With sequence numbers, duplicates are instantly detected and skipped
-- Provides diagnostic information about network quality
+> `verifyUpdates`, `gapGraceMs` and `seqWindowSize` are deprecated and ignored. Earlier
+> versions sent each update with a document hash and sequence number (message type 3). The
+> hash differed between peers during ordinary concurrent editing, which triggered needless
+> full-document resyncs. Type 3 messages from older peers are still accepted.
 
 ### Built-in Rate Limiting
 
@@ -620,7 +543,7 @@ class PubNubTransportAdapter implements Transport {
 
 ## Optional Monitoring Utilities
 
-The GenericProvider includes **built-in hash verification** (enabled by default with `verifyUpdates: true`). This is sufficient for most use cases.
+The GenericProvider recovers lost updates on its own (CRC32 checks plus periodic sync). This is sufficient for most use cases.
 
 However, for **advanced diagnostics and monitoring**, the `SyncHealthMonitor` utility is available:
 

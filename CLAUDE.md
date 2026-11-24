@@ -60,7 +60,13 @@ Releases: bump `package.json`, commit, push a tag matching the version (bare num
 ### Wire types (`src/index.ts`)
 
 `MESSAGE_SYNC` (0), `MESSAGE_AWARENESS` (1), `MESSAGE_PUBSUB` (2), `MESSAGE_SYNC_VERIFIED` (3,
-sync + CRC32 + state-vector hash + sequence number), `MESSAGE_PUBSUB_TARGETED` (4).
+sequence number + sync message + state-vector hash), `MESSAGE_PUBSUB_TARGETED` (4). Every
+frame is prefixed with a 4-byte CRC32 (`wrapMessageWithChecksum`).
+
+Opcode 3 is receive-only: updates are always sent as opcode 0, but 2.0.x peers still send 3,
+so it is decoded with its sequence number and hash skipped. Its hash mismatched on ordinary
+concurrent edits and caused needless full-document resyncs. The deprecated `verifyUpdates`,
+`gapGraceMs` and `seqWindowSize` options are accepted and ignored until the next major.
 
 `MESSAGE_AWARENESS` carries a channel byte after the type: `AWARENESS_CHANNEL_MAIN` (0) for
 edrys' own identity/presence, `AWARENESS_CHANNEL_APP` (1) for `appAwareness`. This differs
@@ -70,12 +76,14 @@ peers mis-decode silently instead of failing.
 
 ### Core protocol
 
-- **Sync**: `y-protocols/sync` with an optional verified variant (`verifyUpdates`).
-- **Unified resync coordinator** (`_requestResync`): hash-mismatch, corruption and gap
-  triggers share one timer and one exponential backoff (rationale:
-  `docs/superpowers/plans/2026-07-26-sync-storm-ratelimit.md`).
-- **Sync-request rate limiting** (`_syncRequestTimes`), shared by SyncStep1 pulls and
-  `syncNow()` pushes.
+- **Sync**: `y-protocols/sync` (`_handleSyncMessage`). Lost updates are recovered by the
+  periodic SyncStep1 (`syncInterval`, default 5s).
+- **Resync coordinator** (`_requestResync`): a CRC-failed message schedules one resync with
+  exponential backoff; bursts coalesce into it (rationale:
+  `docs/superpowers/plans/2026-07-26-sync-storm-ratelimit.md`, written when hash-mismatch and
+  sequence-gap triggers still existed).
+- **Sync-request rate limiting** (`_syncRequestTimes`), shared by SyncStep1 pulls,
+  `syncNow()` pushes and SyncStep2 replies.
 - **SyncStep2 reply suppression** (`_pendingSyncReply`) when ≥3 awareness states are known.
 - **Update batching** (`batchUpdates`, defaulting to `transport.preferredBatchMs`) and
   **awareness throttling** are separate debounce paths.
@@ -107,6 +115,9 @@ edrys-Lite (`src/ts/`: `GenericWebrtcProviderAdapter`, `GenericWebsocketProvider
   unicast via `sendTo` where available, broadcast-and-filtered on `localId` otherwise.
 - **`excludeOrigins`** — both adapters pass `[REVERT_INVALID_ORIGIN]` so local rollback
   transactions stay off the wire.
-- **`syncMode: 'pull'` + `verifyUpdates: false`** — WebSocket adapter only: the edrys relay
-  doesn't forward verified sync (3), and a pull-only join adopts the server's document instead
-  of pushing a stale local copy.
+- **`syncMode: 'pull'`** — WebSocket adapter only: a pull-only join adopts the server's
+  document instead of pushing a stale local copy. (It also passes `verifyUpdates: false`, now
+  ignored; the edrys relay doesn't forward opcode 3, which is no longer sent anyway.)
+- **WebSocket `connect()` stays pending while the server is unreachable** and resolves once a
+  retry opens (with `autoReconnect`, the default). The adapter doesn't await it; it sends its
+  first heartbeat in `.then()`.

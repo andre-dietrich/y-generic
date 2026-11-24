@@ -7,6 +7,7 @@ import * as encoding from 'lib0/encoding'
 import * as syncProtocol from 'y-protocols/sync'
 import { GenericProvider } from '../../src/index'
 import { WebSocketTransport } from '../../src/providers/websocket/index'
+import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
 import { RecordingTransport, FakeWS, flush } from './helpers'
 
 afterEach(() => {
@@ -114,6 +115,57 @@ describe('connect with a WebSocket server unreachable at startup (B2)', () => {
     await vi.advanceTimersByTimeAsync(60000)
     expect(FakeWS.instances).toHaveLength(1)
     provider.destroy()
+  })
+})
+
+describe('concurrent editing (B1)', () => {
+  // 2.0.3 sent updates as opcode 3 with a state-vector hash; a receiver that
+  // had meanwhile applied a third peer's concurrent edit saw a mismatch and
+  // scheduled a full-document resync, although nothing was lost.
+  test('two concurrent typists converge without any resync', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    const hub = new DummyHub()
+    const bytes = { total: 0 }
+    const peers = await Promise.all(
+      [1, 2, 3].map(async (id) => {
+        const doc = new Y.Doc()
+        doc.clientID = id
+        const transport = new DummyTransport({ hub, latency: 5, jitter: 0.5 })
+        const send = transport.send.bind(transport)
+        transport.send = (data: Uint8Array) => {
+          bytes.total += data.length
+          send(data)
+        }
+        const provider = new GenericProvider(doc, transport, {
+          disableBc: true,
+          syncInterval: 0,
+          awarenessInterval: 0,
+        })
+        await provider.connect({ room: 'b1' })
+        return { doc, provider }
+      }),
+    )
+    await sleep(50)
+    warn.mockClear()
+    bytes.total = 0
+
+    // Peers 1 and 2 type at the same time; peer 3 only listens.
+    for (let i = 0; i < 10; i++) {
+      peers[0].doc.getText('t').insert(0, 'a')
+      peers[1].doc.getText('t').insert(0, 'b')
+      await sleep(2)
+    }
+    await sleep(100)
+
+    const texts = peers.map((p) => p.doc.getText('t').toString())
+    for (const p of peers) p.provider.destroy()
+
+    expect(texts[0]).toHaveLength(20)
+    expect(new Set(texts).size).toBe(1)
+    expect(warn).not.toHaveBeenCalled()
+    // 20 one-character edits; with resyncs this was many kilobytes.
+    expect(bytes.total).toBeLessThan(2000)
   })
 })
 

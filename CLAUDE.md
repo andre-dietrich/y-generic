@@ -12,9 +12,15 @@ targeted cherry-pick or re-implementation, never as a merge: the last full merge
 `dev`, now history on the `dev` branch and the 1.5.1/1.5.2 releases) silently broke edrys
 module cursors and simple-peer discovery.
 
-Wire compatibility: 2.x and 3.x speak the same wire format as 1.0.4 and are **not** compatible with
-1.5.x (see wire types below). Every peer in a room, and the edrys WebSocket relay's opcode
-allow-list, must match.
+Wire compatibility: 3.x frames are 2.x frames (the 1.0.4 format) without the 4-byte CRC32
+header, and simple-peer no longer XORs them with a password. So 3.x can't talk to 2.x over
+WebRTC or BroadcastChannel; `WIRE_TAG` (`'v3'`, in both `src/index.ts` and
+`providers/simple-peer`) is part of the signaling topic and channel name so the two never
+meet. Bump it on the next wire change there. On a WebSocket the bytes are unchanged (2.x
+already stripped the CRC32 before sending), so 2.x and 3.x clients share the edrys relay,
+and 2.0.x clients still send opcode 3 through it. None of this is compatible with upstream
+1.5.x (see wire types below). Every peer in a room, and the relay's opcode allow-list, must
+match.
 
 ## What this is
 
@@ -46,8 +52,10 @@ transports (gun, trystero, peerjs, indexeddb, matrix, pubnub, supabase, nostr) a
   them before `npm publish`). Fakes for the transport, WebSocket and simple-peer live in
   `test/unit/helpers.ts`.
   - `wire-format.test.ts` checks encode and decode against `fixtures/wire-2.0.3.json`, frames
-    captured from 2.0.3. If it fails, the wire changed: that breaks 2.0.x peers unless it was
-    intended. Never re-capture the fixture (`WIRE_CAPTURE=1`) to make it pass.
+    captured from 2.0.3: each 3.x provider frame must equal its 2.0.3 counterpart minus the
+    CRC32 header. If it fails, the wire changed, which breaks peers on the WebSocket relay
+    and other 3.x peers unless it was intended. The fixture is fixed; never edit it to make
+    the test pass.
   - Known but unfixed bugs go in `known-bugs.test.ts` as `test.fails` tests that describe the
     correct behaviour (none at the moment, so the file doesn't exist). A fix makes its test
     pass, which vitest reports as an error: remove the `.fails` marker and move the test next
@@ -64,8 +72,10 @@ Releases: bump `package.json`, commit, push a tag matching the version (bare num
 ### Wire types (`src/index.ts`)
 
 `MESSAGE_SYNC` (0), `MESSAGE_AWARENESS` (1), `MESSAGE_PUBSUB` (2), `MESSAGE_SYNC_VERIFIED` (3,
-sequence number + sync message + state-vector hash), `MESSAGE_PUBSUB_TARGETED` (4). Every
-frame is prefixed with a 4-byte CRC32 (`wrapMessageWithChecksum`).
+sequence number + sync message + state-vector hash), `MESSAGE_PUBSUB_TARGETED` (4). A frame
+is `[opcode][payload]` with no checksum (removed in 3.1.0: WebSocket and WebRTC data channels
+are reliable and TLS/DTLS-authenticated). A frame that fails to decode is dropped and the
+periodic SyncStep1 recovers whatever it carried.
 
 Opcode 3 is receive-only: updates are always sent as opcode 0, but 2.0.x peers still send 3,
 so it is decoded with its sequence number and hash skipped. Its hash mismatched on ordinary
@@ -82,10 +92,6 @@ peers mis-decode silently instead of failing.
 
 - **Sync**: `y-protocols/sync` (`_handleSyncMessage`). Lost updates are recovered by the
   periodic SyncStep1 (`syncInterval`, default 5s).
-- **Resync coordinator** (`_requestResync`): a CRC-failed message schedules one resync with
-  exponential backoff; bursts coalesce into it (rationale:
-  `docs/superpowers/plans/2026-07-26-sync-storm-ratelimit.md`, written when hash-mismatch and
-  sequence-gap triggers still existed).
 - **Sync-request rate limiting** (`_syncRequestTimes`), shared by SyncStep1 pulls,
   `syncNow()` pushes and SyncStep2 replies.
 - **SyncStep2 reply suppression** (`_pendingSyncReply`) when ≥3 awareness states are known.
@@ -114,7 +120,7 @@ edrys-Lite (`src/ts/`: `GenericWebrtcProviderAdapter`, `GenericWebsocketProvider
   Keep the two states separate.
 - **`sendControl` / `onControlFrame` / `disconnectPeer`** (simple-peer `MSG_TYPE_CONTROL`,
   0x02) — per-peer side-channel for edrys' signed identity handshake. These frames bypass the
-  provider pipe: never CRC-verified, decrypted or decoded as Yjs data.
+  provider pipe: never held by the trust gate or decoded as Yjs data.
 - **`requireTrust` / `trustPeer`** (simple-peer) — `EdrysSimplePeerTransport` turns on
   `requireTrust` and calls `trustPeer(peerId)` once the handshake verifies. Until then the
   peer's data frames are held (max 256 frames / 16 MB, discarded on disconnect), so an

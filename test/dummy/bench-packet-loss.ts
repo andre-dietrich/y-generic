@@ -55,14 +55,11 @@ const EDIT_COUNT = 10
 const CONVERGENCE_TIMEOUT_MS = 30000
 
 interface WarnCounts {
-  hashMismatch: number
   rateLimited: number
-  gapConfirmed: number
-  corrupted: number
 }
 
 function newWarnCounts(): WarnCounts {
-  return { hashMismatch: 0, rateLimited: 0, gapConfirmed: 0, corrupted: 0 }
+  return { rateLimited: 0 }
 }
 
 /** Like bench-user-scaling.ts's silenced(), but categorizes warnings instead of swallowing them silently. */
@@ -74,10 +71,7 @@ async function withWarnCounts<T>(
   const origError = console.error
   console.warn = (...args: unknown[]) => {
     const msg = String(args[0] ?? '')
-    if (msg.includes('Hash mismatch #')) warns.hashMismatch++
-    else if (msg.includes('Sync rate limit exceeded')) warns.rateLimited++
-    else if (msg.includes('Sequence gap confirmed')) warns.gapConfirmed++
-    else if (msg.includes('Corrupted message rejected')) warns.corrupted++
+    if (msg.includes('Sync rate limit exceeded')) warns.rateLimited++
   }
   console.error = () => {}
   try {
@@ -206,7 +200,7 @@ async function runScenario(
   for (const profile of TEST_PROFILES) {
     console.log(`\n-- Profile: ${profile.name} (latency=${profile.latency}ms, jitter=${profile.jitter}) --`)
     console.log(
-      'dropRate |   N | converged | msgs(mean/min/max) |  ms(mean) | mismatch | rateLimited | gapConfirmed',
+      'dropRate |   N | converged | msgs(mean/min/max) |  ms(mean) | rateLimited',
     )
     for (const dropRate of DROP_RATES) {
       for (const N of N_VALUES) {
@@ -217,9 +211,7 @@ async function runScenario(
         const converged = samples.filter((s) => s.converged).length
         const msgs = samples.map((s) => s.messages)
         const times = samples.filter((s) => s.converged).map((s) => s.totalMs)
-        const mismatch = samples.reduce((a, s) => a + s.warns.hashMismatch, 0)
         const rateLimited = samples.reduce((a, s) => a + s.warns.rateLimited, 0)
-        const gapConfirmed = samples.reduce((a, s) => a + s.warns.gapConfirmed, 0)
 
         if (converged < SAMPLES) anyCollapse = true
 
@@ -229,9 +221,7 @@ async function runScenario(
             `${String(`${converged}/${SAMPLES}`).padStart(9)} | ` +
             `${String(`${mean(msgs)}/${Math.min(...msgs)}/${Math.max(...msgs)}`).padStart(19)} | ` +
             `${String(mean(times)).padStart(9)} | ` +
-            `${String(mismatch).padStart(8)} | ` +
-            `${String(rateLimited).padStart(11)} | ` +
-            `${String(gapConfirmed).padStart(12)}`,
+            `${String(rateLimited).padStart(11)}`,
         )
       }
     }

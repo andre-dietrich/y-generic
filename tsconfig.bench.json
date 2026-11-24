@@ -19,7 +19,6 @@
     "test/dummy/bench-packet-loss.ts",
     "test/dummy/bench-late-join.ts",
     "test/dummy/bench-awareness-relay.ts",
-    "test/dummy/bench-corruption-storm.ts",
     "test/dummy/repro-station-invisible.ts",
     "test/simple-peer/repro-stalled-connect.ts"
   ]

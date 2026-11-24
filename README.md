@@ -463,18 +463,13 @@ const provider = new GenericProvider(doc, transport, {
 
 ### Recovering Lost Updates
 
-Updates are sent as plain Yjs sync messages. Every message carries a CRC32 checksum; a
-corrupted message is dropped and triggers a resync (one at a time, with exponential backoff:
-100ms, 500ms, 2.5s, then 5s). Lost messages are recovered by the periodic sync
-(`syncInterval`, default 5s), which asks peers for anything this client is missing.
+Updates are sent as plain Yjs sync messages, without a checksum: TLS (WebSocket) and DTLS
+(WebRTC) already protect each connection. A message that can't be decoded is dropped. Lost
+messages are recovered by the periodic sync (`syncInterval`, default 5s), which asks peers
+for anything this client is missing.
 
 Yjs updates are idempotent and commutative, so duplicates and out-of-order delivery need no
 special handling.
-
-> Up to 2.0.3, updates were sent with a document hash and sequence number (message type 3,
-> options `verifyUpdates`, `gapGraceMs`, `seqWindowSize`, now removed). The hash differed
-> between peers during ordinary concurrent editing, which triggered needless full-document
-> resyncs. Type 3 messages from older peers are still accepted.
 
 ### Built-in Rate Limiting
 

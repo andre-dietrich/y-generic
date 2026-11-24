@@ -99,9 +99,6 @@ export declare class GenericProvider extends Observable<string> {
     private _bcChannel;
     private _bcConnected;
     private _bcSubscriber?;
-    private _resyncAttemptCount;
-    private _lastResyncAttemptTime;
-    private _pendingResyncTimeoutId?;
     private _syncRequestTimes;
     private _maxSyncRequestsPerWindow;
     private _syncRequestWindowMs;
@@ -194,8 +191,8 @@ export declare class GenericProvider extends Observable<string> {
         /**
          * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
          * combined) this provider will send within `syncRequestWindowMs`.
-         * Protects against self-inflicted resync storms (e.g. many corrupted
-         * messages or peer joins in a short window). Raise this
+         * Protects against self-inflicted sync storms (e.g. many peer joins
+         * in a short window). Raise this
          * if legitimate resyncs are being throttled under heavy loss; lower
          * it to bound worst-case traffic more aggressively per peer.
          * @default 20
@@ -280,9 +277,12 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _awarenessClientsToSend;
     /**
-     * Handle incoming messages from the transport.
-     * Verifies message integrity with CRC32 before processing.
-     * Corrupt messages are rejected immediately without attempting to decode.
+     * Handle a frame from the transport or another tab: [opcode][payload].
+     *
+     * Frames carry no checksum: both transports run over reliable, ordered
+     * channels (WebSocket/TCP, WebRTC data channels/SCTP) that already detect
+     * corruption. A frame that fails to decode is dropped; if it carried an
+     * update, the periodic SyncStep1 fetches it.
      */
     private _handleIncomingMessage;
     /**
@@ -313,35 +313,24 @@ export declare class GenericProvider extends Observable<string> {
      * Previously SyncStep2 replies were completely unrated - the only
      * defense against redundant replies was the best-effort NACK-style
      * suppression in `_scheduleSyncReply()`/`_cancelPendingSyncReply()`,
-     * which itself is just an ordinary broadcast message subject to the same
-     * wire corruption as everything else. Under sustained corruption, more
-     * competing repliers independently miss the "someone already answered"
-     * signal as peer count grows, and none of that traffic was bounded.
-     * Measured in test/dummy/bench-corruption-storm.ts: SyncStep2/SyncStep1
-     * ratio grew from ~1.1-1.3 at N=2 to ~4.5-5.9 at N=10 (should stay near
-     * 1 if suppression alone were sufficient). This is a hard backstop on
-     * top of that suppression, not a replacement for it - a rate-limited
-     * reply is dropped silently (no warn) since under normal, uncorrupted
+     * which itself is just an ordinary broadcast message that can be delayed
+     * or lost like everything else. When it is, more competing repliers
+     * independently miss the "someone already answered" signal as peer count
+     * grows, and none of that traffic was bounded (measured in 2.x: the
+     * SyncStep2/SyncStep1 ratio grew from ~1.1-1.3 at N=2 to ~4.5-5.9 at
+     * N=10 under message loss). This is a hard backstop on top of that
+     * suppression, not a replacement for it - a rate-limited reply is
+     * dropped silently (no warn) since under normal
      * operation this path is rarely exercised and logging every drop here
      * would itself become log spam exactly when things are already noisy.
      */
     private _sendSyncReply;
     /**
-     * Request a resync after a corrupted (CRC-failed) message, whose content
-     * - possibly an update - is lost. Coalesces bursts behind a single pending
-     * timer with exponential backoff, so many corrupted messages in a short
-     * window schedule exactly one resync.
-     *
-     * Resolves to `syncNow()` (push + pull): the lost message may have been a
-     * request for our state as well as an update for us.
-     */
-    private _requestResync;
-    /**
      * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`
      * per `_syncRequestWindowMs`), recording the request if there's room.
      * Shared by `_sendSyncStep1()`, `syncNow()` and SyncStep2 replies so a
-     * burst of triggers from different sources (periodic sync, corruption
-     * resyncs, peer joins) draws from one combined budget instead of each
+     * burst of triggers from different sources (periodic sync, peer joins)
+     * draws from one combined budget instead of each
      * having its own uncapped or separately-capped allowance.
      */
     private _tryReserveSyncSlot;
@@ -395,9 +384,8 @@ export declare class GenericProvider extends Observable<string> {
      */
     private _disconnectBroadcastChannel;
     /**
-     * Send data through both BroadcastChannel (if connected) and transport.
-     * All messages are wrapped with CRC32 checksum for integrity verification.
-     * This ensures updates reach both local tabs and remote peers with corruption detection.
+     * Send a frame through both BroadcastChannel (if connected) and transport,
+     * so updates reach both local tabs and remote peers.
      */
     private _send;
     /**

@@ -22,84 +22,13 @@ const MESSAGE_PUBSUB_TARGETED = 4 // Pub/sub message aimed at a single target
 const AWARENESS_CHANNEL_MAIN = 0
 const AWARENESS_CHANNEL_APP = 1
 
-/**
- * CRC32 lookup table for fast computation.
- * Generated once and reused for all CRC calculations.
- */
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256)
-  for (let i = 0; i < 256; i++) {
-    let crc = i
-    for (let j = 0; j < 8; j++) {
-      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1
-    }
-    table[i] = crc
-  }
-  return table
-})()
-
-/**
- * Compute CRC32 checksum of data for message integrity verification.
- * Fast, non-cryptographic checksum optimized for corruption detection.
- */
-function computeCRC32(data: Uint8Array): number {
-  let crc = 0xffffffff
-  for (let i = 0; i < data.length; i++) {
-    crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ data[i]) & 0xff]
-  }
-  return (crc ^ 0xffffffff) >>> 0
-}
-
-/**
- * Wrap message with CRC32 checksum for integrity verification.
- * Format: [CRC32 (4 bytes)][message data]
- */
-function wrapMessageWithChecksum(message: Uint8Array): Uint8Array {
-  const crc = computeCRC32(message)
-  const wrapped = new Uint8Array(4 + message.length)
-
-  // Write CRC32 as 4 bytes (big-endian)
-  wrapped[0] = (crc >>> 24) & 0xff
-  wrapped[1] = (crc >>> 16) & 0xff
-  wrapped[2] = (crc >>> 8) & 0xff
-  wrapped[3] = crc & 0xff
-
-  // Copy message data
-  wrapped.set(message, 4)
-
-  return wrapped
-}
-
-/**
- * Unwrap and verify message integrity using CRC32 checksum.
- * Returns the message data if valid, null if corrupted.
- */
-function unwrapAndVerifyMessage(wrapped: Uint8Array): Uint8Array | null {
-  if (wrapped.length < 4) {
-    return null // Too short to contain CRC32
-  }
-
-  // Read CRC32 (big-endian)
-  const expectedCrc =
-    ((wrapped[0] << 24) |
-      (wrapped[1] << 16) |
-      (wrapped[2] << 8) |
-      wrapped[3]) >>>
-    0
-
-  // Extract message data
-  const message = wrapped.subarray(4)
-
-  // Compute actual CRC32
-  const actualCrc = computeCRC32(message)
-
-  // Verify integrity
-  if (actualCrc !== expectedCrc) {
-    return null // Checksum mismatch - message corrupted
-  }
-
-  return message
-}
+// Wire generation, in names peers meet under (BroadcastChannel here, the
+// simple-peer signaling topic). 2.x framed every message as
+// [CRC32][opcode]..., 3.x sends [opcode]... with no checksum; the tag keeps
+// the two from meeting and mis-decoding each other. The WebSocket relay never
+// saw the CRC (the transport stripped it), so it needs no tag. Keep in step
+// with WIRE_TAG in providers/simple-peer.
+const WIRE_TAG = 'v3'
 
 /**
  * PubSub channel for real-time messaging alongside Yjs.
@@ -231,14 +160,6 @@ export class GenericProvider extends Observable<string> {
   private _bcConnected: boolean = false
   private _bcSubscriber?: (data: ArrayBuffer, origin: any) => void
 
-  // Resync-request coordinator for corrupted (CRC-failed) messages: one
-  // pending timer and one escalation counter, so a burst of corrupted
-  // messages schedules a single resync with exponential backoff instead of
-  // one each (see test/dummy/bench-corruption-storm.ts). See _requestResync().
-  private _resyncAttemptCount: number = 0
-  private _lastResyncAttemptTime: number = 0
-  private _pendingResyncTimeoutId?: ReturnType<typeof setTimeout>
-
   // Rate limiting for sync requests
   private _syncRequestTimes: number[] = []
   private _maxSyncRequestsPerWindow: number // max requests per window
@@ -359,8 +280,8 @@ export class GenericProvider extends Observable<string> {
       /**
        * Max number of sync requests (SyncStep1 pulls and syncNow() pushes
        * combined) this provider will send within `syncRequestWindowMs`.
-       * Protects against self-inflicted resync storms (e.g. many corrupted
-       * messages or peer joins in a short window). Raise this
+       * Protects against self-inflicted sync storms (e.g. many peer joins
+       * in a short window). Raise this
        * if legitimate resyncs are being throttled under heavy loss; lower
        * it to bound worst-case traffic more aggressively per peer.
        * @default 20
@@ -522,18 +443,6 @@ export class GenericProvider extends Observable<string> {
     if (this._syncIntervalId !== undefined) {
       clearInterval(this._syncIntervalId)
       this._syncIntervalId = undefined
-    }
-
-    // Reset resync escalation tracking
-    this._resyncAttemptCount = 0
-    this._lastResyncAttemptTime = 0
-
-    // Cancel any pending unified resync - it would otherwise still fire
-    // syncNow() after disconnect/reconnect against a transport that may be
-    // in a completely different state by then.
-    if (this._pendingResyncTimeoutId !== undefined) {
-      clearTimeout(this._pendingResyncTimeoutId)
-      this._pendingResyncTimeoutId = undefined
     }
 
     // Reset the sync rate-limit budget. Without this, a reconnect inherits
@@ -717,8 +626,8 @@ export class GenericProvider extends Observable<string> {
     // Push (full document state) and pull (SyncStep1 request) share a
     // single rate-limit reservation. syncNow() is called from several
     // triggers that can all fire in a short window when many peers are
-    // converging at once (corruption resyncs, per-peer connect events on
-    // mesh transports) - without this gate the
+    // converging at once (per-peer connect events on mesh transports) -
+    // without this gate the
     // push above had NO limit at all, so each trigger broadcast the full
     // document state to the whole room, and those broadcasts caused more
     // reordering/mismatches elsewhere, causing more triggers. Measured in
@@ -882,28 +791,14 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Handle incoming messages from the transport.
-   * Verifies message integrity with CRC32 before processing.
-   * Corrupt messages are rejected immediately without attempting to decode.
+   * Handle a frame from the transport or another tab: [opcode][payload].
+   *
+   * Frames carry no checksum: both transports run over reliable, ordered
+   * channels (WebSocket/TCP, WebRTC data channels/SCTP) that already detect
+   * corruption. A frame that fails to decode is dropped; if it carried an
+   * update, the periodic SyncStep1 fetches it.
    */
-  private _handleIncomingMessage(data: Uint8Array): void {
-    // Verify message integrity with CRC32 checksum
-    const message = unwrapAndVerifyMessage(data)
-
-    if (message === null) {
-      // Message is corrupted - reject it immediately
-      console.warn(
-        `[GenericProvider] 💥 Corrupted message rejected: CRC32 checksum mismatch. ` +
-          `This is expected if data corruption simulation is enabled.`,
-      )
-
-      // Request re-sync to recover any lost data; bursts are coalesced.
-      this._requestResync()
-
-      return // Don't process corrupted message
-    }
-
-    // Message integrity verified - safe to decode
+  private _handleIncomingMessage(message: Uint8Array): void {
     try {
       const decoder = decoding.createDecoder(message)
       const messageType = decoding.readVarUint(decoder)
@@ -981,9 +876,7 @@ export class GenericProvider extends Observable<string> {
           console.warn('Unknown message type:', messageType)
       }
     } catch (error) {
-      // This should only happen for logic errors, not corruption
-      // (corruption is caught by CRC32 check above)
-      console.error('[GenericProvider] Error handling message:', error)
+      console.error('[GenericProvider] Dropping undecodable message:', error)
     }
   }
 
@@ -1076,15 +969,14 @@ export class GenericProvider extends Observable<string> {
    * Previously SyncStep2 replies were completely unrated - the only
    * defense against redundant replies was the best-effort NACK-style
    * suppression in `_scheduleSyncReply()`/`_cancelPendingSyncReply()`,
-   * which itself is just an ordinary broadcast message subject to the same
-   * wire corruption as everything else. Under sustained corruption, more
-   * competing repliers independently miss the "someone already answered"
-   * signal as peer count grows, and none of that traffic was bounded.
-   * Measured in test/dummy/bench-corruption-storm.ts: SyncStep2/SyncStep1
-   * ratio grew from ~1.1-1.3 at N=2 to ~4.5-5.9 at N=10 (should stay near
-   * 1 if suppression alone were sufficient). This is a hard backstop on
-   * top of that suppression, not a replacement for it - a rate-limited
-   * reply is dropped silently (no warn) since under normal, uncorrupted
+   * which itself is just an ordinary broadcast message that can be delayed
+   * or lost like everything else. When it is, more competing repliers
+   * independently miss the "someone already answered" signal as peer count
+   * grows, and none of that traffic was bounded (measured in 2.x: the
+   * SyncStep2/SyncStep1 ratio grew from ~1.1-1.3 at N=2 to ~4.5-5.9 at
+   * N=10 under message loss). This is a hard backstop on top of that
+   * suppression, not a replacement for it - a rate-limited reply is
+   * dropped silently (no warn) since under normal
    * operation this path is rarely exercised and logging every drop here
    * would itself become log spam exactly when things are already noisy.
    */
@@ -1096,57 +988,11 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Request a resync after a corrupted (CRC-failed) message, whose content
-   * - possibly an update - is lost. Coalesces bursts behind a single pending
-   * timer with exponential backoff, so many corrupted messages in a short
-   * window schedule exactly one resync.
-   *
-   * Resolves to `syncNow()` (push + pull): the lost message may have been a
-   * request for our state as well as an update for us.
-   */
-  private _requestResync(): void {
-    // Coalesced: a trigger while a resync is pending is absorbed into it.
-    // Escalation only advances when we actually schedule a NEW timer below -
-    // incrementing once per absorbed trigger too would let a burst of
-    // corrupted messages ratchet the counter straight to its cap, so the
-    // *next* resync would always wait the maximum backoff.
-    if (this._pendingResyncTimeoutId !== undefined) {
-      return
-    }
-
-    this._resyncAttemptCount++
-    const now = Date.now()
-
-    // Reset the escalation counter if it's been stable for 10 seconds -
-    // same quiet-period reset the old per-trigger counters used.
-    if (now - this._lastResyncAttemptTime > 10000) {
-      this._resyncAttemptCount = 1
-    }
-    this._lastResyncAttemptTime = now
-
-    // Exponential backoff: 100ms, 500ms, 2.5s, then cap at 5s.
-    const delay = Math.min(
-      5000,
-      100 * Math.pow(5, Math.min(this._resyncAttemptCount - 1, 3)),
-    )
-
-    console.warn(
-      `[GenericProvider] Resync scheduled in ${delay}ms (attempt #${this._resyncAttemptCount})...`,
-    )
-    this._pendingResyncTimeoutId = setTimeout(() => {
-      this._pendingResyncTimeoutId = undefined
-      if (this.transport.isConnected && !this._destroying) {
-        this.syncNow()
-      }
-    }, delay)
-  }
-
-  /**
    * Reserve a slot in the sync rate limiter (max `_maxSyncRequestsPerWindow`
    * per `_syncRequestWindowMs`), recording the request if there's room.
    * Shared by `_sendSyncStep1()`, `syncNow()` and SyncStep2 replies so a
-   * burst of triggers from different sources (periodic sync, corruption
-   * resyncs, peer joins) draws from one combined budget instead of each
+   * burst of triggers from different sources (periodic sync, peer joins)
+   * draws from one combined budget instead of each
    * having its own uncapped or separately-capped allowance.
    */
   private _tryReserveSyncSlot(): boolean {
@@ -1261,13 +1107,12 @@ export class GenericProvider extends Observable<string> {
 
       if (this.transport.sendTo) {
         // Direct delivery to the target peer.
-        const wrapped = wrapMessageWithChecksum(frame)
         // The target may be another tab of this browser, reachable only
         // through BroadcastChannel; tabs it isn't for drop it by localId.
         if (this._bcConnected) {
-          bc.publish(this._bcChannel, wrapped, this)
+          bc.publish(this._bcChannel, frame, this)
         }
-        const result = this.transport.sendTo(target, wrapped)
+        const result = this.transport.sendTo(target, frame)
         if (result instanceof Promise) {
           result.catch((error) => {
             console.error('Error sending targeted pub/sub message:', error)
@@ -1378,8 +1223,9 @@ export class GenericProvider extends Observable<string> {
       return
     }
 
-    // Create channel name based on room
-    this._bcChannel = `yjs-${config.room}`
+    // Channel name per room. The wire tag keeps a tab still running 2.x
+    // (CRC32 header) out of the channel: it would mis-decode our frames.
+    this._bcChannel = `yjs-${WIRE_TAG}-${config.room}`
 
     // Setup subscriber for incoming messages from other tabs
     this._bcSubscriber = (data: ArrayBuffer, origin: any) => {
@@ -1388,8 +1234,6 @@ export class GenericProvider extends Observable<string> {
         return
       }
 
-      // Messages from BroadcastChannel are already CRC32-wrapped
-      // Pass through to _handleIncomingMessage which will unwrap and verify
       const uint8Data = new Uint8Array(data)
       this._handleIncomingMessage(uint8Data)
     }
@@ -1398,28 +1242,28 @@ export class GenericProvider extends Observable<string> {
     bc.subscribe(this._bcChannel, this._bcSubscriber)
     this._bcConnected = true
 
-    // Send initial sync via BroadcastChannel (wrapped with CRC32)
+    // Send initial sync via BroadcastChannel
     // This allows syncing with other tabs immediately
     const encoderSync = encoding.createEncoder()
     encoding.writeVarUint(encoderSync, MESSAGE_SYNC)
     syncProtocol.writeSyncStep1(encoderSync, this.doc)
     bc.publish(
       this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoderSync)),
+      encoding.toUint8Array(encoderSync),
       this,
     )
 
-    // Broadcast local state via BroadcastChannel (wrapped with CRC32)
+    // Broadcast local state via BroadcastChannel
     const encoderState = encoding.createEncoder()
     encoding.writeVarUint(encoderState, MESSAGE_SYNC)
     syncProtocol.writeSyncStep2(encoderState, this.doc)
     bc.publish(
       this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoderState)),
+      encoding.toUint8Array(encoderState),
       this,
     )
 
-    // Broadcast local awareness state via BroadcastChannel (wrapped with CRC32)
+    // Broadcast local awareness state via BroadcastChannel
     if (this.awareness.getLocalState() !== null) {
       this._publishAwarenessToBroadcastChannel(
         this.awareness,
@@ -1450,7 +1294,7 @@ export class GenericProvider extends Observable<string> {
     )
     bc.publish(
       this._bcChannel,
-      wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
+      encoding.toUint8Array(encoder),
       this,
     )
   }
@@ -1463,7 +1307,7 @@ export class GenericProvider extends Observable<string> {
       return
     }
 
-    // Broadcast awareness state with null (indicating disconnect) - wrapped with CRC32
+    // Broadcast awareness state with null (indicating disconnect)
     for (const [awareness, channel] of [
       [this.awareness, AWARENESS_CHANNEL_MAIN],
       [this.appAwareness, AWARENESS_CHANNEL_APP],
@@ -1481,7 +1325,7 @@ export class GenericProvider extends Observable<string> {
       )
       bc.publish(
         this._bcChannel,
-        wrapMessageWithChecksum(encoding.toUint8Array(encoder)),
+        encoding.toUint8Array(encoder),
         this,
       )
     }
@@ -1493,17 +1337,13 @@ export class GenericProvider extends Observable<string> {
   }
 
   /**
-   * Send data through both BroadcastChannel (if connected) and transport.
-   * All messages are wrapped with CRC32 checksum for integrity verification.
-   * This ensures updates reach both local tabs and remote peers with corruption detection.
+   * Send a frame through both BroadcastChannel (if connected) and transport,
+   * so updates reach both local tabs and remote peers.
    */
   private _send(data: Uint8Array): void {
-    // Wrap message with CRC32 checksum
-    const wrappedData = wrapMessageWithChecksum(data)
-
     // Send via BroadcastChannel to other tabs first
     if (this._bcConnected) {
-      bc.publish(this._bcChannel, wrappedData, this)
+      bc.publish(this._bcChannel, data, this)
     }
 
     // Send via network transport
@@ -1512,7 +1352,7 @@ export class GenericProvider extends Observable<string> {
     }
 
     try {
-      const result = this.transport.send(wrappedData)
+      const result = this.transport.send(data)
       // Handle async send
       if (result instanceof Promise) {
         result.catch((error) => {

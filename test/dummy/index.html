@@ -428,58 +428,6 @@
                 style="width: 100%"
               />
             </div>
-            <div>
-              <label
-                style="
-                  display: block;
-                  font-size: 12px;
-                  margin-bottom: 5px;
-                  color: #666;
-                "
-              >
-                Data Corruption:
-                <span
-                  id="corruption-value"
-                  style="font-weight: bold; color: #f44336"
-                  >0%</span
-                >
-              </label>
-              <input
-                type="range"
-                id="corruption-slider"
-                min="0"
-                max="100"
-                value="0"
-                style="width: 100%"
-              />
-            </div>
-            <div>
-              <label
-                style="
-                  display: block;
-                  font-size: 12px;
-                  margin-bottom: 5px;
-                  color: #666;
-                "
-              >
-                Corruption Type:
-              </label>
-              <select
-                id="corruption-type"
-                style="
-                  width: 100%;
-                  padding: 5px;
-                  border: 1px solid #ccc;
-                  border-radius: 5px;
-                  font-size: 12px;
-                "
-              >
-                <option value="bitflip">Bit Flip (subtle)</option>
-                <option value="truncate">Truncate (incomplete)</option>
-                <option value="garbage">Garbage (random bytes)</option>
-                <option value="insert">Insert (length change)</option>
-              </select>
-            </div>
           </div>
         </div>
       </header>
@@ -511,16 +459,6 @@
             <strong>Adjust delay/packet loss/jitter</strong> - Test sync
             resilience under adverse network conditions. Jitter causes
             out-of-order delivery!
-          </li>
-          <li>
-            <strong>💥 Enable data corruption</strong> - Use the "Data
-            Corruption" slider to corrupt network packets and test message
-            integrity verification! Choose corruption type: Bit Flip
-            (realistic), Truncate (incomplete), Garbage (worst case), or Insert
-            (protocol errors). All messages are protected with CRC32 checksums -
-            corrupted messages are rejected immediately before decoding. Watch
-            console for "CRC32 checksum mismatch" warnings and automatic
-            re-sync!
           </li>
           <li>
             <strong>🧪 Run edge case tests</strong> - Click the red test buttons

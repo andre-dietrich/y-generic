@@ -19,7 +19,6 @@ import Peer from 'simple-peer'
 const transport = new SimplePeerTransport({
   peer: Peer, // Pass the simple-peer constructor
   signaling: ['wss://signaling.yjs.dev'],
-  password: 'optional-encryption',
   maxConns: 30
 })
 const provider = new GenericProvider(doc, transport)
@@ -28,7 +27,6 @@ await provider.connect({ room: 'my-room' })
 
 **Options:**
 - `signaling`: Array of signaling server URLs (default: `['wss://signaling.yjs.dev']`)
-- `password`: Optional encryption password
 - `maxConns`: Max peer connections (default: 20-35 random)
 - `peerOpts`: Options passed to simple-peer
 - `debug`: Enable debug logging

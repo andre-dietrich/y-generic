@@ -1,42 +1,3 @@
-// ---------------------------------------------------------------------------
-// CRC32 translation helpers
-//
-// GenericProvider wraps every message as [CRC32 (4 bytes)][payload] before
-// calling transport.send(), and expects the same format from onMessage().
-// The y-websocket server however speaks plain Yjs wire format (no header).
-// These helpers translate between the two worlds at the transport boundary.
-// ---------------------------------------------------------------------------
-const _CRC32_TABLE = (() => {
-    const table = new Uint32Array(256);
-    for (let i = 0; i < 256; i++) {
-        let c = i;
-        for (let j = 0; j < 8; j++)
-            c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-        table[i] = c;
-    }
-    return table;
-})();
-function _crc32(data) {
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i++)
-        crc = (crc >>> 8) ^ _CRC32_TABLE[(crc ^ data[i]) & 0xff];
-    return (crc ^ 0xffffffff) >>> 0;
-}
-/** Strip the 4-byte CRC32 header that GenericProvider prepends. */
-function stripCRC32Header(data) {
-    return data.length >= 4 ? data.subarray(4) : data;
-}
-/** Add a valid CRC32 header so GenericProvider accepts the message. */
-function addCRC32Header(data) {
-    const crc = _crc32(data);
-    const wrapped = new Uint8Array(4 + data.length);
-    wrapped[0] = (crc >>> 24) & 0xff;
-    wrapped[1] = (crc >>> 16) & 0xff;
-    wrapped[2] = (crc >>> 8) & 0xff;
-    wrapped[3] = crc & 0xff;
-    wrapped.set(data, 4);
-    return wrapped;
-}
 /**
  * WebSocket Transport for Yjs
  *
@@ -236,10 +197,8 @@ export class WebSocketTransport {
             return;
         }
         try {
-            // Strip CRC32 header added by GenericProvider before sending to server
-            const raw = stripCRC32Header(data);
-            this.ws.send(raw);
-            this.log(`📤 Sent ${raw.length} bytes (${data.length} with header)`);
+            this.ws.send(data);
+            this.log(`📤 Sent ${data.length} bytes`);
         }
         catch (error) {
             this.log('❌ Send error:', error);
@@ -272,9 +231,8 @@ export class WebSocketTransport {
                 this.log('📨 Received text message:', data);
                 return;
             }
-            // Wrap plain y-websocket message with CRC32 header expected by GenericProvider
-            const uint8Data = addCRC32Header(new Uint8Array(data));
-            this.log(`📨 Received ${uint8Data.length - 4} bytes`);
+            const uint8Data = new Uint8Array(data);
+            this.log(`📨 Received ${uint8Data.length} bytes`);
             if (this.messageCallback) {
                 this.messageCallback(uint8Data);
             }

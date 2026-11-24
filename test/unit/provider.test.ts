@@ -6,6 +6,7 @@ import * as Y from 'yjs'
 import * as encoding from 'lib0/encoding'
 import * as syncProtocol from 'y-protocols/sync'
 import * as awarenessProtocol from 'y-protocols/awareness'
+import * as bc from 'lib0/broadcastchannel'
 import { GenericProvider } from '../../src/index'
 import { WebSocketTransport } from '../../src/providers/websocket/index'
 import { DummyHub, DummyTransport } from '../../src/providers/dummy/index'
@@ -17,7 +18,7 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
-/** An update as the edrys relay sends it: plain y-websocket bytes, no CRC. */
+/** An update as the edrys relay sends it: plain y-websocket bytes. */
 function serverUpdate(text: string): ArrayBuffer {
   const remote = new Y.Doc()
   remote.getText('t').insert(0, text)
@@ -237,6 +238,22 @@ describe('cross-tab delivery via BroadcastChannel', () => {
     expect(got).toHaveBeenCalledWith({ n: 1 }, 'rpc')
   })
 
+  test('a tab still running 2.x shares no channel with 3.x tabs', async () => {
+    // 2.x used `yjs-<room>` and CRC32-prefixed frames; 3.x would mis-decode them.
+    vi.stubGlobal('window', { addEventListener() {}, removeEventListener() {} })
+    const room = `bc-${Math.random()}`
+    const old: ArrayBuffer[] = []
+    const oldTab = (d: ArrayBuffer) => old.push(d)
+    bc.subscribe(`yjs-${room}`, oldTab)
+    const p = new GenericProvider(new Y.Doc(), new RecordingTransport(), { syncInterval: 0 })
+    await p.connect({ room })
+    p.pubsub.publish('chat', { n: 1 })
+    await flush()
+    bc.unsubscribe(`yjs-${room}`, oldTab)
+    p.destroy()
+    expect(old).toEqual([])
+  })
+
   test('a targeted message for someone else is dropped by the other tab', async () => {
     const { a, b } = await twoTabs()
     const got = vi.fn()
@@ -268,9 +285,9 @@ describe('awareness relay (B4)', () => {
         }
         const send = transport.send.bind(transport)
         transport.send = (data: Uint8Array) => {
-          // [CRC32 x4][opcode][channel]: count awareness frames.
-          if (data[4] === 1) {
-            const key = `${id}:${data[5]}`
+          // [opcode][channel]: count awareness frames.
+          if (data[0] === 1) {
+            const key = `${id}:${data[1]}`
             sent.set(key, (sent.get(key) ?? 0) + 1)
           }
           send(data)

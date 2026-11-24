@@ -8,7 +8,6 @@
  * - Direct peer-to-peer connections
  * - Mesh network (each peer connects to multiple others)
  * - Uses signaling server only for peer discovery (not for data)
- * - Optional encryption
  * - Automatic connection management
  * - Resilient to peer disconnections
  *
@@ -22,7 +21,6 @@
  * const transport = new SimplePeerTransport({
  *   peer: Peer, // Pass the simple-peer constructor
  *   signaling: ['wss://signaling.example.com'],
- *   password: 'optional-encryption-key'
  * })
  * const provider = new GenericProvider(doc, transport)
  * await provider.connect({ room: 'my-room' })
@@ -95,13 +93,6 @@ export interface SimplePeerTransportOptions {
    * ```
    */
   iceServers?: IceServer[]
-
-  /**
-   * Optional password for encrypting messages.
-   * When provided, all messages are encrypted before sending.
-   * @default undefined
-   */
-  password?: string
 
   /**
    * Maximum number of WebRTC peer connections.
@@ -190,7 +181,7 @@ interface PeerConnection {
   drainWait?: boolean
   /** Set by trustPeer(); only consulted when `requireTrust` is on */
   trusted: boolean
-  /** Decrypted data frames received before the peer was trusted */
+  /** Data frames received before the peer was trusted */
   heldFrames: Uint8Array[]
   heldBytes: number
 }
@@ -268,11 +259,19 @@ const PEER_SEEN_WINDOW = 12000
  * - 0x00: Complete message (no chunking, raw data)
  * - 0x01: Chunked message with header
  * - 0x02: Consumer control frame — per-peer side-channel via sendControl()/
- *   onControlFrame(), never reaches the provider pipe. Not chunked/encrypted.
+ *   onControlFrame(), never reaches the provider pipe. Not chunked.
  */
 const MSG_TYPE_COMPLETE = 0x00
 const MSG_TYPE_CHUNKED = 0x01
 const MSG_TYPE_CONTROL = 0x02
+
+/**
+ * Appended to the room name to form the signaling topic, so 3.x peers never
+ * connect to 2.x ones: 2.x frames carry a CRC32 header and XOR "encryption",
+ * and the two would mis-decode each other. Keep in step with WIRE_TAG in
+ * src/index.ts.
+ */
+const WIRE_TAG = 'v3'
 
 /** Counter for generating unique message IDs */
 let messageIdCounter = 0
@@ -295,7 +294,6 @@ export class SimplePeerTransport implements Transport {
   private options: {
     peer: SimplePeerConstructor
     signaling: string[]
-    password: string
     maxConns: number
     peerOpts: Record<string, any>
     debug: boolean
@@ -306,6 +304,8 @@ export class SimplePeerTransport implements Transport {
   }
   private _connected: boolean = false
   private _room: string = ''
+  /** Signaling topic: the room plus WIRE_TAG */
+  private _topic: string = ''
   private _callback?: (data: Uint8Array) => void
   private _peerConnectCallbacks = new Set<(peerId: string) => void>()
   private _peerDisconnectCallbacks = new Set<(peerId: string) => void>()
@@ -371,7 +371,6 @@ export class SimplePeerTransport implements Transport {
     this.options = {
       peer: options.peer,
       signaling: options.signaling ?? ['wss://signaling.yjs.dev'],
-      password: options.password ?? '',
       maxConns: options.maxConns ?? 20 + Math.floor(Math.random() * 15),
       peerOpts,
       debug: options.debug ?? false,
@@ -407,6 +406,7 @@ export class SimplePeerTransport implements Transport {
     }
 
     this._room = config.room
+    this._topic = `${config.room}/${WIRE_TAG}`
     this.log(`🔌 Connecting to room "${config.room}" as ${this.peerId}`)
 
     // Try to connect to signaling servers
@@ -469,11 +469,11 @@ export class SimplePeerTransport implements Transport {
         // is otherwise only sent once, in onopen.
         this.sendSignaling(ws, {
           type: 'subscribe',
-          topics: [this._room],
+          topics: [this._topic],
         })
         this.sendSignaling(ws, {
           type: 'publish',
-          topic: this._room,
+          topic: this._topic,
           from: this.peerId,
         })
       }
@@ -548,17 +548,12 @@ export class SimplePeerTransport implements Transport {
       return
     }
 
-    // Encrypt if password is set
-    const dataToSend = this.options.password
-      ? this.encrypt(data, this.options.password)
-      : data
-
     // Send to all connected peers
     let sentCount = 0
     for (const peerConn of this.peers.values()) {
       if (peerConn.connected) {
         try {
-          this.sendToPeer(peerConn, dataToSend)
+          this.sendToPeer(peerConn, data)
           sentCount++
         } catch (error) {
           this.log(
@@ -595,12 +590,8 @@ export class SimplePeerTransport implements Transport {
       return
     }
 
-    const dataToSend = this.options.password
-      ? this.encrypt(data, this.options.password)
-      : data
-
     try {
-      this.sendToPeer(peerConn, dataToSend)
+      this.sendToPeer(peerConn, data)
     } catch (error) {
       this.log(`❌ sendTo failed to ${peerId}:`, (error as Error).message)
     }
@@ -754,7 +745,7 @@ export class SimplePeerTransport implements Transport {
   }
 
   /**
-   * Send a control frame to a single peer. Not chunked or encrypted — keep
+   * Send a control frame to a single peer. Not chunked — keep
    * payloads small (they must fit one DataChannel message).
    */
   sendControl(peerId: string, payload: Uint8Array): void {
@@ -982,7 +973,7 @@ export class SimplePeerTransport implements Transport {
         // Subscribe to room
         this.sendSignaling(ws, {
           type: 'subscribe',
-          topics: [this._room],
+          topics: [this._topic],
         })
 
         // Announce presence with topic (room) for y-webrtc protocol
@@ -990,14 +981,14 @@ export class SimplePeerTransport implements Transport {
           // y-webrtc uses 'publish' with from field
           this.sendSignaling(ws, {
             type: 'publish',
-            topic: this._room,
+            topic: this._topic,
             from: this.peerId,
           })
           // Also send announce for basic protocol compatibility
           this.sendSignaling(ws, {
             type: 'announce',
             from: this.peerId,
-            topic: this._room,
+            topic: this._topic,
           })
         }
 
@@ -1114,7 +1105,7 @@ export class SimplePeerTransport implements Transport {
               for (const ws of this.signalingConns) {
                 this.sendSignaling(ws, {
                   type: 'publish',
-                  topic: this._room,
+                  topic: this._topic,
                   from: this.peerId,
                 })
               }
@@ -1276,7 +1267,7 @@ export class SimplePeerTransport implements Transport {
         from: this.peerId,
         to: remotePeerId,
         signal,
-        topic: this._room,
+        topic: this._topic,
         attempt: peerConn.attemptId,
       })
     })
@@ -1342,11 +1333,7 @@ export class SimplePeerTransport implements Transport {
 
         if (msgType === MSG_TYPE_COMPLETE) {
           // Complete message, extract payload (skip type byte)
-          const payload = uint8Data.slice(1)
-          const decryptedData = this.options.password
-            ? this.decrypt(payload, this.options.password)
-            : payload
-          this.deliver(peerConn, decryptedData)
+          this.deliver(peerConn, uint8Data.slice(1))
         } else if (msgType === MSG_TYPE_CHUNKED) {
           // Chunked message - reassemble
           if (uint8Data.length < 13) {
@@ -1419,21 +1406,13 @@ export class SimplePeerTransport implements Transport {
             // Clean up buffer
             peerConn.chunkBuffers.delete(messageId)
 
-            // Decrypt and deliver
-            const decryptedData = this.options.password
-              ? this.decrypt(fullMessage, this.options.password)
-              : fullMessage
-            this.deliver(peerConn, decryptedData)
+            this.deliver(peerConn, fullMessage)
             this.log(
               `📥 Reassembled ${totalLength}B from ${totalChunks} chunks (msgId=${messageId})`,
             )
           }
         } else {
-          // Unknown type or legacy message without type marker - try as raw data
-          const decryptedData = this.options.password
-            ? this.decrypt(uint8Data, this.options.password)
-            : uint8Data
-          this.deliver(peerConn, decryptedData)
+          this.log(`🗑️ Dropping frame of unknown type ${msgType} from ${remotePeerId}`)
         }
       } catch (error) {
         this.log('Error handling peer data:', error)
@@ -1607,34 +1586,6 @@ export class SimplePeerTransport implements Transport {
    */
   private generatePeerId(): string {
     return Date.now().toString(36) + Math.random().toString(36).substr(2, 9)
-  }
-
-  /**
-   * Simple XOR encryption (not cryptographically secure, just obfuscation).
-   */
-  private encrypt(data: Uint8Array, password: string): Uint8Array {
-    const key = this.hashPassword(password)
-    const encrypted = new Uint8Array(data.length)
-    for (let i = 0; i < data.length; i++) {
-      encrypted[i] = data[i] ^ key[i % key.length]
-    }
-    return encrypted
-  }
-
-  /**
-   * Simple XOR decryption.
-   */
-  private decrypt(data: Uint8Array, password: string): Uint8Array {
-    // XOR is symmetric, so decrypt is the same as encrypt
-    return this.encrypt(data, password)
-  }
-
-  /**
-   * Hash password to key.
-   */
-  private hashPassword(password: string): Uint8Array {
-    const encoder = new TextEncoder()
-    return encoder.encode(password)
   }
 
   /**

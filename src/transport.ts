@@ -68,7 +68,7 @@ export interface Transport {
   /**
    * Optional: per-peer control side-channel that bypasses the provider pipe.
    * For consumer-defined out-of-band exchanges (identity/auth handshakes) that
-   * must not be CRC-verified or decoded as Yjs/pubsub data. Only transports
+   * must not be decoded as Yjs/pubsub data. Only transports
    * with a peer concept implement these.
    *
    * @param peerId - Target peer's ID
@@ -128,9 +128,6 @@ export interface Transport {
 export interface ConnectionConfig {
   /** Room/channel identifier for grouping clients */
   room: string
-
-  /** Optional password for encrypted communication */
-  password?: string
 
   /** Any other backend-specific configuration */
   [key: string]: any

@@ -38,8 +38,8 @@ async function run(n: number, relay: boolean) {
     if (relay) Object.defineProperty(transport, 'reachesAllPeers', { value: false })
     const send = transport.send.bind(transport)
     transport.send = (data: Uint8Array) => {
-      // [CRC32 x4][opcode]: opcode 1 is awareness.
-      if (data[4] === 1) {
+      // [opcode]: opcode 1 is awareness.
+      if (data[0] === 1) {
         sent++
         delivered += n - 1
       }

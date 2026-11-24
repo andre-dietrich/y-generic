@@ -456,6 +456,17 @@ describe('signaling liveness (ported from edrys-Lite)', () => {
     t.disconnect()
   })
 
+  test('the signaling topic is the room tagged with the wire version', async () => {
+    // 2.x peers (CRC32 + XOR framing) subscribe to the bare room name and
+    // must never connect to us.
+    const t = await connected()
+    const ws = FakeWS.latest()
+    ws.sent = []
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(ws.sent.map((m) => m.topics?.[0] ?? m.topic)).toEqual(['room/v3', 'room/v3'])
+    t.disconnect()
+  })
+
   test('re-subscribes and re-announces every 5s', async () => {
     const t = await connected()
     const ws = FakeWS.latest()
@@ -519,7 +530,7 @@ describe('signaling liveness (ported from edrys-Lite)', () => {
 })
 
 describe('trust gate (requireTrust)', () => {
-  /** A data frame as a peer sends it without a password: [0x00][payload]. */
+  /** A data frame as a peer sends it: [0x00][payload]. */
   const frame = (...bytes: number[]) => new Uint8Array([0x00, ...bytes])
 
   async function gated(ids = ['p1']) {

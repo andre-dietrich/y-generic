@@ -38,7 +38,7 @@ describe('WebSocketTransport', () => {
   test('messages sent before the socket opens are queued and flushed', async () => {
     const t = new WebSocketTransport()
     const p = t.connect({ room: 'room', serverUrl: 'wss://relay' } as any)
-    t.send(new Uint8Array([0, 0, 0, 0, 7]))
+    t.send(new Uint8Array([7]))
     expect(FakeWS.latest().sent).toEqual([])
     FakeWS.latest().open()
     await p
@@ -52,7 +52,7 @@ describe('WebSocketTransport', () => {
     const got: Uint8Array[] = []
     t.onMessage((d) => got.push(d))
     expect(got).toHaveLength(1)
-    expect([...got[0].subarray(4)]).toEqual([0, 1])
+    expect([...got[0]]).toEqual([0, 1])
     t.disconnect()
   })
 

@@ -8,7 +8,6 @@
  * - Direct peer-to-peer connections
  * - Mesh network (each peer connects to multiple others)
  * - Uses signaling server only for peer discovery (not for data)
- * - Optional encryption
  * - Automatic connection management
  * - Resilient to peer disconnections
  *
@@ -22,7 +21,6 @@
  * const transport = new SimplePeerTransport({
  *   peer: Peer, // Pass the simple-peer constructor
  *   signaling: ['wss://signaling.example.com'],
- *   password: 'optional-encryption-key'
  * })
  * const provider = new GenericProvider(doc, transport)
  * await provider.connect({ room: 'my-room' })
@@ -91,12 +89,6 @@ export interface SimplePeerTransportOptions {
      */
     iceServers?: IceServer[];
     /**
-     * Optional password for encrypting messages.
-     * When provided, all messages are encrypted before sending.
-     * @default undefined
-     */
-    password?: string;
-    /**
      * Maximum number of WebRTC peer connections.
      * Too many connections can overwhelm the browser.
      * @default 20 + random(0-15)
@@ -157,6 +149,8 @@ export declare class SimplePeerTransport implements Transport {
     private options;
     private _connected;
     private _room;
+    /** Signaling topic: the room plus WIRE_TAG */
+    private _topic;
     private _callback?;
     private _peerConnectCallbacks;
     private _peerDisconnectCallbacks;
@@ -235,7 +229,7 @@ export declare class SimplePeerTransport implements Transport {
      */
     disconnectPeer(peerId: string): void;
     /**
-     * Send a control frame to a single peer. Not chunked or encrypted — keep
+     * Send a control frame to a single peer. Not chunked — keep
      * payloads small (they must fit one DataChannel message).
      */
     sendControl(peerId: string, payload: Uint8Array): void;
@@ -352,18 +346,6 @@ export declare class SimplePeerTransport implements Transport {
      * Generate a unique peer ID.
      */
     private generatePeerId;
-    /**
-     * Simple XOR encryption (not cryptographically secure, just obfuscation).
-     */
-    private encrypt;
-    /**
-     * Simple XOR decryption.
-     */
-    private decrypt;
-    /**
-     * Hash password to key.
-     */
-    private hashPassword;
     /**
      * Log debug messages if enabled.
      */

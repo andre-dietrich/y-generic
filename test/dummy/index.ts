@@ -56,75 +56,6 @@ let globalNetworkOnline: boolean = true
 let networkDelay: number = 10 // milliseconds
 let networkPacketLoss: number = 0 // percentage (0-100)
 let networkJitter: number = 0 // jitter factor (0-1)
-let dataCorruptionRate: number = 0 // percentage (0-100) - probability of corrupting data
-let corruptionType: 'bitflip' | 'truncate' | 'garbage' | 'insert' = 'bitflip' // corruption strategy
-
-/**
- * Corruption strategies for testing Y.mergeUpdates error handling:
- * - bitflip: Flip random bits (subtle corruption, realistic)
- * - truncate: Cut off message at random point (incomplete message)
- * - garbage: Replace entire payload with random data (worst case)
- * - insert: Insert random bytes at random positions (length changes)
- */
-function corruptData(data: Uint8Array, type: string): Uint8Array {
-  const corrupted = new Uint8Array(data)
-
-  switch (type) {
-    case 'bitflip': {
-      // Flip 1-5 random bits
-      const numFlips = 1 + Math.floor(Math.random() * 5)
-      for (let i = 0; i < numFlips; i++) {
-        const byteIndex = Math.floor(Math.random() * corrupted.length)
-        const bitIndex = Math.floor(Math.random() * 8)
-        corrupted[byteIndex] ^= 1 << bitIndex
-      }
-      return corrupted
-    }
-
-    case 'truncate': {
-      // Cut off 10-90% of the message
-      const keepPercent = 0.1 + Math.random() * 0.8
-      const newLength = Math.max(1, Math.floor(corrupted.length * keepPercent))
-      return corrupted.slice(0, newLength)
-    }
-
-    case 'garbage': {
-      // Replace entire payload with random bytes
-      const garbage = new Uint8Array(corrupted.length)
-      for (let i = 0; i < garbage.length; i++) {
-        garbage[i] = Math.floor(Math.random() * 256)
-      }
-      return garbage
-    }
-
-    case 'insert': {
-      // Insert 1-10 random bytes at random positions
-      const numInserts = 1 + Math.floor(Math.random() * 10)
-      let result = new Uint8Array(corrupted.length + numInserts)
-      let srcPos = 0
-      let dstPos = 0
-
-      for (let i = 0; i < numInserts; i++) {
-        const insertAt = Math.floor(
-          Math.random() * (corrupted.length - srcPos + 1),
-        )
-        // Copy original data up to insert point
-        result.set(corrupted.slice(srcPos, srcPos + insertAt), dstPos)
-        srcPos += insertAt
-        dstPos += insertAt
-        // Insert random byte
-        result[dstPos++] = Math.floor(Math.random() * 256)
-      }
-      // Copy remaining data
-      result.set(corrupted.slice(srcPos), dstPos)
-      return result
-    }
-
-    default:
-      return corrupted
-  }
-}
-
 /**
  * Dummy transport that simulates network communication.
  * All Dummy instances communicate through a shared in-memory registry.
@@ -184,19 +115,8 @@ export class Dummy implements Transport {
 
         // CRITICAL: Always copy data to avoid reference issues with async delivery
         // Without copying, if sender modifies array before setTimeout fires,
-        // receiver gets corrupted data even at 0% corruption rate
-        let dataToSend: Uint8Array = new Uint8Array(data)
-
-        // Apply data corruption if enabled (corrupts the copy)
-        if (
-          dataCorruptionRate > 0 &&
-          Math.random() * 100 < dataCorruptionRate
-        ) {
-          console.warn(
-            `[Dummy ${this.id}] 💥 CORRUPTING data (type: ${corruptionType})`,
-          )
-          dataToSend = corruptData(dataToSend, corruptionType) as Uint8Array
-        }
+        // receiver gets a modified copy
+        const dataToSend: Uint8Array = new Uint8Array(data)
 
         setTimeout(() => {
           // Check network status again after delay (both global and target client)
@@ -834,42 +754,6 @@ async function init() {
     )
   })
 
-  // Data corruption slider
-  const corruptionSlider = document.getElementById(
-    'corruption-slider',
-  ) as HTMLInputElement
-  const corruptionValue = document.getElementById('corruption-value')!
-  corruptionSlider.addEventListener('input', () => {
-    dataCorruptionRate = parseInt(corruptionSlider.value)
-    corruptionValue.textContent = `${dataCorruptionRate}%`
-    log(`💥 Data corruption rate set to ${dataCorruptionRate}%`)
-    if (dataCorruptionRate > 0) {
-      log(`   Corruption type: ${corruptionType}`)
-      log(`   This will trigger Y.mergeUpdates error handling!`)
-      log(`   ✅ System will gracefully recover from corrupted messages`)
-      log(`   🔄 Automatic re-sync with exponential backoff (50ms → 10s)`)
-      log(`   Watch for: 💥 corruption detected, 🔄 auto recovery messages`)
-    } else {
-      log('   Data corruption disabled - clean network simulation')
-    }
-  })
-
-  // Corruption type selector
-  const corruptionTypeSelect = document.getElementById(
-    'corruption-type',
-  ) as HTMLSelectElement
-  corruptionTypeSelect.addEventListener('change', () => {
-    corruptionType = corruptionTypeSelect.value as any
-    log(`🔧 Corruption type changed to: ${corruptionType}`)
-    const descriptions: Record<string, string> = {
-      bitflip: 'Flip random bits (subtle, realistic)',
-      truncate: 'Cut messages short (incomplete data)',
-      garbage: 'Random bytes (worst case)',
-      insert: 'Insert random bytes (length changes)',
-    }
-    log(`   ${descriptions[corruptionType]}`)
-  })
-
   log('✅ Test environment ready!')
   log(
     'TIP: Use the rich text editor - format text, add images, see live cursors!',
@@ -880,8 +764,6 @@ async function init() {
   log(
     'TIP: Jitter causes out-of-order message delivery (realistic network behavior)',
   )
-  log('TIP: 💥 Enable data corruption to test Y.mergeUpdates error handling!')
-  log('INFO: Corrupted messages trigger a resync with exponential backoff')
   log('INFO: Rate limiting active - max 20 sync requests per 10 seconds')
 
   // Intercept console.warn to surface provider warnings in the log
@@ -892,28 +774,6 @@ async function init() {
       const match = args[0].match(/(\d+) requests per (\d+)s/)
       if (match) {
         log(`🚫 Rate limit hit: max ${match[1]} sync requests per ${match[2]}s`)
-      }
-    } else if (args[0]?.includes?.('Corrupted message detected')) {
-      // Extract corruption count
-      const match = args[0].match(/#(\d+)/)
-      if (match) {
-        log(
-          `💥 Corrupted message #${match[1]} detected (data corruption simulation active)`,
-        )
-      }
-    } else if (args[0]?.includes?.('Corrupted awareness message')) {
-      log(`💥 Corrupted awareness message (JSON parse failed)`)
-      log('   Awareness is ephemeral - update skipped, system continues')
-    } else if (args[0]?.includes?.('Corrupted sync message type')) {
-      log(`💥 Corrupted sync message type (invalid message type byte)`)
-      log('   Re-sync will be triggered to recover')
-    } else if (args[0]?.includes?.('Scheduling re-sync')) {
-      // Extract re-sync delay
-      const match = args[0].match(/(\d+)ms/)
-      if (match) {
-        log(
-          `🔄 Automatic recovery: re-sync in ${match[1]}ms (exponential backoff)`,
-        )
       }
     }
     originalWarn.apply(console, args)
@@ -1052,18 +912,6 @@ function testMergeUpdatesFailure(client: TestClient): void {
 
   log('💡 SIMULATION LIMITATION:')
   log('   Cannot directly mock Y.mergeUpdates (read-only property)')
-  log('')
-  log('💡 HOW TO SIMULATE MERGE FAILURES:')
-  log('   1. Use the "Data Corruption" slider above to enable corruption')
-  log('   2. Set corruption rate to 5-20% for realistic testing')
-  log('   3. Choose corruption type:')
-  log('      • Bit Flip: Subtle corruption (realistic network errors)')
-  log('      • Truncate: Incomplete messages (connection interruption)')
-  log('      • Garbage: Random bytes (worst case scenario)')
-  log('      • Insert: Length changes (protocol corruption)')
-  log('   4. Make changes and watch the provider handle corrupted data')
-  log('   5. Check console for "Failed to merge updates" errors')
-  log('   6. System should gracefully recover and continue syncing')
   log('')
   log('In real scenarios, merge failures occur with:')
   log('   - Corrupted network packets')

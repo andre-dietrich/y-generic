@@ -1,40 +1,72 @@
 name: Publish to npm
 
+# Push a tag that matches package.json, without a "v" (.npmrc sets
+# tag-version-prefix so npm version tags it that way), e.g.
+#   npm version 3.2.0 && git push --follow-tags
+# A version with a pre-release part (3.3.0-dev.0) goes to the npm tag "next",
+# any other to "latest".
+#
+# Auth is npm trusted publishing (OIDC), no token secret: on npmjs.com,
+# @edryslabs/genericprovider → Settings → Trusted publishing → GitHub Actions,
+# organization andre-dietrich, repository y-generic, workflow publish-npm.yml.
+
 on:
     push:
         tags:
             - "*.*.*"
-    workflow_dispatch: # Allow manual trigger
+
+permissions:
+    contents: write # GitHub release
+    id-token: write # npm trusted publishing and provenance
+
+concurrency:
+    group: publish
+    cancel-in-progress: false
 
 jobs:
     publish:
         runs-on: ubuntu-latest
-
-        permissions:
-            contents: read
-            id-token: write # Needed for npm provenance
+        timeout-minutes: 20
 
         steps:
-            - name: Checkout repository
-              uses: actions/checkout@v4
+            - uses: actions/checkout@v4
 
-            - name: Setup Node.js
-              uses: actions/setup-node@v4
+            - uses: actions/setup-node@v4
               with:
-                  node-version: "20"
-                  cache: "npm"
+                  # trusted publishing needs npm >= 11.5.1, which Node 24 ships
+                  node-version: "24"
                   registry-url: "https://registry.npmjs.org"
+                  cache: "npm"
 
-            - name: Install dependencies
+            - name: Check that the tag matches package.json
+              id: version
+              run: |
+                  version=$(node -p "require('./package.json').version")
+                  if [ "$version" != "$GITHUB_REF_NAME" ]; then
+                    echo "::error::tag $GITHUB_REF_NAME does not match package.json version $version"
+                    exit 1
+                  fi
+                  if [[ "$version" == *-* ]]; then
+                    echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+                    echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+                    echo "prerelease=" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Install
               run: npm ci
 
-            - name: Test
+            - name: Unit tests
               run: npm test
 
             - name: Build
               run: npm run build
 
             - name: Publish to npm
-              run: npm publish --access public --provenance
+              run: npm publish --access public --tag ${{ steps.version.outputs.dist_tag }}
+
+            - name: Create GitHub release
               env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+                  GH_TOKEN: ${{ github.token }}
+              run: gh release create "$GITHUB_REF_NAME" --generate-notes ${{ steps.version.outputs.prerelease }}

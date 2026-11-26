@@ -65,7 +65,8 @@ When changing sync/awareness/resync logic, add a unit test; for load or scaling 
 or extend a bench script.
 
 Releases: bump `package.json`, commit, push a tag matching the version (bare numbers, e.g.
-`2.0.1`); `.github/workflows/publish-npm.yml` publishes on tag push.
+`2.0.1`); `.github/workflows/publish-npm.yml` publishes on tag push via npm trusted publishing
+(OIDC, no token secret) and creates a GitHub release.
 
 ## Architecture
 

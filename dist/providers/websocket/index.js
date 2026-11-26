@@ -17,8 +17,6 @@ export class WebSocketTransport {
         this.debug = false;
         this.reconnectAttempts = 0;
         this.intentionalDisconnect = false;
-        this.messageQueue = []; // sent while not open
-        this.receivedBuffer = []; // received before onMessage()
         this.lastMessageAt = 0;
         this.wsUrl = '';
     }
@@ -103,7 +101,6 @@ export class WebSocketTransport {
             this.reconnectAttempts = 0;
             this.log(`✅ WebSocket connected to room: ${config.room}`);
             this.startLivenessCheck();
-            this.flushMessageQueue();
             this.settleConnect();
         };
         ws.onmessage = (event) => {
@@ -151,16 +148,18 @@ export class WebSocketTransport {
         }
         if (this.ws) {
             this.log('Disconnecting from WebSocket...');
-            this.ws.close(1000, 'Client disconnect');
+            const ws = this.ws;
+            // Its late onclose would otherwise hit a socket opened by a new connect().
+            ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+            ws.close(1000, 'Client disconnect');
             this.ws = null;
         }
         this._isConnected = false;
     }
-    /** Send now, or queue until the socket opens. */
+    /** Send now; dropped while not open (the periodic SyncStep1 recovers it). */
     send(data) {
         if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            this.log('⚠️ WebSocket not ready, queueing message');
-            this.messageQueue.push(data);
+            this.log('⚠️ WebSocket not open, message dropped');
             return;
         }
         try {
@@ -173,13 +172,6 @@ export class WebSocketTransport {
     }
     onMessage(callback) {
         this.messageCallback = callback;
-        if (this.receivedBuffer.length > 0) {
-            this.log(`📦 Flushing ${this.receivedBuffer.length} buffered received messages`);
-            for (const data of this.receivedBuffer) {
-                callback(data);
-            }
-            this.receivedBuffer = [];
-        }
         return () => {
             this.messageCallback = undefined;
         };
@@ -193,26 +185,11 @@ export class WebSocketTransport {
             }
             const uint8Data = new Uint8Array(data);
             this.log(`📨 Received ${uint8Data.length} bytes`);
-            if (this.messageCallback) {
-                this.messageCallback(uint8Data);
-            }
-            else {
-                this.log('⏳ Buffering message (callback not yet registered)');
-                this.receivedBuffer.push(uint8Data);
-            }
+            this.messageCallback?.(uint8Data);
         }
         catch (error) {
             this.log('❌ Error handling message:', error);
         }
-    }
-    flushMessageQueue() {
-        if (this.messageQueue.length === 0)
-            return;
-        this.log(`📦 Flushing ${this.messageQueue.length} queued messages`);
-        for (const data of this.messageQueue) {
-            this.send(data);
-        }
-        this.messageQueue = [];
     }
     /**
      * Reconnect a socket that stays OPEN but receives nothing (dead TCP path,

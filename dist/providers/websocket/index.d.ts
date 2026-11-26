@@ -36,8 +36,6 @@ export declare class WebSocketTransport implements Transport {
     private reconnectAttempts;
     private reconnectTimer?;
     private intentionalDisconnect;
-    private messageQueue;
-    private receivedBuffer;
     private lastMessageAt;
     private livenessTimer?;
     private wsUrl;
@@ -56,11 +54,10 @@ export declare class WebSocketTransport implements Transport {
     /** A socket that never opened: retry, or give up and reject connect(). */
     private connectFailed;
     disconnect(): void;
-    /** Send now, or queue until the socket opens. */
+    /** Send now; dropped while not open (the periodic SyncStep1 recovers it). */
     send(data: Uint8Array): void;
     onMessage(callback: (data: Uint8Array) => void): () => void;
     private handleMessage;
-    private flushMessageQueue;
     /**
      * Reconnect a socket that stays OPEN but receives nothing (dead TCP path,
      * NAT or proxy timeout); the browser may not fire onclose for minutes.

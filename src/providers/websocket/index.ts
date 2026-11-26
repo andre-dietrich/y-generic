@@ -38,8 +38,6 @@ export class WebSocketTransport implements Transport {
   private reconnectAttempts: number = 0
   private reconnectTimer?: ReturnType<typeof setTimeout>
   private intentionalDisconnect: boolean = false
-  private messageQueue: Uint8Array[] = [] // sent while not open
-  private receivedBuffer: Uint8Array[] = [] // received before onMessage()
   private lastMessageAt: number = 0
   private livenessTimer?: ReturnType<typeof setInterval>
   private wsUrl: string = ''
@@ -133,8 +131,6 @@ export class WebSocketTransport implements Transport {
       this.reconnectAttempts = 0
       this.log(`✅ WebSocket connected to room: ${config.room}`)
       this.startLivenessCheck()
-      this.flushMessageQueue()
-
       this.settleConnect()
     }
 
@@ -187,18 +183,20 @@ export class WebSocketTransport implements Transport {
 
     if (this.ws) {
       this.log('Disconnecting from WebSocket...')
-      this.ws.close(1000, 'Client disconnect')
+      const ws = this.ws
+      // Its late onclose would otherwise hit a socket opened by a new connect().
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null
+      ws.close(1000, 'Client disconnect')
       this.ws = null
     }
 
     this._isConnected = false
   }
 
-  /** Send now, or queue until the socket opens. */
+  /** Send now; dropped while not open (the periodic SyncStep1 recovers it). */
   send(data: Uint8Array): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.log('⚠️ WebSocket not ready, queueing message')
-      this.messageQueue.push(data)
+      this.log('⚠️ WebSocket not open, message dropped')
       return
     }
 
@@ -212,17 +210,6 @@ export class WebSocketTransport implements Transport {
 
   onMessage(callback: (data: Uint8Array) => void): () => void {
     this.messageCallback = callback
-
-    if (this.receivedBuffer.length > 0) {
-      this.log(
-        `📦 Flushing ${this.receivedBuffer.length} buffered received messages`,
-      )
-      for (const data of this.receivedBuffer) {
-        callback(data)
-      }
-      this.receivedBuffer = []
-    }
-
     return () => {
       this.messageCallback = undefined
     }
@@ -238,28 +225,10 @@ export class WebSocketTransport implements Transport {
 
       const uint8Data = new Uint8Array(data)
       this.log(`📨 Received ${uint8Data.length} bytes`)
-
-      if (this.messageCallback) {
-        this.messageCallback(uint8Data)
-      } else {
-        this.log('⏳ Buffering message (callback not yet registered)')
-        this.receivedBuffer.push(uint8Data)
-      }
+      this.messageCallback?.(uint8Data)
     } catch (error) {
       this.log('❌ Error handling message:', error)
     }
-  }
-
-  private flushMessageQueue(): void {
-    if (this.messageQueue.length === 0) return
-
-    this.log(`📦 Flushing ${this.messageQueue.length} queued messages`)
-
-    for (const data of this.messageQueue) {
-      this.send(data)
-    }
-
-    this.messageQueue = []
   }
 
   /**

@@ -58,8 +58,7 @@ await provider.connect({
 Updates are sent as standard sync messages (type 0), which a stock y-websocket server
 understands. Awareness frames carry an extra channel byte, and pub/sub messages (types 2 and 4)
 are not y-websocket message types, so presence and pub/sub need a relay that forwards them
-unchanged, such as the edrys websocket-server. (Up to 2.0.3 this needed `verifyUpdates: false`;
-the option has been removed.)
+unchanged, such as the edrys websocket-server.
 
 ### With Auto-reconnect
 

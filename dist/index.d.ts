@@ -54,18 +54,11 @@ export declare class GenericProvider extends Observable<string> {
     private _pendingUpdate;
     private _batchTimeoutId?;
     private _awarenessInterval;
-    private _pendingAwarenessClients;
-    private _awarenessTimeoutId?;
-    private _lastAwarenessTime;
-    private _pendingAppAwarenessClients;
-    private _appAwarenessTimeoutId?;
-    private _lastAppAwarenessTime;
+    private _channels;
     private _excludeOrigins;
     private _localId?;
     private _syncMode;
     private _updateHandler?;
-    private _awarenessUpdateHandler?;
-    private _appAwarenessUpdateHandler?;
     private _unsubscribeTransport?;
     private _beforeUnloadHandler?;
     constructor(doc: Y.Doc, transport: Transport, options?: {
@@ -121,6 +114,7 @@ export declare class GenericProvider extends Observable<string> {
     /** Merge updates and send them once no new one arrived for `batchUpdates` ms. */
     private _batchUpdate;
     private _setupAwarenessSync;
+    private _removeLocalAwareness;
     /**
      * Changed awareness clients to broadcast. If the transport reaches every
      * peer, only our own state (relaying others' is N² duplication). Otherwise
@@ -163,10 +157,10 @@ export declare class GenericProvider extends Observable<string> {
     _sendPubSubTo(target: string, topic: string, message: any): void;
     /** Broadcast these clients' awareness, batched to one frame per `awarenessInterval`. */
     private _broadcastAwareness;
-    private _sendAwarenessNow;
+    /** [MESSAGE_AWARENESS][channel][update]; `states` overrides the current ones. */
+    private _awarenessFrame;
     /** Join the room's BroadcastChannel and send our state to other tabs. */
     private _setupBroadcastChannel;
-    private _publishAwarenessToBroadcastChannel;
     /** Tell other tabs we're offline (null awareness) and leave the channel. */
     private _disconnectBroadcastChannel;
     /** Send a frame to other tabs and through the transport. */

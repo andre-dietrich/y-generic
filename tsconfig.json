@@ -17,5 +17,5 @@
     "types": []
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "test", "version", "src/providers/dummy"]
+  "exclude": ["node_modules", "dist", "test", "src/providers/dummy"]
 }

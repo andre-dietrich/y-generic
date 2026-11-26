@@ -1,9 +1,6 @@
 node_modules/
-version/
 .parcel-cache/
 .parcel-dev/
-demos/
-examples/
 bench-dist/
 bench-dist-baseline/
 bench-dist-*/

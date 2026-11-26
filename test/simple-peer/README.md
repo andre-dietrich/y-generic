@@ -83,7 +83,7 @@ This demo tests peer-to-peer synchronization using SimplePeer transport (WebRTC 
 
 Signaling servers are used for peer discovery only (not for data transfer).
 
-**Default**: `wss://signaling.yjs.dev`, `wss://0.peerjs.com/peerjs`
+**Default**: `wss://signaling.yjs.dev`
 
 **In the UI**: Click "⚙️ WebRTC Configuration" to configure signaling servers in the browser.
 

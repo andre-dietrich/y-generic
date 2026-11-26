@@ -75,12 +75,7 @@ export class GenericProvider extends Observable {
         this._pendingSyncReply = null;
         this._batchUpdates = 0; // ms, 0 = send immediately
         this._pendingUpdate = null;
-        // Awareness throttling, one set of state per channel.
         this._awarenessInterval = 100;
-        this._pendingAwarenessClients = new Set();
-        this._lastAwarenessTime = 0;
-        this._pendingAppAwarenessClients = new Set();
-        this._lastAppAwarenessTime = 0;
         this._excludeOrigins = new Set();
         this._syncMode = 'push-pull';
         this.doc = doc;
@@ -100,6 +95,15 @@ export class GenericProvider extends Observable {
         this._maxSyncRequestsPerWindow = options.maxSyncRequestsPerWindow ?? 20;
         this._syncRequestWindowMs = options.syncRequestWindowMs ?? 10000;
         this._syncReplySuppressionMs = options.syncReplySuppressionMs ?? 30;
+        const channel = (id, awareness) => ({
+            id,
+            awareness,
+            pending: new Set(),
+            lastSent: 0,
+        });
+        this._channels = [];
+        this._channels[AWARENESS_CHANNEL_MAIN] = channel(AWARENESS_CHANNEL_MAIN, this.awareness);
+        this._channels[AWARENESS_CHANNEL_APP] = channel(AWARENESS_CHANNEL_APP, this.appAwareness);
         this._setupDocumentSync();
         this._setupAwarenessSync();
     }
@@ -149,8 +153,8 @@ export class GenericProvider extends Observable {
             else {
                 this.syncNow();
             }
-            this._broadcastAwareness([this.doc.clientID]);
-            this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP);
+            for (const ch of this._channels)
+                this._broadcastAwareness(ch, [this.doc.clientID]);
             // Periodic pull only (no full-state push) to recover lost updates.
             if (this._syncInterval > 0) {
                 this._syncIntervalId = setInterval(() => {
@@ -187,8 +191,7 @@ export class GenericProvider extends Observable {
         // A suppressed reply is redundant by design; discard rather than flush.
         this._cancelPendingSyncReply();
         // Before the flush below, so the throttled removal goes out with it.
-        awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'disconnect');
-        awarenessProtocol.removeAwarenessStates(this.appAwareness, [this.doc.clientID], 'disconnect');
+        this._removeLocalAwareness('disconnect');
         // Flush pending batched updates and awareness.
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
@@ -198,25 +201,16 @@ export class GenericProvider extends Observable {
             }
             this._pendingUpdate = null;
         }
-        if (this._awarenessTimeoutId !== undefined) {
-            clearTimeout(this._awarenessTimeoutId);
-            this._awarenessTimeoutId = undefined;
-            if (this._pendingAwarenessClients.size > 0 &&
-                this.transport.isConnected) {
-                const clientsToSend = Array.from(this._pendingAwarenessClients);
-                this._sendAwarenessNow(clientsToSend);
+        for (const ch of this._channels) {
+            if (ch.timeoutId === undefined)
+                continue;
+            clearTimeout(ch.timeoutId);
+            ch.timeoutId = undefined;
+            if (ch.pending.size > 0 && this.transport.isConnected) {
+                this._send(this._awarenessFrame(ch, [...ch.pending]));
             }
+            ch.pending.clear();
         }
-        this._pendingAwarenessClients.clear();
-        if (this._appAwarenessTimeoutId !== undefined) {
-            clearTimeout(this._appAwarenessTimeoutId);
-            this._appAwarenessTimeoutId = undefined;
-            if (this._pendingAppAwarenessClients.size > 0 &&
-                this.transport.isConnected) {
-                this._sendAwarenessNow(Array.from(this._pendingAppAwarenessClients), AWARENESS_CHANNEL_APP);
-            }
-        }
-        this._pendingAppAwarenessClients.clear();
         this._disconnectBroadcastChannel();
         if (this._unsubscribeTransport) {
             this._unsubscribeTransport();
@@ -234,13 +228,10 @@ export class GenericProvider extends Observable {
             this.doc.off('update', this._updateHandler);
             this._updateHandler = undefined;
         }
-        if (this._awarenessUpdateHandler) {
-            this.awareness.off('update', this._awarenessUpdateHandler);
-            this._awarenessUpdateHandler = undefined;
-        }
-        if (this._appAwarenessUpdateHandler) {
-            this.appAwareness.off('update', this._appAwarenessUpdateHandler);
-            this._appAwarenessUpdateHandler = undefined;
+        for (const ch of this._channels) {
+            if (ch.onUpdate)
+                ch.awareness.off('update', ch.onUpdate);
+            ch.onUpdate = undefined;
         }
         if (this._beforeUnloadHandler && typeof window !== 'undefined') {
             window.removeEventListener('beforeunload', this._beforeUnloadHandler);
@@ -279,8 +270,8 @@ export class GenericProvider extends Observable {
             this._writeSyncStep1();
         }
         // Awareness has its own throttle and isn't rate-limited.
-        this._broadcastAwareness([this.doc.clientID]);
-        this._broadcastAwareness([this.doc.clientID], AWARENESS_CHANNEL_APP);
+        for (const ch of this._channels)
+            this._broadcastAwareness(ch, [this.doc.clientID]);
     }
     _setupDocumentSync() {
         this._updateHandler = (update, origin) => {
@@ -325,22 +316,24 @@ export class GenericProvider extends Observable {
         }, this._batchUpdates);
     }
     _setupAwarenessSync() {
-        this._awarenessUpdateHandler = ({ added, updated, removed, }, _origin) => {
-            this._broadcastAwareness(this._awarenessClientsToSend(added.concat(updated, removed)));
-        };
-        this.awareness.on('update', this._awarenessUpdateHandler);
-        this._appAwarenessUpdateHandler = ({ added, updated, removed, }, _origin) => {
-            this._broadcastAwareness(this._awarenessClientsToSend(added.concat(updated, removed)), AWARENESS_CHANNEL_APP);
-        };
-        this.appAwareness.on('update', this._appAwarenessUpdateHandler);
+        for (const ch of this._channels) {
+            ch.onUpdate = ({ added, updated, removed }, _origin) => {
+                this._broadcastAwareness(ch, this._awarenessClientsToSend(added.concat(updated, removed)));
+            };
+            ch.awareness.on('update', ch.onUpdate);
+        }
         // On page unload, go offline and tell other tabs.
         if (typeof window !== 'undefined') {
             this._beforeUnloadHandler = () => {
-                awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'window unload');
-                awarenessProtocol.removeAwarenessStates(this.appAwareness, [this.doc.clientID], 'window unload');
+                this._removeLocalAwareness('window unload');
                 this._disconnectBroadcastChannel();
             };
             window.addEventListener('beforeunload', this._beforeUnloadHandler);
+        }
+    }
+    _removeLocalAwareness(origin) {
+        for (const ch of this._channels) {
+            awarenessProtocol.removeAwarenessStates(ch.awareness, [this.doc.clientID], origin);
         }
     }
     /**
@@ -374,9 +367,7 @@ export class GenericProvider extends Observable {
                     break;
                 case MESSAGE_AWARENESS: {
                     const channel = decoding.readVarUint(decoder);
-                    awarenessProtocol.applyAwarenessUpdate(channel === AWARENESS_CHANNEL_APP
-                        ? this.appAwareness
-                        : this.awareness, decoding.readVarUint8Array(decoder), this);
+                    awarenessProtocol.applyAwarenessUpdate((this._channels[channel] ?? this._channels[AWARENESS_CHANNEL_MAIN]).awareness, decoding.readVarUint8Array(decoder), this);
                     break;
                 }
                 case MESSAGE_PUBSUB: {
@@ -569,55 +560,36 @@ export class GenericProvider extends Observable {
         }
     }
     /** Broadcast these clients' awareness, batched to one frame per `awarenessInterval`. */
-    _broadcastAwareness(clients, channel = AWARENESS_CHANNEL_MAIN) {
+    _broadcastAwareness(ch, clients) {
         if (clients.length === 0)
             return;
-        const isApp = channel === AWARENESS_CHANNEL_APP;
-        const pending = isApp
-            ? this._pendingAppAwarenessClients
-            : this._pendingAwarenessClients;
         if (this._awarenessInterval <= 0) {
-            this._sendAwarenessNow(clients, channel);
+            this._send(this._awarenessFrame(ch, clients));
             return;
         }
-        for (const client of clients) {
-            pending.add(client);
-        }
+        for (const client of clients)
+            ch.pending.add(client);
         // A broadcast is already scheduled and will include them.
-        if ((isApp ? this._appAwarenessTimeoutId : this._awarenessTimeoutId) !==
-            undefined) {
+        if (ch.timeoutId !== undefined)
             return;
-        }
-        const now = Date.now();
-        const lastTime = isApp ? this._lastAppAwarenessTime : this._lastAwarenessTime;
-        const delay = Math.max(0, this._awarenessInterval - (now - lastTime));
-        const timeoutId = setTimeout(() => {
-            if (isApp) {
-                this._appAwarenessTimeoutId = undefined;
-                this._lastAppAwarenessTime = Date.now();
-            }
-            else {
-                this._awarenessTimeoutId = undefined;
-                this._lastAwarenessTime = Date.now();
-            }
-            const clientsToSend = Array.from(pending);
-            pending.clear();
+        const delay = Math.max(0, this._awarenessInterval - (Date.now() - ch.lastSent));
+        ch.timeoutId = setTimeout(() => {
+            ch.timeoutId = undefined;
+            ch.lastSent = Date.now();
+            const clientsToSend = [...ch.pending];
+            ch.pending.clear();
             if (clientsToSend.length > 0) {
-                this._sendAwarenessNow(clientsToSend, channel);
+                this._send(this._awarenessFrame(ch, clientsToSend));
             }
         }, delay);
-        if (isApp)
-            this._appAwarenessTimeoutId = timeoutId;
-        else
-            this._awarenessTimeoutId = timeoutId;
     }
-    _sendAwarenessNow(clients, channel = AWARENESS_CHANNEL_MAIN) {
-        const aw = channel === AWARENESS_CHANNEL_APP ? this.appAwareness : this.awareness;
+    /** [MESSAGE_AWARENESS][channel][update]; `states` overrides the current ones. */
+    _awarenessFrame(ch, clients, states) {
         const encoder = encoding.createEncoder();
         encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
-        encoding.writeVarUint(encoder, channel);
-        encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(aw, clients));
-        this._send(encoding.toUint8Array(encoder));
+        encoding.writeVarUint(encoder, ch.id);
+        encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(ch.awareness, clients, states));
+        return encoding.toUint8Array(encoder);
     }
     /** Join the room's BroadcastChannel and send our state to other tabs. */
     _setupBroadcastChannel(config) {
@@ -643,34 +615,20 @@ export class GenericProvider extends Observable {
         encoding.writeVarUint(encoderState, MESSAGE_SYNC);
         syncProtocol.writeSyncStep2(encoderState, this.doc);
         bc.publish(this._bcChannel, encoding.toUint8Array(encoderState), this);
-        if (this.awareness.getLocalState() !== null) {
-            this._publishAwarenessToBroadcastChannel(this.awareness, AWARENESS_CHANNEL_MAIN);
+        for (const ch of this._channels) {
+            if (ch.awareness.getLocalState() !== null) {
+                bc.publish(this._bcChannel, this._awarenessFrame(ch, [this.doc.clientID]), this);
+            }
         }
-        if (this.appAwareness.getLocalState() !== null) {
-            this._publishAwarenessToBroadcastChannel(this.appAwareness, AWARENESS_CHANNEL_APP);
-        }
-    }
-    _publishAwarenessToBroadcastChannel(awareness, channel) {
-        const encoder = encoding.createEncoder();
-        encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
-        encoding.writeVarUint(encoder, channel);
-        encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, [this.doc.clientID]));
-        bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this);
     }
     /** Tell other tabs we're offline (null awareness) and leave the channel. */
     _disconnectBroadcastChannel() {
         if (!this._bcConnected || !this._bcSubscriber) {
             return;
         }
-        for (const [awareness, channel] of [
-            [this.awareness, AWARENESS_CHANNEL_MAIN],
-            [this.appAwareness, AWARENESS_CHANNEL_APP],
-        ]) {
-            const encoder = encoding.createEncoder();
-            encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
-            encoding.writeVarUint(encoder, channel);
-            encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, [this.doc.clientID], new Map()));
-            bc.publish(this._bcChannel, encoding.toUint8Array(encoder), this);
+        for (const ch of this._channels) {
+            const offline = this._awarenessFrame(ch, [this.doc.clientID], new Map());
+            bc.publish(this._bcChannel, offline, this);
         }
         bc.unsubscribe(this._bcChannel, this._bcSubscriber);
         this._bcConnected = false;

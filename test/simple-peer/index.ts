@@ -244,7 +244,7 @@ function populateConfigForm(): void {
       'turn-servers',
     ) as HTMLTextAreaElement
 
-    signalingInput.value = 'wss://signaling.yjs.dev\nwss://0.peerjs.com/peerjs'
+    signalingInput.value = 'wss://signaling.yjs.dev'
     stunInput.value =
       'stun:stun.l.google.com:19302\nstun:stun1.l.google.com:19302'
     turnInput.value = ''

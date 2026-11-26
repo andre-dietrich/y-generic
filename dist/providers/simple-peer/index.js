@@ -109,7 +109,6 @@ export class SimplePeerTransport {
         this.log(`🔌 Connecting to room "${config.room}" as ${this.peerId}`);
         const results = await Promise.allSettled(this.options.signaling.map((url) => this.connectSignaling(url)));
         const successCount = results.filter((r) => r.status === 'fulfilled').length;
-        const failCount = results.filter((r) => r.status === 'rejected').length;
         if (successCount > 0) {
             this.log(`📡 Signaling: ${successCount}/${this.options.signaling.length} server(s) connected`);
         }
@@ -638,10 +637,7 @@ export class SimplePeerTransport {
                     return;
                 }
                 // Some servers strip `to`; accept those too.
-                if (msg.to === this.peerId && msg.signal) {
-                    this.handlePeerSignal(msg.from, msg.signal, msg.attempt);
-                }
-                else if (!msg.to && msg.signal) {
+                if (msg.signal && (!msg.to || msg.to === this.peerId)) {
                     this.handlePeerSignal(msg.from, msg.signal, msg.attempt);
                 }
                 break;
@@ -734,8 +730,7 @@ export class SimplePeerTransport {
             peerConn.connected = true;
             clearTimeout(peerConn.connectTimer);
             this._connectFailures.delete(remotePeerId);
-            const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
-            this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${connectedCount}/${this.peers.size} peer(s) connected`);
+            this.log(`✅ Peer channel open (${via}): ${remotePeerId} — ${this.connectedPeers}/${this.peers.size} peer(s) connected`);
             for (const cb of this._peerConnectCallbacks)
                 cb(remotePeerId);
         };
@@ -864,9 +859,8 @@ export class SimplePeerTransport {
         peer.on('close', () => {
             if (this.peers.get(remotePeerId) !== peerConn)
                 return;
-            const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected && p.peerId !== remotePeerId).length;
-            this.log(`🔴 Peer channel closed: ${remotePeerId} — ${connectedCount}/${this.peers.size - 1} remaining`);
-            this.removePeer(remotePeerId);
+            this.log(`🔴 Peer channel closed: ${remotePeerId}`);
+            this.removePeer(remotePeerId); // logs the remaining count
         });
     }
     handlePeerSignal(remotePeerId, signal, attempt) {
@@ -969,12 +963,11 @@ export class SimplePeerTransport {
             if (wasConnected)
                 for (const cb of this._peerDisconnectCallbacks)
                     cb(peerId);
-            const connectedCount = Array.from(this.peers.values()).filter((p) => p.connected).length;
-            this.log(`🗑️ Removed peer ${peerId} — ${connectedCount} connected / ${this.peers.size} total`);
+            this.log(`🗑️ Removed peer ${peerId} — ${this.connectedPeers} connected / ${this.peers.size} total`);
         }
     }
     generatePeerId() {
-        return Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
+        return Date.now().toString(36) + Math.random().toString(36).slice(2, 11);
     }
     log(...args) {
         if (this.options.debug) {

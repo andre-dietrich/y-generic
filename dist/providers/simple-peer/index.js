@@ -19,6 +19,9 @@ const DRAIN_POLL_MS = 250;
 const MAX_TOTAL_CHUNKS = 4096;
 const MAX_PENDING_MESSAGES = 16;
 const CHUNK_TIMEOUT = 30000;
+// Bytes of partial messages buffered per peer; an untrusted peer gets
+// MAX_HELD_BYTES, since chunks are reassembled before the trust gate.
+const MAX_CHUNK_BYTES = 64 * 1024 * 1024;
 // Held frames per untrusted peer; enough for an initial sync. Excess frames
 // are dropped and recovered by the periodic sync after trust.
 const MAX_HELD_FRAMES = 256;
@@ -808,10 +811,23 @@ export class SimplePeerTransport {
                             const oldest = peerConn.chunkBuffers.keys().next().value;
                             peerConn.chunkBuffers.delete(oldest);
                         }
-                        buffer = { chunks: new Map(), totalChunks, lastChunkAt: now };
+                        buffer = { chunks: new Map(), totalChunks, lastChunkAt: now, bytes: 0 };
                         peerConn.chunkBuffers.set(messageId, buffer);
                     }
+                    const grow = chunkData.length - (buffer.chunks.get(chunkIndex)?.length ?? 0);
+                    let pendingBytes = grow;
+                    for (const b of peerConn.chunkBuffers.values())
+                        pendingBytes += b.bytes;
+                    const maxBytes = this.options.requireTrust && !peerConn.trusted
+                        ? MAX_HELD_BYTES
+                        : MAX_CHUNK_BYTES;
+                    if (pendingBytes > maxBytes) {
+                        this.log(`🗑️ Dropping message ${messageId} from ${remotePeerId}: partial messages over ${maxBytes}B`);
+                        peerConn.chunkBuffers.delete(messageId);
+                        return;
+                    }
                     buffer.chunks.set(chunkIndex, chunkData);
+                    buffer.bytes += grow;
                     buffer.lastChunkAt = now;
                     if (buffer.chunks.size === totalChunks) {
                         let totalLength = 0;

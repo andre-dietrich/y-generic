@@ -186,6 +186,9 @@ export class GenericProvider extends Observable {
         this._syncRequestTimes = [];
         // A suppressed reply is redundant by design; discard rather than flush.
         this._cancelPendingSyncReply();
+        // Before the flush below, so the throttled removal goes out with it.
+        awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'disconnect');
+        awarenessProtocol.removeAwarenessStates(this.appAwareness, [this.doc.clientID], 'disconnect');
         // Flush pending batched updates and awareness.
         if (this._batchTimeoutId !== undefined) {
             clearTimeout(this._batchTimeoutId);
@@ -219,8 +222,6 @@ export class GenericProvider extends Observable {
             this._unsubscribeTransport();
             this._unsubscribeTransport = undefined;
         }
-        awarenessProtocol.removeAwarenessStates(this.awareness, [this.doc.clientID], 'disconnect');
-        awarenessProtocol.removeAwarenessStates(this.appAwareness, [this.doc.clientID], 'disconnect');
         this.transport.disconnect();
         this._synced = false;
         this._setStatus({ state: 'disconnected' });

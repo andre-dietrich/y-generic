@@ -352,6 +352,33 @@ describe('awareness relay (B4)', () => {
     expect(counts).toEqual([1, 1, 1])
   })
 
+  test('disconnect() tells other peers we went offline', async () => {
+    const hub = new DummyHub()
+    const [a, b] = await Promise.all(
+      [1, 2].map(async (id) => {
+        const doc = new Y.Doc()
+        doc.clientID = id
+        const p = new GenericProvider(doc, new DummyTransport({ hub }), {
+          disableBc: true,
+          syncInterval: 0,
+        })
+        await p.connect({ room: 'leave' })
+        return p
+      }),
+    )
+    a.awareness.setLocalStateField('user', 'alice')
+    a.appAwareness.setLocalStateField('cursor', 1)
+    await new Promise((r) => setTimeout(r, 150)) // past the awareness throttle
+    const seenBefore = b.awareness.getStates().has(1) && b.appAwareness.getStates().has(1)
+    a.disconnect()
+    await flush()
+    const gone = !b.awareness.getStates().has(1) && !b.appAwareness.getStates().has(1)
+    a.destroy()
+    b.destroy()
+    expect(seenBefore).toBe(true)
+    expect(gone).toBe(true)
+  })
+
   test('our own state is still sent when the transport reaches all peers', async () => {
     const { peers, count } = await threePeers()
     awarenessProtocol.removeAwarenessStates(peers[0].awareness, [1], 'window unload')

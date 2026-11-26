@@ -305,6 +305,35 @@ describe('chunk reassembly limits (B3)', () => {
     t.disconnect()
   })
 
+  test('partial messages from an untrusted peer are capped at 16MB in total', async () => {
+    const { t, peers } = await withPeers(['p1'], { requireTrust: true })
+    t.onMessage(() => {})
+    const buffers = (t as any).peers.get('p1').chunkBuffers as Map<number, any>
+    const big = new Array(256 * 1024).fill(7) // a max-size data channel message
+    // 64 chunks of 256KB = 16MB fit across messages; the next one doesn't.
+    for (let id = 0; id < 16; id++) {
+      for (let i = 0; i < 4; i++) peers.p1.receive(chunk(id, i, 4096, big))
+    }
+    expect(buffers.size).toBe(16)
+    peers.p1.receive(chunk(0, 4, 4096, big))
+    expect(buffers.has(0)).toBe(false)
+    let total = 0
+    for (const b of buffers.values()) total += b.bytes
+    expect(total).toBeLessThanOrEqual(16 * 1024 * 1024)
+    t.disconnect()
+  })
+
+  test('a trusted peer may buffer more than the untrusted cap', async () => {
+    const { t, peers } = await withPeers(['p1'], { requireTrust: true })
+    t.onMessage(() => {})
+    t.trustPeer('p1')
+    const buffers = (t as any).peers.get('p1').chunkBuffers as Map<number, any>
+    const big = new Array(256 * 1024).fill(7)
+    for (let i = 0; i < 100; i++) peers.p1.receive(chunk(1, i, 4096, big)) // 25MB
+    expect(buffers.get(1).chunks.size).toBe(100)
+    t.disconnect()
+  })
+
   test('a reused message id with a different chunk count starts over', async () => {
     const { t, peer, got } = await receiver()
     peer.receive(chunk(1, 0, 3, [9]))

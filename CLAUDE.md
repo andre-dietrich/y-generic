@@ -123,7 +123,9 @@ edrys-Lite (`src/ts/`: `GenericWebrtcProviderAdapter`, `GenericWebsocketProvider
   provider pipe: never held by the trust gate or decoded as Yjs data.
 - **`requireTrust` / `trustPeer`** (simple-peer) — `EdrysSimplePeerTransport` turns on
   `requireTrust` and calls `trustPeer(peerId)` once the handshake verifies. Until then the
-  peer's data frames are held (max 256 frames / 16 MB, discarded on disconnect), so an
+  peer's data frames are held (max 256 frames / 16 MB, discarded on disconnect; its partial
+  chunked messages are capped at 16 MB too, 64 MB once trusted, since reassembly runs before the
+  gate), so an
   unverified peer can't inject doc, awareness or pubsub data. Holding instead of dropping
   keeps the newcomer's initial sync; control frames are never held.
 - **`localPeerId` / `getPeerFingerprints(peerId)`** (simple-peer) — the handshake signature

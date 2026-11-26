@@ -323,6 +323,25 @@ describe('chunk reassembly limits (B3)', () => {
     t.disconnect()
   })
 
+  test('going over the cap warns once per connection, only for a trusted peer', async () => {
+    const { t, peers } = await withPeers(['p1'], { requireTrust: true })
+    t.onMessage(() => {})
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const big = new Array(256 * 1024).fill(7)
+    // Untrusted: 65 chunks of 256KB pass 16MB, dropped silently.
+    for (let i = 0; i < 65; i++) peers.p1.receive(chunk(1, i, 4096, big))
+    expect(warn).not.toHaveBeenCalled()
+    t.trustPeer('p1')
+    // Trusted: 257 chunks pass 64MB, twice over.
+    for (let id = 2; id < 4; id++) {
+      for (let i = 0; i < 257; i++) peers.p1.receive(chunk(id, i, 4096, big))
+    }
+    expect(warn).toHaveBeenCalledTimes(1)
+    expect(String(warn.mock.calls[0][0])).toContain('64 MB')
+    warn.mockRestore()
+    t.disconnect()
+  })
+
   test('a trusted peer may buffer more than the untrusted cap', async () => {
     const { t, peers } = await withPeers(['p1'], { requireTrust: true })
     t.onMessage(() => {})

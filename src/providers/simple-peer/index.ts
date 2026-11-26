@@ -88,6 +88,8 @@ interface PeerConnection {
   /** True while the queue waits for the channel buffer to drain */
   drainWait?: boolean
   trusted: boolean
+  /** Set once the over-cap warning was logged for this connection */
+  warnedChunkCap?: boolean
   heldFrames: Uint8Array[]
   heldBytes: number
 }
@@ -1089,12 +1091,18 @@ export class SimplePeerTransport implements Transport {
           const grow = chunkData.length - (buffer.chunks.get(chunkIndex)?.length ?? 0)
           let pendingBytes = grow
           for (const b of peerConn.chunkBuffers.values()) pendingBytes += b.bytes
-          const maxBytes =
-            this.options.requireTrust && !peerConn.trusted
-              ? MAX_HELD_BYTES
-              : MAX_CHUNK_BYTES
+          const untrusted = this.options.requireTrust && !peerConn.trusted
+          const maxBytes = untrusted ? MAX_HELD_BYTES : MAX_CHUNK_BYTES
           if (pendingBytes > maxBytes) {
             this.log(`🗑️ Dropping message ${messageId} from ${remotePeerId}: partial messages over ${maxBytes}B`)
+            // Untrusted: expected for a big doc, the periodic sync after trust delivers it.
+            if (!untrusted && !peerConn.warnedChunkCap) {
+              peerConn.warnedChunkCap = true
+              console.warn(
+                `[SimplePeerTransport] Dropping a ${totalChunks}-chunk message from ${remotePeerId}: over the ${MAX_CHUNK_BYTES / 1048576} MB limit. ` +
+                  'The shared document is probably too large to sync over WebRTC (images in modules?); use the WebSocket relay.',
+              )
+            }
             peerConn.chunkBuffers.delete(messageId)
             return
           }

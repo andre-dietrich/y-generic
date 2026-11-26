@@ -100,7 +100,10 @@ peers mis-decode silently instead of failing.
 - **Awareness relay** (`_awarenessClientsToSend`): when `transport.reachesAllPeers` is true
   (WebSocket, dummy, a small complete simple-peer mesh) a provider broadcasts only changes made
   locally, filtered by origin, not clientID: edrys applies module cursors into `appAwareness`
-  under the module's own clientID, and those must still go out. Otherwise it re-broadcasts every remote change once, which is how presence
+  under the module's own clientID, and those must still go out. One exception: a received
+  change that touched our own clientID is answered with our state, because y-protocols counters
+  a remote removal of our state (keeps it, bumps the clock) with origin = provider, and only
+  that broadcast tells the other peers we're still here (edrys Exploit 1). Otherwise it re-broadcasts every remote change once, which is how presence
   crosses a partial WebRTC mesh (room ≥ 20 peers or a pair that can't connect); remote
   states expire after 30s without renewal. Re-broadcasting on a full mesh or relay is pure
   duplication (N² frames, see `bench-awareness-relay.ts`).

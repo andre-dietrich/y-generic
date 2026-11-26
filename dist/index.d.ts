@@ -120,6 +120,9 @@ export declare class GenericProvider extends Observable<string> {
      * peer, only changes made here (relaying received ones is N² duplication);
      * these include states the app applied for other clientIDs, such as module
      * cursors. Otherwise all of them, which is how presence crosses a partial mesh.
+     * A received update that touched our own state is answered with our state:
+     * y-protocols keeps it against a remote removal and bumps its clock, and only
+     * this broadcast tells the other peers we are still here.
      */
     private _awarenessClientsToSend;
     /**

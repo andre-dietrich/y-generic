@@ -362,6 +362,30 @@ describe('awareness relay (B4)', () => {
     expect(counts).toEqual([1, 0, 0])
   })
 
+  test('a peer removing our state is answered, so the others keep us', async () => {
+    const { peers, count } = await threePeers()
+    peers[0].awareness.setLocalStateField('user', { name: 'alice' })
+    await flush()
+    // peers[2] sends a removal of alice's state with a newer clock.
+    const fake = new awarenessProtocol.Awareness(new Y.Doc())
+    fake.clientID = 1
+    fake.setLocalState({ user: { name: 'alice' } })
+    fake.setLocalState(null)
+    fake.setLocalState(null) // clock 2, above alice's 1
+    const removal = awarenessProtocol.encodeAwarenessUpdate(fake, [1])
+    // Origin = the provider, as for a frame received from the network.
+    for (const p of [peers[0], peers[1]]) {
+      awarenessProtocol.applyAwarenessUpdate(p.awareness, removal, p)
+    }
+    await flush()
+    const atSecond = peers[1].awareness.getStates().get(1)
+    const counts = count(0)
+    for (const p of peers) p.destroy()
+    fake.destroy()
+    expect(atSecond).toEqual({ user: { name: 'alice' } })
+    expect(counts[0]).toBeGreaterThan(1)
+  })
+
   test('on a partial mesh, each peer relays remote changes once', async () => {
     const { peers, count } = await threePeers(false)
     peers[0].awareness.setLocalStateField('user', { name: 'alice' })

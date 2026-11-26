@@ -117,8 +117,9 @@ export declare class GenericProvider extends Observable<string> {
     private _removeLocalAwareness;
     /**
      * Changed awareness clients to broadcast. If the transport reaches every
-     * peer, only our own state (relaying others' is N² duplication). Otherwise
-     * all of them, which is how presence crosses a partial mesh.
+     * peer, only changes made here (relaying received ones is N² duplication);
+     * these include states the app applied for other clientIDs, such as module
+     * cursors. Otherwise all of them, which is how presence crosses a partial mesh.
      */
     private _awarenessClientsToSend;
     /**

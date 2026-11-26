@@ -317,8 +317,8 @@ export class GenericProvider extends Observable {
     }
     _setupAwarenessSync() {
         for (const ch of this._channels) {
-            ch.onUpdate = ({ added, updated, removed }, _origin) => {
-                this._broadcastAwareness(ch, this._awarenessClientsToSend(added.concat(updated, removed)));
+            ch.onUpdate = ({ added, updated, removed }, origin) => {
+                this._broadcastAwareness(ch, this._awarenessClientsToSend(added.concat(updated, removed), origin));
             };
             ch.awareness.on('update', ch.onUpdate);
         }
@@ -338,13 +338,15 @@ export class GenericProvider extends Observable {
     }
     /**
      * Changed awareness clients to broadcast. If the transport reaches every
-     * peer, only our own state (relaying others' is N² duplication). Otherwise
-     * all of them, which is how presence crosses a partial mesh.
+     * peer, only changes made here (relaying received ones is N² duplication);
+     * these include states the app applied for other clientIDs, such as module
+     * cursors. Otherwise all of them, which is how presence crosses a partial mesh.
      */
-    _awarenessClientsToSend(changed) {
+    _awarenessClientsToSend(changed, origin) {
         if (this.transport.reachesAllPeers !== true)
             return changed;
-        return changed.filter((client) => client === this.doc.clientID);
+        // `this`: received from a peer or tab. 'timeout': y-protocols expired it locally.
+        return origin === this || origin === 'timeout' ? [] : changed;
     }
     /**
      * Handle a frame [opcode][payload] from the transport or another tab.

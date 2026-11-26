@@ -98,8 +98,9 @@ peers mis-decode silently instead of failing.
 - **Update batching** (`batchUpdates`, defaulting to `transport.preferredBatchMs`) and
   **awareness throttling** are separate debounce paths.
 - **Awareness relay** (`_awarenessClientsToSend`): when `transport.reachesAllPeers` is true
-  (WebSocket, dummy, a small complete simple-peer mesh) a provider broadcasts only its own
-  awareness state. Otherwise it re-broadcasts every remote change once, which is how presence
+  (WebSocket, dummy, a small complete simple-peer mesh) a provider broadcasts only changes made
+  locally, filtered by origin, not clientID: edrys applies module cursors into `appAwareness`
+  under the module's own clientID, and those must still go out. Otherwise it re-broadcasts every remote change once, which is how presence
   crosses a partial WebRTC mesh (room ≥ 20 peers or a pair that can't connect); remote
   states expire after 30s without renewal. Re-broadcasting on a full mesh or relay is pure
   duplication (N² frames, see `bench-awareness-relay.ts`).

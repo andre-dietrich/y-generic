@@ -343,6 +343,25 @@ describe('awareness relay (B4)', () => {
     expect(stillAtThird).toEqual({ user: { name: 'alice' } })
   })
 
+  test('a state applied locally for another clientID (module cursor) reaches peers', async () => {
+    const { peers, count } = await threePeers()
+    // A module iframe has its own Awareness; edrys applies its updates into appAwareness.
+    const module = new awarenessProtocol.Awareness(new Y.Doc())
+    module.setLocalStateField('cursor', { x: 5 })
+    awarenessProtocol.applyAwarenessUpdate(
+      peers[0].appAwareness,
+      awarenessProtocol.encodeAwarenessUpdate(module, [module.clientID]),
+      { transactionId: 'extern' },
+    )
+    await flush()
+    const seen = peers[1].appAwareness.getStates().get(module.clientID)
+    const counts = count(1)
+    for (const p of peers) p.destroy()
+    module.destroy()
+    expect(seen).toEqual({ cursor: { x: 5 } })
+    expect(counts).toEqual([1, 0, 0])
+  })
+
   test('on a partial mesh, each peer relays remote changes once', async () => {
     const { peers, count } = await threePeers(false)
     peers[0].awareness.setLocalStateField('user', { name: 'alice' })

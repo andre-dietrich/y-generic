@@ -34,8 +34,8 @@ export interface Transport {
     readonly preferredBatchMs?: number;
     /**
      * True while every `send()` reaches every peer (relay server or complete
-     * mesh): the provider then broadcasts only its own awareness instead of
-     * relaying others'. May be a getter whose value changes.
+     * mesh): the provider then broadcasts only awareness changes made locally
+     * instead of relaying received ones. May be a getter whose value changes.
      */
     readonly reachesAllPeers?: boolean;
 }
